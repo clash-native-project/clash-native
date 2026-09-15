@@ -1,2 +1,54 @@
 # clash-native
 An experimental native reimplementation inspired by Mihomo. This project is in a very early stage of development and is not recommended for use at this time.
+
+## Build
+
+The initial build uses CMake, Ninja, and Clang from an MSYS2 64-bit environment. The build script downloads and bootstraps the latest vcpkg checkout when needed. Dependency versions are controlled by `vcpkg.json` and its registry baseline.
+
+Set `MSYS2_ROOT` to the MSYS2 installation directory, then run:
+
+```powershell
+$env:MSYS2_ROOT = "C:\msys64"
+python scripts/build.py
+```
+
+The default environment is `ucrt64`. Use `--msys2-environment mingw64` when the MinGW 64-bit environment is required. Use `--update-vcpkg` to update an existing vcpkg checkout. The executable, dependency installation, and CMake files are written below `build/<msys2-environment>/` unless `--build-dir` is supplied.
+
+To run the executable directly from PowerShell, add the selected MSYS2 environment to `PATH`:
+
+```powershell
+$env:PATH = "$env:MSYS2_ROOT\ucrt64\bin;$env:PATH"
+& .\build\ucrt64\clash-native.exe --version
+```
+
+## Current SOCKS5 Flow
+
+The experimental proxy can accept unauthenticated SOCKS5 `CONNECT` requests:
+
+```powershell
+& .\build\ucrt64\clash-native.exe --listen 127.0.0.1:1080
+```
+
+The current implementation supports IPv4, IPv6, and domain-name targets with
+TCP bidirectional relay. UDP association, BIND, and username/password
+authentication are not implemented yet. Press `Ctrl+C` to stop the listener.
+
+## Stage 0 Build Boundaries
+
+The current CMake build defines these targets:
+
+- `clash-native-core`: a reusable static library containing the runtime,
+  platform adapter, and experimental SOCKS5 proxy implementation;
+- `clash-native`: the standalone process, including CLI parsing and
+  process-level application lifecycle, linked to `clash-native-core`;
+- `clash-native-tests`: the C++ test executable, which links to
+  `clash-native-core` instead of compiling core sources again.
+
+This is a build and ownership boundary only. The broader engine, routing, DNS,
+additional protocols, and C API described in `docs/architecture.md` remain
+planned work.
+
+Stage 0 also includes the initial runtime set and scheduler adapter, owned
+channel primitives, a core-only test host, and Go process/network test
+scaffolding. These foundations do not implement the later routing, DNS,
+protocol, or platform traffic-capture stages.

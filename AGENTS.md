@@ -15,6 +15,13 @@ Use English for all project content, including source code comments, documentati
 - Preserve platform boundaries and keep operating-system-specific code isolated in platform adapters.
 - Avoid adding dependencies without documenting the reason and evaluating their maintenance and licensing impact.
 - Do not treat experimental code as production-ready without explicit validation.
+- After every implementation change, append a concise entry dated `YYYY-MM-DD` to `docs/implementation-log.md` describing what was done. Keep this implementation log separate from `docs/architecture.md`.
+
+## Platform documentation
+
+- Before platform-specific implementation or validation, read the matching document under `docs/platform/`.
+- Use `docs/platform/windows.md` for Windows work and the corresponding `<platform>.md` document for other platforms.
+- Keep platform-specific toolchain choices, commands, validated scope, and known limitations in the matching platform document. Do not infer one platform's setup or validation from another platform.
 
 ## Validation
 

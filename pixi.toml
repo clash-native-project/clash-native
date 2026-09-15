@@ -1,0 +1,10 @@
+[workspace]
+authors = ["clash-native <329424465+clash-native@users.noreply.github.com>"]
+channels = ["conda-forge"]
+name = "clash-native"
+platforms = ["win-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
+  "name": "clash-native",
+  "version-semver": "0.1.0",
+  "builtin-baseline": "9e44ec0e9f247d77c230ced0ee66c76296837807",
+  "dependencies": [
+    {
+      "name": "boost-asio",
+      "version>=": "1.92.0",
+      "default-features": false
+    },
+    {
+      "name": "spdlog",
+      "version>=": "1.17.0",
+      "default-features": false
+    },
+    {
+      "name": "gtest",
+      "version>=": "1.16.0"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# CMake build output
+/build/
+
+# Tooling downloaded by the build script
+/.tools/
+/vcpkg_installed/
