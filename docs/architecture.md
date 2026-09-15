@@ -526,7 +526,9 @@ Expected network failures use the project's typed error model. Cooperative
 cancellation remains `set_stopped`; it is not silently converted into a
 generic socket error. The common error taxonomy must distinguish at least
 resolution, endpoint connection, carrier handshake, authentication, protocol
-framing, timeout, rejection, unsupported capability, and transport I/O.
+framing, timeout, rejection, unsupported capability, and transport I/O. The
+full mapping between `Result`, sender completion, and exception containment is
+defined in the error model.
 
 ### 7.11 Protocol extension contract
 
@@ -682,7 +684,212 @@ not by themselves guarantee:
 
 Those guarantees belong to the runtime, scope, adapter, and shutdown design.
 
-## 10. Ownership, cancellation, and shutdown
+## 10. Error model and exception containment
+
+The error model must preserve actionable failure information without assuming
+that every C++ or third-party operation is non-throwing. A `Result` return type
+describes expected operational failure. It does not promise that an unexpected
+C++ exception can never occur.
+
+### 10.1 Result vocabulary
+
+The core uses one dependency-light project vocabulary for synchronous and
+domain-level asynchronous results. The intended shape is:
+
+```cpp
+enum class ErrorCode : std::uint16_t {
+  invalid_argument,
+  invalid_configuration,
+  unsupported,
+  resolution_failed,
+  connection_failed,
+  handshake_failed,
+  authentication_failed,
+  protocol_error,
+  timed_out,
+  rejected,
+  transport_error,
+  resource_exhausted,
+  internal_error,
+};
+
+struct Error {
+  ErrorCode code;
+  std::error_code cause;
+  std::string context;
+};
+
+template <class T>
+using Result = tl::expected<T, Error>;
+
+using Status = Result<void>;
+```
+
+This is an illustrative storage shape, not a frozen ABI. The stable semantics
+are:
+
+- `ErrorCode` is a project-owned, transport-independent classification used by
+  policy and frontend translation;
+- `cause` preserves an operating-system, Asio, TLS, or other underlying error
+  code when one exists;
+- diagnostic context explains the operation and stage without replacing the
+  machine-readable code;
+- protocol-specific details may enrich an error internally, but normal callers
+  must not depend on a separate error type for every protocol.
+
+Only the base result header may name `tl::expected` and `tl::unexpected`
+directly. Other project code uses `Result<T>`, `Status`, and a project helper
+such as `fail(Error)`. This prevents one third-party vocabulary from spreading
+through the source tree and keeps a later move to `std::expected` tractable.
+
+### 10.2 Failure channels
+
+Each failure class has exactly one primary representation:
+
+| Condition | Representation |
+| --- | --- |
+| Expected configuration, resolution, connection, handshake, authentication, protocol, timeout, rejection, resource, or I/O failure | `Result<T>` containing `Error` |
+| Cooperative cancellation or intentional abandonment | `set_stopped()` |
+| Unexpected exception escaping task code | `set_error(std::exception_ptr)` |
+| Programmer invariant violation | assertion or controlled termination |
+| Fatal process or runtime failure | top-level containment and shutdown policy |
+
+Cancellation is not an `ErrorCode`. Converting cancellation into a timeout or
+generic I/O error prevents structured concurrency from distinguishing a stop
+request from an actual failed operation.
+
+An absent value that is part of normal behavior uses `std::optional`, not a
+success-valued `Result` with a fabricated error. Conversely, an error that
+changes routing, fallback, retry, or client response behavior must not be
+reduced to `false`, an empty optional, or an unstructured string.
+
+### 10.3 Propagation and context
+
+Functions returning `Result<T>` are not automatically `noexcept`. Known,
+recoverable failures are returned explicitly, while an unexpected exception
+may propagate to the nearest execution containment boundary. A function is
+marked `noexcept` only when its complete implementation and callees satisfy
+that contract; violating `noexcept` terminates the process and cannot be
+recovered by an outer catch.
+
+Ordinary layers do not catch and rethrow every error. They either propagate the
+result unchanged or add context when the semantic operation changes, for
+example from a socket connection failure to a named proxy-server connection
+failure. Code should prefer the future-standard operations `and_then`,
+`transform`, `or_else`, and `transform_error` where they remain clear.
+
+Errors are normally logged once by the boundary that finally observes or acts
+on them. Lower layers return information; they do not repeatedly log and
+return the same failure. Connection groups and routing policy may inspect an
+error to decide fallback or retry before the frontend renders the final
+diagnostic.
+
+A catch-all must not mechanically convert every exception into an ordinary
+recoverable `internal_error`. In particular, allocation failure, violated
+invariants, and unknown third-party failures may require session termination,
+runtime shutdown, or process termination rather than continued operation in a
+potentially invalid state.
+
+### 10.4 stdexec mapping
+
+The core follows a Rust-like asynchronous result shape for expected domain
+failures:
+
+```text
+task<Result<T>>
+  set_value(Result<T>)        expected success or operational failure
+  set_stopped()               cooperative cancellation
+  set_error(exception_ptr)    unexpected C++ exception
+```
+
+Expected failures carried by `Result<T>` are value completions from the
+sender's perspective. Generic `upon_error` does not see them. Retry, fallback,
+group selection, and protocol response logic must inspect the `Result`
+explicitly. A pipeline must never create `Result<Result<T>>`.
+
+Asio adapters should use non-throwing `error_code` completion forms where
+available. They map successful completion to a successful result, cancellation
+errors such as operation aborted to `set_stopped()`, and other expected I/O
+errors to the project `Error`. Callback adapters complete exactly once and
+must not allow an exception to escape through a C callback or receiver
+completion function.
+
+An unexpected exception inside a task is allowed to reach its sender error
+channel. Every spawned session, service, and background operation must attach
+an error-observing receiver or a common guarded-spawn helper. A potentially
+failing sender must not be passed to a detached consumer whose error behavior
+is termination. Final `upon_error` and `upon_stopped` handlers used for
+detached work are explicitly `noexcept`.
+
+### 10.5 Exception containment boundaries
+
+Exception containment is concentrated at execution roots rather than repeated
+throughout business logic:
+
+- a session or service spawn boundary observes `set_error` so one unexpected
+  exception does not silently terminate the entire runtime;
+- each blocking-pool job wrapper captures an unexpected exception and reports
+  it through its result channel;
+- each Asio runtime thread contains exceptions escaping `io_context::run()`,
+  reports them as critical diagnostics, and applies the runtime continuation or
+  shutdown policy;
+- the standalone frontend contains exceptions at `main()` and maps the final
+  outcome to an English diagnostic and process exit code;
+- every C API entry point catches exceptions before they cross the C ABI and
+  translates them into a stable C error result;
+- callbacks invoked through a C ABI are `noexcept` at the ABI edge and convert
+  any C++ callback failure before returning to foreign code.
+
+Asio permits an exception thrown by a handler to propagate from the current
+thread's `io_context::run()` call. Other runtime threads are unaffected, and
+the throwing thread may call `run()` again after containment. The project must
+define which exception classes allow that continuation. Unknown exceptions or
+evidence of a broken invariant stop the affected runtime instead of blindly
+resuming it.
+
+Destructors remain non-throwing. Cleanup failure is reported before destruction
+where possible; a destructor must not introduce a second exception during
+stack unwinding.
+
+### 10.6 Frontend and C ABI translation
+
+The standalone frontend owns final presentation. It converts structured errors
+to English CLI messages, assigns process exit codes where appropriate, and
+includes chained diagnostic context without exposing sensitive configuration
+or credentials.
+
+The C API exposes a stable, fixed-width error-code enum plus explicitly owned
+or borrowed diagnostic text. It does not expose `tl::expected`, C++ standard
+library types, `std::exception_ptr`, `std::error_code`, or C++ exceptions. The
+facade maps the richer internal error to the closest stable public code while
+retaining detailed diagnostics through an explicitly documented mechanism.
+
+### 10.7 `tl::expected` dependency policy
+
+The C++20 baseline does not provide `std::expected`, which is a C++23 library
+facility. The initial implementation therefore uses the header-only,
+CC0-licensed `tl::expected` package through its vcpkg port. The selected vcpkg
+baseline pins the actual package version.
+
+Project code uses only behavior aligned with `std::expected`, including
+`and_then`, `transform`, `or_else`, and `transform_error`. The tl-specific
+`map` and `map_error` names are not used. Construction of unexpected values is
+hidden by the project result header so differences between `tl::unexpected`
+and `std::unexpected` do not leak into call sites.
+
+Adding `tl::expected` does not by itself make the complete program safe to
+compile without C++ exceptions. Exception support remains enabled initially.
+A no-exception build is a separate deployment decision that requires verifying
+stdexec, Asio, QUICHE, the standard library, logging, allocation behavior, and
+all other dependencies on each supported toolchain. The result abstraction
+should make such an evaluation easier without claiming it has already passed.
+
+The dependency and result wrapper require Windows Clang x86 and x86-64 build
+coverage. Zig-based Linux profiles require their own compile and runtime
+validation before the dependency is considered portable across release
+targets.
+
+## 11. Ownership, cancellation, and shutdown
 
 Every long-lived asynchronous operation must be owned by a service scope or a
 session scope. Detached work without an owner is not part of the core model.
@@ -705,7 +912,7 @@ The intended engine shutdown sequence is:
 No frontend may destroy `clash-native-core` while a callback into that
 frontend is still possible.
 
-## 11. Configuration and reload
+## 12. Configuration and reload
 
 The initial configuration model reuses Mihomo's core concepts but does not
 promise syntax compatibility.
@@ -726,13 +933,251 @@ Reload must construct and validate the replacement state before publishing
 it. Reusable state may be retained deliberately, but running components must
 not observe a half-applied configuration.
 
-## 12. DNS architecture
+## 13. Traffic routing and metadata enrichment
+
+Traffic routing is a core service shared by every inbound, outbound, and
+frontend. It is independent of any particular proxy protocol and is not part
+of DNS upstream selection. The first implementation should preserve Mihomo's
+useful routing concepts without copying its configuration parser or coupling
+rules to mutable connection objects.
+
+The routing path is:
+
+```text
+normalized inbound metadata
+  -> optional explicit metadata transform
+  -> ordered TrafficRouter evaluation
+  -> lazy metadata enrichment when requested
+  -> RouteDecision
+  -> outbound or group resolution
+```
+
+Rules inspect metadata and return evaluation results. They must not dial
+connections, perform DNS or platform queries directly, mutate shared
+metadata, choose members inside a proxy group, or emit the final connection
+decision. Those responsibilities belong to the router and the services it
+coordinates.
+
+### 13.1 Routing metadata
+
+The router receives immutable `ConnectionMetadata` containing facts learned
+at the inbound boundary, including where available:
+
+- source address and port;
+- original destination host or address and port;
+- network type;
+- inbound name and type;
+- authenticated user;
+- a separately identified sniffed-host candidate.
+
+The original domain name and a resolved destination address must be retained
+as separate values. Resolving a domain must not overwrite the domain, because
+later rules and the selected outbound may need both. A sniffed host also
+remains distinguishable from the original destination and records its
+provenance rather than silently replacing it.
+
+Each routing operation owns a mutable, per-flow `RoutingContext`. It contains
+only derived state, such as:
+
+- destination-address lookup state and result;
+- process-attribution lookup state and result;
+- cached GeoIP, ASN, or set membership results;
+- the current rule cursor and bounded rematch state.
+
+Lookup state distinguishes at least `unrequested`, `in_progress`, `resolved`,
+and `failed`. It is never shared as mutable state between unrelated
+connections.
+
+### 13.2 Ordered evaluation protocol
+
+Traffic rules use ordered first-match semantics. Evaluation is one ordered
+traversal, not a domain-rule pass followed by DNS and then an unconditional
+second pass from the beginning.
+
+A rule evaluation has three conceptual outcomes:
+
+```cpp
+struct NoMatch {};
+struct Matched {
+  RouteAction action;
+};
+
+enum class MetadataNeed {
+  destination_ip,
+  process_info,
+};
+
+struct NeedMetadata {
+  MetadataNeed need;
+};
+
+using RuleEvaluation =
+    std::variant<NoMatch, Matched, NeedMetadata>;
+```
+
+This sketch defines behavior rather than fixing the final C++ representation.
+Pure rule evaluation must not block or suspend. The asynchronous
+`TrafficRouter` owns the rule cursor and handles `NeedMetadata`:
+
+1. evaluate the current rule against the available context;
+2. return immediately when the rule produces `Matched`;
+3. advance to the next rule when it produces `NoMatch`;
+4. when it produces `NeedMetadata`, suspend the routing operation and ask the
+   appropriate resolver or platform capability for that metadata;
+5. store the outcome in the per-flow context and re-evaluate the same rule;
+6. continue from that point rather than restarting at the first rule.
+
+Domain, domain-suffix, and domain-set rules inspect domain metadata and never
+trigger DNS merely to test themselves. Destination IP, GeoIP, ASN, and IP-set
+rules may request destination resolution only when no usable address is
+already present and the rule permits resolution. Process rules request
+process attribution through the same lazy protocol.
+
+### 13.3 Resolution and `no-resolve` semantics
+
+A literal destination IP satisfies the destination-address requirement
+without a DNS query. A domain destination is resolved lazily only when the
+ordered evaluation reaches a rule that needs its IP address.
+
+An IP-dependent rule marked `no-resolve` must never initiate DNS. It matches
+only when the routing context already contains an address, for example from a
+literal destination, FakeIP reverse mapping, transparent-proxy metadata, or
+an earlier enrichment step.
+
+Only one destination-resolution attempt is made by one ordinary routing
+decision. Multiple later IP-dependent rules consume the recorded result or
+failure rather than issuing duplicate queries. If resolution fails, the
+current IP-dependent rule becomes a non-match and ordered evaluation
+continues. A later connection stage that requires an IP consumes the recorded
+outcome unless an explicit resolver policy permits a distinct retry.
+
+Cancellation stops the enrichment operation and the complete routing
+operation. It maps to the stopped completion channel rather than to a
+synthetic rule miss. Resolver roles remain explicit so lazy enrichment cannot
+create an accidental DNS/outbound dependency cycle.
+
+### 13.4 Route decisions and actions
+
+`RouteDecision` identifies the selected action and enough provenance for
+observability. It should contain, as applicable:
+
+- a built-in `Direct` or `Reject` action;
+- a named outbound or outbound group;
+- the matched rule identity and optional rule payload;
+- the immutable runtime snapshot that owns referenced configuration;
+- an explicit reason when the default action was selected.
+
+Configuration validation ensures that every named target exists and that the
+combined outbound, group, chained-endpoint, and resolver graph is acyclic.
+Rule evaluation selects a group but does not select one of its members; group
+policy runs afterwards through the ordinary outbound-resolution path.
+
+Every `RuntimeSnapshot` contains an explicit default action. A frontend may
+normalize an omitted user setting to `Direct`, but the running router must not
+depend on a hidden fallthrough.
+
+Metadata transformation and rematching are explicit router actions. If a
+future compatibility layer needs sub-rules, metadata rewrites, or another
+rematch, it must use bounded depth and cycle detection. A connection or
+outbound must not restart routing as an undocumented side effect.
+
+### 13.5 Rule model and initial matcher scope
+
+Rules are immutable values owned by a runtime snapshot. Common matchers may
+be composed, but their matching logic stays independent of configuration
+syntax. The internal model should be able to represent, over time:
+
+- domain exact, suffix, keyword, regular-expression, and domain-set rules;
+- destination and source IP CIDR, GeoIP, ASN, and IP-set rules;
+- source and destination port rules;
+- TCP, UDP, and inbound identity rules;
+- authenticated user, process, executable path, and platform-specific
+  metadata rules;
+- external rule sets, logical `AND`, `OR`, and `NOT`, and sub-rule dispatch;
+- an explicit terminal/default action.
+
+The initial implementation does not need every matcher. It establishes one
+stable evaluation contract so adding a matcher does not require changes in
+inbounds, outbounds, relays, or frontends. Matcher-specific indexes and
+compiled structures may be added behind that contract after profiling.
+
+### 13.6 Separation from DNS and platform policy
+
+Three decisions that all mention routing remain independent:
+
+```text
+application metadata -> TrafficRouter -> application outbound
+DNS question name     -> DnsPolicyRouter -> DNS upstream group
+DNS upstream endpoint -> DnsUpstreamDialer -> DNS connection outbound
+```
+
+`TrafficRouter` may ask `DefaultResolver` to enrich an application
+destination. `DnsPolicyRouter` chooses which configured resolver should
+answer a DNS question. `DnsUpstreamDialer` decides how the connection to that
+resolver exits. Sharing matcher implementations does not merge these policy
+layers.
+
+Process attribution and other operating-system metadata are injected through
+platform capability interfaces. When a capability is unavailable, an
+optional rule treats that metadata as unavailable and does not match. Any
+future rule that requires a capability must be rejected during configuration
+validation on an unsupported product profile.
+
+Portable routing tests on Windows use real portable providers or injected
+fakes. Linux TUN, transparent proxy, original-destination recovery, and
+process lookup are later adapters feeding the same metadata and router; they
+do not create a second rule engine.
+
+### 13.7 Ownership, reload, and concurrency
+
+The compiled rule program and all referenced matcher data are immutable parts
+of `RuntimeSnapshot`. A routing operation retains its snapshot until its
+decision and any owned enrichment operations complete. Publishing a new
+snapshot affects new operations without invalidating existing rule cursors or
+matcher storage.
+
+The per-flow `RoutingContext` is owned by the session scope and stays on its
+owning scheduler. Asynchronous DNS or platform enrichment uses the established
+request/channel boundary and resumes on that scheduler before the context is
+updated. Stop requests propagate to all outstanding enrichment operations.
+
+Metrics and diagnostics are emitted as separate events or concurrency-safe
+counters. They must not make otherwise immutable rules or snapshots mutable.
+
+### 13.8 Implementation and validation order
+
+Routing should be delivered in independently testable slices:
+
+1. define immutable connection metadata, per-flow routing context,
+   `RouteAction`, `RouteDecision`, and an explicit default action;
+2. implement pure ordered evaluation for domain, network, port, and inbound
+   rules with `Direct`, `Reject`, and named targets;
+3. add asynchronous destination-IP enrichment, IP CIDR rules, recorded lookup
+   state, and `no-resolve`;
+4. integrate resolver roles, DNS policy routing, and upstream egress routing;
+5. add external rule sets, GeoData, process rules, logical composition,
+   sub-rules, and bounded rematching only as their stages require them.
+
+Unit and black-box tests must prove at least:
+
+- rule order and first-match behavior;
+- a matching domain rule performs no DNS query;
+- the first IP-dependent rule triggers at most one resolution and resumes at
+  the same rule rather than restarting the program;
+- original domain metadata remains available after resolution;
+- `no-resolve` never initiates a lookup;
+- DNS failure allows later non-IP and default rules to run;
+- cancellation stops routing and its enrichment operation;
+- process lookup is lazy and an unavailable capability has defined behavior;
+- reload preserves the old snapshot for in-flight routing operations.
+
+## 14. DNS architecture
 
 DNS is a core routing subsystem, not a utility hidden inside a socket dialer.
 The core needs rich DNS behavior comparable in shape to mature proxy engines,
 but its protocol, policy, and lifecycle responsibilities must remain separate.
 
-### 12.1 Responsibility split
+### 14.1 Responsibility split
 
 The DNS subsystem is divided into the following components:
 
@@ -753,7 +1198,7 @@ The wire codec may initially use a suitable maintained dependency. Upstream
 selection, routing integration, caching policy, resolver roles, FakeIP, and
 lifecycle belong to clash-native-core regardless of the codec choice.
 
-### 12.2 Three independent routing decisions
+### 14.2 Three independent routing decisions
 
 DNS-related routing contains three independent decisions:
 
@@ -790,7 +1235,7 @@ The last option is equivalent in purpose to rule-aware DNS upstream dialing,
 but the internal API should express it as a dial policy instead of scattering
 special `respect-rules` checks through transports.
 
-### 12.3 Resolver roles and dependency cycles
+### 14.3 Resolver roles and dependency cycles
 
 The engine uses distinct resolver roles:
 
@@ -813,7 +1258,7 @@ Configuration validation must reject resolver/outbound dependency cycles
 before a runtime snapshot is applied. Runtime recursion guards are still
 required as a defensive boundary, but they are not the primary design.
 
-### 12.4 Query pipeline
+### 14.4 Query pipeline
 
 The logical query path is:
 
@@ -844,7 +1289,7 @@ Concurrent equivalent misses should share one upstream operation. Cancelling
 one waiter must not cancel the shared operation while other live waiters still
 need it.
 
-### 12.5 FakeIP and mapping
+### 14.5 FakeIP and mapping
 
 FakeIP is an enhancer over resolver results, not an upstream transport.
 
@@ -866,7 +1311,7 @@ optional persistence, reload transfer, and clear failure behavior when a
 mapping is missing. FakeIP filters may reuse domain/rule matchers, but they are
 not the same decision as DNS upstream selection.
 
-### 12.6 Multi-runtime ownership
+### 14.6 Multi-runtime ownership
 
 The initial implementation assigns one logical `ResolverService` owner to a
 selected I/O runtime. It owns the cache, in-flight-query table, upstream
@@ -891,7 +1336,7 @@ If measurement later shows the single owner is a bottleneck, transports and
 cache shards may be distributed per worker without changing the public
 resolver or policy interfaces.
 
-### 12.7 Implementation order
+### 14.7 Implementation order
 
 DNS implementation proceeds in independently testable slices:
 
@@ -906,7 +1351,7 @@ DNS implementation proceeds in independently testable slices:
 Each slice must include malformed-response, timeout, cancellation, reload, and
 shutdown tests appropriate to the behavior it introduces.
 
-## 13. QUICHE boundary
+## 15. QUICHE boundary
 
 QUICHE owns QUIC and HTTP/3 protocol behavior. clash-native owns the event
 loop, UDP sockets, routing, proxy protocols, application lifecycle, and
@@ -935,7 +1380,7 @@ QUICHE and BoringSSL integration is a separate build milestone. It must be
 validated independently for every target architecture and linkage profile
 before a QUIC-based proxy protocol is placed on the main roadmap.
 
-## 14. Platform boundary
+## 16. Platform boundary
 
 Portable code depends on capability interfaces. Backends may be organized as:
 
@@ -967,7 +1412,7 @@ Platform capabilities include:
 Missing capabilities must be reported explicitly. Protocol modules must not
 accumulate platform preprocessor branches as a substitute for adapters.
 
-### 14.1 Windows-first core development
+### 16.1 Windows-first core development
 
 Windows is the primary development and functional-test platform for the
 portable proxy core. Before native platform work begins, the Windows test
@@ -990,7 +1435,7 @@ dependency interfaces. A protocol must not require a TUN device, transparent
 socket option, route mutation, process lookup, or another operating-system
 feature to be testable.
 
-### 14.2 Platform work starts after the core gate
+### 16.2 Platform work starts after the core gate
 
 Native platform work begins only after the portable core exit criteria in the
 delivery roadmap are met. It then connects operating-system traffic sources
@@ -1019,9 +1464,9 @@ prove Linux ABI compatibility, Linux 3.10 compatibility, platform socket
 semantics, TUN/TProxy behavior, route changes, daemon integration, or
 performance on router hardware. Those claims require their own target tests.
 
-## 15. Frontends
+## 17. Frontends
 
-### 15.1 Standalone process
+### 17.1 Standalone process
 
 The standalone `clash-native` process is a composition root over
 `clash-native-core`. It may provide:
@@ -1035,7 +1480,7 @@ The standalone `clash-native` process is a composition root over
 The process frontend is initially Linux-oriented, but the core remains
 portable.
 
-### 15.2 C API
+### 17.2 C API
 
 The C API is a thin ABI facade over the same engine. It exposes opaque handles,
 fixed-width values, explicit ownership functions, callbacks, and stable error
@@ -1049,7 +1494,7 @@ objects. It must not expose:
 
 The first consumer platforms and ABI stability policy remain later decisions.
 
-## 16. Build and deployment profiles
+## 18. Build and deployment profiles
 
 All supported project builds use Clang-family compiler drivers, CMake, Ninja,
 and Python orchestration. Windows development uses MSYS2 Clang. Linux release
@@ -1077,7 +1522,7 @@ Static linkage claims apply only after inspecting the final executable. DNS,
 certificate roots, configuration, GeoData, and other runtime files must be
 documented separately from ELF linkage.
 
-### 16.1 Linux toolchain policy
+### 18.1 Linux toolchain policy
 
 The project must pin one exact Zig version for release and CI builds. The
 Python build entry point selects a named Linux profile and supplies the
@@ -1104,7 +1549,7 @@ These are project profile names; their concrete triplet files and compiler
 flags are accepted only after a minimal C and C++ probe, vcpkg dependency
 probe, and final executable have been validated.
 
-### 16.2 Compatibility validation
+### 18.2 Compatibility validation
 
 The glibc suffix in a Zig target constrains the libc ABI selected by the
 toolchain. It does not by itself prove compatibility with Linux 3.10.
@@ -1134,7 +1579,7 @@ Each third-party dependency must record:
 - binary-size and maintenance impact;
 - whether vcpkg can own it or a separate integration is required.
 
-## 17. Delivery roadmap
+## 19. Delivery roadmap
 
 The roadmap has a hard boundary between the portable proxy core and native
 platform integration. Stages 0 through 4 are developed and functionally
@@ -1168,10 +1613,15 @@ validated on Windows. Stages 5 and 6 begin only after the portable core gate.
 - resolver roles and bootstrap dependency validation;
 - unified outbound, group, chained-endpoint, and resolver dependency graph with
   cycle validation;
+- immutable routing metadata, per-flow enrichment state, explicit default
+  action, and ordered first-match evaluation;
+- domain, network, port, inbound, and IP CIDR matchers with `no-resolve`;
+- lazy asynchronous destination-IP enrichment that resumes at the requesting
+  rule and performs at most one lookup per routing decision;
 - DNS UDP/TCP forwarding, cache, and in-flight query coalescing;
 - DNS upstream policy, fallback, and upstream egress routing;
 - local DNS service and FakeIP;
-- validated routing rules;
+- validated routing targets and independent rule-engine conformance tests;
 - immutable runtime snapshots and reload;
 - initial proxy groups and connection registry.
 
@@ -1232,7 +1682,7 @@ already been validated.
 - C API facade and language bindings;
 - optional Mihomo-compatible configuration or control translation layers.
 
-## 18. Validation principles
+## 20. Validation principles
 
 Every stage must validate the narrow behavior it introduces:
 
@@ -1249,7 +1699,7 @@ Every stage must validate the narrow behavior it introduces:
 - runtime tests on representative old Linux environments before claiming the
   Linux 3.10/glibc 2.17 baseline.
 
-### 18.1 Independent evidence
+### 20.1 Independent evidence
 
 Network-visible correctness must not be established only by having one
 clash-native component communicate with another clash-native component. A
@@ -1274,7 +1724,7 @@ invariants and failure paths that cannot be observed reliably through a socket.
 External black-box tests are required for the behavior that peers actually
 observe on the network.
 
-### 18.2 Test implementation responsibilities
+### 20.2 Test implementation responsibilities
 
 The intended division of responsibility is:
 
@@ -1293,7 +1743,7 @@ is not the primary harness for low-level TCP, UDP, DNS, or binary proxy
 protocol behavior. The project should not maintain equivalent Go and Deno
 network suites.
 
-### 18.3 System under test
+### 20.3 System under test
 
 Black-box tests must exercise the real core data path through one of these
 process boundaries:
@@ -1311,7 +1761,7 @@ the later standalone product a prerequisite.
 The C API requires additional ABI tests using small external consumers, but
 those tests complement rather than replace the core network suite.
 
-### 18.4 Black-box topology
+### 20.4 Black-box topology
 
 Portable tests construct complete paths with independently observable ends:
 
@@ -1359,7 +1809,7 @@ Hand-written protocol messages are appropriate for narrowly targeted malformed
 input and boundary tests. They must not be the sole success-path oracle for a
 complete protocol implementation.
 
-### 18.5 Portable network behavior
+### 20.5 Portable network behavior
 
 The Windows portable suite must cover behavior that frequently escapes simple
 loopback success tests:
@@ -1385,7 +1835,7 @@ fragmentation, delay, bandwidth limiting, drop, duplication, and reordering on
 Windows. Linux network namespaces and traffic-control facilities may later add
 platform-specific coverage, but are not substitutes for the portable suite.
 
-### 18.6 Harness lifecycle and reproducibility
+### 20.6 Harness lifecycle and reproducibility
 
 Every black-box case owns all processes, sockets, temporary configuration,
 certificates, and logs that it creates. The harness must:
@@ -1434,7 +1884,7 @@ Existing test directories need not be reorganized merely to create this
 layout. New interop infrastructure should be added incrementally as real core
 boundaries replace the experimental SOCKS5 path.
 
-### 18.7 Test suites and gates
+### 20.7 Test suites and gates
 
 Tests are grouped by cost and evidence rather than by one undifferentiated
 command:
@@ -1469,7 +1919,7 @@ A successful Windows test suite is therefore the required functional gate for
 portable core development, but it is not evidence that another architecture,
 libc, kernel, router environment, or platform adapter works.
 
-## 19. Deferred decisions
+## 21. Deferred decisions
 
 The architecture deliberately leaves these questions open until evidence is
 available:
