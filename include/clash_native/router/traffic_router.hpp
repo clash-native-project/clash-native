@@ -1,6 +1,7 @@
 #pragma once
 
 #include <clash_native/core/metadata.hpp>
+#include <clash_native/core/result.hpp>
 
 #include <boost/asio/ip/address.hpp>
 
@@ -8,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <variant>
 #include <vector>
@@ -95,6 +97,7 @@ class TrafficRouter {
     const RouteAction &default_action() const noexcept;
     void add_rule(TrafficRule rule);
     const std::vector<TrafficRule> &rules() const noexcept;
+    core::Status validate(std::span<const std::string> outbound_ids) const;
     Snapshot snapshot() const;
 
     RuleEvaluation evaluate(const core::ConnectionMetadata &metadata, const RoutingContext &context,

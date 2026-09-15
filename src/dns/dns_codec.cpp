@@ -21,6 +21,13 @@ void append_u16(std::vector<std::uint8_t> &output, std::uint16_t value) {
     output.push_back(static_cast<std::uint8_t>(value & 0xff));
 }
 
+void append_u32(std::vector<std::uint8_t> &output, std::uint32_t value) {
+    output.push_back(static_cast<std::uint8_t>(value >> 24));
+    output.push_back(static_cast<std::uint8_t>(value >> 16));
+    output.push_back(static_cast<std::uint8_t>(value >> 8));
+    output.push_back(static_cast<std::uint8_t>(value & 0xff));
+}
+
 bool read_u16(std::span<const std::uint8_t> message, std::size_t &position, std::uint16_t &value) {
     if (position + 2 > message.size()) {
         return false;
@@ -161,6 +168,54 @@ core::Result<std::vector<std::uint8_t>> DnsMessageCodec::encode_query(const DnsQ
     return output;
 }
 
+core::Result<DnsQuery> DnsMessageCodec::decode_query(std::span<const std::uint8_t> message) {
+    if (message.size() < 12) {
+        return core::fail(codec_error("DNS query header is truncated"));
+    }
+
+    std::size_t position = 0;
+    DnsQuery query;
+    std::uint16_t flags = 0;
+    std::uint16_t question_count = 0;
+    std::uint16_t answer_count = 0;
+    std::uint16_t authority_count = 0;
+    std::uint16_t additional_count = 0;
+    if (!read_u16(message, position, query.id) || !read_u16(message, position, flags) ||
+        !read_u16(message, position, question_count) ||
+        !read_u16(message, position, answer_count) ||
+        !read_u16(message, position, authority_count) ||
+        !read_u16(message, position, additional_count)) {
+        return core::fail(codec_error("DNS query header is invalid"));
+    }
+    if ((flags & 0x8000) != 0 || question_count != 1 || answer_count != 0 || authority_count != 0) {
+        return core::fail(codec_error("DNS query must contain one question"));
+    }
+
+    auto name = read_name(message, position);
+    if (!name) {
+        return core::fail(name.error());
+    }
+    std::uint16_t type = 0;
+    if (!read_u16(message, position, type) ||
+        !read_u16(message, position, query.question.class_code)) {
+        return core::fail(codec_error("DNS query question is truncated"));
+    }
+    query.question.name = std::move(name.value());
+    query.question.type = static_cast<DnsRecordType>(type);
+    query.recursion_desired = (flags & 0x0100) != 0;
+
+    for (std::uint16_t index = 0; index < additional_count; ++index) {
+        std::uint16_t record_type = 0;
+        std::uint16_t class_code = 0;
+        std::uint32_t ttl = 0;
+        std::span<const std::uint8_t> rdata;
+        if (!skip_record(message, position, record_type, class_code, ttl, rdata)) {
+            return core::fail(codec_error("DNS query additional record is invalid"));
+        }
+    }
+    return query;
+}
+
 core::Result<DnsAnswer> DnsMessageCodec::decode_response(std::span<const std::uint8_t> message,
                                                          std::uint16_t expected_id) {
     if (message.size() < 12) {
@@ -184,7 +239,7 @@ core::Result<DnsAnswer> DnsMessageCodec::decode_response(std::span<const std::ui
     if (id != expected_id) {
         return core::fail(codec_error("DNS response transaction ID does not match"));
     }
-    if ((flags & 0x8000) == 0) {
+    if ((flags & 0x8000) == 0 || question_count == 0) {
         return core::fail(codec_error("DNS response is not a response message"));
     }
 
@@ -241,6 +296,56 @@ core::Result<DnsAnswer> DnsMessageCodec::decode_response(std::span<const std::ui
         answer.ttl_seconds = minimum_ttl;
     }
     return answer;
+}
+
+core::Result<std::vector<std::uint8_t>> DnsMessageCodec::encode_response(const DnsQuery &query,
+                                                                         const DnsAnswer &answer) {
+    if (normalize_name(query.question.name) != normalize_name(answer.question.name) ||
+        query.question.type != answer.question.type ||
+        query.question.class_code != answer.question.class_code) {
+        return core::fail(codec_error("DNS response question does not match the query"));
+    }
+    if (answer.addresses.size() > std::numeric_limits<std::uint16_t>::max()) {
+        return core::fail(codec_error("DNS response contains too many answers"));
+    }
+
+    const auto encoded_query = encode_query(query.question, query.id);
+    if (!encoded_query) {
+        return core::fail(encoded_query.error());
+    }
+
+    const auto answer_count = answer.response_code == 0 ? answer.addresses.size() : 0;
+    std::vector<std::uint8_t> response(encoded_query.value().begin(),
+                                       encoded_query.value().begin() + 12);
+    response[2] = static_cast<std::uint8_t>(0x80 | (query.recursion_desired ? 0x01 : 0x00) |
+                                            (answer.authoritative ? 0x04 : 0x00));
+    response[3] = static_cast<std::uint8_t>(0x80 | (answer.response_code & 0x0f));
+    response[6] = static_cast<std::uint8_t>(answer_count >> 8);
+    response[7] = static_cast<std::uint8_t>(answer_count & 0xff);
+    response.insert(response.end(), encoded_query.value().begin() + 12,
+                    encoded_query.value().end());
+
+    for (std::size_t index = 0; index < answer_count; ++index) {
+        const auto &address = answer.addresses[index];
+        if ((answer.question.type == DnsRecordType::a && !address.is_v4()) ||
+            (answer.question.type == DnsRecordType::aaaa && !address.is_v6())) {
+            return core::fail(codec_error("DNS answer address type does not match the query"));
+        }
+        response.insert(response.end(), {0xc0, 0x0c});
+        append_u16(response, static_cast<std::uint16_t>(answer.question.type));
+        append_u16(response, answer.question.class_code);
+        append_u32(response, answer.ttl_seconds);
+        if (address.is_v4()) {
+            const auto bytes = address.to_v4().to_bytes();
+            append_u16(response, static_cast<std::uint16_t>(bytes.size()));
+            response.insert(response.end(), bytes.begin(), bytes.end());
+        } else {
+            const auto bytes = address.to_v6().to_bytes();
+            append_u16(response, static_cast<std::uint16_t>(bytes.size()));
+            response.insert(response.end(), bytes.begin(), bytes.end());
+        }
+    }
+    return response;
 }
 
 } // namespace clash_native::dns

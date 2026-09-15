@@ -134,6 +134,31 @@ TrafficRouter::Snapshot TrafficRouter::snapshot() const {
     return std::make_shared<const TrafficRouter>(*this);
 }
 
+core::Status TrafficRouter::validate(std::span<const std::string> outbound_ids) const {
+    const auto has_target = [outbound_ids](const std::string &target) {
+        return std::find(outbound_ids.begin(), outbound_ids.end(), target) != outbound_ids.end();
+    };
+    const auto validate_action = [has_target](const RouteAction &action) -> core::Status {
+        if (action.kind == RouteActionKind::named &&
+            (action.target.empty() || !has_target(action.target))) {
+            return core::fail(
+                core::Error{core::ErrorCode::configuration,
+                            "route action references an unknown outbound: " + action.target});
+        }
+        return {};
+    };
+
+    if (const auto result = validate_action(default_action_); !result) {
+        return result;
+    }
+    for (const auto &rule : rules_) {
+        if (const auto result = validate_action(rule.action); !result) {
+            return result;
+        }
+    }
+    return {};
+}
+
 RuleEvaluation TrafficRouter::evaluate(const core::ConnectionMetadata &metadata,
                                        const RoutingContext &context, std::size_t start) const {
     for (std::size_t index = start; index < rules_.size(); ++index) {

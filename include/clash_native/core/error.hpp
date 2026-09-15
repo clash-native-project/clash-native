@@ -16,6 +16,7 @@ enum class ErrorCode {
     timeout,
     rejected,
     unsupported,
+    configuration,
     transport_io,
 };
 
@@ -39,6 +40,8 @@ constexpr std::string_view to_string(ErrorCode code) noexcept {
         return "rejected";
     case ErrorCode::unsupported:
         return "unsupported";
+    case ErrorCode::configuration:
+        return "configuration";
     case ErrorCode::transport_io:
         return "transport_io";
     }

@@ -49,18 +49,22 @@ class ResolverService::Operation final
     Operation(ResolverService &owner, std::string key, DnsQuestion question, std::uint16_t query_id)
         : owner_(owner), key_(std::move(key)), question_(std::move(question)), query_id_(query_id),
           udp_socket_(owner.runtime_.context()), tcp_socket_(owner.runtime_.context()),
-          timeout_timer_(owner.runtime_.context()) {}
+          timeout_timer_(owner.runtime_.context()), udp_endpoint_(owner.config_.endpoint),
+          tcp_endpoint_(owner.config_.tcp_endpoint) {}
 
     const std::string &key() const noexcept { return key_; }
 
     void add_waiter(RequestId id, Handler handler) { waiters_.push_back({id, std::move(handler)}); }
 
-    bool remove_waiter(RequestId id) {
-        const auto old_size = waiters_.size();
-        waiters_.erase(std::remove_if(waiters_.begin(), waiters_.end(),
-                                      [id](const Waiter &waiter) { return waiter.id == id; }),
-                       waiters_.end());
-        return old_size != waiters_.size();
+    std::optional<Handler> remove_waiter(RequestId id) {
+        const auto found = std::find_if(waiters_.begin(), waiters_.end(),
+                                        [id](const Waiter &waiter) { return waiter.id == id; });
+        if (found == waiters_.end()) {
+            return std::nullopt;
+        }
+        auto handler = std::move(found->handler);
+        waiters_.erase(found);
+        return handler;
     }
 
     bool has_waiters() const noexcept { return !waiters_.empty(); }
@@ -75,56 +79,68 @@ class ResolverService::Operation final
         }
         query_ = encoded.value();
 
+        start_attempt();
+    }
+
+    void start_attempt() {
+        const auto generation = ++attempt_generation_;
         timeout_timer_.expires_after(owner_.config_.timeout);
         auto self = shared_from_this();
-        timeout_timer_.async_wait([self](const boost::system::error_code &error) {
-            if (!error) {
-                self->finish(core::fail(timeout_error()));
+        timeout_timer_.async_wait([self, generation](const boost::system::error_code &error) {
+            if (!error && generation == self->attempt_generation_ && !self->completed_) {
+                self->retry_or_finish(timeout_error());
             }
         });
 
         if (owner_.config_.prefer_tcp) {
-            start_tcp();
+            start_tcp(generation);
             return;
         }
 
         boost::system::error_code error;
-        udp_socket_.open(owner_.config_.endpoint.protocol(), error);
+        udp_socket_.open(udp_endpoint_.protocol(), error);
         if (error) {
-            finish(core::fail(upstream_error("failed to open DNS UDP socket", error)));
+            retry_or_finish(upstream_error("failed to open DNS UDP socket", error));
             return;
         }
-        udp_socket_.async_send_to(boost::asio::buffer(query_), owner_.config_.endpoint,
-                                  [self](const boost::system::error_code &send_error, std::size_t) {
-                                      if (send_error) {
-                                          self->finish(core::fail(upstream_error(
-                                              "failed to send DNS UDP query", send_error)));
-                                          return;
-                                      }
-                                      self->receive_udp();
-                                  });
+        udp_socket_.async_send_to(
+            boost::asio::buffer(query_), udp_endpoint_,
+            [self, generation](const boost::system::error_code &send_error, std::size_t) {
+                if (generation != self->attempt_generation_ || self->completed_) {
+                    return;
+                }
+                if (send_error) {
+                    self->retry_or_finish(
+                        upstream_error("failed to send DNS UDP query", send_error));
+                    return;
+                }
+                self->receive_udp(generation);
+            });
     }
 
     void cancel_shared() { finish(core::fail(cancelled_error())); }
 
   private:
-    void receive_udp() {
-        if (completed_) {
+    void receive_udp(std::uint64_t generation) {
+        if (completed_ || generation != attempt_generation_) {
             return;
         }
         auto self = shared_from_this();
         udp_socket_.async_receive_from(
             boost::asio::buffer(response_buffer_), sender_,
-            [self](const boost::system::error_code &error, std::size_t size) {
+            [self, generation](const boost::system::error_code &error, std::size_t size) {
+                if (generation != self->attempt_generation_ || self->completed_) {
+                    return;
+                }
                 if (error) {
-                    self->finish(
-                        core::fail(upstream_error("failed to receive DNS UDP response", error)));
+                    self->retry_or_finish(
+                        upstream_error("failed to receive DNS UDP response", error));
                     return;
                 }
                 if (size < 2 ||
                     static_cast<std::uint16_t>(self->response_buffer_[0] << 8 |
                                                self->response_buffer_[1]) != self->query_id_) {
-                    self->receive_udp();
+                    self->receive_udp(generation);
                     return;
                 }
 
@@ -136,57 +152,73 @@ class ResolverService::Operation final
                     return;
                 }
                 if (response.value().truncated) {
-                    self->start_tcp();
+                    self->start_tcp(generation);
                     return;
                 }
                 self->finish(response);
             });
     }
 
-    void start_tcp() {
+    void start_tcp(std::uint64_t generation) {
+        if (completed_ || generation != attempt_generation_) {
+            return;
+        }
         boost::system::error_code error;
         udp_socket_.close(error);
-        const auto endpoint = owner_.config_.tcp_endpoint.value_or(boost::asio::ip::tcp::endpoint(
-            owner_.config_.endpoint.address(), owner_.config_.endpoint.port()));
+        const auto endpoint = tcp_endpoint_.value_or(
+            boost::asio::ip::tcp::endpoint(udp_endpoint_.address(), udp_endpoint_.port()));
         tcp_socket_.open(endpoint.protocol(), error);
         if (error) {
-            finish(core::fail(upstream_error("failed to open DNS TCP socket", error)));
+            retry_or_finish(upstream_error("failed to open DNS TCP socket", error));
             return;
         }
 
         auto self = shared_from_this();
-        tcp_socket_.async_connect(endpoint, [self](const boost::system::error_code &connect_error) {
-            if (connect_error) {
-                self->finish(core::fail(
-                    upstream_error("failed to connect to DNS TCP upstream", connect_error)));
-                return;
-            }
+        tcp_socket_.async_connect(
+            endpoint, [self, generation](const boost::system::error_code &connect_error) {
+                if (generation != self->attempt_generation_ || self->completed_) {
+                    return;
+                }
+                if (connect_error) {
+                    self->retry_or_finish(
+                        upstream_error("failed to connect to DNS TCP upstream", connect_error));
+                    return;
+                }
 
-            self->tcp_query_.resize(2 + self->query_.size());
-            self->tcp_query_[0] = static_cast<std::uint8_t>(self->query_.size() >> 8);
-            self->tcp_query_[1] = static_cast<std::uint8_t>(self->query_.size() & 0xff);
-            std::copy(self->query_.begin(), self->query_.end(), self->tcp_query_.begin() + 2);
-            boost::asio::async_write(
-                self->tcp_socket_, boost::asio::buffer(self->tcp_query_),
-                [self](const boost::system::error_code &write_error, std::size_t) {
-                    if (write_error) {
-                        self->finish(core::fail(
-                            upstream_error("failed to send DNS TCP query", write_error)));
-                        return;
-                    }
-                    self->read_tcp_length();
-                });
-        });
+                self->tcp_query_.resize(2 + self->query_.size());
+                self->tcp_query_[0] = static_cast<std::uint8_t>(self->query_.size() >> 8);
+                self->tcp_query_[1] = static_cast<std::uint8_t>(self->query_.size() & 0xff);
+                std::copy(self->query_.begin(), self->query_.end(), self->tcp_query_.begin() + 2);
+                boost::asio::async_write(
+                    self->tcp_socket_, boost::asio::buffer(self->tcp_query_),
+                    [self, generation](const boost::system::error_code &write_error, std::size_t) {
+                        if (generation != self->attempt_generation_ || self->completed_) {
+                            return;
+                        }
+                        if (write_error) {
+                            self->retry_or_finish(
+                                upstream_error("failed to send DNS TCP query", write_error));
+                            return;
+                        }
+                        self->read_tcp_length(generation);
+                    });
+            });
     }
 
-    void read_tcp_length() {
+    void read_tcp_length(std::uint64_t generation) {
+        if (completed_ || generation != attempt_generation_) {
+            return;
+        }
         auto self = shared_from_this();
         boost::asio::async_read(
             tcp_socket_, boost::asio::buffer(tcp_length_),
-            [self](const boost::system::error_code &error, std::size_t) {
+            [self, generation](const boost::system::error_code &error, std::size_t) {
+                if (generation != self->attempt_generation_ || self->completed_) {
+                    return;
+                }
                 if (error) {
-                    self->finish(
-                        core::fail(upstream_error("failed to receive DNS TCP length", error)));
+                    self->retry_or_finish(
+                        upstream_error("failed to receive DNS TCP length", error));
                     return;
                 }
                 const auto size =
@@ -199,10 +231,13 @@ class ResolverService::Operation final
                 self->tcp_response_.resize(size);
                 boost::asio::async_read(
                     self->tcp_socket_, boost::asio::buffer(self->tcp_response_),
-                    [self](const boost::system::error_code &read_error, std::size_t) {
+                    [self, generation](const boost::system::error_code &read_error, std::size_t) {
+                        if (generation != self->attempt_generation_ || self->completed_) {
+                            return;
+                        }
                         if (read_error) {
-                            self->finish(core::fail(
-                                upstream_error("failed to receive DNS TCP response", read_error)));
+                            self->retry_or_finish(
+                                upstream_error("failed to receive DNS TCP response", read_error));
                             return;
                         }
                         const auto response =
@@ -228,6 +263,21 @@ class ResolverService::Operation final
         owner_.complete(shared_from_this(), std::move(result));
     }
 
+    void retry_or_finish(core::Error error) {
+        if (!fallback_attempted_ && owner_.config_.fallback_endpoint) {
+            fallback_attempted_ = true;
+            timeout_timer_.cancel();
+            boost::system::error_code ignored;
+            udp_socket_.close(ignored);
+            tcp_socket_.close(ignored);
+            udp_endpoint_ = *owner_.config_.fallback_endpoint;
+            tcp_endpoint_ = owner_.config_.fallback_tcp_endpoint;
+            start_attempt();
+            return;
+        }
+        finish(core::fail(std::move(error)));
+    }
+
     ResolverService &owner_;
     std::string key_;
     DnsQuestion question_;
@@ -235,6 +285,8 @@ class ResolverService::Operation final
     boost::asio::ip::udp::socket udp_socket_;
     boost::asio::ip::tcp::socket tcp_socket_;
     boost::asio::steady_timer timeout_timer_;
+    boost::asio::ip::udp::endpoint udp_endpoint_;
+    std::optional<boost::asio::ip::tcp::endpoint> tcp_endpoint_;
     boost::asio::ip::udp::endpoint sender_;
     std::array<std::uint8_t, 4096> response_buffer_{};
     std::array<std::uint8_t, 2> tcp_length_{};
@@ -243,6 +295,8 @@ class ResolverService::Operation final
     std::vector<std::uint8_t> tcp_response_;
     std::vector<Waiter> waiters_;
     bool completed_ = false;
+    bool fallback_attempted_ = false;
+    std::uint64_t attempt_generation_ = 0;
 };
 
 ResolverService::ResolverService(runtime::AsioRuntime &runtime, DnsUpstreamConfig config)
@@ -296,9 +350,14 @@ void ResolverService::cancel(RequestId request_id) noexcept {
     }
     auto operation = request->second.lock();
     requests_.erase(request);
-    if (!operation || !operation->remove_waiter(request_id)) {
+    if (!operation) {
         return;
     }
+    const auto handler = operation->remove_waiter(request_id);
+    if (!handler) {
+        return;
+    }
+    (*handler)(core::fail(cancelled_error()));
     if (!operation->has_waiters()) {
         operation->cancel_shared();
     }

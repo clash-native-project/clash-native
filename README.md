@@ -62,6 +62,9 @@ platform traffic-capture stages.
 The core now contains initial ordered routing snapshots, destination-IP CIDR
 matching with lazy enrichment, a dependency-free DNS codec, system resolver
 adapter, DNS policy matcher, and UDP/TCP resolver service with TTL caching and
-in-flight query coalescing. This is not a complete configuration engine:
-upstream groups, local DNS service, FakeIP, encrypted DNS transports, and
-platform traffic-capture integration remain planned work.
+in-flight query coalescing. It also contains local UDP/TCP DNS forwarding,
+primary/fallback upstream selection, an initial FakeIP store, validated
+outbound groups, resolver dependency checks, and a connection registry. This
+is not a complete configuration engine: hosts/static overrides, upstream
+health policy, encrypted DNS transports, and platform traffic-capture
+integration remain planned work.

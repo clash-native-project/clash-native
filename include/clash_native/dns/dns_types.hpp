@@ -20,6 +20,12 @@ struct DnsQuestion {
     std::uint16_t class_code = 1;
 };
 
+struct DnsQuery {
+    std::uint16_t id = 0;
+    DnsQuestion question;
+    bool recursion_desired = true;
+};
+
 struct DnsAnswer {
     DnsQuestion question;
     std::vector<boost::asio::ip::address> addresses;

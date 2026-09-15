@@ -23,6 +23,8 @@ struct DnsUpstreamConfig {
     std::chrono::milliseconds timeout = std::chrono::seconds(2);
     std::optional<boost::asio::ip::tcp::endpoint> tcp_endpoint;
     bool prefer_tcp = false;
+    std::optional<boost::asio::ip::udp::endpoint> fallback_endpoint;
+    std::optional<boost::asio::ip::tcp::endpoint> fallback_tcp_endpoint;
 };
 
 class ResolverService final {

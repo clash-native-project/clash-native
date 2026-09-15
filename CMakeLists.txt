@@ -18,9 +18,14 @@ add_library(clash-native-core STATIC
     src/dns/dns_codec.cpp
     src/dns/dns_policy_router.cpp
     src/dns/resolver_service.cpp
+    src/dns/dns_server.cpp
+    src/dns/fake_ip_store.cpp
+    src/dns/resolver_graph.cpp
     src/dns/system_resolver.cpp
     src/net/tcp_stream.cpp
     src/outbound/builtin_outbound.cpp
+    src/outbound/outbound_registry.cpp
+    src/observability/connection_registry.cpp
     src/platform/platform_adapter.cpp
     src/proxy/proxy_server.cpp
     src/proxy/tcp_relay.cpp
@@ -98,6 +103,10 @@ if(BUILD_TESTING)
         tests/core/outbound_contract_test.cpp
         tests/core/version_test.cpp
         tests/dns/dns_test.cpp
+        tests/dns/dns_server_test.cpp
+        tests/dns/resolver_graph_test.cpp
+        tests/observability/connection_registry_test.cpp
+        tests/outbound/outbound_registry_test.cpp
         tests/platform/platform_adapter_test.cpp
         tests/proxy/proxy_server_test.cpp
         tests/proxy/stage1_proxy_test.cpp

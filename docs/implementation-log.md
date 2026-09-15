@@ -72,3 +72,21 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Added malformed-message, policy, routing, cache/coalescing, and truncation
   fallback tests. The truncation fallback integration test is skipped when
   Windows UDP loopback is unavailable; the TCP path remains covered directly.
+
+### 2026-09-16 — Stage 2 integration boundaries
+
+- Added resolver-role declarations and dependency-cycle validation, including
+  the bootstrap resolver restriction.
+- Added configurable primary/fallback DNS upstream attempts with stale callback
+  suppression across retries.
+- Added local UDP/TCP DNS forwarding, query/response codec support, initial
+  bounded FakeIP allocation with reverse lookup, and connection registry state.
+- Added outbound group selection, routing target validation, and tests for the
+  new Stage 2 integration boundaries.
+
+### 2026-09-16 — Stage 2 correctness fixes
+
+- Fixed per-waiter cancellation completion and suppressed callbacks from a
+  failed DNS attempt after fallback retry begins.
+- Accepted DNS query additional records and corrected local response flag
+  serialization while keeping malformed-message validation strict.

@@ -4,6 +4,7 @@
 #include <clash_native/core/result.hpp>
 #include <clash_native/dns/resolver_service.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
+#include <clash_native/outbound/outbound_registry.hpp>
 #include <clash_native/router/traffic_router.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 
@@ -31,6 +32,7 @@ class ProxyServer {
     void set_default_action(router::RouteAction action);
     void add_rule(router::TrafficRule rule);
     void set_resolver(std::shared_ptr<dns::ResolverService> resolver);
+    void set_outbound_registry(std::shared_ptr<outbound::OutboundRegistry> registry);
     core::Status start();
     void stop() noexcept;
     bool running() const noexcept;
@@ -56,6 +58,7 @@ class ProxyServer {
     router::TrafficRouter router_;
     std::shared_ptr<outbound::DirectOutbound> direct_outbound_;
     std::shared_ptr<outbound::RejectOutbound> reject_outbound_;
+    std::shared_ptr<outbound::OutboundRegistry> outbound_registry_;
     std::shared_ptr<dns::ResolverService> resolver_;
 };
 

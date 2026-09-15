@@ -93,3 +93,17 @@ TEST(TrafficRouterTest, SnapshotsKeepTheOldRuleProgramImmutable) {
     ASSERT_NE(new_match, nullptr);
     EXPECT_EQ(new_match->decision.matched_rule, "new");
 }
+
+TEST(TrafficRouterTest, ValidatesNamedTargetsBeforePublishingAProgram) {
+    clash_native::router::TrafficRouter router(clash_native::router::RouteAction::named("proxy"));
+    router.add_rule({"named", clash_native::router::RuleKind::network, "tcp", 0, 0, false,
+                     clash_native::router::RouteAction::named("proxy")});
+
+    const std::vector<std::string> targets{"direct", "proxy"};
+    EXPECT_TRUE(router.validate(targets));
+
+    const std::vector<std::string> missing{"direct"};
+    const auto result = router.validate(missing);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::configuration);
+}

@@ -518,7 +518,13 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
 ProxyServer::ProxyServer(runtime::AsioRuntime &runtime, boost::asio::ip::tcp::endpoint endpoint)
     : runtime_(runtime), acceptor_(runtime.context()), endpoint_(endpoint), router_(),
       direct_outbound_(std::make_shared<outbound::DirectOutbound>(runtime)),
-      reject_outbound_(std::make_shared<outbound::RejectOutbound>(runtime)) {}
+      reject_outbound_(std::make_shared<outbound::RejectOutbound>(runtime)),
+      outbound_registry_(std::make_shared<outbound::OutboundRegistry>()) {
+    if (!outbound_registry_->add_outbound("direct", direct_outbound_) ||
+        !outbound_registry_->add_outbound("reject", reject_outbound_)) {
+        throw std::logic_error("failed to initialize proxy built-in outbounds");
+    }
+}
 
 ProxyServer::~ProxyServer() { stop(); }
 
@@ -551,9 +557,30 @@ void ProxyServer::set_resolver(std::shared_ptr<dns::ResolverService> resolver) {
     resolver_ = std::move(resolver);
 }
 
+void ProxyServer::set_outbound_registry(std::shared_ptr<outbound::OutboundRegistry> registry) {
+    if (running()) {
+        throw std::logic_error("Cannot change outbound registry on a running proxy");
+    }
+    outbound_registry_ = std::move(registry);
+}
+
 core::Status ProxyServer::start() {
     if (running_.exchange(true)) {
         return {};
+    }
+
+    if (!outbound_registry_) {
+        running_ = false;
+        return core::fail({core::ErrorCode::configuration, "proxy outbound registry is missing"});
+    }
+    if (const auto result = outbound_registry_->validate(); !result) {
+        running_ = false;
+        return result;
+    }
+    const auto outbound_ids = outbound_registry_->ids();
+    if (const auto result = router_.validate(outbound_ids); !result) {
+        running_ = false;
+        return result;
     }
 
     boost::system::error_code error;
@@ -699,9 +726,20 @@ void ProxyServer::route_stream(router::TrafficRouter::Snapshot snapshot,
             {std::move(metadata.destination), context.destination_address}, std::move(handler));
         return;
     case router::RouteActionKind::named:
-        handler(core::StreamOpenResult::failed(
-            {core::ErrorCode::unsupported, fmt::format("named outbound '{}' is not configured",
-                                                       matched->decision.action.target)}));
+        if (!outbound_registry_) {
+            handler(core::StreamOpenResult::failed(
+                {core::ErrorCode::configuration, "proxy outbound registry is missing"}));
+            return;
+        }
+        {
+            const auto selected = outbound_registry_->select(matched->decision.action.target);
+            if (!selected) {
+                handler(core::StreamOpenResult::failed(selected.error()));
+                return;
+            }
+            selected.value()->connect_stream(
+                {std::move(metadata.destination), context.destination_address}, std::move(handler));
+        }
         return;
     }
 }
