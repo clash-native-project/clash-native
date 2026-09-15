@@ -2,7 +2,11 @@
 
 #include <clash_native/core/error.hpp>
 
+#include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/buffer.hpp>
 #include <boost/asio/ip/address.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/system/error_code.hpp>
 
 #include <cstdint>
 #include <functional>
@@ -83,6 +87,17 @@ struct DatagramRequest {
 
 class StreamHandle {
   public:
+    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
+    virtual void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) = 0;
+    virtual void async_write(boost::asio::const_buffer buffer, WriteHandler handler) = 0;
+    virtual boost::asio::any_io_executor executor() noexcept = 0;
+    virtual boost::asio::ip::tcp::endpoint
+    local_endpoint(boost::system::error_code &error) const noexcept = 0;
+    virtual void shutdown_send(boost::system::error_code &error) noexcept = 0;
+    virtual void close() noexcept = 0;
+
     virtual ~StreamHandle() = default;
 };
 

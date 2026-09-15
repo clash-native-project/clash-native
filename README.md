@@ -21,32 +21,36 @@ $env:PATH = "$env:MSYS2_ROOT\ucrt64\bin;$env:PATH"
 & .\build\ucrt64\clash-native.exe --version
 ```
 
-## Current SOCKS5 Flow
+## Current Ordinary Proxy Flow
 
-The experimental proxy can accept unauthenticated SOCKS5 `CONNECT` requests:
+The experimental proxy can accept unauthenticated SOCKS5 `CONNECT` and HTTP
+`CONNECT` requests:
 
 ```powershell
 & .\build\ucrt64\clash-native.exe --listen 127.0.0.1:1080
 ```
 
 The current implementation supports IPv4, IPv6, and domain-name targets with
-TCP bidirectional relay. UDP association, BIND, and username/password
-authentication are not implemented yet. Press `Ctrl+C` to stop the listener.
+TCP bidirectional relay. The core also has initial direct/reject outbounds and
+first-match routing primitives; named outbounds, DNS-aware routing, UDP
+association, BIND, and username/password authentication are not implemented
+yet. Press `Ctrl+C` to stop the listener.
 
-## Stage 0 Build Boundaries
+## Implemented Build Boundaries
 
 The current CMake build defines these targets:
 
 - `clash-native-core`: a reusable static library containing the runtime,
-  platform adapter, and experimental SOCKS5 proxy implementation;
+  platform adapter, ordinary proxy data-plane code, and routing primitives;
 - `clash-native`: the standalone process, including CLI parsing and
   process-level application lifecycle, linked to `clash-native-core`;
 - `clash-native-tests`: the C++ test executable, which links to
   `clash-native-core` instead of compiling core sources again.
 
-This is a build and ownership boundary only. The broader engine, routing, DNS,
-additional protocols, and C API described in `docs/architecture.md` remain
-planned work.
+This is a build and ownership boundary. The broader engine, DNS, additional
+protocols, and C API described in `docs/architecture.md` remain planned work;
+the Stage 1 routing primitives are intentionally not a complete routing or
+DNS implementation.
 
 Stage 0 also includes the initial runtime set and scheduler adapter, owned
 channel primitives, a core-only test host, and Go process/network test

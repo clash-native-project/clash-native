@@ -43,3 +43,19 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   process-level boundaries.
 - Added `fmt 12.2.0` as a vcpkg dependency and used `fmt::format` for proxy
   listener error-context construction.
+
+### Stage 1 ordinary proxy core
+
+- Replaced the monolithic proxy session's direct-connect and relay ownership
+  with core-owned `DirectOutbound`, `RejectOutbound`, `StreamHandle`, and
+  `TcpRelay` boundaries.
+- Added normalized connection metadata and first-match traffic routing for
+  network, inbound, domain, port, and initial destination-IP rule decisions.
+- Added HTTP `CONNECT` handling alongside the existing unauthenticated SOCKS5
+  `CONNECT` flow, including buffered data handoff after the HTTP headers.
+- Added C++ routing, HTTP relay, reject-outbound, and existing SOCKS5
+  regression coverage, plus an independent Go HTTP process test.
+- Added bounded connect, handshake, and relay-idle timeout handling with
+  cancellation and half-close preservation.
+- Validation: Windows x64 MSYS2 UCRT64 Clang build completed; 24/24 CTest
+  cases, Go interop tests, and `go vet ./...` passed.

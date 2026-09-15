@@ -15,8 +15,12 @@ find_package(tl-expected CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
 add_library(clash-native-core STATIC
+    src/net/tcp_stream.cpp
+    src/outbound/builtin_outbound.cpp
     src/platform/platform_adapter.cpp
     src/proxy/proxy_server.cpp
+    src/proxy/tcp_relay.cpp
+    src/router/traffic_router.cpp
     src/runtime/asio_runtime.cpp
     src/runtime/runtime_set.cpp
 )
@@ -91,7 +95,9 @@ if(BUILD_TESTING)
         tests/core/version_test.cpp
         tests/platform/platform_adapter_test.cpp
         tests/proxy/proxy_server_test.cpp
+        tests/proxy/stage1_proxy_test.cpp
         tests/proxy/socks5_proxy_test.cpp
+        tests/router/traffic_router_test.cpp
         tests/runtime/asio_runtime_test.cpp
         tests/runtime/runtime_set_test.cpp
     )

@@ -1,6 +1,9 @@
 #pragma once
 
+#include <clash_native/core/metadata.hpp>
 #include <clash_native/core/result.hpp>
+#include <clash_native/outbound/builtin_outbound.hpp>
+#include <clash_native/router/traffic_router.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 
 #include <boost/asio/ip/tcp.hpp>
@@ -23,6 +26,8 @@ class ProxyServer {
     ProxyServer &operator=(const ProxyServer &) = delete;
 
     void set_endpoint(boost::asio::ip::tcp::endpoint endpoint);
+    void set_default_action(router::RouteAction action);
+    void add_rule(router::TrafficRule rule);
     core::Status start();
     void stop() noexcept;
     bool running() const noexcept;
@@ -33,6 +38,7 @@ class ProxyServer {
     using SessionPtr = std::shared_ptr<Session>;
 
     void accept();
+    void open_stream(core::ConnectionMetadata metadata, core::StreamOpenHandler handler);
     void remove_session(const SessionPtr &session) noexcept;
 
     runtime::AsioRuntime &runtime_;
@@ -41,6 +47,9 @@ class ProxyServer {
     mutable std::mutex sessions_mutex_;
     std::set<SessionPtr> sessions_;
     std::atomic_bool running_{false};
+    router::TrafficRouter router_;
+    std::shared_ptr<outbound::DirectOutbound> direct_outbound_;
+    std::shared_ptr<outbound::RejectOutbound> reject_outbound_;
 };
 
 } // namespace clash_native::proxy

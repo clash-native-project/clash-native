@@ -1,6 +1,7 @@
 package interop
 
 import (
+	"bufio"
 	"context"
 	"io"
 	"net"
@@ -81,6 +82,73 @@ func TestSocks5ProcessWithIndependentTCPEndpoint(t *testing.T) {
 	writeBytes(t, client, payload)
 	echoed := make([]byte, len(payload))
 	readBytes(t, client, echoed)
+	if string(echoed) != string(payload) {
+		t.Fatalf("unexpected echoed payload: %q", echoed)
+	}
+}
+
+func TestHTTPConnectProcessWithIndependentTCPEndpoint(t *testing.T) {
+	executable := os.Getenv("CLASH_NATIVE_TEST_HOST")
+	if executable == "" {
+		t.Skip("CLASH_NATIVE_TEST_HOST is not set")
+	}
+
+	echo, err := endpoints.StartTCPEcho()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	process, err := harness.Start(ctx, executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		stopContext, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer stopCancel()
+		if err := process.Stop(stopContext); err != nil {
+			t.Errorf("stop test host: %v", err)
+		}
+	}()
+
+	line, err := harness.WaitForLine(ctx, process, readyPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyAddress := strings.TrimPrefix(line, readyPrefix)
+
+	client, err := net.DialTimeout("tcp", proxyAddress, 2*time.Second)
+	if err != nil {
+		t.Fatalf("connect to test host: %v", err)
+	}
+	defer client.Close()
+
+	request := "CONNECT " + echo.Addr() + " HTTP/1.1\r\nHost: " + echo.Addr() + "\r\n\r\n"
+	writeBytes(t, client, []byte(request))
+	reader := bufio.NewReader(client)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(statusLine, "HTTP/1.1 200 ") {
+		t.Fatalf("unexpected HTTP CONNECT response: %q", statusLine)
+	}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+
+	payload := []byte("clash-native-http-independent-endpoint")
+	writeBytes(t, client, payload)
+	echoed := make([]byte, len(payload))
+	readBytes(t, reader, echoed)
 	if string(echoed) != string(payload) {
 		t.Fatalf("unexpected echoed payload: %q", echoed)
 	}
