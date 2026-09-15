@@ -7,6 +7,8 @@
 #include <csignal>
 #include <future>
 #include <iostream>
+#include <stdexcept>
+#include <system_error>
 
 #include <spdlog/spdlog.h>
 
@@ -36,12 +38,15 @@ int Application::run(const ApplicationOptions &options) {
     });
 
     runtime_.start();
-    try {
-        proxy_server_.start();
-    } catch (...) {
+    const auto start_result = proxy_server_.start();
+    if (!start_result) {
         signals.cancel();
         runtime_.stop();
-        throw;
+        const auto &error = start_result.error();
+        if (error.cause) {
+            throw std::system_error(error.cause, error.context);
+        }
+        throw std::runtime_error(error.context);
     }
 
     const auto endpoint = proxy_server_.endpoint();

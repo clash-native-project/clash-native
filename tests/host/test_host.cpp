@@ -7,6 +7,8 @@
 #include <exception>
 #include <future>
 #include <iostream>
+#include <stdexcept>
+#include <system_error>
 
 int main(int argc, char **) {
     if (argc != 1) {
@@ -28,7 +30,15 @@ int main(int argc, char **) {
         });
 
         runtime.start();
-        proxy.start();
+        const auto start_result = proxy.start();
+        if (!start_result) {
+            runtime.stop();
+            const auto &error = start_result.error();
+            if (error.cause) {
+                throw std::system_error(error.cause, error.context);
+            }
+            throw std::runtime_error(error.context);
+        }
 
         const auto endpoint = proxy.endpoint();
         std::cout << "clash-native-test-host ready " << endpoint.address().to_string() << ":"

@@ -37,3 +37,9 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   the environment.
 - Documented that current Windows testing is limited to x64 with MSYS2 UCRT64
   Clang; Win32/x86 remains unvalidated and outside the current test gate.
+- Added the `tl::expected` dependency behind the project-owned `Result<T>` and
+  `Status` aliases. Proxy listener startup now returns structured transport
+  errors, while the application and test host translate them at their
+  process-level boundaries.
+- Added `fmt 12.2.0` as a vcpkg dependency and used `fmt::format` for proxy
+  listener error-context construction.

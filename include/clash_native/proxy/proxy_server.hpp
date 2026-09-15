@@ -1,5 +1,6 @@
 #pragma once
 
+#include <clash_native/core/result.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 
 #include <boost/asio/ip/tcp.hpp>
@@ -22,7 +23,7 @@ class ProxyServer {
     ProxyServer &operator=(const ProxyServer &) = delete;
 
     void set_endpoint(boost::asio::ip::tcp::endpoint endpoint);
-    void start();
+    core::Status start();
     void stop() noexcept;
     bool running() const noexcept;
     boost::asio::ip::tcp::endpoint endpoint() const noexcept;

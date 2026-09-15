@@ -10,11 +10,11 @@ TEST(ProxyServerTest, TracksLifecycle) {
 
     EXPECT_FALSE(proxy_server.running());
 
-    proxy_server.start();
+    ASSERT_TRUE(proxy_server.start());
     EXPECT_TRUE(proxy_server.running());
     EXPECT_NE(proxy_server.endpoint().port(), 0);
 
-    proxy_server.start();
+    ASSERT_TRUE(proxy_server.start());
     EXPECT_TRUE(proxy_server.running());
 
     proxy_server.stop();

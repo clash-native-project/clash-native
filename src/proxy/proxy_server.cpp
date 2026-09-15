@@ -5,12 +5,15 @@
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
+#include <fmt/format.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -22,6 +25,11 @@ constexpr std::uint8_t kSocksVersion = 0x05;
 constexpr std::uint8_t kNoAuthentication = 0x00;
 constexpr std::uint8_t kNoAcceptableMethods = 0xff;
 constexpr std::uint8_t kConnectCommand = 0x01;
+
+core::Error listener_error(std::string_view operation, const boost::system::error_code &error) {
+    return {core::ErrorCode::transport_io, fmt::format("failed to {} proxy listener", operation),
+            std::error_code(error.value(), std::system_category())};
+}
 
 } // namespace
 
@@ -351,9 +359,9 @@ void ProxyServer::set_endpoint(boost::asio::ip::tcp::endpoint endpoint) {
     endpoint_ = endpoint;
 }
 
-void ProxyServer::start() {
+core::Status ProxyServer::start() {
     if (running_.exchange(true)) {
-        return;
+        return {};
     }
 
     boost::system::error_code error;
@@ -371,17 +379,18 @@ void ProxyServer::start() {
     if (error) {
         running_ = false;
         acceptor_.close();
-        throw boost::system::system_error(error);
+        return core::fail(listener_error("open, bind, or listen", error));
     }
 
     endpoint_ = acceptor_.local_endpoint(error);
     if (error) {
         running_ = false;
         acceptor_.close();
-        throw boost::system::system_error(error);
+        return core::fail(listener_error("query", error));
     }
 
     accept();
+    return {};
 }
 
 void ProxyServer::stop() noexcept {

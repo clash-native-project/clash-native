@@ -9,7 +9,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(boost_asio CONFIG REQUIRED)
+find_package(fmt CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
+find_package(tl-expected CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
 add_library(clash-native-core STATIC
@@ -30,6 +32,9 @@ target_link_libraries(clash-native-core
     PUBLIC
         Boost::asio
         Threads::Threads
+        tl::expected
+    PRIVATE
+        fmt::fmt
 )
 
 if(WIN32)

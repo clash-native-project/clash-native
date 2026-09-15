@@ -2,6 +2,7 @@
 
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace clash_native::core {
 
@@ -47,7 +48,8 @@ constexpr std::string_view to_string(ErrorCode code) noexcept {
 
 struct Error {
     ErrorCode code;
-    std::string message;
+    std::string context;
+    std::error_code cause;
 };
 
 } // namespace clash_native::core

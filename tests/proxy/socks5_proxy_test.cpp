@@ -60,7 +60,7 @@ TEST(Socks5ProxyTest, ConnectsAndRelaysTcpData) {
     });
 
     clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
-    proxy.start();
+    ASSERT_TRUE(proxy.start());
     runtime.start();
 
     boost::asio::ip::tcp::socket client(runtime.context());
