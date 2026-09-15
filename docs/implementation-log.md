@@ -44,7 +44,7 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Added `fmt 12.2.0` as a vcpkg dependency and used `fmt::format` for proxy
   listener error-context construction.
 
-### Stage 1 ordinary proxy core
+### 2026-09-15 — Stage 1 ordinary proxy core
 
 - Replaced the monolithic proxy session's direct-connect and relay ownership
   with core-owned `DirectOutbound`, `RejectOutbound`, `StreamHandle`, and
@@ -59,3 +59,16 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   cancellation and half-close preservation.
 - Validation: Windows x64 MSYS2 UCRT64 Clang build completed; 24/24 CTest
   cases, Go interop tests, and `go vet ./...` passed.
+
+### 2026-09-15 — Stage 2 DNS and routing foundations
+
+- Added normalized ordered routing snapshots with destination-IP CIDR matching,
+  lazy destination enrichment, same-rule resumption, and `no-resolve`
+  behavior.
+- Added a dependency-free DNS message codec, a system resolver adapter, DNS
+  policy routing, and a UDP resolver service with TCP length-framed fallback.
+- Added positive and negative TTL caching, equivalent-query coalescing, and
+  per-waiter cancellation without cancelling other live waiters.
+- Added malformed-message, policy, routing, cache/coalescing, and truncation
+  fallback tests. The truncation fallback integration test is skipped when
+  Windows UDP loopback is unavailable; the TCP path remains covered directly.

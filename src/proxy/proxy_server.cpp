@@ -544,6 +544,13 @@ void ProxyServer::add_rule(router::TrafficRule rule) {
     router_.add_rule(std::move(rule));
 }
 
+void ProxyServer::set_resolver(std::shared_ptr<dns::ResolverService> resolver) {
+    if (running()) {
+        throw std::logic_error("Cannot change the resolver on a running proxy");
+    }
+    resolver_ = std::move(resolver);
+}
+
 core::Status ProxyServer::start() {
     if (running_.exchange(true)) {
         return {};
@@ -639,7 +646,42 @@ void ProxyServer::accept() {
 }
 
 void ProxyServer::open_stream(core::ConnectionMetadata metadata, core::StreamOpenHandler handler) {
-    const auto evaluation = router_.evaluate(metadata, {});
+    route_stream(router_.snapshot(), std::move(metadata), {}, 0, std::move(handler));
+}
+
+void ProxyServer::route_stream(router::TrafficRouter::Snapshot snapshot,
+                               core::ConnectionMetadata metadata, router::RoutingContext context,
+                               std::size_t start, core::StreamOpenHandler handler) {
+    const auto evaluation = snapshot->evaluate(metadata, context, start);
+    if (const auto *need = std::get_if<router::NeedMetadata>(&evaluation)) {
+        if (need->need != router::MetadataNeed::destination_ip ||
+            !metadata.destination.is_domain() || !resolver_) {
+            handler(core::StreamOpenResult::failed(
+                {core::ErrorCode::resolution, "destination IP enrichment is not configured"}));
+            return;
+        }
+
+        context.destination_lookup = router::LookupState::in_progress;
+        const auto resolver = resolver_;
+        auto self = this;
+        resolver->resolve(
+            {metadata.destination.domain(), dns::DnsRecordType::a, 1},
+            [self, snapshot, metadata = std::move(metadata), context = std::move(context),
+             start = need->rule_index,
+             handler = std::move(handler)](core::Result<dns::DnsAnswer> result) mutable {
+                if (result && !result.value().addresses.empty()) {
+                    context.destination_lookup = router::LookupState::resolved;
+                    context.destination_address = result.value().addresses.front();
+                } else {
+                    context.destination_lookup = router::LookupState::failed;
+                    context.destination_address.reset();
+                }
+                self->route_stream(snapshot, std::move(metadata), std::move(context), start,
+                                   std::move(handler));
+            });
+        return;
+    }
+
     const auto *matched = std::get_if<router::Matched>(&evaluation);
     if (!matched) {
         handler(core::StreamOpenResult::failed(
@@ -649,10 +691,12 @@ void ProxyServer::open_stream(core::ConnectionMetadata metadata, core::StreamOpe
 
     switch (matched->decision.action.kind) {
     case router::RouteActionKind::direct:
-        direct_outbound_->connect_stream({std::move(metadata.destination)}, std::move(handler));
+        direct_outbound_->connect_stream(
+            {std::move(metadata.destination), context.destination_address}, std::move(handler));
         return;
     case router::RouteActionKind::reject:
-        reject_outbound_->connect_stream({std::move(metadata.destination)}, std::move(handler));
+        reject_outbound_->connect_stream(
+            {std::move(metadata.destination), context.destination_address}, std::move(handler));
         return;
     case router::RouteActionKind::named:
         handler(core::StreamOpenResult::failed(

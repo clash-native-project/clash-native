@@ -15,6 +15,10 @@ find_package(tl-expected CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
 add_library(clash-native-core STATIC
+    src/dns/dns_codec.cpp
+    src/dns/dns_policy_router.cpp
+    src/dns/resolver_service.cpp
+    src/dns/system_resolver.cpp
     src/net/tcp_stream.cpp
     src/outbound/builtin_outbound.cpp
     src/platform/platform_adapter.cpp
@@ -93,6 +97,7 @@ if(BUILD_TESTING)
         tests/core/error_test.cpp
         tests/core/outbound_contract_test.cpp
         tests/core/version_test.cpp
+        tests/dns/dns_test.cpp
         tests/platform/platform_adapter_test.cpp
         tests/proxy/proxy_server_test.cpp
         tests/proxy/stage1_proxy_test.cpp

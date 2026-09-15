@@ -54,6 +54,10 @@ class DirectConnectOperation final : public std::enable_shared_from_this<DirectC
             }
         });
 
+        if (request_.resolved_address) {
+            connect(*request_.resolved_address);
+            return;
+        }
         if (request_.destination.is_address()) {
             connect(request_.destination.address());
             return;

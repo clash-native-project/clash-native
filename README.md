@@ -32,9 +32,9 @@ The experimental proxy can accept unauthenticated SOCKS5 `CONNECT` and HTTP
 
 The current implementation supports IPv4, IPv6, and domain-name targets with
 TCP bidirectional relay. The core also has initial direct/reject outbounds and
-first-match routing primitives; named outbounds, DNS-aware routing, UDP
-association, BIND, and username/password authentication are not implemented
-yet. Press `Ctrl+C` to stop the listener.
+first-match routing primitives; named outbounds, configured DNS-aware routing,
+UDP association, BIND, and username/password authentication are not implemented
+in the CLI yet. Press `Ctrl+C` to stop the listener.
 
 ## Implemented Build Boundaries
 
@@ -54,5 +54,14 @@ DNS implementation.
 
 Stage 0 also includes the initial runtime set and scheduler adapter, owned
 channel primitives, a core-only test host, and Go process/network test
-scaffolding. These foundations do not implement the later routing, DNS,
-protocol, or platform traffic-capture stages.
+scaffolding. These foundations do not implement the later protocol or
+platform traffic-capture stages.
+
+## Stage 2 DNS and Routing Foundations
+
+The core now contains initial ordered routing snapshots, destination-IP CIDR
+matching with lazy enrichment, a dependency-free DNS codec, system resolver
+adapter, DNS policy matcher, and UDP/TCP resolver service with TTL caching and
+in-flight query coalescing. This is not a complete configuration engine:
+upstream groups, local DNS service, FakeIP, encrypted DNS transports, and
+platform traffic-capture integration remain planned work.

@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <variant>
@@ -47,6 +48,7 @@ enum class MetadataNeed {
 
 struct NeedMetadata {
     MetadataNeed need;
+    std::size_t rule_index = 0;
 };
 
 using RuleEvaluation = std::variant<NoMatch, Matched, NeedMetadata>;
@@ -85,12 +87,15 @@ struct RoutingContext {
 
 class TrafficRouter {
   public:
+    using Snapshot = std::shared_ptr<const TrafficRouter>;
+
     explicit TrafficRouter(RouteAction default_action = RouteAction::direct());
 
     void set_default_action(RouteAction action);
     const RouteAction &default_action() const noexcept;
     void add_rule(TrafficRule rule);
     const std::vector<TrafficRule> &rules() const noexcept;
+    Snapshot snapshot() const;
 
     RuleEvaluation evaluate(const core::ConnectionMetadata &metadata, const RoutingContext &context,
                             std::size_t start = 0) const;

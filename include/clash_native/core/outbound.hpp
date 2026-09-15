@@ -79,6 +79,7 @@ struct OutboundCapabilities {
 
 struct StreamRequest {
     Destination destination;
+    std::optional<boost::asio::ip::address> resolved_address;
 };
 
 struct DatagramRequest {
