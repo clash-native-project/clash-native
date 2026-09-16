@@ -14,4 +14,4 @@ std::string_view name() noexcept {
 #endif
 }
 
-}  // namespace clash_native::platform
+} // namespace clash_native::platform

@@ -73,6 +73,25 @@ TEST(TrafficRouterTest, MatchesDestinationIpCidrAndResumesAfterLookupFailure) {
     EXPECT_EQ(fallback_match->decision.matched_rule, "domain-fallback");
 }
 
+TEST(TrafficRouterTest, MatchesAnyResolvedDestinationAddress) {
+    const auto destination = clash_native::core::Destination::domain("example.test", 443);
+    const clash_native::core::ConnectionMetadata metadata{
+        clash_native::core::Network::tcp, {}, destination, "", "socks5", {}, {}};
+
+    clash_native::router::TrafficRouter router;
+    router.add_rule({"private-v6", clash_native::router::RuleKind::destination_ip_cidr,
+                     "2001:db8:1::/48", 0, 0, false, clash_native::router::RouteAction::reject()});
+
+    clash_native::router::RoutingContext context;
+    context.destination_lookup = clash_native::router::LookupState::resolved;
+    context.destination_addresses = {boost::asio::ip::make_address("192.0.2.42"),
+                                     boost::asio::ip::make_address("2001:db8:1::42")};
+    const auto evaluation = router.evaluate(metadata, context);
+    const auto *matched = std::get_if<clash_native::router::Matched>(&evaluation);
+    ASSERT_NE(matched, nullptr);
+    EXPECT_EQ(matched->decision.matched_rule, "private-v6");
+}
+
 TEST(TrafficRouterTest, SnapshotsKeepTheOldRuleProgramImmutable) {
     clash_native::router::TrafficRouter router;
     const auto old_snapshot = router.snapshot();

@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import sys
 
+from windows_clang import prepare_windows_clang
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VCPKG_REPOSITORY = "https://github.com/microsoft/vcpkg.git"
@@ -22,7 +24,7 @@ def parse_args() -> argparse.Namespace:
         "--build-dir",
         type=Path,
         default=None,
-        help="CMake build directory (default: build/<msys2-environment>[-<architecture>])",
+        help="CMake build directory (default: build/windows-clang-cl-x64)",
     )
     parser.add_argument(
         "--build-type",
@@ -31,22 +33,22 @@ def parse_args() -> argparse.Namespace:
         help="CMake build type (default: Debug)",
     )
     parser.add_argument(
-        "--msys2-root",
-        type=Path,
-        default=None,
-        help="MSYS2 installation root; MSYS2_ROOT is used when omitted",
-    )
-    parser.add_argument(
-        "--msys2-environment",
-        choices=("ucrt64", "mingw64"),
-        default="ucrt64",
-        help="MSYS2 environment used for the compiler (default: ucrt64)",
-    )
-    parser.add_argument(
         "--architecture",
-        choices=("x64", "x86"),
+        choices=("x64",),
         default="x64",
         help="Windows target architecture (default: x64)",
+    )
+    parser.add_argument(
+        "--llvm-root",
+        type=Path,
+        default=None,
+        help="Standalone LLVM root; LLVM_ROOT is used when omitted",
+    )
+    parser.add_argument(
+        "--vs-installation",
+        type=Path,
+        default=None,
+        help="Visual Studio installation; VSINSTALLDIR is used when omitted",
     )
     parser.add_argument(
         "--vcpkg-root",
@@ -89,23 +91,6 @@ def resolve_program(
     raise RuntimeError(f"Could not find {name}. Searched PATH and: {searched}")
 
 
-def resolve_msys2_root(explicit_root: Path | None) -> Path:
-    root = explicit_root or (
-        Path(os.environ["MSYS2_ROOT"])
-        if os.environ.get("MSYS2_ROOT")
-        else None
-    )
-    if root is None:
-        raise RuntimeError(
-            "MSYS2_ROOT is not set. Pass --msys2-root or set MSYS2_ROOT."
-        )
-
-    root = root.expanduser().resolve()
-    if not root.is_dir():
-        raise RuntimeError(f"MSYS2 root does not exist: {root}")
-    return root
-
-
 def run(
     command: list[str],
     environment: dict[str, str],
@@ -118,6 +103,11 @@ def run(
         flush=True,
     )
     subprocess.run(command, cwd=cwd, env=environment, check=True)
+
+
+def cmake_path(path: Path) -> str:
+    """Return a CMake cache path with portable separators on Windows."""
+    return path.resolve().as_posix()
 
 
 def resolve_vcpkg_root(explicit_root: Path | None) -> Path:
@@ -227,35 +217,26 @@ def validate_build_cache(build_dir: Path, toolchain_file: Path, triplet: str) ->
 def main() -> int:
     arguments = parse_args()
     try:
-        msys2_root = resolve_msys2_root(arguments.msys2_root)
-        msys2_bin = msys2_root / arguments.msys2_environment / "bin"
-        if not msys2_bin.is_dir():
-            raise RuntimeError(f"MSYS2 environment does not exist: {msys2_bin}")
-
         cmake = resolve_program(
             "cmake",
-            [msys2_bin / "cmake.exe"],
+            [
+                PROJECT_ROOT / ".pixi" / "envs" / "default" / "Library" / "bin" / "cmake.exe",
+            ],
+            prefer_candidates=True,
         )
         ninja = resolve_program(
             "ninja",
-            [msys2_bin / "ninja.exe"],
-        )
-        clang = resolve_program(
-            "clang.exe",
-            [msys2_bin / "clang.exe"],
+            [
+                PROJECT_ROOT / ".pixi" / "envs" / "default" / "Library" / "bin" / "ninja.exe",
+                PROJECT_ROOT / ".pixi" / "envs" / "default" / "Scripts" / "ninja.exe",
+            ],
             prefer_candidates=True,
         )
-        clangxx = resolve_program(
-            "clang++.exe",
-            [msys2_bin / "clang++.exe"],
-            prefer_candidates=True,
+        toolchain = prepare_windows_clang(
+            arguments.llvm_root,
+            arguments.vs_installation,
         )
-
-        environment = os.environ.copy()
-        environment["PATH"] = os.pathsep.join(
-            [str(msys2_bin), environment.get("PATH", "")]
-        )
-        environment["CLASH_NATIVE_MSYS2_BIN"] = str(msys2_bin)
+        environment = toolchain.environment.copy()
         environment["CLASH_NATIVE_TARGET_ARCHITECTURE"] = arguments.architecture
 
         vcpkg_root = ensure_vcpkg(
@@ -269,11 +250,7 @@ def main() -> int:
             if arguments.build_dir is not None
             else PROJECT_ROOT
             / "build"
-            / (
-                arguments.msys2_environment
-                if arguments.architecture == "x64"
-                else f"{arguments.msys2_environment}-{arguments.architecture}"
-            )
+            / "windows-clang-cl-x64"
         ).expanduser()
         if not build_dir.is_absolute():
             build_dir = PROJECT_ROOT / build_dir
@@ -283,28 +260,32 @@ def main() -> int:
         toolchain_file = (
             vcpkg_root / "scripts" / "buildsystems" / "vcpkg.cmake"
         ).resolve()
-        triplet = f"{arguments.architecture}-msys2-clang"
+        triplet = "x64-windows-clang-cl"
         has_cached_toolchain = validate_build_cache(build_dir, toolchain_file, triplet)
 
         configure_command = [
             str(cmake),
             "-S",
-            str(PROJECT_ROOT),
+            cmake_path(PROJECT_ROOT),
             "-B",
-            str(build_dir),
+            cmake_path(build_dir),
             "-G",
             "Ninja",
-            f"-DCMAKE_MAKE_PROGRAM={ninja}",
+            f"-DCMAKE_MAKE_PROGRAM={cmake_path(ninja)}",
             f"-DVCPKG_TARGET_TRIPLET={triplet}",
-            f"-DVCPKG_OVERLAY_TRIPLETS={PROJECT_ROOT / 'triplets'}",
+            f"-DVCPKG_OVERLAY_TRIPLETS={cmake_path(PROJECT_ROOT / 'triplets')}",
             "-DVCPKG_MANIFEST_MODE=ON",
-            f"-DCMAKE_C_COMPILER={clang}",
-            f"-DCMAKE_CXX_COMPILER={clangxx}",
+            f"-DCMAKE_C_COMPILER={cmake_path(toolchain.clang_cl)}",
+            f"-DCMAKE_CXX_COMPILER={cmake_path(toolchain.clang_cl)}",
+            f"-DCMAKE_LINKER={cmake_path(toolchain.msvc_link)}",
+            f"-DCMAKE_RC_COMPILER={cmake_path(toolchain.resource_compiler)}",
             f"-DCMAKE_BUILD_TYPE={arguments.build_type}",
             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
         ]
         if not has_cached_toolchain:
-            configure_command.insert(7, f"-DCMAKE_TOOLCHAIN_FILE={toolchain_file}")
+            configure_command.insert(
+                7, f"-DCMAKE_TOOLCHAIN_FILE={cmake_path(toolchain_file)}"
+            )
         run(configure_command, environment)
 
         run([str(cmake), "--build", str(build_dir), "--parallel"], environment)

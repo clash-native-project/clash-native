@@ -17,7 +17,7 @@ namespace clash_native::app {
 Application::Application() : runtime_(), proxy_server_(runtime_) {}
 
 int Application::run(const ApplicationOptions &options) {
-    spdlog::set_level(spdlog::level::off);
+    spdlog::set_level(spdlog::level::info);
 
     if (!options.listen_endpoint) {
         std::cout << "clash-native is an experimental native proxy core on " << platform::name()
@@ -28,19 +28,51 @@ int Application::run(const ApplicationOptions &options) {
     }
 
     proxy_server_.set_endpoint(*options.listen_endpoint);
+    if (options.dns_config) {
+        resolver_ = std::make_shared<dns::ResolverService>(runtime_, *options.dns_config);
+        if (const auto result = resolver_->validate(); !result) {
+            throw std::runtime_error(result.error().context);
+        }
+        proxy_server_.set_resolver(resolver_);
+        if (options.fake_ip_store) {
+            proxy_server_.set_fake_ip_store(options.fake_ip_store);
+        }
+        dns_server_ = std::make_unique<dns::DnsServer>(
+            runtime_, resolver_->query_service(),
+            options.dns_udp_endpoint.value_or(
+                boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 0)),
+            options.dns_tcp_endpoint.value_or(
+                boost::asio::ip::tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0)));
+        dns_server_->set_fake_ip_store(options.fake_ip_store, options.fake_ip_filter);
+    }
 
     boost::asio::signal_set signals(runtime_.context(), SIGINT, SIGTERM);
     std::promise<void> stopped;
     auto stopped_future = stopped.get_future();
     signals.async_wait([this, &stopped](const boost::system::error_code &, int) {
+        if (dns_server_) {
+            dns_server_->stop();
+        }
         proxy_server_.stop();
         stopped.set_value();
     });
 
     runtime_.start();
+    if (dns_server_) {
+        const auto start_result = dns_server_->start();
+        if (!start_result) {
+            signals.cancel();
+            dns_server_->stop();
+            runtime_.stop();
+            throw std::runtime_error(start_result.error().context);
+        }
+    }
     const auto start_result = proxy_server_.start();
     if (!start_result) {
         signals.cancel();
+        if (dns_server_) {
+            dns_server_->stop();
+        }
         runtime_.stop();
         const auto &error = start_result.error();
         if (error.cause) {
@@ -55,6 +87,9 @@ int Application::run(const ApplicationOptions &options) {
 
     stopped_future.wait();
     signals.cancel();
+    if (dns_server_) {
+        dns_server_->stop();
+    }
     proxy_server_.stop();
     runtime_.stop();
     return 0;

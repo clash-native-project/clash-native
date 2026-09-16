@@ -3,12 +3,14 @@
 #include <clash_native/proxy/tcp_relay.hpp>
 
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/read_until.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/streambuf.hpp>
 #include <boost/asio/write.hpp>
 #include <fmt/format.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
@@ -18,6 +20,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <semaphore>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -363,6 +366,9 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     }
 
     void open_target(core::Destination destination) {
+        if (closed_.load(std::memory_order_acquire)) {
+            return;
+        }
         boost::system::error_code source_error;
         const auto source = client_.remote_endpoint(source_error);
         std::optional<boost::asio::ip::tcp::endpoint> source_endpoint;
@@ -377,13 +383,19 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
                                           protocol_ == Protocol::socks5 ? "socks5" : "http",
                                           {},
                                           {}};
+        if (owner_.connection_registry_) {
+            connection_id_ = owner_.connection_registry_->add(metadata, {});
+        }
         auto self = shared_from_this();
-        owner_.open_stream(std::move(metadata), [self](core::StreamOpenResult result) {
-            self->handle_open_result(std::move(result));
-        });
+        owner_.open_stream(
+            std::move(metadata), connection_id_,
+            [self](core::StreamOpenResult result) { self->handle_open_result(std::move(result)); });
     }
 
     void handle_open_result(core::StreamOpenResult result) {
+        if (closed_.load(std::memory_order_acquire)) {
+            return;
+        }
         cancel_handshake_timer();
         if (!result.succeeded()) {
             if (protocol_ == Protocol::socks5) {
@@ -405,6 +417,9 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     }
 
     void send_socks_reply(std::uint8_t reply, bool start_relay) {
+        if (closed_.load(std::memory_order_acquire)) {
+            return;
+        }
         std::size_t reply_size = 10;
         reply_[0] = kSocksVersion;
         reply_[1] = reply;
@@ -443,6 +458,9 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     }
 
     void send_http_response(int status, std::string_view reason, bool start_relay) {
+        if (closed_.load(std::memory_order_acquire)) {
+            return;
+        }
         http_response_ =
             fmt::format("HTTP/1.1 {} {}\r\nProxy-Agent: clash-native\r\n\r\n", status, reason);
         auto self = shared_from_this();
@@ -458,6 +476,9 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     }
 
     void start_relay() {
+        if (closed_.load(std::memory_order_acquire)) {
+            return;
+        }
         cancel_handshake_timer();
         if (!remote_) {
             close();
@@ -483,6 +504,11 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
             remote_->close();
         }
 
+        if (connection_id_ && owner_.connection_registry_) {
+            owner_.connection_registry_->remove(*connection_id_);
+            connection_id_.reset();
+        }
+
         boost::system::error_code ignored;
         client_.cancel(ignored);
         client_.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored);
@@ -499,6 +525,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     std::unique_ptr<core::StreamHandle> remote_;
     std::shared_ptr<TcpRelay> relay_;
     CloseHandler close_handler_;
+    std::optional<observability::ConnectionRegistry::ConnectionId> connection_id_;
     std::atomic_bool closed_{false};
     Protocol protocol_ = Protocol::socks5;
 
@@ -519,7 +546,9 @@ ProxyServer::ProxyServer(runtime::AsioRuntime &runtime, boost::asio::ip::tcp::en
     : runtime_(runtime), acceptor_(runtime.context()), endpoint_(endpoint), router_(),
       direct_outbound_(std::make_shared<outbound::DirectOutbound>(runtime)),
       reject_outbound_(std::make_shared<outbound::RejectOutbound>(runtime)),
-      outbound_registry_(std::make_shared<outbound::OutboundRegistry>()) {
+      outbound_registry_(std::make_shared<outbound::OutboundRegistry>()),
+      connection_registry_(std::make_shared<observability::ConnectionRegistry>()),
+      callback_gate_(std::make_shared<std::atomic_bool>(false)) {
     if (!outbound_registry_->add_outbound("direct", direct_outbound_) ||
         !outbound_registry_->add_outbound("reject", reject_outbound_)) {
         throw std::logic_error("failed to initialize proxy built-in outbounds");
@@ -555,6 +584,14 @@ void ProxyServer::set_resolver(std::shared_ptr<dns::ResolverService> resolver) {
         throw std::logic_error("Cannot change the resolver on a running proxy");
     }
     resolver_ = std::move(resolver);
+    direct_outbound_->set_resolver(resolver_);
+}
+
+void ProxyServer::set_fake_ip_store(std::shared_ptr<dns::FakeIpStore> store) {
+    if (running()) {
+        throw std::logic_error("Cannot change FakeIP configuration on a running proxy");
+    }
+    fake_ip_store_ = std::move(store);
 }
 
 void ProxyServer::set_outbound_registry(std::shared_ptr<outbound::OutboundRegistry> registry) {
@@ -564,21 +601,44 @@ void ProxyServer::set_outbound_registry(std::shared_ptr<outbound::OutboundRegist
     outbound_registry_ = std::move(registry);
 }
 
+void ProxyServer::set_connection_registry(
+    std::shared_ptr<observability::ConnectionRegistry> registry) {
+    if (running()) {
+        throw std::logic_error("Cannot change the connection registry on a running proxy");
+    }
+    connection_registry_ = std::move(registry);
+}
+
 core::Status ProxyServer::start() {
     if (running_.exchange(true)) {
+        spdlog::debug("Proxy server start requested while already running");
         return {};
     }
 
     if (!outbound_registry_) {
+        spdlog::error("Proxy server cannot start without an outbound registry");
         running_ = false;
         return core::fail({core::ErrorCode::configuration, "proxy outbound registry is missing"});
     }
     if (const auto result = outbound_registry_->validate(); !result) {
+        spdlog::error("Proxy server outbound registry validation failed: {}",
+                      result.error().context);
         running_ = false;
         return result;
     }
     const auto outbound_ids = outbound_registry_->ids();
     if (const auto result = router_.validate(outbound_ids); !result) {
+        spdlog::error("Proxy server routing validation failed: {}", result.error().context);
+        running_ = false;
+        return result;
+    }
+
+    auto snapshot = std::make_shared<const runtime::RuntimeSnapshot>(
+        runtime::RuntimeSnapshot{next_snapshot_generation_++, router_.snapshot(),
+                                 outbound_registry_->snapshot(), resolver_, fake_ip_store_});
+    if (const auto result = snapshot_store_.publish(snapshot); !result) {
+        spdlog::error("Proxy server runtime snapshot validation failed: {}",
+                      result.error().context);
         running_ = false;
         return result;
     }
@@ -596,6 +656,7 @@ core::Status ProxyServer::start() {
     }
 
     if (error) {
+        spdlog::error("Proxy server failed to open listener: {}", error.message());
         running_ = false;
         acceptor_.close();
         return core::fail(listener_error("open, bind, or listen", error));
@@ -603,19 +664,47 @@ core::Status ProxyServer::start() {
 
     endpoint_ = acceptor_.local_endpoint(error);
     if (error) {
+        spdlog::error("Proxy server failed to query listener endpoint: {}", error.message());
         running_ = false;
         acceptor_.close();
         return core::fail(listener_error("query", error));
     }
 
+    callback_gate_ = std::make_shared<std::atomic_bool>(true);
+    spdlog::info("Proxy server listening on {}:{}", endpoint_.address().to_string(),
+                 endpoint_.port());
     accept();
     return {};
 }
 
 void ProxyServer::stop() noexcept {
     if (!running_.exchange(false)) {
+        spdlog::debug("Proxy server stop requested while already stopped");
         return;
     }
+
+    spdlog::debug("Stopping proxy server");
+    callback_gate_->store(false, std::memory_order_release);
+    if (!runtime_.running()) {
+        stop_on_owner();
+        return;
+    }
+
+    std::binary_semaphore completed(0);
+    boost::asio::dispatch(runtime_.context(), [this, &completed] {
+        stop_on_owner();
+        completed.release();
+    });
+    completed.acquire();
+}
+
+void ProxyServer::stop_on_owner() noexcept {
+    if (resolver_) {
+        for (const auto request_id : resolver_requests_) {
+            resolver_->cancel(request_id);
+        }
+    }
+    resolver_requests_.clear();
 
     boost::system::error_code ignored;
     acceptor_.cancel(ignored);
@@ -634,6 +723,24 @@ void ProxyServer::stop() noexcept {
     for (const auto &session : sessions) {
         session->stop();
     }
+    spdlog::debug("Proxy server stopped");
+}
+
+core::Status ProxyServer::reload(runtime::RuntimeSnapshotPtr snapshot) {
+    if (!snapshot) {
+        return core::fail({core::ErrorCode::configuration, "proxy runtime snapshot is required"});
+    }
+    if (snapshot->generation == 0) {
+        auto replacement = std::make_shared<runtime::RuntimeSnapshot>(*snapshot);
+        replacement->generation = next_snapshot_generation_++;
+        snapshot = std::move(replacement);
+    }
+    if (const auto result = snapshot_store_.publish(std::move(snapshot)); !result) {
+        return result;
+    }
+    spdlog::info("Proxy server published runtime snapshot generation {}",
+                 snapshot_store_.load()->generation);
+    return {};
 }
 
 bool ProxyServer::running() const noexcept { return running_.load(); }
@@ -646,11 +753,18 @@ void ProxyServer::accept() {
     }
 
     auto client = std::make_shared<boost::asio::ip::tcp::socket>(runtime_.context());
-    acceptor_.async_accept(*client, [this, client](const boost::system::error_code &error) {
+    const auto gate = callback_gate_;
+    acceptor_.async_accept(*client, [this, gate, client](const boost::system::error_code &error) {
+        if (!gate->load(std::memory_order_acquire)) {
+            return;
+        }
         if (!error && running()) {
             auto session = std::make_shared<Session>(
-                *this, std::move(*client),
-                [this](const SessionPtr &closed_session) { remove_session(closed_session); });
+                *this, std::move(*client), [this, gate](const SessionPtr &closed_session) {
+                    if (gate->load(std::memory_order_acquire)) {
+                        remove_session(closed_session);
+                    }
+                });
             bool accepted_session = false;
             {
                 std::lock_guard lock(sessions_mutex_);
@@ -666,46 +780,98 @@ void ProxyServer::accept() {
             }
         }
 
-        if (running()) {
+        if (gate->load(std::memory_order_acquire)) {
             accept();
         }
     });
 }
 
-void ProxyServer::open_stream(core::ConnectionMetadata metadata, core::StreamOpenHandler handler) {
-    route_stream(router_.snapshot(), std::move(metadata), {}, 0, std::move(handler));
+void ProxyServer::open_stream(
+    core::ConnectionMetadata metadata,
+    std::optional<observability::ConnectionRegistry::ConnectionId> connection_id,
+    core::StreamOpenHandler handler) {
+    const auto snapshot = snapshot_store_.load();
+    if (!snapshot) {
+        handler(core::StreamOpenResult::failed(
+            {core::ErrorCode::configuration, "proxy runtime snapshot is not published"}));
+        return;
+    }
+    if (snapshot->fake_ip_store && metadata.destination.is_address() &&
+        metadata.destination.address().is_v4()) {
+        if (const auto domain =
+                snapshot->fake_ip_store->reverse(metadata.destination.address().to_v4())) {
+            metadata.destination = core::Destination::domain(*domain, metadata.destination.port());
+        }
+    }
+    route_stream(snapshot, std::move(metadata), {}, 0, connection_id, std::move(handler));
 }
 
-void ProxyServer::route_stream(router::TrafficRouter::Snapshot snapshot,
-                               core::ConnectionMetadata metadata, router::RoutingContext context,
-                               std::size_t start, core::StreamOpenHandler handler) {
-    const auto evaluation = snapshot->evaluate(metadata, context, start);
+void ProxyServer::route_stream(
+    runtime::RuntimeSnapshotPtr snapshot, core::ConnectionMetadata metadata,
+    router::RoutingContext context, std::size_t start,
+    std::optional<observability::ConnectionRegistry::ConnectionId> connection_id,
+    core::StreamOpenHandler handler) {
+    const auto evaluation = snapshot->router->evaluate(metadata, context, start);
     if (const auto *need = std::get_if<router::NeedMetadata>(&evaluation)) {
         if (need->need != router::MetadataNeed::destination_ip ||
-            !metadata.destination.is_domain() || !resolver_) {
+            !metadata.destination.is_domain() || !snapshot->resolver) {
             handler(core::StreamOpenResult::failed(
                 {core::ErrorCode::resolution, "destination IP enrichment is not configured"}));
             return;
         }
 
         context.destination_lookup = router::LookupState::in_progress;
-        const auto resolver = resolver_;
+        const auto resolver = snapshot->resolver;
+        const auto gate = callback_gate_;
         auto self = this;
-        resolver->resolve(
+        const auto request_id = std::make_shared<dns::ResolverService::RequestId>();
+        *request_id = resolver->resolve(
             {metadata.destination.domain(), dns::DnsRecordType::a, 1},
-            [self, snapshot, metadata = std::move(metadata), context = std::move(context),
-             start = need->rule_index,
+            [self, gate, resolver, request_id, snapshot, connection_id,
+             metadata = std::move(metadata), context = std::move(context), start = need->rule_index,
              handler = std::move(handler)](core::Result<dns::DnsAnswer> result) mutable {
-                if (result && !result.value().addresses.empty()) {
-                    context.destination_lookup = router::LookupState::resolved;
-                    context.destination_address = result.value().addresses.front();
-                } else {
-                    context.destination_lookup = router::LookupState::failed;
-                    context.destination_address.reset();
+                if (!gate->load(std::memory_order_acquire)) {
+                    return;
                 }
-                self->route_stream(snapshot, std::move(metadata), std::move(context), start,
-                                   std::move(handler));
-            });
+                self->resolver_requests_.erase(*request_id);
+                auto addresses = std::make_shared<std::vector<boost::asio::ip::address>>();
+                if (result) {
+                    addresses->insert(addresses->end(), result.value().addresses.begin(),
+                                      result.value().addresses.end());
+                }
+                const auto ipv6_request_id = std::make_shared<dns::ResolverService::RequestId>();
+                *ipv6_request_id = resolver->resolve(
+                    {metadata.destination.domain(), dns::DnsRecordType::aaaa, 1},
+                    [self, gate, snapshot, ipv6_request_id, metadata = std::move(metadata),
+                     context = std::move(context), start, connection_id,
+                     handler = std::move(handler),
+                     addresses](core::Result<dns::DnsAnswer> ipv6_result) mutable {
+                        if (!gate->load(std::memory_order_acquire)) {
+                            return;
+                        }
+                        self->resolver_requests_.erase(*ipv6_request_id);
+                        if (ipv6_result) {
+                            addresses->insert(addresses->end(),
+                                              ipv6_result.value().addresses.begin(),
+                                              ipv6_result.value().addresses.end());
+                        }
+                        if (!addresses->empty()) {
+                            context.destination_lookup = router::LookupState::resolved;
+                            context.destination_addresses = std::move(*addresses);
+                            context.destination_address = context.destination_addresses.front();
+                        } else {
+                            context.destination_lookup = router::LookupState::failed;
+                            context.destination_addresses.clear();
+                            context.destination_address.reset();
+                        }
+                        self->route_stream(snapshot, std::move(metadata), std::move(context), start,
+                                           connection_id, std::move(handler));
+                    },
+                    self->runtime_.scheduler());
+                self->resolver_requests_.insert(*ipv6_request_id);
+            },
+            runtime_.scheduler());
+        resolver_requests_.insert(*request_id);
         return;
     }
 
@@ -718,24 +884,34 @@ void ProxyServer::route_stream(router::TrafficRouter::Snapshot snapshot,
 
     switch (matched->decision.action.kind) {
     case router::RouteActionKind::direct:
+        if (connection_id && connection_registry_) {
+            connection_registry_->update_outbound(*connection_id, "direct");
+        }
         direct_outbound_->connect_stream(
             {std::move(metadata.destination), context.destination_address}, std::move(handler));
         return;
     case router::RouteActionKind::reject:
+        if (connection_id && connection_registry_) {
+            connection_registry_->update_outbound(*connection_id, "reject");
+        }
         reject_outbound_->connect_stream(
             {std::move(metadata.destination), context.destination_address}, std::move(handler));
         return;
     case router::RouteActionKind::named:
-        if (!outbound_registry_) {
+        if (!snapshot->outbounds) {
             handler(core::StreamOpenResult::failed(
                 {core::ErrorCode::configuration, "proxy outbound registry is missing"}));
             return;
         }
         {
-            const auto selected = outbound_registry_->select(matched->decision.action.target);
+            const auto selected = snapshot->outbounds->select(matched->decision.action.target);
             if (!selected) {
                 handler(core::StreamOpenResult::failed(selected.error()));
                 return;
+            }
+            if (connection_id && connection_registry_) {
+                connection_registry_->update_outbound(*connection_id,
+                                                      selected.value()->descriptor().id);
             }
             selected.value()->connect_stream(
                 {std::move(metadata.destination), context.destination_address}, std::move(handler));

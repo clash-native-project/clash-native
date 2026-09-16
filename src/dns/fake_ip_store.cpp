@@ -19,20 +19,21 @@ core::Error exhaustion_error() {
 } // namespace
 
 FakeIpStore::FakeIpStore(boost::asio::ip::address_v4 network, std::uint8_t prefix,
-                         std::size_t capacity) {
-    const auto result = configure(network, prefix, capacity);
+                         std::size_t capacity, std::chrono::seconds entry_ttl) {
+    const auto result = configure(network, prefix, capacity, entry_ttl);
     if (!result) {
         network_ = 0;
         prefix_ = 32;
         first_offset_ = 0;
         address_count_ = 0;
         capacity_ = 0;
+        entry_ttl_ = std::chrono::seconds(0);
     }
 }
 
 core::Status FakeIpStore::configure(boost::asio::ip::address_v4 network, std::uint8_t prefix,
-                                    std::size_t capacity) {
-    if (prefix > 30 || capacity == 0) {
+                                    std::size_t capacity, std::chrono::seconds entry_ttl) {
+    if (prefix > 30 || capacity == 0 || entry_ttl.count() < 0) {
         return core::fail(configuration_error("FakeIP requires a non-empty IPv4 pool"));
     }
     const auto total = std::uint64_t{1} << (32 - prefix);
@@ -48,16 +49,18 @@ core::Status FakeIpStore::configure(boost::asio::ip::address_v4 network, std::ui
     address_count_ = static_cast<std::uint32_t>(total - 2);
     next_offset_ = first_offset_;
     capacity_ = capacity;
+    entry_ttl_ = entry_ttl;
     return {};
 }
 
 core::Result<boost::asio::ip::address_v4> FakeIpStore::resolve(std::string_view domain) {
+    purge_expired();
     const auto normalized = normalize_name(domain);
     if (normalized.empty()) {
         return core::fail(configuration_error("FakeIP requires a non-empty domain"));
     }
     if (const auto existing = by_domain_.find(normalized); existing != by_domain_.end()) {
-        return existing->second;
+        return existing->second.address;
     }
     if (by_domain_.size() >= capacity_ || address_count_ == 0) {
         return core::fail(exhaustion_error());
@@ -69,7 +72,11 @@ core::Result<boost::asio::ip::address_v4> FakeIpStore::resolve(std::string_view 
         const auto value = network_ + offset;
         if (!by_address_.contains(value)) {
             const auto address = boost::asio::ip::address_v4(value);
-            by_domain_.emplace(normalized, address);
+            const auto now = std::chrono::steady_clock::now();
+            const auto expires = entry_ttl_.count() == 0
+                                     ? std::chrono::steady_clock::time_point::max()
+                                     : now + entry_ttl_;
+            by_domain_.emplace(normalized, Entry{address, expires});
             by_address_.emplace(value, normalized);
             return address;
         }
@@ -78,6 +85,7 @@ core::Result<boost::asio::ip::address_v4> FakeIpStore::resolve(std::string_view 
 }
 
 std::optional<std::string> FakeIpStore::reverse(boost::asio::ip::address_v4 address) const {
+    purge_expired();
     const auto found = by_address_.find(address.to_uint());
     if (found == by_address_.end()) {
         return std::nullopt;
@@ -86,12 +94,13 @@ std::optional<std::string> FakeIpStore::reverse(boost::asio::ip::address_v4 addr
 }
 
 bool FakeIpStore::release(std::string_view domain) noexcept {
+    purge_expired();
     const auto normalized = normalize_name(domain);
     const auto found = by_domain_.find(normalized);
     if (found == by_domain_.end()) {
         return false;
     }
-    by_address_.erase(found->second.to_uint());
+    by_address_.erase(found->second.address.to_uint());
     by_domain_.erase(found);
     return true;
 }
@@ -101,6 +110,21 @@ void FakeIpStore::clear() noexcept {
     by_address_.clear();
 }
 
-std::size_t FakeIpStore::size() const noexcept { return by_domain_.size(); }
+std::size_t FakeIpStore::size() const noexcept {
+    purge_expired();
+    return by_domain_.size();
+}
+
+void FakeIpStore::purge_expired() const noexcept {
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = by_domain_.begin(); it != by_domain_.end();) {
+        if (it->second.expires > now) {
+            ++it;
+            continue;
+        }
+        by_address_.erase(it->second.address.to_uint());
+        it = by_domain_.erase(it);
+    }
+}
 
 } // namespace clash_native::dns

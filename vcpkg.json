@@ -23,6 +23,14 @@
       "default-features": false
     },
     {
+      "name": "openssl",
+      "version>=": "3.6.0"
+    },
+    {
+      "name": "nghttp2",
+      "version>=": "1.70.0"
+    },
+    {
       "name": "gtest",
       "version>=": "1.16.0"
     }

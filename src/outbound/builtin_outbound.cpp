@@ -11,6 +11,7 @@
 #include <memory>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace clash_native::outbound {
 
@@ -35,8 +36,9 @@ core::Error connection_error(core::ErrorCode code, std::string context,
 class DirectConnectOperation final : public std::enable_shared_from_this<DirectConnectOperation> {
   public:
     DirectConnectOperation(boost::asio::io_context &context, core::StreamRequest request,
+                           std::shared_ptr<dns::ResolverService> resolver,
                            core::StreamOpenHandler handler)
-        : request_(std::move(request)), resolver_(context), socket_(context),
+        : request_(std::move(request)), resolver_(std::move(resolver)), socket_(context),
           connect_timer_(context), handler_(std::move(handler)) {}
 
     void start() {
@@ -44,7 +46,9 @@ class DirectConnectOperation final : public std::enable_shared_from_this<DirectC
         auto self = shared_from_this();
         connect_timer_.async_wait([self](const boost::system::error_code &error) {
             if (!error) {
-                self->resolver_.cancel();
+                if (self->resolver_ && self->resolver_request_id_) {
+                    self->resolver_->cancel(*self->resolver_request_id_);
+                }
                 boost::system::error_code ignored;
                 self->socket_.cancel(ignored);
                 self->complete(
@@ -55,53 +59,69 @@ class DirectConnectOperation final : public std::enable_shared_from_this<DirectC
         });
 
         if (request_.resolved_address) {
-            connect(*request_.resolved_address);
+            connect(std::vector<boost::asio::ip::address>{*request_.resolved_address});
             return;
         }
         if (request_.destination.is_address()) {
-            connect(request_.destination.address());
+            connect(std::vector<boost::asio::ip::address>{request_.destination.address()});
             return;
         }
 
-        resolver_.async_resolve(
-            request_.destination.domain(), std::to_string(request_.destination.port()),
-            [self](const boost::system::error_code &error,
-                   const boost::asio::ip::tcp::resolver::results_type &results) {
-                if (error) {
-                    self->complete(
-                        connection_error(core::ErrorCode::resolution,
-                                         fmt::format("failed to resolve direct target {}",
-                                                     destination_text(self->request_.destination)),
-                                         error));
-                    return;
-                }
+        if (!resolver_) {
+            complete(core::Error{core::ErrorCode::configuration,
+                                 "direct outbound requires a configured DNS resolver"});
+            return;
+        }
 
-                auto endpoints =
-                    std::make_shared<boost::asio::ip::tcp::resolver::results_type>(results);
-                self->connect(*endpoints);
-            });
+        resolve_domain(dns::DnsRecordType::a);
     }
 
   private:
-    void connect(const boost::asio::ip::address &address) {
+    void resolve_domain(dns::DnsRecordType type) {
         auto self = shared_from_this();
-        socket_.async_connect(
-            {address, request_.destination.port()}, [self](const boost::system::error_code &error) {
-                self->complete(error
-                                   ? connection_error(
-                                         core::ErrorCode::endpoint_connection,
-                                         fmt::format("failed to connect direct target {}",
-                                                     destination_text(self->request_.destination)),
-                                         error)
-                                   : std::optional<core::Error>{});
-            });
+        resolver_request_id_ = resolver_->resolve(
+            {request_.destination.domain(), type, 1},
+            [self, type](core::Result<dns::DnsAnswer> result) {
+                self->resolver_request_id_.reset();
+                if (result) {
+                    self->resolved_addresses_.insert(self->resolved_addresses_.end(),
+                                                     result.value().addresses.begin(),
+                                                     result.value().addresses.end());
+                } else if (!self->first_resolution_error_) {
+                    self->first_resolution_error_ = result.error();
+                }
+
+                if (type == dns::DnsRecordType::a) {
+                    self->resolve_domain(dns::DnsRecordType::aaaa);
+                    return;
+                }
+                if (self->resolved_addresses_.empty()) {
+                    if (self->first_resolution_error_) {
+                        self->complete(*self->first_resolution_error_);
+                    } else {
+                        self->complete(
+                            core::Error{core::ErrorCode::resolution,
+                                        fmt::format("direct target {} has no resolved addresses",
+                                                    destination_text(self->request_.destination))});
+                    }
+                    return;
+                }
+                self->connect(self->resolved_addresses_);
+            },
+            std::nullopt);
     }
 
-    void connect(const boost::asio::ip::tcp::resolver::results_type &endpoints) {
+    void connect(const std::vector<boost::asio::ip::address> &addresses) {
+        auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
+        endpoints->reserve(addresses.size());
+        for (const auto &address : addresses) {
+            endpoints->emplace_back(address, request_.destination.port());
+        }
         auto self = shared_from_this();
         boost::asio::async_connect(
-            socket_, endpoints,
-            [self](const boost::system::error_code &error, const boost::asio::ip::tcp::endpoint &) {
+            socket_, *endpoints,
+            [self, endpoints](const boost::system::error_code &error,
+                              const boost::asio::ip::tcp::endpoint &) {
                 self->complete(error
                                    ? connection_error(
                                          core::ErrorCode::endpoint_connection,
@@ -120,7 +140,10 @@ class DirectConnectOperation final : public std::enable_shared_from_this<DirectC
         boost::system::error_code ignored;
         connect_timer_.cancel();
         if (error) {
-            resolver_.cancel();
+            if (resolver_ && resolver_request_id_) {
+                resolver_->cancel(*resolver_request_id_);
+                resolver_request_id_.reset();
+            }
             socket_.close(ignored);
             handler_(core::StreamOpenResult::failed(std::move(*error)));
             return;
@@ -131,11 +154,56 @@ class DirectConnectOperation final : public std::enable_shared_from_this<DirectC
     }
 
     core::StreamRequest request_;
-    boost::asio::ip::tcp::resolver resolver_;
+    std::shared_ptr<dns::ResolverService> resolver_;
+    std::optional<dns::ResolverService::RequestId> resolver_request_id_;
+    std::vector<boost::asio::ip::address> resolved_addresses_;
+    std::optional<core::Error> first_resolution_error_;
     boost::asio::ip::tcp::socket socket_;
     boost::asio::steady_timer connect_timer_;
     core::StreamOpenHandler handler_;
     bool completed_ = false;
+};
+
+class DirectDatagramHandle final : public core::DatagramHandle {
+  public:
+    explicit DirectDatagramHandle(std::shared_ptr<boost::asio::ip::udp::socket> socket)
+        : socket_(std::move(socket)) {}
+
+    void async_send_to(boost::asio::const_buffer buffer, boost::asio::ip::udp::endpoint destination,
+                       WriteHandler handler) override {
+        const auto socket = socket_;
+        socket->async_send_to(buffer, destination,
+                              [socket, handler = std::move(handler)](
+                                  const boost::system::error_code &error,
+                                  std::size_t size) mutable { handler(error, size); });
+    }
+
+    void async_receive_from(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+        const auto socket = socket_;
+        const auto sender = std::make_shared<boost::asio::ip::udp::endpoint>();
+        socket->async_receive_from(
+            buffer, *sender,
+            [socket, sender, handler = std::move(handler)](const boost::system::error_code &error,
+                                                           std::size_t size) mutable {
+                handler(error, size, *sender);
+            });
+    }
+
+    boost::asio::any_io_executor executor() noexcept override { return socket_->get_executor(); }
+
+    void cancel() noexcept override {
+        boost::system::error_code ignored;
+        socket_->cancel(ignored);
+    }
+
+    void close() noexcept override {
+        boost::system::error_code ignored;
+        socket_->cancel(ignored);
+        socket_->close(ignored);
+    }
+
+  private:
+    std::shared_ptr<boost::asio::ip::udp::socket> socket_;
 };
 
 core::StreamOpenResult rejected_stream() {
@@ -145,7 +213,13 @@ core::StreamOpenResult rejected_stream() {
 
 } // namespace
 
-DirectOutbound::DirectOutbound(runtime::AsioRuntime &runtime) : runtime_(runtime) {}
+DirectOutbound::DirectOutbound(runtime::AsioRuntime &runtime,
+                               std::shared_ptr<dns::ResolverService> resolver)
+    : runtime_(runtime), resolver_(std::move(resolver)) {}
+
+void DirectOutbound::set_resolver(std::shared_ptr<dns::ResolverService> resolver) {
+    resolver_ = std::move(resolver);
+}
 
 const core::OutboundDescriptor &DirectOutbound::descriptor() const noexcept { return descriptor_; }
 
@@ -153,14 +227,42 @@ core::OutboundCapabilities DirectOutbound::capabilities() const noexcept { retur
 
 void DirectOutbound::connect_stream(core::StreamRequest request, core::StreamOpenHandler handler) {
     auto operation = std::make_shared<DirectConnectOperation>(
-        runtime_.context(), std::move(request), std::move(handler));
+        runtime_.context(), std::move(request), resolver_, std::move(handler));
     operation->start();
 }
 
-void DirectOutbound::open_datagram(core::DatagramRequest, core::DatagramOpenHandler handler) {
-    boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
-        handler(core::DatagramOpenResult::unsupported());
-    });
+void DirectOutbound::open_datagram(core::DatagramRequest request,
+                                   core::DatagramOpenHandler handler) {
+    if (!request.initial_destination || !request.initial_destination->is_address()) {
+        boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
+            handler(core::DatagramOpenResult::failed(
+                {core::ErrorCode::configuration,
+                 "direct outbound datagram dialing requires an IP address"}));
+        });
+        return;
+    }
+
+    const auto address = request.initial_destination->address();
+    auto socket = std::make_shared<boost::asio::ip::udp::socket>(runtime_.context());
+    boost::system::error_code error;
+    socket->open(address.is_v4() ? boost::asio::ip::udp::v4() : boost::asio::ip::udp::v6(), error);
+    if (!error) {
+        const auto local_address =
+            address.is_v4() ? boost::asio::ip::address(boost::asio::ip::address_v4::any())
+                            : boost::asio::ip::address(boost::asio::ip::address_v6::any());
+        socket->bind({local_address, 0}, error);
+    }
+    if (error) {
+        boost::asio::post(runtime_.context(), [handler = std::move(handler), error]() mutable {
+            handler(core::DatagramOpenResult::failed(
+                {core::ErrorCode::transport_io, "failed to open direct outbound datagram", error}));
+        });
+        return;
+    }
+
+    handler(
+        core::DatagramOpenResult::opened(std::make_unique<DirectDatagramHandle>(std::move(socket)),
+                                         core::DatagramSemantics::fixed_destination));
 }
 
 RejectOutbound::RejectOutbound(runtime::AsioRuntime &runtime) : runtime_(runtime) {}

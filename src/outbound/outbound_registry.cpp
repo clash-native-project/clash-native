@@ -93,7 +93,8 @@ OutboundRegistry::select_entry(std::string_view id, std::vector<std::string> &vi
     }
 
     visiting.emplace_back(id);
-    const auto begin = group->second.next_member++ % group->second.members.size();
+    const auto begin = group->second.next_member.fetch_add(1, std::memory_order_relaxed) %
+                       group->second.members.size();
     core::Result<OutboundPtr> last_error =
         core::fail(configuration_error("outbound group has no usable member: " + std::string(id)));
     for (std::size_t offset = 0; offset < group->second.members.size(); ++offset) {

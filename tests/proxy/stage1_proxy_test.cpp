@@ -1,3 +1,4 @@
+#include <clash_native/observability/connection_registry.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
 
 #include <gtest/gtest.h>
@@ -11,8 +12,10 @@
 
 #include <array>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace {
@@ -133,5 +136,56 @@ TEST(Stage1ProxyTest, RejectOutboundReturnsSocks5Rejection) {
     boost::system::error_code ignored;
     client.close(ignored);
     proxy.stop();
+    runtime.stop();
+}
+
+TEST(Stage1ProxyTest, TracksAProxyConnectionUntilTheClientCloses) {
+    clash_native::runtime::AsioRuntime runtime;
+    EchoTarget target(runtime);
+    auto registry = std::make_shared<clash_native::observability::ConnectionRegistry>();
+    clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
+    proxy.set_connection_registry(registry);
+    ASSERT_TRUE(proxy.start());
+    runtime.start();
+
+    boost::asio::ip::tcp::socket client(runtime.context());
+    client.connect(proxy.endpoint());
+    const std::array<std::uint8_t, 3> method_request{5, 1, 0};
+    boost::asio::write(client, boost::asio::buffer(method_request));
+    std::array<std::uint8_t, 2> method_response{};
+    boost::asio::read(client, boost::asio::buffer(method_response));
+    ASSERT_EQ(method_response, (std::array<std::uint8_t, 2>{5, 0}));
+
+    const auto port = target.endpoint.port();
+    const std::array<std::uint8_t, 10> request{5,
+                                               1,
+                                               0,
+                                               1,
+                                               127,
+                                               0,
+                                               0,
+                                               1,
+                                               static_cast<std::uint8_t>(port >> 8),
+                                               static_cast<std::uint8_t>(port & 0xff)};
+    boost::asio::write(client, boost::asio::buffer(request));
+    std::array<std::uint8_t, 10> response{};
+    boost::asio::read(client, boost::asio::buffer(response));
+    ASSERT_EQ(response[0], 5);
+    ASSERT_EQ(response[1], 0);
+
+    const auto records = registry->snapshot();
+    ASSERT_EQ(records.size(), 1U);
+    EXPECT_EQ(records.front().outbound_id, "direct");
+    EXPECT_EQ(records.front().metadata.destination.port(), port);
+
+    boost::system::error_code ignored;
+    client.close(ignored);
+    for (int attempt = 0; attempt < 200 && !registry->snapshot().empty(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(registry->snapshot().empty());
+
+    proxy.stop();
+    target.acceptor.close(ignored);
     runtime.stop();
 }

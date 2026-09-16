@@ -2,6 +2,8 @@
 
 #include <boost/asio/executor_work_guard.hpp>
 
+#include <spdlog/spdlog.h>
+
 #include <stdexcept>
 
 namespace clash_native::runtime {
@@ -25,9 +27,11 @@ void AsioRuntime::start() {
     }
 
     if (started_.exchange(true)) {
+        spdlog::debug("Asio runtime start requested more than once");
         return;
     }
 
+    spdlog::debug("Starting Asio runtime");
     running_ = true;
     try {
         thread_ = std::thread([this] {
@@ -43,17 +47,19 @@ void AsioRuntime::start() {
 
 void AsioRuntime::stop() {
     if (stopped_.exchange(true)) {
+        spdlog::debug("Asio runtime stop requested more than once");
         return;
     }
 
+    spdlog::debug("Stopping Asio runtime");
     work_guard_.reset();
-    io_context_.stop();
 
     if (thread_.joinable()) {
         thread_.join();
     }
 
     running_ = false;
+    spdlog::debug("Asio runtime stopped");
 }
 
 } // namespace clash_native::runtime

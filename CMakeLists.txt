@@ -10,14 +10,29 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(boost_asio CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
+find_package(OpenSSL CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(tl-expected CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
+find_path(NGHTTP2_INCLUDE_DIR NAMES nghttp2/nghttp2.h REQUIRED)
+find_library(NGHTTP2_LIBRARY NAMES nghttp2 REQUIRED)
+add_library(clash-native-nghttp2 UNKNOWN IMPORTED)
+set_target_properties(clash-native-nghttp2 PROPERTIES
+    IMPORTED_LOCATION "${NGHTTP2_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${NGHTTP2_INCLUDE_DIR}"
+)
+
 add_library(clash-native-core STATIC
     src/dns/dns_codec.cpp
     src/dns/dns_policy_router.cpp
+    src/dns/dns_query_service.cpp
+    src/dns/dns_upstream.cpp
+    src/dns/address_resolver.cpp
     src/dns/resolver_service.cpp
+    src/dns/dns_transport.cpp
+    src/dns/dot_dns_transport.cpp
+    src/dns/doh2_dns_transport.cpp
     src/dns/dns_server.cpp
     src/dns/fake_ip_store.cpp
     src/dns/resolver_graph.cpp
@@ -44,10 +59,14 @@ target_compile_features(clash-native-core PUBLIC cxx_std_20)
 target_link_libraries(clash-native-core
     PUBLIC
         Boost::asio
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        clash-native-nghttp2
         Threads::Threads
         tl::expected
     PRIVATE
         fmt::fmt
+        spdlog::spdlog_header_only
 )
 
 if(WIN32)
@@ -103,6 +122,8 @@ if(BUILD_TESTING)
         tests/core/outbound_contract_test.cpp
         tests/core/version_test.cpp
         tests/dns/dns_test.cpp
+        tests/dns/dns_transport_test.cpp
+        tests/dns/dns_packet_test.cpp
         tests/dns/dns_server_test.cpp
         tests/dns/resolver_graph_test.cpp
         tests/observability/connection_registry_test.cpp
@@ -113,6 +134,7 @@ if(BUILD_TESTING)
         tests/proxy/socks5_proxy_test.cpp
         tests/router/traffic_router_test.cpp
         tests/runtime/asio_runtime_test.cpp
+        tests/runtime/runtime_snapshot_test.cpp
         tests/runtime/runtime_set_test.cpp
     )
 

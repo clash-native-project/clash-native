@@ -3,6 +3,7 @@
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -27,7 +28,39 @@ class OutboundRegistry final {
   private:
     struct Group {
         std::vector<std::string> members;
-        mutable std::size_t next_member = 0;
+        mutable std::atomic<std::size_t> next_member{0};
+
+        Group() = default;
+        Group(std::vector<std::string> members, std::size_t next_member = 0)
+            : members(std::move(members)), next_member(next_member) {}
+
+        Group(const Group &other)
+            : members(other.members),
+              next_member(other.next_member.load(std::memory_order_relaxed)) {}
+
+        Group &operator=(const Group &other) {
+            if (this == &other) {
+                return *this;
+            }
+            members = other.members;
+            next_member.store(other.next_member.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+            return *this;
+        }
+
+        Group(Group &&other) noexcept
+            : members(std::move(other.members)),
+              next_member(other.next_member.load(std::memory_order_relaxed)) {}
+
+        Group &operator=(Group &&other) noexcept {
+            if (this == &other) {
+                return *this;
+            }
+            members = std::move(other.members);
+            next_member.store(other.next_member.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+            return *this;
+        }
     };
 
     core::Status validate_group(std::string_view id, std::vector<std::string> &visiting) const;

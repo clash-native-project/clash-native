@@ -6,6 +6,7 @@
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/ip/udp.hpp>
 #include <boost/system/error_code.hpp>
 
 #include <cstdint>
@@ -104,6 +105,19 @@ class StreamHandle {
 
 class DatagramHandle {
   public:
+    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t,
+                                           boost::asio::ip::udp::endpoint)>;
+    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
+    virtual void async_send_to(boost::asio::const_buffer buffer,
+                               boost::asio::ip::udp::endpoint destination,
+                               WriteHandler handler) = 0;
+    virtual void async_receive_from(boost::asio::mutable_buffer buffer, ReadHandler handler) = 0;
+    virtual boost::asio::any_io_executor executor() noexcept = 0;
+    virtual std::size_t max_datagram_size() const noexcept { return 65507; }
+    virtual void cancel() noexcept = 0;
+    virtual void close() noexcept = 0;
+
     virtual ~DatagramHandle() = default;
 };
 

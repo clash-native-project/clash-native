@@ -2,6 +2,4 @@
 
 #include <gtest/gtest.h>
 
-TEST(VersionTest, IsNotEmpty) {
-    EXPECT_FALSE(clash_native::core::version.empty());
-}
+TEST(VersionTest, IsNotEmpty) { EXPECT_FALSE(clash_native::core::version.empty()); }

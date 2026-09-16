@@ -85,6 +85,7 @@ enum class LookupState {
 struct RoutingContext {
     LookupState destination_lookup = LookupState::unrequested;
     std::optional<boost::asio::ip::address> destination_address;
+    std::vector<boost::asio::ip::address> destination_addresses;
 };
 
 class TrafficRouter {

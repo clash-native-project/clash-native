@@ -65,13 +65,15 @@ bool matches_rule(const TrafficRule &rule, const core::ConnectionMetadata &metad
     case RuleKind::inbound:
         return rule.value == metadata.inbound_name || rule.value == metadata.inbound_type;
     case RuleKind::destination_ip_cidr: {
-        const auto address =
-            context.destination_address
-                ? context.destination_address
-                : (metadata.destination.is_address()
-                       ? std::optional<boost::asio::ip::address>(metadata.destination.address())
-                       : std::nullopt);
-        if (!address) {
+        std::vector<boost::asio::ip::address> addresses;
+        if (!context.destination_addresses.empty()) {
+            addresses = context.destination_addresses;
+        } else if (context.destination_address) {
+            addresses.push_back(*context.destination_address);
+        } else if (metadata.destination.is_address()) {
+            addresses.push_back(metadata.destination.address());
+        }
+        if (addresses.empty()) {
             return false;
         }
 
@@ -82,7 +84,7 @@ bool matches_rule(const TrafficRule &rule, const core::ConnectionMetadata &metad
         boost::system::error_code error;
         const auto network =
             boost::asio::ip::make_address(std::string_view(rule.value).substr(0, separator), error);
-        if (error || network.is_v4() != address->is_v4()) {
+        if (error) {
             return false;
         }
         unsigned int prefix = 0;
@@ -96,15 +98,20 @@ bool matches_rule(const TrafficRule &rule, const core::ConnectionMetadata &metad
         }
 
         const auto network_bytes = address_bytes(network);
-        const auto target_bytes = address_bytes(*address);
         const auto full_bytes = prefix / 8;
         const auto remaining_bits = prefix % 8;
-        if (!std::equal(network_bytes.begin(), network_bytes.begin() + full_bytes,
-                        target_bytes.begin())) {
-            return false;
-        }
-        return remaining_bits == 0 || (network_bytes[full_bytes] >> (8 - remaining_bits)) ==
-                                          (target_bytes[full_bytes] >> (8 - remaining_bits));
+        return std::any_of(addresses.begin(), addresses.end(), [&](const auto &address) {
+            if (network.is_v4() != address.is_v4()) {
+                return false;
+            }
+            const auto target_bytes = address_bytes(address);
+            if (!std::equal(network_bytes.begin(), network_bytes.begin() + full_bytes,
+                            target_bytes.begin())) {
+                return false;
+            }
+            return remaining_bits == 0 || (network_bytes[full_bytes] >> (8 - remaining_bits)) ==
+                                              (target_bytes[full_bytes] >> (8 - remaining_bits));
+        });
     }
     }
 
@@ -163,8 +170,8 @@ RuleEvaluation TrafficRouter::evaluate(const core::ConnectionMetadata &metadata,
                                        const RoutingContext &context, std::size_t start) const {
     for (std::size_t index = start; index < rules_.size(); ++index) {
         const auto &rule = rules_[index];
-        if (rule.kind == RuleKind::destination_ip_cidr && !context.destination_address &&
-            !metadata.destination.is_address()) {
+        if (rule.kind == RuleKind::destination_ip_cidr && context.destination_addresses.empty() &&
+            !context.destination_address && !metadata.destination.is_address()) {
             if (!rule.no_resolve && context.destination_lookup == LookupState::unrequested) {
                 return NeedMetadata{MetadataNeed::destination_ip, index};
             }

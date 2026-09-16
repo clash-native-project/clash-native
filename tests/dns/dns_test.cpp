@@ -21,6 +21,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -33,8 +34,12 @@ void append_u16(std::vector<std::uint8_t> &message, std::uint16_t value) {
     message.push_back(static_cast<std::uint8_t>(value & 0xff));
 }
 
-std::vector<std::uint8_t> response_for(std::span<const std::uint8_t> query, bool truncated) {
+std::vector<std::uint8_t> response_for(std::span<const std::uint8_t> query, bool truncated,
+                                       bool mismatched_question = false) {
     std::vector<std::uint8_t> response(query.begin(), query.end());
+    if (mismatched_question && response.size() > 13) {
+        response[13] ^= 1;
+    }
     response[2] = truncated ? 0x83 : 0x81;
     response[3] = 0x80;
     response[6] = 0;
@@ -52,11 +57,14 @@ std::vector<std::uint8_t> response_for(std::span<const std::uint8_t> query, bool
 
 class DnsTestServer final {
   public:
-    DnsTestServer(boost::asio::io_context &context, bool truncate_udp)
+    DnsTestServer(boost::asio::io_context &context, bool truncate_udp,
+                  bool wrong_udp_sender = false, bool mismatched_question = false)
         : udp_socket_(context, {boost::asio::ip::address_v4::loopback(), 0}),
           endpoint_(udp_socket_.local_endpoint()),
+          wrong_udp_socket_(context, {boost::asio::ip::address_v4::loopback(), 0}),
           tcp_acceptor_(context, {boost::asio::ip::address_v4::loopback(), 0}),
-          truncate_udp_(truncate_udp) {}
+          truncate_udp_(truncate_udp), wrong_udp_sender_(wrong_udp_sender),
+          mismatched_question_(mismatched_question) {}
 
     boost::asio::ip::udp::endpoint endpoint() const noexcept { return endpoint_; }
     boost::asio::ip::tcp::endpoint tcp_endpoint() const noexcept {
@@ -68,6 +76,16 @@ class DnsTestServer final {
     void start() {
         receive_udp();
         accept_tcp();
+    }
+
+    void stop() {
+        boost::system::error_code ignored;
+        udp_socket_.cancel(ignored);
+        udp_socket_.close(ignored);
+        wrong_udp_socket_.cancel(ignored);
+        wrong_udp_socket_.close(ignored);
+        tcp_acceptor_.cancel(ignored);
+        tcp_acceptor_.close(ignored);
     }
 
   private:
@@ -82,8 +100,9 @@ class DnsTestServer final {
                 const auto query = std::make_shared<std::vector<std::uint8_t>>(
                     udp_buffer_.begin(), udp_buffer_.begin() + size);
                 auto response = std::make_shared<std::vector<std::uint8_t>>(
-                    response_for(*query, truncate_udp_));
-                udp_socket_.async_send_to(
+                    response_for(*query, truncate_udp_, mismatched_question_));
+                auto &response_socket = wrong_udp_sender_ ? wrong_udp_socket_ : udp_socket_;
+                response_socket.async_send_to(
                     boost::asio::buffer(*response), sender_,
                     [response](const boost::system::error_code &, std::size_t) {});
                 if (!truncate_udp_) {
@@ -136,12 +155,15 @@ class DnsTestServer final {
 
     boost::asio::ip::udp::socket udp_socket_;
     boost::asio::ip::udp::endpoint endpoint_;
+    boost::asio::ip::udp::socket wrong_udp_socket_;
     boost::asio::ip::tcp::acceptor tcp_acceptor_;
     std::array<std::uint8_t, 4096> udp_buffer_{};
     boost::asio::ip::udp::endpoint sender_;
     std::atomic_int udp_queries_{0};
     std::atomic_int tcp_queries_{0};
     bool truncate_udp_;
+    bool wrong_udp_sender_;
+    bool mismatched_question_;
 };
 
 } // namespace
@@ -167,6 +189,19 @@ TEST(DnsCodecTest, EncodesAndDecodesIpv4Answers) {
 TEST(DnsCodecTest, RejectsMalformedResponses) {
     const auto decoded = clash_native::dns::DnsMessageCodec::decode_response(
         std::array<std::uint8_t, 3>{0, 1, 2}, 1);
+    ASSERT_FALSE(decoded);
+    EXPECT_EQ(decoded.error().code, clash_native::core::ErrorCode::protocol_framing);
+}
+
+TEST(DnsCodecTest, RejectsResponsesWithMultipleQuestions) {
+    const auto query = clash_native::dns::DnsMessageCodec::encode_query(
+        {"example.test", clash_native::dns::DnsRecordType::a, 1}, 0x1234);
+    ASSERT_TRUE(query);
+    auto response = response_for(query.value(), false);
+    response[4] = 0;
+    response[5] = 2;
+
+    const auto decoded = clash_native::dns::DnsMessageCodec::decode_response(response, 0x1234);
     ASSERT_FALSE(decoded);
     EXPECT_EQ(decoded.error().code, clash_native::core::ErrorCode::protocol_framing);
 }
@@ -260,7 +295,129 @@ TEST(ResolverServiceTest, CoalescesEquivalentQueriesAndCachesTheAnswer) {
     ASSERT_EQ(cached_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
     EXPECT_EQ(server.tcp_queries(), 1);
 
+    server.stop();
     runtime.stop();
+}
+
+TEST(ResolverServiceTest, RoutesQueriesThroughTheSelectedDnsUpstreamGroup) {
+    clash_native::runtime::AsioRuntime runtime;
+    DnsTestServer default_server(runtime.context(), false);
+    DnsTestServer internal_server(runtime.context(), false);
+    default_server.start();
+    internal_server.start();
+
+    auto policy = std::make_shared<clash_native::dns::DnsPolicyRouter>("system");
+    policy->add_rule({"internal", clash_native::dns::DnsPolicyRuleKind::suffix, "internal.example",
+                      "internal-dns"});
+
+    clash_native::dns::DnsResolverConfig config{
+        {default_server.endpoint(), std::chrono::milliseconds(500), default_server.tcp_endpoint(),
+         true},
+        {{"internal-dns",
+          {internal_server.endpoint(), std::chrono::milliseconds(500),
+           internal_server.tcp_endpoint(), true}}},
+        policy};
+    clash_native::dns::ResolverService resolver(runtime, std::move(config));
+    runtime.start();
+
+    auto completed = std::make_shared<std::atomic_int>(0);
+    auto done = std::make_shared<std::promise<void>>();
+    auto future = done->get_future();
+    boost::asio::post(runtime.context(), [&resolver, completed, done] {
+        const auto handler =
+            [completed, done](clash_native::core::Result<clash_native::dns::DnsAnswer> result) {
+                ASSERT_TRUE(result) << (result ? "" : result.error().context);
+                if (++*completed == 2) {
+                    done->set_value();
+                }
+            };
+        resolver.resolve({"api.internal.example", clash_native::dns::DnsRecordType::a, 1}, handler);
+        resolver.resolve({"www.example.org", clash_native::dns::DnsRecordType::a, 1}, handler);
+    });
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    EXPECT_EQ(internal_server.tcp_queries(), 1);
+    EXPECT_EQ(default_server.tcp_queries(), 1);
+
+    resolver.stop();
+    internal_server.stop();
+    default_server.stop();
+    runtime.stop();
+}
+
+TEST(ResolverServiceTest, RejectsPolicyRulesThatReferenceAnUnknownUpstreamGroup) {
+    clash_native::runtime::AsioRuntime runtime;
+    DnsTestServer server(runtime.context(), false);
+    server.start();
+
+    auto policy = std::make_shared<clash_native::dns::DnsPolicyRouter>("system");
+    policy->add_rule(
+        {"missing", clash_native::dns::DnsPolicyRuleKind::exact, "missing.example", "missing-dns"});
+    clash_native::dns::ResolverService resolver(
+        runtime,
+        clash_native::dns::DnsResolverConfig{
+            {server.endpoint(), std::chrono::milliseconds(500), server.tcp_endpoint(), true},
+            {},
+            policy});
+    runtime.start();
+
+    auto done = std::make_shared<std::promise<void>>();
+    auto future = done->get_future();
+    boost::asio::post(runtime.context(), [&resolver, done] {
+        resolver.resolve({"missing.example", clash_native::dns::DnsRecordType::a, 1},
+                         [done](clash_native::core::Result<clash_native::dns::DnsAnswer> result) {
+                             ASSERT_FALSE(result);
+                             EXPECT_EQ(result.error().code,
+                                       clash_native::core::ErrorCode::configuration);
+                             done->set_value();
+                         });
+    });
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    EXPECT_EQ(server.tcp_queries(), 0);
+
+    resolver.stop();
+    server.stop();
+    runtime.stop();
+}
+
+TEST(ResolverServiceTest, DeliversCompletionsOnTheCallingRuntime) {
+    clash_native::runtime::AsioRuntime resolver_runtime;
+    DnsTestServer server(resolver_runtime.context(), false);
+    server.start();
+    clash_native::dns::ResolverService resolver(
+        resolver_runtime,
+        {server.endpoint(), std::chrono::milliseconds(500), server.tcp_endpoint(), true});
+    clash_native::runtime::AsioRuntime caller_runtime;
+    resolver_runtime.start();
+    caller_runtime.start();
+
+    auto caller_thread = std::make_shared<std::thread::id>();
+    auto completion_thread = std::make_shared<std::thread::id>();
+    auto done = std::make_shared<std::promise<void>>();
+    auto future = done->get_future();
+    boost::asio::post(caller_runtime.context(),
+                      [&resolver, &caller_runtime, caller_thread, completion_thread, done] {
+                          *caller_thread = std::this_thread::get_id();
+                          resolver.resolve(
+                              {"cross-runtime.example", clash_native::dns::DnsRecordType::a, 1},
+                              [completion_thread, done](
+                                  clash_native::core::Result<clash_native::dns::DnsAnswer> result) {
+                                  if (result) {
+                                      *completion_thread = std::this_thread::get_id();
+                                  }
+                                  done->set_value();
+                              },
+                              caller_runtime.scheduler());
+                      });
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    EXPECT_EQ(*completion_thread, *caller_thread);
+    EXPECT_EQ(server.tcp_queries(), 1);
+    resolver.stop();
+    server.stop();
+    caller_runtime.stop();
+    resolver_runtime.stop();
 }
 
 TEST(ResolverServiceTest, UsesConfiguredFallbackAfterPrimaryFailure) {
@@ -287,6 +444,67 @@ TEST(ResolverServiceTest, UsesConfiguredFallbackAfterPrimaryFailure) {
     });
     ASSERT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
     EXPECT_EQ(fallback.tcp_queries(), 1);
+    fallback.stop();
+    runtime.stop();
+}
+
+TEST(ResolverServiceTest, IgnoresResponsesFromUnexpectedUdpSender) {
+    clash_native::runtime::AsioRuntime runtime;
+    DnsTestServer unexpected(runtime.context(), false, true);
+    DnsTestServer fallback(runtime.context(), false);
+    unexpected.start();
+    fallback.start();
+    clash_native::dns::ResolverService resolver(
+        runtime, {unexpected.endpoint(), std::chrono::milliseconds(100), unexpected.tcp_endpoint(),
+                  false, fallback.endpoint(), fallback.tcp_endpoint()});
+    runtime.start();
+
+    auto done = std::make_shared<std::promise<void>>();
+    auto future = done->get_future();
+    boost::asio::post(runtime.context(), [&resolver, done] {
+        resolver.resolve({"unexpected-sender.example", clash_native::dns::DnsRecordType::a, 1},
+                         [done](clash_native::core::Result<clash_native::dns::DnsAnswer> result) {
+                             ASSERT_TRUE(result) << (result ? "" : result.error().context);
+                             ASSERT_FALSE(result.value().addresses.empty());
+                             done->set_value();
+                         });
+    });
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    EXPECT_EQ(unexpected.udp_queries(), 1);
+    EXPECT_EQ(fallback.udp_queries(), 1);
+    unexpected.stop();
+    fallback.stop();
+    runtime.stop();
+}
+
+TEST(ResolverServiceTest, IgnoresResponsesWithAnUnexpectedQuestion) {
+    clash_native::runtime::AsioRuntime runtime;
+    DnsTestServer unexpected(runtime.context(), false, false, true);
+    DnsTestServer fallback(runtime.context(), false);
+    unexpected.start();
+    fallback.start();
+    clash_native::dns::ResolverService resolver(
+        runtime, {unexpected.endpoint(), std::chrono::milliseconds(100), unexpected.tcp_endpoint(),
+                  false, fallback.endpoint(), fallback.tcp_endpoint()});
+    runtime.start();
+
+    auto done = std::make_shared<std::promise<void>>();
+    auto future = done->get_future();
+    boost::asio::post(runtime.context(), [&resolver, done] {
+        resolver.resolve({"unexpected-question.example", clash_native::dns::DnsRecordType::a, 1},
+                         [done](clash_native::core::Result<clash_native::dns::DnsAnswer> result) {
+                             ASSERT_TRUE(result) << (result ? "" : result.error().context);
+                             ASSERT_FALSE(result.value().addresses.empty());
+                             done->set_value();
+                         });
+    });
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    EXPECT_EQ(unexpected.udp_queries(), 1);
+    EXPECT_EQ(fallback.udp_queries(), 1);
+    unexpected.stop();
+    fallback.stop();
     runtime.stop();
 }
 
@@ -312,7 +530,143 @@ TEST(ResolverServiceTest, CancelsTheWaiterAndSharedOperation) {
         resolver.cancel(request_id);
     });
     ASSERT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    resolver.stop();
     runtime.stop();
+}
+
+TEST(ResolverServiceTest, ValidatesPolicyGroupsBeforeRuntimeSnapshotPublication) {
+    clash_native::runtime::AsioRuntime runtime;
+    auto policy = std::make_shared<clash_native::dns::DnsPolicyRouter>("default");
+    policy->add_rule({"missing-group-rule", clash_native::dns::DnsPolicyRuleKind::exact,
+                      "missing.example", "missing"});
+    auto resolver = std::make_shared<clash_native::dns::ResolverService>(
+        runtime, clash_native::dns::DnsResolverConfig{
+                     {boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 1),
+                      std::chrono::milliseconds(100)},
+                     {},
+                     policy});
+
+    const auto result = resolver->validate();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::configuration);
+    EXPECT_NE(result.error().context.find("missing"), std::string::npos);
+}
+
+TEST(ResolverServiceTest, RejectsAnUnknownPolicyDefaultGroupBeforeQuerying) {
+    clash_native::runtime::AsioRuntime runtime;
+    auto policy = std::make_shared<clash_native::dns::DnsPolicyRouter>("missing-default");
+    auto resolver = std::make_shared<clash_native::dns::ResolverService>(
+        runtime, clash_native::dns::DnsResolverConfig{
+                     {boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 1),
+                      std::chrono::milliseconds(100)},
+                     {},
+                     std::move(policy)});
+
+    const auto result = resolver->validate();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::configuration);
+    EXPECT_NE(result.error().context.find("missing-default"), std::string::npos);
+}
+
+TEST(ResolverServiceTest, ValidatesTheConfiguredResolverDependencyGraph) {
+    clash_native::runtime::AsioRuntime runtime;
+    auto graph = std::make_shared<clash_native::dns::ResolverDependencyGraph>();
+    ASSERT_TRUE(graph->add_resolver("bootstrap", clash_native::dns::ResolverRole::bootstrap));
+    ASSERT_TRUE(graph->add_resolver("default", clash_native::dns::ResolverRole::default_resolver));
+    ASSERT_TRUE(graph->add_outbound("direct"));
+    ASSERT_TRUE(graph->add_dependency("bootstrap", "direct"));
+    ASSERT_TRUE(graph->add_dependency("direct", "default"));
+
+    clash_native::dns::ResolverService resolver(
+        runtime, clash_native::dns::DnsResolverConfig{
+                     {boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 1),
+                      std::chrono::milliseconds(100)},
+                     {},
+                     nullptr,
+                     {},
+                     {},
+                     4096,
+                     std::chrono::seconds(5),
+                     0,
+                     graph});
+
+    const auto result = resolver.validate();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::configuration);
+    EXPECT_NE(result.error().context.find("bootstrap"), std::string::npos);
+}
+
+TEST(ResolverServiceTest, RejectsInvalidUpstreamConfigurationBeforeQuerying) {
+    clash_native::runtime::AsioRuntime runtime;
+    clash_native::dns::DnsResolverConfig config{
+        {boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 1),
+         std::chrono::milliseconds(1)},
+        {},
+        nullptr,
+        {}};
+    config.default_upstream.timeout = std::chrono::milliseconds(0);
+    clash_native::dns::ResolverService resolver(runtime, std::move(config));
+
+    const auto result = resolver.validate();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::configuration);
+    EXPECT_NE(result.error().context.find("timeout"), std::string::npos);
+}
+
+TEST(ResolverServiceTest, RejectsUnsupportedDnsDialPolicyBeforeQuerying) {
+    clash_native::runtime::AsioRuntime runtime;
+    clash_native::dns::DnsResolverConfig config{
+        {boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 1),
+         std::chrono::milliseconds(100)},
+        {},
+        nullptr,
+        {}};
+    config.default_upstream.dial_policy.kind = clash_native::dns::DnsDialPolicyKind::named_outbound;
+    config.default_upstream.dial_policy.outbound_id = "proxy";
+    clash_native::dns::ResolverService resolver(runtime, std::move(config));
+
+    const auto result = resolver.validate();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::configuration);
+    EXPECT_NE(result.error().context.find("dialer"), std::string::npos);
+}
+
+TEST(ResolverServiceTest, RejectsInvalidDnsEnumConfigurationBeforeQuerying) {
+    clash_native::runtime::AsioRuntime runtime;
+    clash_native::dns::DnsResolverConfig config{
+        {boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 1),
+         std::chrono::milliseconds(100)},
+        {},
+        nullptr,
+        {}};
+    config.default_upstream.mode = static_cast<clash_native::dns::DnsTransportMode>(99);
+    clash_native::dns::ResolverService resolver(runtime, std::move(config));
+
+    const auto result = resolver.validate();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::configuration);
+    EXPECT_NE(result.error().context.find("transport mode"), std::string::npos);
+}
+
+TEST(ResolverServiceTest, ValidatesDoqAndDoh3ConfigurationContracts) {
+    clash_native::runtime::AsioRuntime runtime;
+    clash_native::dns::DnsResolverConfig config{
+        {boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 853),
+         std::chrono::milliseconds(100)},
+        {},
+        nullptr,
+        {}};
+    config.default_upstream.mode = clash_native::dns::DnsTransportMode::doq;
+    clash_native::dns::ResolverService doq_resolver(runtime, config);
+    EXPECT_TRUE(doq_resolver.validate());
+
+    config.default_upstream.mode = clash_native::dns::DnsTransportMode::doh3;
+    config.default_upstream.doh_path = "relative-path";
+    clash_native::dns::ResolverService doh3_resolver(runtime, std::move(config));
+    const auto result = doh3_resolver.validate();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::configuration);
+    EXPECT_NE(result.error().context.find("DoH3 path"), std::string::npos);
 }
 
 TEST(ResolverServiceTest, FallsBackToTcpForTruncatedUdpResponses) {
@@ -346,6 +700,7 @@ TEST(ResolverServiceTest, FallsBackToTcpForTruncatedUdpResponses) {
     EXPECT_EQ(server.udp_queries(), 1);
     EXPECT_EQ(server.tcp_queries(), 1);
 
+    server.stop();
     runtime.stop();
 }
 
@@ -365,4 +720,24 @@ TEST(FakeIpStoreTest, AllocatesStableAddressesAndReversesThem) {
     EXPECT_TRUE(store.release("EXAMPLE.COM"));
     EXPECT_FALSE(store.reverse(first.value()).has_value());
     EXPECT_EQ(store.size(), 1U);
+}
+
+TEST(FakeIpStoreTest, ExpiresMappingsAndReusesReleasedAddresses) {
+    clash_native::dns::FakeIpStore store(boost::asio::ip::make_address_v4("198.18.0.0"), 30, 2,
+                                         std::chrono::seconds(1));
+    const auto first = store.resolve("temporary.example");
+    ASSERT_TRUE(first);
+    ASSERT_EQ(store.reverse(first.value()), std::optional<std::string>("temporary.example"));
+    const auto second = store.resolve("temporary-second.example");
+    ASSERT_TRUE(second);
+    EXPECT_NE(second.value(), first.value());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_FALSE(store.reverse(first.value()).has_value());
+    EXPECT_EQ(store.size(), 0U);
+
+    const auto reused = store.resolve("replacement.example");
+    ASSERT_TRUE(reused);
+    EXPECT_EQ(reused.value(), first.value());
+    EXPECT_EQ(store.reverse(reused.value()), std::optional<std::string>("replacement.example"));
 }
