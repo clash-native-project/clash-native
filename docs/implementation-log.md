@@ -729,3 +729,15 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 
 - Moved DoQ and DoH over HTTP/3 implementation and validation into the Stage 2 DNS milestone, including the minimum QUIC/HTTP/3 foundation required by those DNS transports.
 - Kept Stage 4 focused on generalizing and validating QUIC for proxy protocols, and moved the user-facing CLI and configuration-file interface to Stage 7.
+
+### 2026-09-17 — Concurrent QUIC DNS stream reuse
+
+- Refactored DoQ and DoH/3 transports to multiplex up to 64 active DNS exchanges on one QUIC session, with per-stream deadlines, response state, cancellation, and stream-limit handling.
+- Kept DoQ exchanges queued when a QUIC packet makes no stream progress or carries only control frames, so later transport progress can resume each request.
+- Added test-only Go quic-go upstream fixtures that assert eight simultaneous unique queries complete over exactly one accepted QUIC connection for both DoQ and DoH/3, and verify zero DNS message IDs on DoQ wire queries. The DNS TCP listener feeds 18 KB padded requests to exercise QUIC packetization and flow control without relying on fragmented local UDP datagrams.
+- Validated Windows x64 with clang-cl/MSVC, all 117 CTest cases, the full Go interoperability suite, `go vet`, formatting checks, and ten repeated runs of the new DoQ/DoH/3 connection-reuse interoperability test.
+
+### 2026-09-17 — Deferred large UDP DNS burst issue
+
+- Recorded the observed Windows loopback loss rates for concurrent oversized UDP datagrams, the successful sequential size checks, and the limits of the current evidence in `docs/known-issues.md`.
+- Kept the cause unresolved and deferred implementation changes; the loopback measurements do not establish IP-fragmentation loss or a fixed 13 KB limit.

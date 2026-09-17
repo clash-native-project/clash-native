@@ -5,6 +5,7 @@
 
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/dispatch.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
 
@@ -32,6 +33,8 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -41,6 +44,10 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t kMaximumIdleQuicSessions = 4;
+constexpr std::size_t kMaximumConcurrentExchangesPerSession = 64;
+constexpr auto kMinimumQuicHandshakeTimeout = std::chrono::seconds(30);
+constexpr std::uint64_t kDoqRequestCancelled = 0x3;
+constexpr std::uint64_t kHttp3RequestCancelled = 0x10c;
 
 core::Error transport_error(std::string context) {
     return {core::ErrorCode::transport_io, std::move(context)};
@@ -118,13 +125,14 @@ std::string authority(const DnsUpstreamConfig &config, std::string host, std::ui
 
 } // namespace
 
-class QuicDnsTransport final : public DnsTransport {
+class QuicDnsTransport final : public DnsTransport,
+                               public std::enable_shared_from_this<QuicDnsTransport> {
   private:
     class Operation;
 
   public:
     QuicDnsTransport(runtime::AsioRuntime &runtime, DnsUpstreamConfig config)
-        : runtime_(runtime), config_(std::move(config)) {
+        : runtime_(runtime), config_(std::move(config)), strand_(runtime.context().get_executor()) {
         if (!config_.dialer) {
             config_.dialer = make_direct_dns_upstream_dialer(runtime_);
         }
@@ -135,15 +143,23 @@ class QuicDnsTransport final : public DnsTransport {
     void stop() noexcept override;
 
   private:
+    struct ExchangeRegistration {
+        std::shared_ptr<Operation> operation;
+        Handler handler;
+    };
+
     void complete(ExchangeId exchange_id, core::Result<DnsPacket> result);
-    void recycle(const std::shared_ptr<Operation> &operation);
-    void retire(const Operation *operation) noexcept;
+    void session_idle(const std::shared_ptr<Operation> &operation);
+    void session_retired(const Operation *operation) noexcept;
+    void add_new_exchange(ExchangeId id, DnsExchangeRequest request, Handler handler);
 
     runtime::AsioRuntime &runtime_;
     DnsUpstreamConfig config_;
-    std::unordered_map<ExchangeId, std::shared_ptr<Operation>> operations_;
+    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
+    std::unordered_map<ExchangeId, ExchangeRegistration> exchanges_;
+    std::vector<std::shared_ptr<Operation>> active_sessions_;
     std::vector<std::shared_ptr<Operation>> idle_sessions_;
-    ExchangeId next_exchange_id_ = 1;
+    std::atomic<ExchangeId> next_exchange_id_ = 1;
     bool stopped_ = false;
 
     friend class Operation;
@@ -151,10 +167,30 @@ class QuicDnsTransport final : public DnsTransport {
 
 class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Operation> {
   public:
-    Operation(QuicDnsTransport &owner, ExchangeId id, DnsExchangeRequest request, Handler handler)
-        : owner_(owner), id_(id), request_(std::move(request)), handler_(std::move(handler)),
-          strand_(boost::asio::make_strand(owner.runtime_.context())),
-          deadline_timer_(owner.runtime_.context()), expiry_timer_(owner.runtime_.context()),
+    struct Exchange {
+        Exchange(ExchangeId exchange_id, DnsExchangeRequest exchange_request,
+                 boost::asio::io_context &context)
+            : id(exchange_id), request(std::move(exchange_request)), deadline_timer(context) {}
+
+        ExchangeId id;
+        DnsExchangeRequest request;
+        boost::asio::steady_timer deadline_timer;
+        std::int64_t stream_id = -1;
+        std::vector<std::uint8_t> doq_request;
+        std::vector<std::uint8_t> doq_response;
+        std::size_t doq_offset = 0;
+        bool doq_fin_submitted = false;
+        bool doq_write_queued = false;
+        bool stream_closed = false;
+        std::size_t http3_request_offset = 0;
+        std::vector<std::uint8_t> response_body;
+        std::string response_status;
+        std::string response_content_type;
+        std::optional<core::Result<DnsPacket>> result;
+    };
+
+    explicit Operation(QuicDnsTransport &owner)
+        : owner_(owner), expiry_timer_(owner.runtime_.context()),
           idle_timer_(owner.runtime_.context()), mode_(owner.config_.mode),
           host_(remote_name(owner.config_)), port_(remote_port(owner.config_)),
           authority_(authority(owner.config_, host_, port_)),
@@ -171,32 +207,17 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
         release_protocol();
     }
 
-    void start() {
-        const auto self = shared_from_this();
-        boost::asio::dispatch(strand_, [self] { self->start_on_strand(); });
+    bool can_accept_exchange() const noexcept {
+        return !retired_ && exchanges_.size() < kMaximumConcurrentExchangesPerSession;
     }
 
-    void reuse(ExchangeId id, DnsExchangeRequest request, Handler handler) {
-        const auto self = shared_from_this();
-        boost::asio::dispatch(strand_, [self, id, request = std::move(request),
-                                        handler = std::move(handler)]() mutable {
-            self->reuse_on_strand(id, std::move(request), std::move(handler));
-        });
-    }
-
-    void cancel() noexcept {
-        const auto self = shared_from_this();
-        boost::asio::dispatch(strand_, [self] { self->finish(core::fail(cancelled_error())); });
-    }
-
-    Handler take_handler() { return std::move(handler_); }
-
-    void close_idle() noexcept {
-        const auto self = shared_from_this();
-        boost::asio::dispatch(strand_, [self] { self->retire_idle(); });
-    }
+    std::size_t active_exchange_count() const noexcept { return exchanges_.size(); }
+    void close_idle() noexcept { retire_idle(); }
+    bool is_idle() const noexcept { return idle_ && !retired_; }
 
   private:
+    friend class QuicDnsTransport;
+
     static ngtcp2_conn *get_connection(ngtcp2_crypto_conn_ref *ref) noexcept {
         auto *self = static_cast<Operation *>(ref->user_data);
         return self->connection_;
@@ -225,11 +246,8 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
         if (!self->check_selected_alpn()) {
             return NGTCP2_ERR_CALLBACK_FAILURE;
         }
-        const bool success = self->mode_ == DnsTransportMode::doq ? self->open_doq_stream()
-                                                                  : self->open_doh3_stream();
-        if (!success) {
-            return NGTCP2_ERR_CALLBACK_FAILURE;
-        }
+        self->handshake_completed_ = true;
+        self->open_pending_exchanges_ = true;
         return 0;
     }
 
@@ -239,7 +257,7 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
         auto *self = static_cast<Operation *>(user_data);
         if (self->mode_ == DnsTransportMode::doq) {
             self->receive_doq(flags, stream_id, data, length);
-            return self->result_ ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+            return 0;
         }
         return self->receive_http3(flags, stream_id, data, length);
     }
@@ -249,7 +267,8 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
         auto *self = static_cast<Operation *>(user_data);
         if (self->http3_ != nullptr &&
             nghttp3_conn_add_ack_offset(self->http3_, stream_id, length) != 0) {
-            self->set_protocol_failure("nghttp3 failed to acknowledge QUIC stream data");
+            self->set_session_error(
+                protocol_error("nghttp3 failed to acknowledge QUIC stream data"));
             return NGTCP2_ERR_CALLBACK_FAILURE;
         }
         return 0;
@@ -259,9 +278,22 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
                                          void *user_data, void *) {
         auto *self = static_cast<Operation *>(user_data);
         if (self->http3_ != nullptr && nghttp3_conn_unblock_stream(self->http3_, stream_id) != 0) {
-            self->set_protocol_failure("nghttp3 failed to unblock a QUIC request stream");
+            self->set_session_error(
+                protocol_error("nghttp3 failed to unblock a QUIC request stream"));
             return NGTCP2_ERR_CALLBACK_FAILURE;
         }
+        if (self->mode_ == DnsTransportMode::doq) {
+            const auto found = self->stream_exchanges_.find(stream_id);
+            if (found != self->stream_exchanges_.end()) {
+                self->doq_blocked_streams_.erase(stream_id);
+                self->queue_doq_write(*found->second);
+            }
+        }
+        return 0;
+    }
+
+    static int on_extend_max_local_streams_bidi(ngtcp2_conn *, std::uint64_t, void *user_data) {
+        static_cast<Operation *>(user_data)->open_pending_exchanges_ = true;
         return 0;
     }
 
@@ -271,24 +303,27 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
         if (self->http3_ != nullptr) {
             const auto result = nghttp3_conn_close_stream(self->http3_, stream_id, app_error);
             if (result != 0 && result != NGHTTP3_ERR_STREAM_NOT_FOUND) {
-                self->set_protocol_failure("nghttp3 failed to close a QUIC stream");
+                self->set_session_error(protocol_error("nghttp3 failed to close a QUIC stream"));
                 return NGTCP2_ERR_CALLBACK_FAILURE;
             }
         }
+        self->stream_closed(stream_id);
         return 0;
     }
 
     static int on_http3_body(nghttp3_conn *, std::int64_t stream_id, const std::uint8_t *data,
                              std::size_t length, void *conn_user_data, void *) {
         auto *self = static_cast<Operation *>(conn_user_data);
-        if (!self->active_exchange_ || stream_id != self->http3_stream_id_) {
+        auto *exchange = self->find_stream_exchange(stream_id);
+        if (exchange == nullptr || exchange->result) {
             return 0;
         }
-        if (self->response_body_.size() + length > 0xffff) {
-            self->set_protocol_failure("DoH/HTTP/3 DNS response exceeds message capacity");
-            return NGHTTP3_ERR_CALLBACK_FAILURE;
+        if (exchange->response_body.size() + length > 0xffff) {
+            self->set_exchange_error(
+                *exchange, protocol_error("DoH/HTTP/3 DNS response exceeds message capacity"));
+            return 0;
         }
-        self->response_body_.insert(self->response_body_.end(), data, data + length);
+        exchange->response_body.insert(exchange->response_body.end(), data, data + length);
         return 0;
     }
 
@@ -296,7 +331,8 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
                                nghttp3_rcbuf *name, nghttp3_rcbuf *value, std::uint8_t,
                                void *conn_user_data, void *) {
         auto *self = static_cast<Operation *>(conn_user_data);
-        if (!self->active_exchange_ || stream_id != self->http3_stream_id_) {
+        auto *exchange = self->find_stream_exchange(stream_id);
+        if (exchange == nullptr || exchange->result) {
             return 0;
         }
         const auto header_name = nghttp3_rcbuf_get_buf(name);
@@ -306,9 +342,9 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
         const std::string_view value_view(reinterpret_cast<const char *>(header_value.base),
                                           header_value.len);
         if (name_view == ":status") {
-            self->response_status_.assign(value_view);
+            exchange->response_status.assign(value_view);
         } else if (name_view == "content-type") {
-            self->response_content_type_ = lower_copy(value_view);
+            exchange->response_content_type = lower_copy(value_view);
         }
         return 0;
     }
@@ -316,20 +352,23 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
     static int on_http3_end_stream(nghttp3_conn *, std::int64_t stream_id, void *conn_user_data,
                                    void *) {
         auto *self = static_cast<Operation *>(conn_user_data);
-        if (!self->active_exchange_ || stream_id != self->http3_stream_id_) {
+        auto *exchange = self->find_stream_exchange(stream_id);
+        if (exchange == nullptr || exchange->result) {
             return 0;
         }
-        if (self->response_status_ != "200") {
-            self->set_protocol_failure("DoH/HTTP/3 upstream returned a non-success status");
+        if (exchange->response_status != "200") {
+            self->set_exchange_error(
+                *exchange, protocol_error("DoH/HTTP/3 upstream returned a non-success status"));
             return 0;
         }
-        const auto content_type = std::string_view(self->response_content_type_)
-                                      .substr(0, self->response_content_type_.find(';'));
+        const auto content_type = std::string_view(exchange->response_content_type)
+                                      .substr(0, exchange->response_content_type.find(';'));
         if (content_type != "application/dns-message") {
-            self->set_protocol_failure("DoH/HTTP/3 response has an invalid content type");
+            self->set_exchange_error(
+                *exchange, protocol_error("DoH/HTTP/3 response has an invalid content type"));
             return 0;
         }
-        self->decode_dns_response(self->response_body_);
+        self->decode_dns_response(*exchange, exchange->response_body);
         return 0;
     }
 
@@ -337,7 +376,7 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
                                          std::size_t consumed, void *conn_user_data, void *) {
         auto *self = static_cast<Operation *>(conn_user_data);
         if (ngtcp2_conn_extend_max_stream_offset(self->connection_, stream_id, consumed) != 0) {
-            self->set_protocol_failure("failed to extend QUIC flow-control credit");
+            self->set_session_error(protocol_error("failed to extend QUIC flow-control credit"));
             return NGHTTP3_ERR_CALLBACK_FAILURE;
         }
         ngtcp2_conn_extend_max_offset(self->connection_, consumed);
@@ -345,22 +384,23 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
     }
 
     static nghttp3_ssize read_http3_request(nghttp3_conn *, std::int64_t, nghttp3_vec *vectors,
-                                            std::size_t vector_count, std::uint32_t *flags,
-                                            void *conn_user_data, void *) {
-        auto *self = static_cast<Operation *>(conn_user_data);
-        if (vector_count == 0 || self->request_offset_ > self->request_.query.wire.size()) {
+                                            std::size_t vector_count, std::uint32_t *flags, void *,
+                                            void *stream_user_data) {
+        auto *exchange = static_cast<Exchange *>(stream_user_data);
+        if (exchange == nullptr || vector_count == 0 ||
+            exchange->http3_request_offset > exchange->request.query.wire.size()) {
             return NGHTTP3_ERR_CALLBACK_FAILURE;
         }
-        const auto remaining = self->request_.query.wire.size() - self->request_offset_;
+        const auto remaining = exchange->request.query.wire.size() - exchange->http3_request_offset;
         if (remaining == 0) {
             *flags |= NGHTTP3_DATA_FLAG_EOF;
             vectors[0] = {nullptr, 0};
             return 1;
         }
-        vectors[0] = {
-            const_cast<std::uint8_t *>(self->request_.query.wire.data() + self->request_offset_),
-            remaining};
-        self->request_offset_ += remaining;
+        vectors[0] = {const_cast<std::uint8_t *>(exchange->request.query.wire.data() +
+                                                 exchange->http3_request_offset),
+                      remaining};
+        exchange->http3_request_offset += remaining;
         *flags |= NGHTTP3_DATA_FLAG_EOF;
         return 1;
     }
@@ -383,138 +423,119 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
                                            secret_length, nullptr);
     }
 
-    static int on_receive_reset(ngtcp2_conn *, std::int64_t, std::uint64_t, std::uint64_t,
-                                void *user_data, void *) {
-        static_cast<Operation *>(user_data)->set_transport_failure(
-            "QUIC upstream reset the DNS stream");
+    static int on_receive_reset(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t,
+                                std::uint64_t app_error, void *user_data, void *) {
+        auto *self = static_cast<Operation *>(user_data);
+        if (self->http3_ != nullptr &&
+            nghttp3_conn_shutdown_stream_read(self->http3_, stream_id) != 0) {
+            self->set_session_error(protocol_error("nghttp3 failed to handle a reset QUIC stream"));
+            return NGTCP2_ERR_CALLBACK_FAILURE;
+        }
+        if (auto *exchange = self->find_stream_exchange(stream_id);
+            exchange != nullptr && !exchange->result) {
+            self->set_exchange_error(*exchange,
+                                     transport_error("QUIC upstream reset DNS stream with code " +
+                                                     std::to_string(app_error)));
+        }
         return 0;
     }
 
     void start_on_strand() {
-        if (completed_) {
+        if (started_ || retired_ || exchanges_.empty()) {
             return;
         }
-        if (Clock::now() >= request_.deadline) {
-            finish(core::fail(timeout_error()));
-            return;
-        }
-        if (request_.query.wire.empty() || request_.query.wire.size() > 0xffff) {
-            finish(core::fail(protocol_error("QUIC DNS query has an invalid message length")));
-            return;
-        }
-        if (mode_ == DnsTransportMode::doh3 &&
-            (path_.empty() || path_.front() != '/' ||
-             std::any_of(path_.begin(), path_.end(),
-                         [](unsigned char value) { return value <= 0x20 || value == 0x7f; }))) {
-            finish(core::fail({core::ErrorCode::configuration,
-                               "DoH/HTTP/3 path is not a valid origin-form target"}));
-            return;
-        }
-
+        started_ = true;
         const auto self = shared_from_this();
-        deadline_timer_.expires_at(request_.deadline);
-        deadline_timer_.async_wait(
-            boost::asio::bind_executor(strand_, [self](const boost::system::error_code &error) {
-                if (!error) {
-                    self->finish(core::fail(timeout_error()));
-                }
-            }));
-
         const auto destination =
             core::Destination::address(owner_.config_.endpoint.address(), port_);
         owner_.config_.dialer->open_datagram(
             {destination}, [self](core::DatagramOpenResult result) mutable {
-                boost::asio::dispatch(self->strand_, [self, result = std::move(result)]() mutable {
-                    self->datagram_opened(std::move(result));
-                });
+                boost::asio::dispatch(self->owner_.strand_,
+                                      [self, result = std::move(result)]() mutable {
+                                          self->datagram_opened(std::move(result));
+                                      });
             });
     }
 
-    void reuse_on_strand(ExchangeId id, DnsExchangeRequest request, Handler handler) {
-        idle_timer_.cancel();
-        id_ = id;
-        request_ = std::move(request);
-        handler_ = std::move(handler);
-        active_exchange_ = true;
-        completed_ = false;
-        result_.reset();
-        if (retired_ || connection_ == nullptr || !datagram_) {
-            finish(core::fail(transport_error("QUIC DNS pooled session is no longer usable")));
+    void add_exchange(ExchangeId id, DnsExchangeRequest request) {
+        if (retired_) {
+            owner_.complete(id, core::fail(transport_error("QUIC DNS session is retired")));
             return;
         }
-        doq_request_.clear();
-        doq_response_.clear();
-        doq_stream_id_ = -1;
-        doq_offset_ = 0;
-        doq_fin_submitted_ = false;
-        http3_stream_id_ = -1;
-        request_offset_ = 0;
-        response_body_.clear();
-        response_status_.clear();
-        response_content_type_.clear();
-        if (request_.query.wire.empty() || request_.query.wire.size() > 0xffff) {
-            finish(core::fail(protocol_error("QUIC DNS query has an invalid message length")));
+        idle_timer_.cancel();
+        idle_ = false;
+        auto exchange =
+            std::make_shared<Exchange>(id, std::move(request), owner_.runtime_.context());
+        exchanges_.emplace(id, exchange);
+        const auto &wire = exchange->request.query.wire;
+        if (wire.size() < 12 || wire.size() > 0xffff) {
+            set_exchange_error(*exchange,
+                               protocol_error("QUIC DNS query has an invalid message length"));
+            drain_exchange_results();
             return;
         }
         if (mode_ == DnsTransportMode::doh3 &&
             (path_.empty() || path_.front() != '/' ||
              std::any_of(path_.begin(), path_.end(),
                          [](unsigned char value) { return value <= 0x20 || value == 0x7f; }))) {
-            finish(core::fail({core::ErrorCode::configuration,
-                               "DoH/HTTP/3 path is not a valid origin-form target"}));
+            set_exchange_error(*exchange,
+                               core::Error{core::ErrorCode::configuration,
+                                           "DoH/HTTP/3 path is not a valid origin-form target"});
+            drain_exchange_results();
             return;
         }
-        if (Clock::now() >= request_.deadline) {
-            finish(core::fail(timeout_error()));
+        if (Clock::now() >= exchange->request.deadline) {
+            set_exchange_error(*exchange, timeout_error());
+            drain_exchange_results();
             return;
         }
-        deadline_timer_.expires_at(request_.deadline);
+        exchange->deadline_timer.expires_at(exchange->request.deadline);
         const auto self = shared_from_this();
-        deadline_timer_.async_wait(
-            boost::asio::bind_executor(strand_, [self](const boost::system::error_code &error) {
+        exchange->deadline_timer.async_wait(boost::asio::bind_executor(
+            owner_.strand_, [self, id](const boost::system::error_code &error) {
                 if (!error) {
-                    self->finish(core::fail(timeout_error()));
+                    self->cancel_exchange(id, timeout_error());
                 }
             }));
-        const bool opened = mode_ == DnsTransportMode::doq ? open_doq_stream() : open_doh3_stream();
-        if (!opened) {
-            if (result_) {
-                auto failure = std::move(*result_);
-                result_.reset();
-                finish(std::move(failure));
-            } else {
-                finish(core::fail(
-                    transport_error("failed to submit a request on a pooled QUIC session")));
-            }
-            return;
+        pending_exchanges_.push_back(id);
+        if (handshake_completed_) {
+            open_pending_exchanges_ = true;
+            pump_open_pending_exchanges();
         }
-        write_packets();
-        schedule_expiry();
+        start_on_strand();
     }
 
+    void cancel_exchange(ExchangeId id, core::Error error) {
+        const auto found = exchanges_.find(id);
+        if (found == exchanges_.end() || found->second->result) {
+            return;
+        }
+        set_exchange_error(*found->second, std::move(error));
+        drain_exchange_results();
+    }
+
+    void cancel_all() { fail_session(cancelled_error()); }
+
     void datagram_opened(core::DatagramOpenResult result) {
-        if (completed_) {
+        if (retired_ || exchanges_.empty()) {
             if (result.handle) {
                 result.handle->close();
+            }
+            if (!retired_) {
+                retire_session();
             }
             return;
         }
         if (!result.succeeded()) {
-            finish(core::fail(result.error.value_or(
+            fail_session(result.error.value_or(
                 core::Error{core::ErrorCode::endpoint_connection,
-                            "QUIC DNS datagram dialer failed to open a handle"})));
+                            "QUIC DNS datagram dialer failed to open a handle"}));
             return;
         }
         datagram_ = std::move(result.handle);
         if (!initialize_protocol()) {
-            if (result_) {
-                auto failure = std::move(*result_);
-                result_.reset();
-                finish(std::move(failure));
-            } else {
-                finish(core::fail(core::Error{core::ErrorCode::carrier_handshake,
-                                              "failed to initialize QUIC DNS TLS"}));
-            }
+            fail_session(session_error_.value_or(core::Error{core::ErrorCode::carrier_handshake,
+                                                             "failed to initialize QUIC DNS TLS"}));
             return;
         }
         receive_next();
@@ -561,6 +582,7 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
         callbacks.get_new_connection_id2 = &get_new_connection_id;
         callbacks.get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb;
         callbacks.extend_max_stream_data = &on_extend_max_stream_data;
+        callbacks.extend_max_local_streams_bidi = &on_extend_max_local_streams_bidi;
         callbacks.stream_close = &on_stream_closed;
         callbacks.stream_reset = &on_receive_reset;
 
@@ -593,10 +615,14 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
         ngtcp2_settings settings;
         ngtcp2_settings_default(&settings);
         settings.initial_ts = timestamp_now();
-        const auto handshake_remaining =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(request_.deadline - Clock::now());
-        settings.handshake_timeout =
-            static_cast<ngtcp2_duration>(std::max<std::int64_t>(handshake_remaining.count(), 1));
+        auto latest_deadline = Clock::time_point::min();
+        for (const auto &[id, exchange] : exchanges_) {
+            latest_deadline = std::max(latest_deadline, exchange->request.deadline);
+        }
+        const auto handshake_remaining = std::max(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(latest_deadline - Clock::now()),
+            std::chrono::duration_cast<std::chrono::nanoseconds>(kMinimumQuicHandshakeTimeout));
+        settings.handshake_timeout = static_cast<ngtcp2_duration>(handshake_remaining.count());
 
         ngtcp2_transport_params parameters;
         ngtcp2_transport_params_default(&parameters);
@@ -604,7 +630,7 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
         parameters.initial_max_stream_data_bidi_local = 256 * 1024;
         parameters.initial_max_stream_data_bidi_remote = 256 * 1024;
         parameters.initial_max_stream_data_uni = 256 * 1024;
-        parameters.initial_max_streams_bidi = 1;
+        parameters.initial_max_streams_bidi = 16;
         parameters.initial_max_streams_uni = 3;
         const int created = ngtcp2_conn_client_new(&connection_, &destination_id, &source_id, &path,
                                                    NGTCP2_PROTO_VER_V1, &callbacks, &settings,
@@ -696,23 +722,7 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
         return true;
     }
 
-    bool open_doq_stream() {
-        if (ngtcp2_conn_open_bidi_stream(connection_, &doq_stream_id_, nullptr) != 0) {
-            set_transport_failure("ngtcp2 could not open the DoQ request stream");
-            return false;
-        }
-        const auto length = request_.query.wire.size();
-        doq_request_.reserve(length + 2);
-        doq_request_.push_back(static_cast<std::uint8_t>((length >> 8) & 0xff));
-        doq_request_.push_back(static_cast<std::uint8_t>(length & 0xff));
-        doq_request_.insert(doq_request_.end(), request_.query.wire.begin(),
-                            request_.query.wire.end());
-        doq_request_[2] = 0;
-        doq_request_[3] = 0;
-        return true;
-    }
-
-    bool open_doh3_stream() {
+    bool initialize_http3() {
         if (http3_ == nullptr) {
             nghttp3_callbacks callbacks{};
             callbacks.recv_data = &on_http3_body;
@@ -739,28 +749,81 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
                 return false;
             }
         }
-
-        if (ngtcp2_conn_open_bidi_stream(connection_, &http3_stream_id_, nullptr) != 0) {
-            set_transport_failure("ngtcp2 could not open the DoH/HTTP/3 request stream");
-            return false;
-        }
-        const auto content_length = std::to_string(request_.query.wire.size());
-        std::array<nghttp3_nv, 7> headers{
-            make_header(":method", "POST"),
-            make_header(":scheme", "https"),
-            make_header(":authority", authority_),
-            make_header(":path", path_),
-            make_header("accept", "application/dns-message"),
-            make_header("content-type", "application/dns-message"),
-            make_header("content-length", content_length),
-        };
-        nghttp3_data_reader reader{&read_http3_request};
-        if (nghttp3_conn_submit_request(http3_, http3_stream_id_, headers.data(), headers.size(),
-                                        &reader, this) != 0) {
-            set_protocol_failure("failed to submit DoH/HTTP/3 DNS request");
-            return false;
-        }
         return true;
+    }
+
+    void pump_open_pending_exchanges() {
+        if (!open_pending_exchanges_ || !handshake_completed_ || retired_ ||
+            connection_ == nullptr) {
+            return;
+        }
+        open_pending_exchanges_ = false;
+        if (mode_ == DnsTransportMode::doh3 && !initialize_http3()) {
+            fail_session(session_error_.value_or(
+                core::Error{core::ErrorCode::protocol_framing,
+                            "failed to initialize HTTP/3 connection state"}));
+            return;
+        }
+        while (!pending_exchanges_.empty() && !retired_) {
+            const auto id = pending_exchanges_.front();
+            const auto active = exchanges_.find(id);
+            if (active == exchanges_.end()) {
+                pending_exchanges_.pop_front();
+                continue;
+            }
+            const auto &exchange = active->second;
+            if (exchange->stream_id >= 0) {
+                pending_exchanges_.pop_front();
+                continue;
+            }
+            std::int64_t stream_id = -1;
+            const auto opened = ngtcp2_conn_open_bidi_stream(connection_, &stream_id, nullptr);
+            if (opened == NGTCP2_ERR_STREAM_ID_BLOCKED) {
+                return;
+            }
+            if (opened != 0) {
+                fail_session(
+                    transport_error(std::string("ngtcp2 could not open a DNS request stream: ") +
+                                    ngtcp2_strerror(opened)));
+                return;
+            }
+            pending_exchanges_.pop_front();
+            exchange->stream_id = stream_id;
+            stream_exchanges_.emplace(stream_id, exchange);
+            if (mode_ == DnsTransportMode::doq) {
+                const auto &wire = exchange->request.query.wire;
+                exchange->doq_request.reserve(wire.size() + 2);
+                exchange->doq_request.push_back(static_cast<std::uint8_t>(wire.size() >> 8));
+                exchange->doq_request.push_back(static_cast<std::uint8_t>(wire.size() & 0xff));
+                exchange->doq_request.insert(exchange->doq_request.end(), wire.begin(), wire.end());
+                exchange->doq_request[2] = 0;
+                exchange->doq_request[3] = 0;
+                queue_doq_write(*exchange);
+                continue;
+            }
+
+            const auto content_length = std::to_string(exchange->request.query.wire.size());
+            std::array<nghttp3_nv, 7> headers{
+                make_header(":method", "POST"),
+                make_header(":scheme", "https"),
+                make_header(":authority", authority_),
+                make_header(":path", path_),
+                make_header("accept", "application/dns-message"),
+                make_header("content-type", "application/dns-message"),
+                make_header("content-length", content_length),
+            };
+            nghttp3_data_reader reader{&read_http3_request};
+            if (nghttp3_conn_submit_request(http3_, stream_id, headers.data(), headers.size(),
+                                            &reader, exchange.get()) != 0) {
+                set_exchange_error(*exchange,
+                                   protocol_error("failed to submit DoH/HTTP/3 DNS request"));
+            }
+        }
+        drain_exchange_results();
+        if (!retired_) {
+            write_packets();
+            schedule_expiry();
+        }
     }
 
     static nghttp3_nv make_header(std::string_view name, std::string_view value) {
@@ -791,74 +854,111 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
         return 0;
     }
 
+    void queue_doq_write(Exchange &exchange) {
+        if (!exchange.doq_fin_submitted && !exchange.doq_write_queued) {
+            exchange.doq_write_queued = true;
+            doq_pending_write_.push_back(exchange.stream_id);
+        }
+    }
+
+    void resume_blocked_doq_streams() {
+        const auto blocked = std::move(doq_blocked_streams_);
+        doq_blocked_streams_.clear();
+        for (const auto stream_id : blocked) {
+            const auto found = stream_exchanges_.find(stream_id);
+            if (found != stream_exchanges_.end() && !found->second->result) {
+                queue_doq_write(*found->second);
+            }
+        }
+    }
+
     void receive_doq(std::uint32_t flags, std::int64_t stream_id, const std::uint8_t *data,
                      std::size_t length) {
-        if (!active_exchange_ || doq_stream_id_ != stream_id) {
+        auto *exchange = find_stream_exchange(stream_id);
+        if (exchange == nullptr || exchange->result) {
             return;
         }
-        if (doq_response_.size() + length > 0xffff + 2) {
-            set_protocol_failure("DoQ response exceeds the DNS message limit");
+        if (exchange->doq_response.size() + length > 0xffff + 2) {
+            set_exchange_error(*exchange,
+                               protocol_error("DoQ response exceeds the DNS message limit"));
             return;
         }
-        doq_response_.insert(doq_response_.end(), data, data + length);
+        exchange->doq_response.insert(exchange->doq_response.end(), data, data + length);
         if ((flags & NGTCP2_STREAM_DATA_FLAG_FIN) == 0) {
             return;
         }
-        if (doq_response_.size() < 2) {
-            set_protocol_failure("DoQ response ended before its length prefix");
+        if (exchange->doq_response.size() < 2) {
+            set_exchange_error(*exchange,
+                               protocol_error("DoQ response ended before its length prefix"));
             return;
         }
         const auto message_length =
-            static_cast<std::size_t>(doq_response_[0] << 8 | doq_response_[1]);
-        if (message_length == 0 || doq_response_.size() != message_length + 2) {
-            set_protocol_failure("DoQ response length prefix does not match the DNS message");
+            static_cast<std::size_t>(exchange->doq_response[0] << 8 | exchange->doq_response[1]);
+        if (message_length == 0 || exchange->doq_response.size() != message_length + 2) {
+            set_exchange_error(
+                *exchange,
+                protocol_error("DoQ response length prefix does not match the DNS message"));
             return;
         }
-        const auto message = std::span<const std::uint8_t>(doq_response_).subspan(2);
+        const auto message = std::span<const std::uint8_t>(exchange->doq_response).subspan(2);
         if (message.size() < 2 || message[0] != 0 || message[1] != 0) {
-            set_protocol_failure("DoQ response DNS message ID is not zero");
+            set_exchange_error(*exchange,
+                               protocol_error("DoQ response DNS message ID is not zero"));
             return;
         }
         std::vector<std::uint8_t> restored(message.begin(), message.end());
-        restored[0] = static_cast<std::uint8_t>(request_.query.id >> 8);
-        restored[1] = static_cast<std::uint8_t>(request_.query.id & 0xff);
-        decode_dns_response(restored);
+        restored[0] = static_cast<std::uint8_t>(exchange->request.query.id >> 8);
+        restored[1] = static_cast<std::uint8_t>(exchange->request.query.id & 0xff);
+        decode_dns_response(*exchange, restored);
     }
 
-    void decode_dns_response(std::span<const std::uint8_t> wire) {
-        const auto response = DnsMessageCodec::decode_packet(wire, request_.query.id);
+    void decode_dns_response(Exchange &exchange, std::span<const std::uint8_t> wire) {
+        const auto response = DnsMessageCodec::decode_packet(wire, exchange.request.query.id);
         if (!response) {
-            result_.emplace(core::fail(response.error()));
+            set_exchange_error(exchange, response.error());
             return;
         }
-        if (!same_question(response.value(), request_.query)) {
-            set_protocol_failure("QUIC DNS response question does not match the query");
+        if (!same_question(response.value(), exchange.request.query)) {
+            set_exchange_error(
+                exchange, protocol_error("QUIC DNS response question does not match the query"));
             return;
         }
-        result_.emplace(response.value());
+        if (!exchange.result) {
+            exchange.result.emplace(response.value());
+        }
+    }
+
+    Exchange *find_stream_exchange(std::int64_t stream_id) noexcept {
+        const auto found = stream_exchanges_.find(stream_id);
+        return found == stream_exchanges_.end() ? nullptr : found->second.get();
+    }
+
+    void set_session_error(core::Error error) {
+        if (!session_error_) {
+            session_error_.emplace(std::move(error));
+        }
     }
 
     void set_transport_failure(std::string message) {
-        if (!result_) {
-            result_.emplace(core::fail(transport_error(std::move(message))));
-        }
+        set_session_error(transport_error(std::move(message)));
     }
 
     void set_protocol_failure(std::string message) {
-        if (!result_) {
-            result_.emplace(core::fail(protocol_error(std::move(message))));
-        }
+        set_session_error(protocol_error(std::move(message)));
     }
 
     void set_authentication_failure(std::string message) {
-        if (!result_) {
-            result_.emplace(
-                core::fail(core::Error{core::ErrorCode::authentication, std::move(message)}));
+        set_session_error(core::Error{core::ErrorCode::authentication, std::move(message)});
+    }
+
+    void set_exchange_error(Exchange &exchange, core::Error error) {
+        if (!exchange.result) {
+            exchange.result.emplace(core::fail(std::move(error)));
         }
     }
 
     void receive_next() {
-        if (completed_ || !datagram_ || receiving_) {
+        if (retired_ || !datagram_ || receiving_) {
             return;
         }
         receiving_ = true;
@@ -868,26 +968,26 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
             boost::asio::buffer(buffer->bytes),
             [self, buffer](const boost::system::error_code &error, std::size_t length,
                            boost::asio::ip::udp::endpoint sender) {
-                boost::asio::dispatch(
-                    self->strand_, [self, buffer, error, length, sender = std::move(sender)] {
-                        self->receiving_ = false;
-                        if (self->completed_) {
-                            return;
+                boost::asio::dispatch(self->owner_.strand_, [self, buffer, error, length,
+                                                             sender = std::move(sender)] {
+                    self->receiving_ = false;
+                    if (self->retired_) {
+                        return;
+                    }
+                    if (error) {
+                        if (error != boost::asio::error::operation_aborted) {
+                            self->fail_session(
+                                upstream_error("failed to receive QUIC DNS datagram", error));
                         }
-                        if (error) {
-                            if (error != boost::asio::error::operation_aborted) {
-                                self->finish(core::fail(
-                                    upstream_error("failed to receive QUIC DNS datagram", error)));
-                            }
-                            return;
-                        }
-                        if (sender == self->remote_endpoint_ && length != 0) {
-                            self->process_datagram(buffer->bytes.data(), length, sender);
-                        }
-                        if (!self->completed_) {
-                            self->receive_next();
-                        }
-                    });
+                        return;
+                    }
+                    if (sender == self->remote_endpoint_ && length != 0) {
+                        self->process_datagram(buffer->bytes.data(), length, sender);
+                    }
+                    if (!self->retired_) {
+                        self->receive_next();
+                    }
+                });
             });
     }
 
@@ -915,10 +1015,16 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
                                       ngtcp2_strerror(result));
             }
         }
-        if (result_) {
-            auto result = std::move(*result_);
-            result_.reset();
-            finish(std::move(result));
+        if (session_error_) {
+            auto error = std::move(*session_error_);
+            session_error_.reset();
+            fail_session(std::move(error));
+            return;
+        }
+        resume_blocked_doq_streams();
+        pump_open_pending_exchanges();
+        drain_exchange_results();
+        if (retired_) {
             return;
         }
         write_packets();
@@ -926,7 +1032,7 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
     }
 
     void write_packets() {
-        if (completed_ || connection_ == nullptr) {
+        if (retired_ || connection_ == nullptr) {
             return;
         }
         for (std::size_t packet_count = 0; packet_count < 32; ++packet_count) {
@@ -934,91 +1040,137 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
             ngtcp2_path_storage path_storage{};
             ngtcp2_path_storage_zero(&path_storage);
             ngtcp2_pkt_info packet_info{};
-            std::int64_t stream_id = -1;
-            int fin = 0;
-            std::array<nghttp3_vec, 16> http3_vectors{};
-            std::array<ngtcp2_vec, 16> stream_vectors{};
-            std::size_t vector_count = 0;
-
-            if (mode_ == DnsTransportMode::doq && doq_stream_id_ >= 0 && !doq_fin_submitted_ &&
-                doq_offset_ <= doq_request_.size()) {
-                stream_id = doq_stream_id_;
-                fin = 1;
-                if (doq_offset_ < doq_request_.size()) {
-                    stream_vectors[0] = {doq_request_.data() + doq_offset_,
-                                         doq_request_.size() - doq_offset_};
-                    vector_count = 1;
-                }
-            } else if (mode_ == DnsTransportMode::doh3 && http3_ != nullptr) {
-                const auto count = nghttp3_conn_writev_stream(
-                    http3_, &stream_id, &fin, http3_vectors.data(), http3_vectors.size());
-                if (count < 0) {
-                    set_protocol_failure("nghttp3 failed to generate HTTP/3 stream data");
-                    break;
-                }
-                vector_count = static_cast<std::size_t>(count);
-                for (std::size_t index = 0; index < vector_count; ++index) {
-                    stream_vectors[index] = {http3_vectors[index].base, http3_vectors[index].len};
-                }
-            }
-
-            std::uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
-            if (fin) {
-                flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
-            }
-            ngtcp2_ssize consumed = -1;
             const auto now = timestamp_now();
-            const auto written = ngtcp2_conn_writev_stream(
-                connection_, &path_storage.path, &packet_info, packet.data(), packet.size(),
-                &consumed, flags, stream_id, stream_vectors.data(), vector_count, now);
-            if (written == NGTCP2_ERR_WRITE_MORE) {
-                if (consumed > 0) {
-                    if (mode_ == DnsTransportMode::doq) {
-                        doq_offset_ += static_cast<std::size_t>(consumed);
-                        doq_fin_submitted_ = doq_offset_ == doq_request_.size();
+            bool packet_ready = false;
+            for (std::size_t frame_count = 0; frame_count < 128; ++frame_count) {
+                std::int64_t stream_id = -1;
+                int fin = 0;
+                std::array<nghttp3_vec, 16> http3_vectors{};
+                std::array<ngtcp2_vec, 16> stream_vectors{};
+                std::size_t vector_count = 0;
+                std::shared_ptr<Exchange> doq_exchange;
+
+                if (mode_ == DnsTransportMode::doq &&
+                    ngtcp2_conn_get_max_data_left2(connection_) != 0) {
+                    while (!doq_pending_write_.empty()) {
+                        const auto candidate_id = doq_pending_write_.front();
+                        doq_pending_write_.pop_front();
+                        const auto found = stream_exchanges_.find(candidate_id);
+                        if (found == stream_exchanges_.end()) {
+                            continue;
+                        }
+                        found->second->doq_write_queued = false;
+                        if (found->second->result || found->second->doq_fin_submitted) {
+                            continue;
+                        }
+                        doq_exchange = found->second;
+                        break;
+                    }
+                }
+                if (doq_exchange != nullptr) {
+                    stream_id = doq_exchange->stream_id;
+                    fin = 1;
+                    if (doq_exchange->doq_offset < doq_exchange->doq_request.size()) {
+                        stream_vectors[0] = {
+                            doq_exchange->doq_request.data() + doq_exchange->doq_offset,
+                            doq_exchange->doq_request.size() - doq_exchange->doq_offset};
+                        vector_count = 1;
+                    }
+                } else if (mode_ == DnsTransportMode::doh3 && http3_ != nullptr &&
+                           ngtcp2_conn_get_max_data_left2(connection_) != 0) {
+                    const auto count = nghttp3_conn_writev_stream(
+                        http3_, &stream_id, &fin, http3_vectors.data(), http3_vectors.size());
+                    if (count < 0) {
+                        set_protocol_failure("nghttp3 failed to generate HTTP/3 stream data");
+                        break;
+                    }
+                    vector_count = static_cast<std::size_t>(count);
+                    for (std::size_t index = 0; index < vector_count; ++index) {
+                        stream_vectors[index] = {http3_vectors[index].base,
+                                                 http3_vectors[index].len};
+                    }
+                }
+
+                std::uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
+                if (fin) {
+                    flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
+                }
+                ngtcp2_ssize consumed = -1;
+                const auto written = ngtcp2_conn_writev_stream(
+                    connection_, &path_storage.path, &packet_info, packet.data(), packet.size(),
+                    &consumed, flags, stream_id, stream_vectors.data(), vector_count, now);
+                if (written == NGTCP2_ERR_WRITE_MORE) {
+                    if (consumed < 0) {
+                        set_transport_failure(
+                            "ngtcp2 returned WRITE_MORE without consuming stream data");
+                        break;
+                    }
+                    if (doq_exchange != nullptr) {
+                        doq_exchange->doq_offset += static_cast<std::size_t>(consumed);
+                        doq_exchange->doq_fin_submitted =
+                            doq_exchange->doq_offset == doq_exchange->doq_request.size();
+                        queue_doq_write(*doq_exchange);
                     } else if (http3_ != nullptr && stream_id >= 0 &&
                                nghttp3_conn_add_write_offset(
                                    http3_, stream_id, static_cast<std::uint64_t>(consumed)) != 0) {
                         set_protocol_failure("nghttp3 failed to advance HTTP/3 stream output");
                         break;
                     }
-                }
-                continue;
-            }
-            if (written < 0) {
-                if (written == NGTCP2_ERR_STREAM_DATA_BLOCKED && http3_ != nullptr &&
-                    stream_id >= 0) {
-                    (void)nghttp3_conn_block_stream(http3_, stream_id);
                     continue;
                 }
-                set_transport_failure(std::string("ngtcp2 failed to write a packet: ") +
-                                      ngtcp2_strerror(static_cast<int>(written)));
-                break;
-            }
-            if (written == 0) {
-                break;
-            }
-            if (consumed > 0) {
-                if (mode_ == DnsTransportMode::doq) {
-                    doq_offset_ += static_cast<std::size_t>(consumed);
-                    doq_fin_submitted_ = doq_offset_ == doq_request_.size();
-                } else if (http3_ != nullptr && stream_id >= 0 &&
-                           nghttp3_conn_add_write_offset(
-                               http3_, stream_id, static_cast<std::uint64_t>(consumed)) != 0) {
-                    set_protocol_failure("nghttp3 failed to advance HTTP/3 stream output");
+                if (written == NGTCP2_ERR_STREAM_DATA_BLOCKED && stream_id >= 0) {
+                    if (doq_exchange != nullptr) {
+                        doq_blocked_streams_.insert(stream_id);
+                    } else if (http3_ != nullptr &&
+                               ngtcp2_conn_get_max_data_left2(connection_) != 0) {
+                        nghttp3_conn_block_stream(http3_, stream_id);
+                    }
+                    continue;
+                }
+                if (written < 0) {
+                    set_transport_failure(std::string("ngtcp2 failed to write a packet: ") +
+                                          ngtcp2_strerror(static_cast<int>(written)));
                     break;
                 }
-            } else if (mode_ == DnsTransportMode::doh3 && http3_ != nullptr && stream_id >= 0 &&
-                       fin != 0) {
-                (void)nghttp3_conn_add_write_offset(http3_, stream_id, 0);
+                if (written == 0) {
+                    if (doq_exchange != nullptr) {
+                        queue_doq_write(*doq_exchange);
+                    }
+                    break;
+                }
+                if (consumed >= 0) {
+                    if (doq_exchange != nullptr) {
+                        doq_exchange->doq_offset += static_cast<std::size_t>(consumed);
+                        doq_exchange->doq_fin_submitted =
+                            doq_exchange->doq_offset == doq_exchange->doq_request.size();
+                        queue_doq_write(*doq_exchange);
+                    } else if (http3_ != nullptr && stream_id >= 0 &&
+                               nghttp3_conn_add_write_offset(
+                                   http3_, stream_id, static_cast<std::uint64_t>(consumed)) != 0) {
+                        set_protocol_failure("nghttp3 failed to advance HTTP/3 stream output");
+                        break;
+                    }
+                } else if (doq_exchange != nullptr) {
+                    // QUIC may emit ACK or control frames without consuming the selected stream.
+                    queue_doq_write(*doq_exchange);
+                }
+                ngtcp2_conn_update_pkt_tx_time(connection_, now);
+                outgoing_.emplace_back(packet.begin(), packet.begin() + written);
+                packet_ready = true;
+                break;
             }
-            ngtcp2_conn_update_pkt_tx_time(connection_, now);
-            outgoing_.emplace_back(packet.begin(), packet.begin() + written);
+            if (session_error_ || retired_ || !packet_ready) {
+                break;
+            }
         }
-        if (result_) {
-            auto result = std::move(*result_);
-            result_.reset();
-            finish(std::move(result));
+        if (session_error_) {
+            auto error = std::move(*session_error_);
+            session_error_.reset();
+            fail_session(std::move(error));
+            return;
+        }
+        drain_exchange_results();
+        if (retired_) {
             return;
         }
         send_next_packet();
@@ -1026,7 +1178,7 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
     }
 
     void send_next_packet() {
-        if (completed_ || sending_ || outgoing_.empty() || !datagram_) {
+        if (retired_ || sending_ || outgoing_.empty() || !datagram_) {
             return;
         }
         sending_ = true;
@@ -1036,15 +1188,15 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
         datagram_->async_send_to(
             boost::asio::buffer(*packet), remote_endpoint_,
             [self, packet](const boost::system::error_code &error, std::size_t length) {
-                boost::asio::dispatch(self->strand_, [self, packet, error, length] {
+                boost::asio::dispatch(self->owner_.strand_, [self, packet, error, length] {
                     self->sending_ = false;
-                    if (self->completed_) {
+                    if (self->retired_) {
                         return;
                     }
                     if (error || length != packet->size()) {
-                        self->finish(core::fail(
+                        self->fail_session(
                             error ? upstream_error("failed to send QUIC DNS datagram", error)
-                                  : transport_error("QUIC DNS datagram was only partially sent")));
+                                  : transport_error("QUIC DNS datagram was only partially sent"));
                         return;
                     }
                     self->send_next_packet();
@@ -1053,7 +1205,7 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
     }
 
     void schedule_expiry() {
-        if (completed_ || connection_ == nullptr) {
+        if (retired_ || connection_ == nullptr) {
             return;
         }
         const auto expiry = ngtcp2_conn_get_expiry2(connection_);
@@ -1064,16 +1216,15 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
         const auto wait = expiry > now ? expiry - now : 1;
         expiry_timer_.expires_after(std::chrono::nanoseconds(wait));
         const auto self = shared_from_this();
-        expiry_timer_.async_wait(
-            boost::asio::bind_executor(strand_, [self](const boost::system::error_code &error) {
-                if (error || self->completed_ || self->connection_ == nullptr) {
+        expiry_timer_.async_wait(boost::asio::bind_executor(
+            owner_.strand_, [self](const boost::system::error_code &error) {
+                if (error || self->retired_ || self->connection_ == nullptr) {
                     return;
                 }
                 const auto result = ngtcp2_conn_handle_expiry(self->connection_, timestamp_now());
                 if (result != 0) {
-                    self->finish(
-                        core::fail(transport_error(std::string("ngtcp2 connection timer failed: ") +
-                                                   ngtcp2_strerror(result))));
+                    self->fail_session(transport_error(
+                        std::string("ngtcp2 connection timer failed: ") + ngtcp2_strerror(result)));
                     return;
                 }
                 self->write_packets();
@@ -1081,77 +1232,94 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
             }));
     }
 
-    void finish(core::Result<DnsPacket> result) {
-        if (completed_ || retired_) {
+    void stream_closed(std::int64_t stream_id) {
+        const auto found = stream_exchanges_.find(stream_id);
+        if (found == stream_exchanges_.end()) {
             return;
         }
-        completed_ = true;
-        deadline_timer_.cancel();
-        if (result && active_exchange_ && !owner_.stopped_) {
-            const auto completed_id = id_;
-            doq_stream_id_ = -1;
-            http3_stream_id_ = -1;
-            doq_request_.clear();
-            doq_response_.clear();
-            doq_offset_ = 0;
-            doq_fin_submitted_ = false;
-            request_offset_ = 0;
-            response_body_.clear();
-            response_status_.clear();
-            response_content_type_.clear();
-            result_.reset();
-            completed_ = false;
-            write_packets();
-            if (retired_ || completed_) {
-                return;
+        auto exchange = found->second;
+        exchange->stream_closed = true;
+        doq_blocked_streams_.erase(stream_id);
+        stream_exchanges_.erase(found);
+        if (!exchange->result && exchanges_.contains(exchange->id)) {
+            set_exchange_error(
+                *exchange, transport_error("QUIC DNS stream closed before a response completed"));
+        }
+    }
+
+    void drain_exchange_results() {
+        std::vector<std::pair<ExchangeId, core::Result<DnsPacket>>> completed;
+        for (auto &[id, exchange] : exchanges_) {
+            if (exchange->result) {
+                completed.emplace_back(id, std::move(*exchange->result));
+                exchange->result.reset();
             }
-            active_exchange_ = false;
-            const auto self = shared_from_this();
-            idle_timer_.expires_after(std::chrono::seconds(30));
-            idle_timer_.async_wait(
-                boost::asio::bind_executor(strand_, [self](const boost::system::error_code &error) {
-                    if (!error) {
-                        self->retire_idle();
-                    }
-                }));
-            receive_next();
-            owner_.recycle(self);
-            owner_.complete(completed_id, std::move(result));
+        }
+        for (auto &[id, result] : completed) {
+            complete_exchange(id, std::move(result));
+        }
+    }
+
+    void complete_exchange(ExchangeId id, core::Result<DnsPacket> result) {
+        const auto found = exchanges_.find(id);
+        if (found == exchanges_.end()) {
             return;
         }
-        const auto completed_id = id_;
-        const bool had_active_exchange = active_exchange_;
-        active_exchange_ = false;
-        retire_session();
-        if (had_active_exchange) {
-            owner_.complete(completed_id, std::move(result));
-        } else {
-            owner_.retire(this);
+        const auto exchange = found->second;
+        exchange->deadline_timer.cancel();
+        if (!result && exchange->stream_id >= 0 && !exchange->stream_closed &&
+            connection_ != nullptr) {
+            if (http3_ != nullptr) {
+                nghttp3_conn_shutdown_stream_read(http3_, exchange->stream_id);
+                nghttp3_conn_shutdown_stream_write(http3_, exchange->stream_id);
+            }
+            const auto app_error =
+                mode_ == DnsTransportMode::doq ? kDoqRequestCancelled : kHttp3RequestCancelled;
+            (void)ngtcp2_conn_shutdown_stream(connection_, 0, exchange->stream_id, app_error);
         }
+        exchanges_.erase(found);
+        std::erase(doq_pending_write_, exchange->stream_id);
+        doq_blocked_streams_.erase(exchange->stream_id);
+        owner_.complete(id, std::move(result));
+        if (exchanges_.empty()) {
+            enter_idle_or_retire();
+        }
+    }
+
+    void enter_idle_or_retire() {
+        if (retired_) {
+            return;
+        }
+        if (!handshake_completed_ || connection_ == nullptr || !datagram_) {
+            retire_session();
+            return;
+        }
+        idle_ = true;
+        const auto self = shared_from_this();
+        idle_timer_.expires_after(std::chrono::seconds(30));
+        idle_timer_.async_wait(boost::asio::bind_executor(
+            owner_.strand_, [self](const boost::system::error_code &error) {
+                if (!error && self->exchanges_.empty()) {
+                    self->retire_idle();
+                }
+            }));
+        owner_.session_idle(self);
     }
 
     void retire_idle() noexcept {
-        if (retired_ || active_exchange_) {
+        if (retired_ || !exchanges_.empty()) {
             return;
         }
-        retired_ = true;
-        completed_ = true;
-        idle_timer_.cancel();
-        deadline_timer_.cancel();
-        expiry_timer_.cancel();
-        if (datagram_) {
-            datagram_->cancel();
-            datagram_->close();
-            datagram_.reset();
-        }
-        release_protocol();
-        owner_.retire(this);
+        retire_session();
     }
 
     void retire_session() noexcept {
+        if (retired_) {
+            return;
+        }
         retired_ = true;
+        idle_ = false;
         idle_timer_.cancel();
-        deadline_timer_.cancel();
         expiry_timer_.cancel();
         if (datagram_) {
             datagram_->cancel();
@@ -1159,6 +1327,43 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
             datagram_.reset();
         }
         release_protocol();
+        exchanges_.clear();
+        stream_exchanges_.clear();
+        pending_exchanges_.clear();
+        doq_pending_write_.clear();
+        doq_blocked_streams_.clear();
+        owner_.session_retired(this);
+    }
+
+    void fail_session(core::Error error) {
+        if (retired_) {
+            return;
+        }
+        std::vector<ExchangeId> exchange_ids;
+        exchange_ids.reserve(exchanges_.size());
+        for (const auto &[id, exchange] : exchanges_) {
+            exchange_ids.push_back(id);
+            exchange->deadline_timer.cancel();
+        }
+        retired_ = true;
+        idle_ = false;
+        idle_timer_.cancel();
+        expiry_timer_.cancel();
+        if (datagram_) {
+            datagram_->cancel();
+            datagram_->close();
+            datagram_.reset();
+        }
+        release_protocol();
+        exchanges_.clear();
+        stream_exchanges_.clear();
+        pending_exchanges_.clear();
+        doq_pending_write_.clear();
+        doq_blocked_streams_.clear();
+        owner_.session_retired(this);
+        for (const auto id : exchange_ids) {
+            owner_.complete(id, core::fail(error));
+        }
     }
 
     void release_protocol() noexcept {
@@ -1181,11 +1386,6 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
     }
 
     QuicDnsTransport &owner_;
-    ExchangeId id_;
-    DnsExchangeRequest request_;
-    Handler handler_;
-    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
-    boost::asio::steady_timer deadline_timer_;
     boost::asio::steady_timer expiry_timer_;
     boost::asio::steady_timer idle_timer_;
     DnsTransportMode mode_;
@@ -1201,20 +1401,17 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
     SSL *ssl_ = nullptr;
     ngtcp2_conn *connection_ = nullptr;
     nghttp3_conn *http3_ = nullptr;
-    std::int64_t doq_stream_id_ = -1;
-    std::int64_t http3_stream_id_ = -1;
-    std::vector<std::uint8_t> doq_request_;
-    std::vector<std::uint8_t> doq_response_;
-    std::size_t doq_offset_ = 0;
-    bool doq_fin_submitted_ = false;
-    std::size_t request_offset_ = 0;
-    std::vector<std::uint8_t> response_body_;
-    std::string response_status_;
-    std::string response_content_type_;
+    std::unordered_map<ExchangeId, std::shared_ptr<Exchange>> exchanges_;
+    std::unordered_map<std::int64_t, std::shared_ptr<Exchange>> stream_exchanges_;
+    std::deque<ExchangeId> pending_exchanges_;
+    std::deque<std::int64_t> doq_pending_write_;
+    std::unordered_set<std::int64_t> doq_blocked_streams_;
     std::deque<std::vector<std::uint8_t>> outgoing_;
-    std::optional<core::Result<DnsPacket>> result_;
-    bool completed_ = false;
-    bool active_exchange_ = true;
+    std::optional<core::Error> session_error_;
+    bool started_ = false;
+    bool handshake_completed_ = false;
+    bool open_pending_exchanges_ = false;
+    bool idle_ = false;
     bool retired_ = false;
     bool receiving_ = false;
     bool sending_ = false;
@@ -1225,79 +1422,115 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
 };
 
 DnsTransport::ExchangeId QuicDnsTransport::exchange(DnsExchangeRequest request, Handler handler) {
-    const auto id = next_exchange_id_++;
-    if (stopped_) {
-        auto operation =
-            std::make_shared<Operation>(*this, id, std::move(request), std::move(handler));
-        operations_.emplace(id, operation);
-        operation->cancel();
-    } else if (!idle_sessions_.empty()) {
-        auto operation = std::move(idle_sessions_.back());
-        idle_sessions_.pop_back();
-        operations_.emplace(id, operation);
-        operation->reuse(id, std::move(request), std::move(handler));
-    } else {
-        auto operation =
-            std::make_shared<Operation>(*this, id, std::move(request), std::move(handler));
-        operations_.emplace(id, operation);
-        operation->start();
-    }
+    const auto id = next_exchange_id_.fetch_add(1, std::memory_order_relaxed);
+    const auto self = shared_from_this();
+    boost::asio::post(
+        strand_, [self, id, request = std::move(request), handler = std::move(handler)]() mutable {
+            self->add_new_exchange(id, std::move(request), std::move(handler));
+        });
     return id;
 }
 
+void QuicDnsTransport::add_new_exchange(ExchangeId id, DnsExchangeRequest request,
+                                        Handler handler) {
+    if (stopped_) {
+        if (handler) {
+            handler(core::fail(cancelled_error()));
+        }
+        return;
+    }
+
+    std::shared_ptr<Operation> operation;
+    for (const auto &candidate : active_sessions_) {
+        if (candidate->can_accept_exchange() &&
+            (!operation ||
+             candidate->active_exchange_count() < operation->active_exchange_count())) {
+            operation = candidate;
+        }
+    }
+    if (!operation && !idle_sessions_.empty()) {
+        operation = std::move(idle_sessions_.back());
+        idle_sessions_.pop_back();
+        active_sessions_.push_back(operation);
+    }
+    if (!operation) {
+        operation = std::make_shared<Operation>(*this);
+        active_sessions_.push_back(operation);
+    }
+    exchanges_.emplace(id, ExchangeRegistration{operation, std::move(handler)});
+    operation->add_exchange(id, std::move(request));
+}
+
 void QuicDnsTransport::cancel(ExchangeId exchange_id) noexcept {
-    const auto found = operations_.find(exchange_id);
-    if (found != operations_.end()) {
-        found->second->cancel();
+    try {
+        const auto self = shared_from_this();
+        boost::asio::post(strand_, [self, exchange_id] {
+            const auto found = self->exchanges_.find(exchange_id);
+            if (found != self->exchanges_.end()) {
+                found->second.operation->cancel_exchange(exchange_id, cancelled_error());
+            }
+        });
+    } catch (...) {
     }
 }
 
 void QuicDnsTransport::stop() noexcept {
-    if (stopped_) {
+    try {
+        const auto self = shared_from_this();
+        boost::asio::post(strand_, [self] {
+            if (self->stopped_) {
+                return;
+            }
+            self->stopped_ = true;
+            const auto active = self->active_sessions_;
+            for (const auto &operation : active) {
+                operation->cancel_all();
+            }
+            const auto idle = std::move(self->idle_sessions_);
+            self->idle_sessions_.clear();
+            for (const auto &operation : idle) {
+                operation->close_idle();
+            }
+        });
+    } catch (...) {
+    }
+}
+
+void QuicDnsTransport::session_idle(const std::shared_ptr<Operation> &operation) {
+    std::erase_if(active_sessions_, [&operation](const auto &candidate) {
+        return candidate.get() == operation.get();
+    });
+    if (stopped_ || !operation->is_idle()) {
+        operation->close_idle();
         return;
     }
-    stopped_ = true;
-    std::vector<std::shared_ptr<Operation>> active;
-    active.reserve(operations_.size());
-    for (const auto &[id, operation] : operations_) {
-        active.push_back(operation);
-    }
-    for (const auto &operation : active) {
-        operation->cancel();
-    }
-    active = std::move(idle_sessions_);
-    idle_sessions_.clear();
-    for (const auto &operation : active) {
-        operation->close_idle();
-    }
-}
-
-void QuicDnsTransport::recycle(const std::shared_ptr<Operation> &operation) {
-    if (!stopped_) {
+    const auto already_idle = std::any_of(
+        idle_sessions_.begin(), idle_sessions_.end(),
+        [&operation](const auto &candidate) { return candidate.get() == operation.get(); });
+    if (!already_idle) {
         idle_sessions_.push_back(operation);
-        if (idle_sessions_.size() > kMaximumIdleQuicSessions) {
-            auto oldest = std::move(idle_sessions_.front());
-            idle_sessions_.erase(idle_sessions_.begin());
-            oldest->close_idle();
-        }
-    } else {
-        operation->close_idle();
+    }
+    if (idle_sessions_.size() > kMaximumIdleQuicSessions) {
+        auto oldest = std::move(idle_sessions_.front());
+        idle_sessions_.erase(idle_sessions_.begin());
+        oldest->close_idle();
     }
 }
 
-void QuicDnsTransport::retire(const Operation *operation) noexcept {
+void QuicDnsTransport::session_retired(const Operation *operation) noexcept {
+    std::erase_if(active_sessions_,
+                  [operation](const auto &candidate) { return candidate.get() == operation; });
     std::erase_if(idle_sessions_,
                   [operation](const auto &candidate) { return candidate.get() == operation; });
 }
 
 void QuicDnsTransport::complete(ExchangeId exchange_id, core::Result<DnsPacket> result) {
-    const auto found = operations_.find(exchange_id);
-    if (found == operations_.end()) {
+    const auto found = exchanges_.find(exchange_id);
+    if (found == exchanges_.end()) {
         return;
     }
-    auto operation = std::move(found->second);
-    operations_.erase(found);
-    auto handler = operation->take_handler();
+    auto handler = std::move(found->second.handler);
+    exchanges_.erase(found);
     if (handler) {
         handler(std::move(result));
     }
