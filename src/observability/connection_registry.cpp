@@ -20,6 +20,17 @@ bool ConnectionRegistry::update_outbound(ConnectionId id, std::string outbound_i
     return true;
 }
 
+bool ConnectionRegistry::update_stats(ConnectionId id, std::uint64_t left_to_right_bytes,
+                                      std::uint64_t right_to_left_bytes) {
+    const auto found = records_.find(id);
+    if (found == records_.end()) {
+        return false;
+    }
+    found->second.left_to_right_bytes = left_to_right_bytes;
+    found->second.right_to_left_bytes = right_to_left_bytes;
+    return true;
+}
+
 bool ConnectionRegistry::remove(ConnectionId id) noexcept { return records_.erase(id) != 0; }
 
 std::optional<ConnectionRecord> ConnectionRegistry::find(ConnectionId id) const {

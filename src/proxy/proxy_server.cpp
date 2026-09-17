@@ -488,7 +488,15 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         auto self = shared_from_this();
         relay_ = TcpRelay::start(
             std::make_unique<net::TcpStream>(std::move(client_)), std::move(remote_),
-            [self](RelayStats) { self->close(); }, std::move(http_initial_data_));
+            [self](RelayStats stats) {
+                if (self->connection_id_ && self->owner_.connection_registry_) {
+                    self->owner_.connection_registry_->update_stats(*self->connection_id_,
+                                                                    stats.left_to_right_bytes,
+                                                                    stats.right_to_left_bytes);
+                }
+                self->close();
+            },
+            std::move(http_initial_data_));
     }
 
     void close() noexcept {

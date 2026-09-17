@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -26,7 +27,36 @@ type Process struct {
 }
 
 func Start(ctx context.Context, executable string, args ...string) (*Process, error) {
+	return start(ctx, executable, nil, args...)
+}
+
+// StartWithEnv starts a child process with the supplied environment overrides.
+func StartWithEnv(ctx context.Context, executable string, environment map[string]string,
+	args ...string) (*Process, error) {
+	return start(ctx, executable, environment, args...)
+}
+
+func start(ctx context.Context, executable string, environment map[string]string,
+	args ...string) (*Process, error) {
 	cmd := exec.CommandContext(ctx, executable, args...)
+	if len(environment) > 0 {
+		cmd.Env = os.Environ()
+		for key, value := range environment {
+			entry := key + "=" + value
+			prefix := key + "="
+			updated := false
+			for index, existing := range cmd.Env {
+				if strings.HasPrefix(existing, prefix) {
+					cmd.Env[index] = entry
+					updated = true
+					break
+				}
+			}
+			if !updated {
+				cmd.Env = append(cmd.Env, entry)
+			}
+		}
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("create stdout pipe: %w", err)

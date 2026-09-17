@@ -18,6 +18,8 @@
 
 namespace clash_native::dns {
 
+class BootstrapResolver;
+
 enum class DnsDialPolicyKind {
     direct,
     named_outbound,
@@ -58,6 +60,7 @@ class OutboundDnsUpstreamDialer final : public DnsUpstreamDialer {
 enum class DnsTransportMode {
     plain,
     dot,
+    doh1,
     doh2,
     doq,
     doh3,
@@ -78,6 +81,9 @@ struct DnsUpstreamConfig {
     std::string doh_authority;
     DnsDialPolicy dial_policy;
     std::shared_ptr<DnsUpstreamDialer> dialer;
+    // When set, the endpoint address is resolved by the explicit bootstrap resolver.
+    std::string hostname;
+    std::shared_ptr<BootstrapResolver> bootstrap_resolver;
 };
 
 struct DnsExchangeRequest {

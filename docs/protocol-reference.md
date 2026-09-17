@@ -417,8 +417,9 @@ Based on the current source:
   proxy behavior.
 - The currently registered built-in outbounds are <code>direct</code> and
   <code>reject</code>.
-- QUICHE is a bundled QUIC/HTTP3 foundation library. Its presence does not
-  mean that Hysteria, Hysteria2, TUIC, ShadowQUIC, or MASQUE is implemented.
+- DNS transport adapters include experimental DoH/1.1, DoH/2, DoQ, and DoH/3
+  paths. This does not mean that QUIC-based proxy protocols such as Hysteria,
+  Hysteria2, TUIC, ShadowQUIC, or MASQUE are implemented or interoperable.
 - The architecture document describes future work and is not implementation
   evidence.
 

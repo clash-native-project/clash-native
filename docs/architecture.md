@@ -48,8 +48,8 @@ architecture and must not be used as the template for future protocol code.
 - Implementing every proxy protocol before the core lifecycle is validated.
 - Implementing TUN, transparent proxying, route manipulation, or other native
   platform features before ordinary proxy flows work.
-- Replacing QUICHE's visitor, delegate, alarm, or packet-writer model with
-  senders.
+- Treating ngtcp2/nghttp3 callbacks as the public asynchronous model; their
+  callbacks remain private to the QUIC transport adapter.
 - Passing every packet or stream chunk through a cross-runtime channel.
 
 Mihomo-compatible configuration and control surfaces may be added later as
@@ -129,7 +129,7 @@ independent boundary.
 | `relay` | TCP copying, half-close, backpressure, idle timeout, and accounting |
 | `dns` | Resolver policy, cache, hosts, and later enhanced DNS behavior |
 | `protocol` | Proxy handshakes and protocol-specific stream/packet transports |
-| `quic` | QUICHE ownership, visitor, packet writer, alarm, and TLS adapters |
+| `quic` | ngtcp2/nghttp3 ownership, UDP packet I/O, timers, and TLS adapters |
 | `platform` | Capability interfaces plus isolated operating-system backends |
 | `observability` | Logging facade, metrics, connection registry, and tracing hooks |
 
@@ -518,7 +518,7 @@ an established flow.
 
 Every connect, handshake, datagram-open, read, and write operation receives the
 parent stop token. Cancellation must reach the lowest cancellable Asio or
-QUICHE operation, and completion must be observed before its state is
+QUIC transport operation, and completion must be observed before its state is
 destroyed. Protocol implementations must not start detached cleanup or reader
 loops that escape their session scope.
 
@@ -593,7 +593,7 @@ number of logical CPUs. A later configuration layer may offer an `auto` mode.
 ### 8.2 Affinity
 
 A connection is assigned to one worker and remains there for its lifetime.
-Its sockets, timers, resolver operations, QUICHE connection objects, and
+Its sockets, timers, resolver operations, ngtcp2/nghttp3 connection objects, and
 mutable protocol state must not migrate between workers.
 
 Load balancing happens when a new session is accepted. Listener distribution
@@ -627,7 +627,7 @@ concurrent child work.
 - `continues_on` moves downstream work to an explicitly selected scheduler.
 - `on` is reserved for temporarily executing a nested operation elsewhere and
   returning to the caller's scheduler.
-- QUICHE callbacks remain callbacks inside the QUIC adapter.
+- ngtcp2/nghttp3 callbacks remain callbacks inside the QUIC adapter.
 - Callback-based external APIs should be wrapped as senders at their adapter
   boundary instead of exposing callback state to business layers.
 
@@ -677,7 +677,7 @@ Channels simplify cross-runtime ownership and request/reply flows, but they do
 not by themselves guarantee:
 
 - that child tasks have completed before their owner is destroyed;
-- that a socket, timer, or QUICHE object is accessed only on its owner thread;
+- that a socket, timer, or ngtcp2/nghttp3 object is accessed only on its owner thread;
 - that callback contexts outlive late callbacks;
 - that all parked sends and receives are completed during shutdown;
 - that application objects are destroyed after their runtime dependencies.
@@ -880,14 +880,15 @@ and `std::unexpected` do not leak into call sites.
 Adding `tl::expected` does not by itself make the complete program safe to
 compile without C++ exceptions. Exception support remains enabled initially.
 A no-exception build is a separate deployment decision that requires verifying
-stdexec, Asio, QUICHE, the standard library, logging, allocation behavior, and
+stdexec, Asio, ngtcp2, nghttp3, the standard library, logging, allocation behavior, and
 all other dependencies on each supported toolchain. The result abstraction
 should make such an evaluation easier without claiming it has already passed.
 
-The dependency and result wrapper require Windows Clang x86 and x86-64 build
-coverage. Zig-based Linux profiles require their own compile and runtime
+The dependency and result wrapper require Windows Clang x86-64 build coverage.
+Zig-based Linux x86-64 profiles require their own compile and runtime
 validation before the dependency is considered portable across release
-targets.
+targets. Support for 32-bit x86 is deferred and is not part of the current
+acceptance criteria.
 
 ## 11. Ownership, cancellation, and shutdown
 
@@ -1183,22 +1184,58 @@ The DNS subsystem is divided into the following components:
 
 | Component | Responsibility |
 | --- | --- |
-| `DnsMessageCodec` | DNS message parsing, serialization, names, and resource records |
-| `DnsTransport` | UDP, TCP, DoT, DoH, and later DoQ exchanges |
+| `DnsPacket` | An owned complete DNS wire message plus validated header and question metadata |
+| `DnsMessageCodec` | DNS message parsing, serialization, names, resource records, and safe transaction-ID rewriting |
+| `DnsQueryService` | Full-message query API, cache, coalescing, policy, cancellation, and result delivery |
+| `AddressResolver` | A/AAAA address lookup and CNAME-aware result assembly over `DnsQueryService` |
+| `DnsTransport` | One logical DNS exchange over UDP, TCP, DoT, DoH, DoQ, or DoH3 |
 | `DnsUpstream` | One configured server, transport, endpoint, and dial policy |
 | `DnsUpstreamGroup` | Concurrent selection, fallback, health, and retry policy |
 | `DnsCache` | Positive/negative entries, TTL expiry, stale policy, and limits |
 | `DnsPolicyRouter` | Select an upstream group from the queried domain |
 | `DnsUpstreamDialer` | Select how the connection to an upstream DNS server exits |
-| `ResolverService` | Lookup API, query coalescing, cancellation, and result assembly |
-| `DnsServer` | Optional local UDP/TCP service over `ResolverService` |
+| `DnsServer` | Optional local UDP/TCP service over the full-message query API |
 | `FakeIpStore` | Fake-IP allocation, reverse mapping, persistence, and expiry |
 
 The wire codec may initially use a suitable maintained dependency. Upstream
 selection, routing integration, caching policy, resolver roles, FakeIP, and
 lifecycle belong to clash-native-core regardless of the codec choice.
 
-### 14.2 Three independent routing decisions
+The names above describe responsibility boundaries rather than a frozen C++
+ABI. In particular, the current `ResolverService` may be split or renamed as
+these boundaries are implemented.
+
+### 14.2 Full-message queries and address resolution
+
+A local DNS forwarder and an application address resolver are different
+consumers of the same query engine:
+
+```text
+local UDP/TCP DNS client
+  -> DnsServer
+  -> complete DnsPacket
+  -> DnsQueryService
+  -> complete response DnsPacket
+
+TrafficRouter / endpoint connector
+  -> AddressResolver
+  -> A and AAAA queries through DnsQueryService
+  -> resolved address set
+```
+
+`DnsPacket` preserves the complete wire message even when the project-owned
+codec does not yet interpret every resource-record type. Unknown records,
+EDNS options, authority data, additional data, DNSSEC records, and response
+flags must not be discarded merely because `AddressResolver` only needs IP
+addresses.
+
+`AddressResolver` is a typed view over DNS results. It follows relevant CNAME
+chains, assembles A and AAAA addresses, and reports typed resolution failures.
+It must not be used as the backend of a general DNS forwarding service. The
+original domain remains distinct from resolved addresses for routing, logging,
+FakeIP reversal, retry, and response translation.
+
+### 14.3 Three independent routing decisions
 
 DNS-related routing contains three independent decisions:
 
@@ -1235,7 +1272,7 @@ The last option is equivalent in purpose to rule-aware DNS upstream dialing,
 but the internal API should express it as a dial policy instead of scattering
 special `respect-rules` checks through transports.
 
-### 14.3 Resolver roles and dependency cycles
+### 14.4 Resolver roles and dependency cycles
 
 The engine uses distinct resolver roles:
 
@@ -1254,42 +1291,167 @@ endpoints must be usable without recursively depending on
 `DefaultResolver`, `ProxyEndpointResolver`, or an outbound whose own server
 still needs resolution.
 
-Configuration validation must reject resolver/outbound dependency cycles
-before a runtime snapshot is applied. Runtime recursion guards are still
-required as a defensive boundary, but they are not the primary design.
+The dependency graph contains resolver roles, DNS upstreams, outbound groups,
+chained outbound endpoints, and named DNS egress targets. It validates missing
+references, required stream or datagram capabilities, and cycles before a
+runtime snapshot is applied. For example, a DoH upstream reached through a
+proxy whose own endpoint can only be resolved by that same DoH upstream is an
+invalid configuration.
 
-### 14.4 Query pipeline
+A `Direct` connection with an unresolved domain must use `DirectResolver`; it
+must not silently invoke the operating-system resolver inside the outbound.
+The system-resolver adapter is available only through an explicitly selected
+resolver role, normally as a bootstrap policy. Runtime recursion guards remain
+a defensive boundary, but they are not the primary cycle-prevention design.
+
+### 14.5 Query pipeline
 
 The logical query path is:
 
 ```text
-DnsQuestion
+DnsPacket
+  -> query validation and normalized question key
   -> hosts/static override
+  -> optional FakeIP policy
   -> cache lookup
   -> in-flight query coalescing
   -> DnsPolicyRouter
   -> primary DnsUpstreamGroup
+  -> selected DnsUpstream
+  -> DnsTransport exchange
   -> response validation
   -> optional fallback decision
   -> cache insertion
-  -> DnsAnswer
+  -> complete response DnsPacket
 ```
 
 The fallback decision can depend on the question name, response code, returned
 IP addresses, GeoIP/IP-set matchers, or transport failure. Lazy and eager
 fallback queries are policy choices and must share the same cancellation
-owner.
+owner. Fallback belongs to `DnsUpstreamGroup`; it is not an optional secondary
+endpoint hidden inside one transport configuration. UDP truncation retry to
+TCP is a same-upstream transport transition and occurs before group fallback.
 
 Cache keys must include every input that can change the answer, including at
 least normalized name, query type, class, and relevant policy options. Expired
 entries, negative answers, stale serving, and configuration reload behavior
 must be explicit rather than accidental consequences of a generic container.
+Negative caching distinguishes NXDOMAIN and NODATA from transient errors such
+as SERVFAIL and derives its lifetime from DNS negative-response data rather
+than an unconditional fixed TTL.
 
 Concurrent equivalent misses should share one upstream operation. Cancelling
 one waiter must not cancel the shared operation while other live waiters still
-need it.
+need it. Transaction IDs used on the wire are transport/session state and are
+not cache or coalescing keys. The service restores the caller-visible ID when
+returning a forwarded response.
 
-### 14.5 FakeIP and mapping
+### 14.6 Transport and carrier boundaries
+
+`DnsTransport` represents one logical query/response exchange. A conceptual
+callback-based shape is shown below; the exact asynchronous result form may
+later become a sender without changing the surrounding responsibilities:
+
+```cpp
+struct DnsExchangeRequest {
+  DnsPacket query;
+  Deadline deadline;
+};
+
+struct DnsExchangeResponse {
+  DnsPacket response;
+  DnsTransportTrace trace;
+};
+
+class DnsTransport {
+ public:
+  virtual ExchangeHandle exchange(
+      DnsExchangeRequest request,
+      std::function<void(Result<DnsExchangeResponse>)> handler) = 0;
+  virtual void stop() noexcept = 0;
+  virtual ~DnsTransport() = default;
+};
+```
+
+Completion is exactly once, including cancellation and shutdown. A transport
+may own reusable protocol sessions, but it does not select policy rules, read
+or populate the DNS cache, choose a fallback upstream, or apply FakeIP.
+
+The supported transports compose as follows:
+
+| Configured protocol | DNS mapping | Reused carrier/session boundary |
+| --- | --- | --- |
+| Plain UDP | One DNS message per datagram, with peer, ID, and question validation | Addressed `DatagramHandle` from `DnsUpstreamDialer` |
+| Plain TCP | Two-octet DNS length framing, connection reuse, pipelining, and ID dispatch | `StreamHandle` plus a TCP DNS session pool |
+| DoT | The same length-framed DNS stream behavior over authenticated TLS | TLS carrier over a dialed `StreamHandle` |
+| DoH over HTTP/2 | One DNS request/response per HTTP exchange using `application/dns-message` | Multiplexed HTTP/2 client session over TLS |
+| DoQ | One query per client-initiated bidirectional QUIC stream, ALPN `doq`, and DNS Message ID zero | Reusable QUIC connection with a DoQ application adapter |
+| DoH over HTTP/3 | The same DNS-over-HTTP mapping used by DoH over HTTP/2 | HTTP/3 client session over QUIC |
+
+Plain TCP and DoT share a small length-framing/session implementation; they do
+not require two DNS parsers. DoH over HTTP/2 and DoH over HTTP/3 share the same
+DNS-over-HTTP request and response validation; HTTP version selection is a
+carrier choice. DoQ and DoH3 may share the Asio/ngtcp2 connection foundation,
+but they remain different application protocols and must not be represented by
+one protocol switch inside the resolver.
+
+The relevant protocol contracts are DNS over TCP in RFC 7766, DoT in RFC 7858,
+DoH in RFC 8484, DoQ in RFC 9250, and HTTP/3 in RFC 9114. DNS Message ID
+allocation and matching follow the selected mapping: TCP and DoT require IDs
+unique among in-flight queries on a session, DoH should use zero when practical,
+and DoQ requires zero.
+
+The query service owns the total deadline. Individual transports may apply
+bounded connection, handshake, stream, and idle sub-timeouts, but no retry or
+reconnection may silently extend the total deadline.
+
+### 14.7 Upstream configuration, dialing, and sessions
+
+Protocol-specific configuration uses a tagged variant instead of one structure
+containing unrelated optional fields:
+
+```cpp
+using DnsTransportSpec = std::variant<
+    UdpDnsSpec,
+    TcpDnsSpec,
+    DotSpec,
+    DohSpec,
+    DoqSpec>;
+
+struct DnsUpstreamSpec {
+  std::string id;
+  DnsTransportSpec transport;
+  DnsDialPolicy dial_policy;
+  BootstrapPolicy bootstrap;
+};
+
+struct DnsUpstreamGroupSpec {
+  std::string id;
+  std::vector<std::string> members;
+  DnsGroupStrategy strategy;
+  DnsFallbackPolicy fallback;
+};
+```
+
+`DohSpec` contains an explicit HTTP version policy such as HTTP/2, HTTP/3, or
+validated automatic selection; DoH3 is not a separate DNS message format.
+TLS certificate name, HTTP authority, configured server hostname, bootstrap
+addresses, and the currently selected dial address remain separate values.
+Connecting to a bootstrap IP must not weaken certificate or authority checks.
+
+`DnsUpstream` owns the transport instance, session pools, health state, and
+immutable configuration generation for one server. `DnsUpstreamGroup` owns
+ordering, racing, retry eligibility, fallback, and health-based selection.
+Neither object performs application traffic routing directly.
+
+All transports obtain established stream or datagram carriers through
+`DnsUpstreamDialer`. Except for a physical Direct implementation behind that
+dialer, transports must not open raw Asio sockets themselves. A TLS, HTTP, or
+QUIC backend selected for this layer must support the required injected I/O or
+adapter boundary; a backend that insists on owning its sockets cannot provide
+named-outbound or rule-aware DNS egress and must not be presented as if it can.
+
+### 14.8 FakeIP and mapping
 
 FakeIP is an enhancer over resolver results, not an upstream transport.
 
@@ -1311,17 +1473,18 @@ optional persistence, reload transfer, and clear failure behavior when a
 mapping is missing. FakeIP filters may reuse domain/rule matchers, but they are
 not the same decision as DNS upstream selection.
 
-### 14.6 Multi-runtime ownership
+### 14.9 Multi-runtime ownership
 
-The initial implementation assigns one logical `ResolverService` owner to a
+The initial implementation assigns one logical `DnsQueryService` owner to a
 selected I/O runtime. It owns the cache, in-flight-query table, upstream
-connection pools, and DNS configuration generation. This does not require an
-additional thread.
+registry, and DNS configuration generation. Each `DnsUpstream` owns its
+transport sessions on that same runtime. This does not require an additional
+thread.
 
 ```text
 caller worker
   -> bounded MPSC query request
-  -> ResolverService owner runtime
+  -> DnsQueryService owner runtime
   -> upstream exchange
   -> oneshot result
   -> caller's owning scheduler
@@ -1332,53 +1495,60 @@ Shutdown stops new requests, closes the request channel, cancels upstream
 operations, completes or stops pending replies, and drains the DNS scope
 before its runtime work guard is released.
 
+Reload publishes an immutable DNS snapshot. Existing operations retain the
+old upstream objects and pools until completion or cancellation; new requests
+use the new snapshot. Old pools stop only after their snapshot is no longer
+referenced, so a reload does not mutate transport configuration underneath an
+in-flight query.
+
 If measurement later shows the single owner is a bottleneck, transports and
 cache shards may be distributed per worker without changing the public
 resolver or policy interfaces.
 
-### 14.7 Implementation order
+### 14.10 Implementation milestones
 
-DNS implementation proceeds in independently testable slices:
+DNS implementation proceeds in independently testable milestones:
 
-1. resolver interfaces, role separation, and a system-resolver adapter;
-2. DNS message codec plus UDP and TCP forwarding with truncation fallback;
-3. bounded cache, TTL handling, cancellation, and in-flight coalescing;
-4. upstream groups, domain policy, fallback, and upstream dial policies;
-5. local UDP/TCP DNS service, hosts, mapping, and FakeIP;
-6. DoT and DoH;
-7. DoQ after the QUICHE adapter is validated.
+1. Extract the current UDP and TCP exchange code behind `DnsTransport`, add a
+   deterministic fake transport, and preserve existing behavior while removing
+   sockets from the query-service operation.
+2. Introduce full-message `DnsPacket` flow, split `AddressResolver` from
+   `DnsQueryService`, and correct CNAME, EDNS, response-size, TTL, and negative
+   caching behavior.
+3. Implement real `DnsUpstream`, `DnsUpstreamGroup`, bootstrap, dial policies,
+   addressed datagram handles, and the unified resolver/outbound dependency
+   graph.
+4. Add DoT and DoH over HTTP/2 after reusable TLS and HTTP/2 carriers can run
+   over an injected `StreamHandle`.
+5. Add DoQ and DoH over HTTP/3 only after the Asio/ngtcp2 adapter and a real
+   HTTP/3 validation flow exist. Reuse the QUIC foundation while retaining
+   separate DoQ and DoH application adapters.
 
 Each slice must include malformed-response, timeout, cancellation, reload, and
-shutdown tests appropriate to the behavior it introduces.
+shutdown tests appropriate to the behavior it introduces. TCP and DoT tests
+cover reuse, pipelining, and out-of-order response dispatch. TLS tests cover
+server-name and trust failures. DoH tests cover HTTP status, content type,
+response bounds, and multiplexing. DoQ tests cover Message ID zero, one query
+per stream, FIN handling, and stream cancellation. DoH3 reruns the shared DoH
+conformance cases over an HTTP/3 session.
 
-## 15. QUICHE boundary
+## 15. QUIC transport boundary
 
-QUICHE owns QUIC and HTTP/3 protocol behavior. clash-native owns the event
-loop, UDP sockets, routing, proxy protocols, application lifecycle, and
-platform integration.
+The QUIC adapter owns one ngtcp2 connection and, for HTTP/3, one nghttp3
+connection. It uses the core's Asio-owned UDP datagram handle and timers; it
+does not create a second event loop or expose library callbacks to callers.
+BoringSSL supplies the QUIC-specific TLS callbacks through ngtcp2's crypto
+helper.
 
 ```text
-Asio UDP receive
-  -> QUICHE packet input
-  -> QUICHE connection/session callbacks
-  -> core QUIC stream abstraction
-
-QUICHE packet writer
-  -> core UDP writer
-  -> Asio UDP send
-
-QUICHE alarm
-  -> core alarm adapter
-  -> Asio steady timer
+Asio UDP receive -> ngtcp2 packet input -> QUIC stream callbacks
+nghttp3 stream output -> ngtcp2 packet output -> Asio UDP send
+ngtcp2 expiry -> Asio steady timer -> ngtcp2 expiry handling
 ```
 
-QUICHE connections, visitors, writers, alarms, and their buffers stay on one
-I/O worker. Sender wrappers may represent completion to higher layers, but
-they must not change QUICHE object affinity.
-
-QUICHE and BoringSSL integration is a separate build milestone. It must be
-validated independently for every target architecture and linkage profile
-before a QUIC-based proxy protocol is placed on the main roadmap.
+Each connection and its ngtcp2/nghttp3 objects are confined to one Asio strand.
+Cancellation and shutdown must complete the exchange exactly once and release
+the datagram handle, timers, TLS objects, and protocol state on that strand.
 
 ## 16. Platform boundary
 
@@ -1426,7 +1596,7 @@ suite is expected to cover:
 - DNS forwarding, cache, policy routing, fallback, and FakeIP;
 - rule matching and outbound selection;
 - Shadowsocks and Trojan;
-- QUICHE integration and selected QUIC-based protocols;
+- ngtcp2/nghttp3 integration and selected QUIC-based protocols;
 - connection accounting, logging interfaces, and resource limits;
 - protocol interoperability and malformed-input handling.
 
@@ -1488,7 +1658,7 @@ objects. It must not expose:
 
 - C++ templates or standard-library containers;
 - Asio or stdexec types;
-- QUICHE classes;
+- ngtcp2/nghttp3 classes;
 - C++ exceptions across the ABI;
 - frontend-specific global state.
 
@@ -1499,16 +1669,14 @@ The first consumer platforms and ABI stability policy remain later decisions.
 All supported project builds use Clang-family compiler drivers, CMake, Ninja,
 and Python orchestration. Windows development uses MSYS2 Clang. Linux release
 and cross-compilation builds use `zig cc` and `zig c++`. The initial
-architecture scope is 32-bit and 64-bit x86.
+architecture scope is x86-64 only. Support for 32-bit x86 may be reconsidered
+later, but it is not part of the current roadmap or stage gates.
 
 | Profile | Architecture | Compiler target | Runtime target | Linkage intent | Status |
 | --- | --- | --- | --- | --- | --- |
 | Windows development | x86-64 | MSYS2 Clang | MSYS2 environment | vcpkg libraries as selected | bootstrap exists |
-| Windows development | x86 | MSYS2 Clang | MSYS2 environment | custom triplet required | planned |
 | Linux glibc | x86-64 | `x86_64-linux-gnu.2.17` | Linux 3.10, glibc 2.17 | compatible dynamic runtime | planned |
-| Linux glibc | x86 | `x86-linux-gnu.2.17` | Linux 3.10, glibc 2.17 | compatible dynamic runtime | planned |
 | Linux musl | x86-64 | `x86_64-linux-musl` | Linux 3.10 | static where feasible | feasibility required |
-| Linux musl | x86 | `x86-linux-musl` | Linux 3.10 | static where feasible | feasibility required |
 
 The glibc and musl profiles solve different deployment problems:
 
@@ -1540,9 +1708,7 @@ The initial planned triplet/profile matrix is:
 
 ```text
 x64-linux-zig-glibc217
-x86-linux-zig-glibc217
 x64-linux-zig-musl
-x86-linux-zig-musl
 ```
 
 These are project profile names; their concrete triplet files and compiler
@@ -1559,7 +1725,7 @@ interfaces.
 The glibc profile is accepted only when the final ELF artifact:
 
 - has no required `GLIBC_*` symbol version newer than `GLIBC_2.17`;
-- uses the expected 32-bit or 64-bit ELF interpreter and architecture;
+- uses the expected x86-64 ELF interpreter and architecture;
 - contains no dependency built for the host ABI;
 - runs on a representative glibc 2.17 environment.
 
@@ -1592,7 +1758,7 @@ validated on Windows. Stages 5 and 6 begin only after the portable core gate.
   conformance harness;
 - introduce runtime-set and scheduler abstractions;
 - import and validate the required channel primitives;
-- establish Windows x86-64 and x86 Clang build profiles;
+- establish the Windows x86-64 Clang build profile;
 - define lifecycle, error, cancellation, and testing conventions;
 - establish the Go black-box harness, minimal core test host, independent TCP
   and UDP endpoints, and deterministic process-lifecycle utilities.
@@ -1618,12 +1784,23 @@ validated on Windows. Stages 5 and 6 begin only after the portable core gate.
 - domain, network, port, inbound, and IP CIDR matchers with `no-resolve`;
 - lazy asynchronous destination-IP enrichment that resumes at the requesting
   rule and performs at most one lookup per routing decision;
-- DNS UDP/TCP forwarding, cache, and in-flight query coalescing;
-- DNS upstream policy, fallback, and upstream egress routing;
+- separate full-message DNS query and typed address-resolution APIs;
+- transport-independent DNS exchange contracts with UDP/TCP forwarding,
+  truncation fallback, bounded cache, and in-flight query coalescing;
+- real DNS upstream and upstream-group objects with policy, fallback, health,
+  bootstrap, and upstream egress routing;
+- DoT and DoH over HTTP/2 through reusable TLS and HTTP/2 carrier boundaries;
+- validated DoQ and DoH3 configuration/contracts, with implementation gated on
+  the Stage 4 ngtcp2 and HTTP/3 foundation;
 - local DNS service and FakeIP;
 - validated routing targets and independent rule-engine conformance tests;
 - immutable runtime snapshots and reload;
 - initial proxy groups and connection registry.
+
+Stage 2 exits without requiring a QUIC implementation, but it must not leave a
+resolver API or configuration model that requires a second DNS architecture
+when DoQ and DoH3 arrive. Plain, TLS, and HTTP/2 DNS behavior is part of the
+Stage 2 functional gate; QUIC-based DNS behavior is part of the Stage 4 gate.
 
 ### Stage 3: encrypted stream protocols
 
@@ -1633,9 +1810,11 @@ validated on Windows. Stages 5 and 6 begin only after the portable core gate.
 
 ### Stage 4: QUIC-based protocols
 
-- QUICHE and BoringSSL build integration;
+- ngtcp2, nghttp3, and BoringSSL build integration;
 - Asio UDP writer/alarm/visitor adapters;
 - a real QUIC/HTTP3 validation flow;
+- DoQ and DoH over HTTP/3 using the Stage 2 DNS transport and upstream
+  contracts;
 - pooled-session capacity, retirement, and 0-RTT replay-safety validation;
 - selected QUIC-based proxy protocols.
 
@@ -1662,7 +1841,7 @@ already been validated.
 ### Stage 5: Linux portability and process delivery
 
 - pin the Zig version used by release and CI builds;
-- establish x86 and x86-64 glibc 2.17 and musl profiles;
+- establish x86-64 glibc 2.17 and musl profiles;
 - build all dependencies with the selected Zig target;
 - rerun the complete portable core suite on Linux;
 - validate the Linux 3.10 and final-artifact requirements;
@@ -1692,7 +1871,7 @@ Every stage must validate the narrow behavior it introduces:
 - interoperability tests against independent protocol implementations;
 - stress tests for channel cancellation, connection churn, reload, and
   shutdown;
-- target-architecture builds for both x86 and x86-64;
+- target-architecture builds for x86-64;
 - final-artifact inspection for glibc symbol versions, static linkage, and
   binary size;
 - dependency probes that confirm vcpkg ports inherit the selected Zig target;
@@ -1928,7 +2107,8 @@ available:
 - exact memory, thread-count, and final binary-size budgets;
 - first platforms and stability policy for the C API;
 - concrete listener distribution strategy on each operating system;
-- QUICHE/BoringSSL feasibility and size on 32-bit x86;
+- whether and when to support 32-bit x86, including ngtcp2/BoringSSL
+  feasibility and binary size;
 - maintained DNS message codec dependency versus an owned implementation;
 - exact type-erasure and typed-result forms used by the protocol-facing async
   contracts;

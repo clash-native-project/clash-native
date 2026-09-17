@@ -1,8 +1,10 @@
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 
+#include "builtin_ca_bundle.hpp"
 #include "stream_handle_adapter.hpp"
 
+#include <boost/asio/buffer.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/ssl.hpp>
@@ -165,9 +167,11 @@ class DotDnsTransport::Session final
     bool configure_tls() {
         boost::system::error_code error;
         if (verify_peer_) {
-            ssl_context_.set_default_verify_paths(error);
+            const auto trust_roots = detail::builtin_ca_bundle_pem();
+            ssl_context_.add_certificate_authority(
+                boost::asio::buffer(trust_roots.data(), trust_roots.size()), error);
             if (error) {
-                connection_failed(io_error("failed to load DoT trust roots", error),
+                connection_failed(io_error("failed to load embedded DoT trust roots", error),
                                   connection_generation_);
                 return false;
             }

@@ -193,7 +193,6 @@ def prepare_windows_clang(
     )
     environment["CC"] = str(clang_cl)
     environment["CXX"] = str(clang_cl)
-    environment["BAZEL_LLVM"] = str(llvm_root)
     environment["USE_CLANG_CL"] = "1"
 
     return WindowsClangToolchain(

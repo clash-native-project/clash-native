@@ -38,4 +38,5 @@ primitive; it is not a packet relay bus between I/O workers.
 - CTest runs the C++ suite and process smoke tests. `scripts/build.py` also
   runs `go test ./...` with the built test host when tests are enabled.
 - A passing Windows test run proves only the exercised Windows paths. It does
-  not prove x86, Linux, Zig, musl, TUN, routing, or router hardware behavior.
+  not prove deferred 32-bit x86, Linux, Zig, musl, TUN, routing, or router
+  hardware behavior.

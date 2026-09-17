@@ -23,8 +23,14 @@ namespace clash_native::dns {
 
 std::shared_ptr<DnsTransport> make_dot_dns_transport(runtime::AsioRuntime &runtime,
                                                      DnsUpstreamConfig config);
+std::shared_ptr<DnsTransport> make_doh1_dns_transport(runtime::AsioRuntime &runtime,
+                                                      DnsUpstreamConfig config);
 std::shared_ptr<DnsTransport> make_doh2_dns_transport(runtime::AsioRuntime &runtime,
                                                       DnsUpstreamConfig config);
+std::shared_ptr<DnsTransport> make_quic_dns_transport(runtime::AsioRuntime &runtime,
+                                                      DnsUpstreamConfig config);
+std::shared_ptr<DnsTransport> make_bootstrap_dns_transport(runtime::AsioRuntime &runtime,
+                                                           DnsUpstreamConfig config);
 
 namespace {
 
@@ -159,67 +165,6 @@ class DirectDnsUpstreamDialer final : public DnsUpstreamDialer {
 
   private:
     runtime::AsioRuntime &runtime_;
-};
-
-class UnsupportedQuicDnsTransport final
-    : public DnsTransport,
-      public std::enable_shared_from_this<UnsupportedQuicDnsTransport> {
-  public:
-    explicit UnsupportedQuicDnsTransport(runtime::AsioRuntime &runtime) : runtime_(runtime) {}
-
-    ExchangeId exchange(DnsExchangeRequest, Handler handler) override {
-        const auto exchange_id = next_exchange_id_++;
-        pending_.emplace(exchange_id, std::move(handler));
-        auto self = shared_from_this();
-        boost::asio::post(runtime_.context(), [self, exchange_id] {
-            const auto found = self->pending_.find(exchange_id);
-            if (found == self->pending_.end()) {
-                return;
-            }
-            auto handler = std::move(found->second);
-            self->pending_.erase(found);
-            if (self->stopped_) {
-                handler(core::fail(
-                    core::Error{core::ErrorCode::cancelled, "QUIC DNS transport was stopped"}));
-                return;
-            }
-            handler(core::fail(
-                core::Error{core::ErrorCode::unsupported,
-                            "QUIC DNS transport requires the Stage 4 QUICHE foundation"}));
-        });
-        return exchange_id;
-    }
-
-    void cancel(ExchangeId exchange_id) noexcept override {
-        const auto found = pending_.find(exchange_id);
-        if (found == pending_.end()) {
-            return;
-        }
-        auto handler = std::move(found->second);
-        pending_.erase(found);
-        handler(
-            core::fail(core::Error{core::ErrorCode::cancelled, "QUIC DNS exchange was cancelled"}));
-    }
-
-    void stop() noexcept override {
-        if (stopped_) {
-            return;
-        }
-        stopped_ = true;
-        while (!pending_.empty()) {
-            auto found = pending_.begin();
-            auto handler = std::move(found->second);
-            pending_.erase(found);
-            handler(core::fail(
-                core::Error{core::ErrorCode::cancelled, "QUIC DNS transport was stopped"}));
-        }
-    }
-
-  private:
-    runtime::AsioRuntime &runtime_;
-    std::unordered_map<ExchangeId, Handler> pending_;
-    ExchangeId next_exchange_id_ = 1;
-    bool stopped_ = false;
 };
 
 } // namespace
@@ -990,14 +935,20 @@ void AsioDnsTransport::complete(ExchangeId exchange_id, core::Result<DnsPacket> 
 
 std::shared_ptr<DnsTransport> make_asio_dns_transport(runtime::AsioRuntime &runtime,
                                                       DnsUpstreamConfig config) {
+    if (!config.hostname.empty()) {
+        return make_bootstrap_dns_transport(runtime, std::move(config));
+    }
     if (config.mode == DnsTransportMode::dot) {
         return make_dot_dns_transport(runtime, std::move(config));
+    }
+    if (config.mode == DnsTransportMode::doh1) {
+        return make_doh1_dns_transport(runtime, std::move(config));
     }
     if (config.mode == DnsTransportMode::doh2) {
         return make_doh2_dns_transport(runtime, std::move(config));
     }
     if (config.mode == DnsTransportMode::doq || config.mode == DnsTransportMode::doh3) {
-        return std::make_shared<UnsupportedQuicDnsTransport>(runtime);
+        return make_quic_dns_transport(runtime, std::move(config));
     }
     return std::make_shared<AsioDnsTransport>(runtime, std::move(config));
 }

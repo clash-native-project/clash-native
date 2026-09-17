@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 project(clash-native VERSION 0.1.0 LANGUAGES C CXX)
 
 include(CTest)
@@ -9,30 +11,113 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(boost_asio CONFIG REQUIRED)
+find_package(boost_beast CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 find_package(OpenSSL CONFIG REQUIRED)
+find_package(nghttp3 CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(tl-expected CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
-find_path(NGHTTP2_INCLUDE_DIR NAMES nghttp2/nghttp2.h REQUIRED)
-find_library(NGHTTP2_LIBRARY NAMES nghttp2 REQUIRED)
-add_library(clash-native-nghttp2 UNKNOWN IMPORTED)
-set_target_properties(clash-native-nghttp2 PROPERTIES
-    IMPORTED_LOCATION "${NGHTTP2_LIBRARY}"
-    INTERFACE_INCLUDE_DIRECTORIES "${NGHTTP2_INCLUDE_DIR}"
+set(CLASH_NATIVE_CA_BUNDLE "${PROJECT_SOURCE_DIR}/third_party/curl-ca/cacert.pem")
+set(CLASH_NATIVE_CA_BUNDLE_TEMPLATE
+    "${PROJECT_SOURCE_DIR}/cmake/builtin_ca_bundle.cpp.in")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CLASH_NATIVE_CA_BUNDLE}"
+    "${CLASH_NATIVE_CA_BUNDLE_TEMPLATE}"
+)
+file(READ "${CLASH_NATIVE_CA_BUNDLE}" CLASH_NATIVE_CA_BUNDLE_PEM)
+file(MAKE_DIRECTORY "${PROJECT_BINARY_DIR}/generated")
+configure_file(
+    "${CLASH_NATIVE_CA_BUNDLE_TEMPLATE}"
+    "${PROJECT_BINARY_DIR}/generated/builtin_ca_bundle.cpp"
+    @ONLY
 )
 
+set(CLASH_NATIVE_VCPKG_TRIPLET_ROOT
+    "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+find_path(CLASH_NATIVE_NGHTTP2_INCLUDE_DIR
+    NAMES nghttp2/nghttp2.h
+    PATHS "${CLASH_NATIVE_VCPKG_TRIPLET_ROOT}/include"
+    NO_DEFAULT_PATH
+    REQUIRED
+)
+find_library(CLASH_NATIVE_NGHTTP2_LIBRARY_RELEASE
+    NAMES nghttp2
+    PATHS "${CLASH_NATIVE_VCPKG_TRIPLET_ROOT}/lib"
+    NO_DEFAULT_PATH
+    REQUIRED
+)
+find_library(CLASH_NATIVE_NGHTTP2_LIBRARY_DEBUG
+    NAMES nghttp2
+    PATHS "${CLASH_NATIVE_VCPKG_TRIPLET_ROOT}/debug/lib"
+    NO_DEFAULT_PATH
+)
+if(NOT CLASH_NATIVE_NGHTTP2_LIBRARY_DEBUG)
+    set(CLASH_NATIVE_NGHTTP2_LIBRARY_DEBUG
+        "${CLASH_NATIVE_NGHTTP2_LIBRARY_RELEASE}")
+endif()
+add_library(clash-native-nghttp2 UNKNOWN IMPORTED GLOBAL)
+set_target_properties(clash-native-nghttp2 PROPERTIES
+    IMPORTED_CONFIGURATIONS "DEBUG;RELEASE"
+    IMPORTED_LOCATION_DEBUG "${CLASH_NATIVE_NGHTTP2_LIBRARY_DEBUG}"
+    IMPORTED_LOCATION_RELEASE "${CLASH_NATIVE_NGHTTP2_LIBRARY_RELEASE}"
+    IMPORTED_LOCATION_RELWITHDEBINFO "${CLASH_NATIVE_NGHTTP2_LIBRARY_RELEASE}"
+    IMPORTED_LOCATION_MINSIZEREL "${CLASH_NATIVE_NGHTTP2_LIBRARY_RELEASE}"
+    INTERFACE_INCLUDE_DIRECTORIES "${CLASH_NATIVE_NGHTTP2_INCLUDE_DIR}"
+    INTERFACE_COMPILE_DEFINITIONS "NGHTTP2_NO_SSIZE_T"
+)
+
+find_path(CLASH_NATIVE_BORINGSSL_INCLUDE_DIR
+    NAMES openssl/base.h
+    PATHS "${CLASH_NATIVE_VCPKG_TRIPLET_ROOT}/include"
+    NO_DEFAULT_PATH
+    REQUIRED
+)
+set(CLASH_NATIVE_BORINGSSL_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
+
+add_library(clash-native-boringssl INTERFACE)
+target_include_directories(clash-native-boringssl SYSTEM INTERFACE
+    "${CLASH_NATIVE_BORINGSSL_INCLUDE_DIR}")
+target_link_libraries(clash-native-boringssl INTERFACE
+    ${CLASH_NATIVE_BORINGSSL_LIBRARIES})
+
+include(FetchContent)
+set(CLASH_NATIVE_BUILD_TESTING "${BUILD_TESTING}")
+function(clash_native_add_ngtcp2)
+    set(BUILD_TESTING OFF)
+    set(ENABLE_LIB_ONLY ON)
+    set(ENABLE_STATIC_LIB ON)
+    set(ENABLE_SHARED_LIB OFF)
+    set(ENABLE_OPENSSL OFF)
+    set(ENABLE_BORINGSSL ON)
+    set(BORINGSSL_INCLUDE_DIR "${CLASH_NATIVE_BORINGSSL_INCLUDE_DIR}")
+    set(BORINGSSL_LIBRARIES ${CLASH_NATIVE_BORINGSSL_LIBRARIES})
+
+    FetchContent_Declare(ngtcp2
+        GIT_REPOSITORY https://github.com/ngtcp2/ngtcp2.git
+        GIT_TAG 843aa72100b508e192f119439a943028b0c6f030
+    )
+    FetchContent_MakeAvailable(ngtcp2)
+endfunction()
+clash_native_add_ngtcp2()
+set(BUILD_TESTING "${CLASH_NATIVE_BUILD_TESTING}" CACHE BOOL "Build clash-native tests" FORCE)
+
 add_library(clash-native-core STATIC
+    "${PROJECT_BINARY_DIR}/generated/builtin_ca_bundle.cpp"
     src/dns/dns_codec.cpp
     src/dns/dns_policy_router.cpp
     src/dns/dns_query_service.cpp
     src/dns/dns_upstream.cpp
     src/dns/address_resolver.cpp
+    src/dns/bootstrap_resolver.cpp
+    src/dns/bootstrap_dns_transport.cpp
     src/dns/resolver_service.cpp
     src/dns/dns_transport.cpp
     src/dns/dot_dns_transport.cpp
+    src/dns/doh1_dns_transport.cpp
     src/dns/doh2_dns_transport.cpp
+    src/dns/quic_dns_transport.cpp
     src/dns/dns_server.cpp
     src/dns/fake_ip_store.cpp
     src/dns/resolver_graph.cpp
@@ -52,6 +137,8 @@ add_library(clash-native-core STATIC
 target_include_directories(clash-native-core
     PUBLIC
         include
+    PRIVATE
+        src
 )
 
 target_compile_features(clash-native-core PUBLIC cxx_std_20)
@@ -59,18 +146,22 @@ target_compile_features(clash-native-core PUBLIC cxx_std_20)
 target_link_libraries(clash-native-core
     PUBLIC
         Boost::asio
-        OpenSSL::SSL
-        OpenSSL::Crypto
-        clash-native-nghttp2
         Threads::Threads
         tl::expected
     PRIVATE
+        Boost::beast
+        clash-native-boringssl
+        clash-native-nghttp2
+        ngtcp2_static
+        ngtcp2_crypto_boringssl_static
+        $<IF:$<TARGET_EXISTS:nghttp3::nghttp3>,nghttp3::nghttp3,nghttp3::nghttp3_static>
         fmt::fmt
         spdlog::spdlog_header_only
 )
 
 if(WIN32)
-    target_link_libraries(clash-native-core PUBLIC ws2_32 mswsock)
+    target_compile_definitions(clash-native-core PUBLIC _HAS_ITERATOR_DEBUGGING=0)
+    target_link_libraries(clash-native-core PUBLIC ws2_32 mswsock synchronization)
 endif()
 
 target_compile_definitions(clash-native-core
@@ -122,6 +213,7 @@ if(BUILD_TESTING)
         tests/core/outbound_contract_test.cpp
         tests/core/version_test.cpp
         tests/dns/dns_test.cpp
+        tests/dns/bootstrap_resolver_test.cpp
         tests/dns/dns_transport_test.cpp
         tests/dns/dns_packet_test.cpp
         tests/dns/dns_server_test.cpp
@@ -148,10 +240,33 @@ if(BUILD_TESTING)
     target_link_libraries(clash-native-tests
         PRIVATE
             clash-native-core
+            clash-native-nghttp2
             GTest::gtest_main
     )
 
     gtest_discover_tests(clash-native-tests)
+
+    add_executable(clash-native-http-quic-smoke-tests
+        tests/core/http_quic_dependencies_test.cpp
+    )
+
+    target_compile_features(clash-native-http-quic-smoke-tests PRIVATE cxx_std_20)
+    target_compile_definitions(clash-native-http-quic-smoke-tests
+        PRIVATE _HAS_ITERATOR_DEBUGGING=0
+    )
+
+    target_link_libraries(clash-native-http-quic-smoke-tests
+        PRIVATE
+            Boost::beast
+            ngtcp2_static
+            ngtcp2_crypto_boringssl_static
+            clash-native-boringssl
+            clash-native-nghttp2
+            $<IF:$<TARGET_EXISTS:nghttp3::nghttp3>,nghttp3::nghttp3,nghttp3::nghttp3_static>
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(clash-native-http-quic-smoke-tests)
 
     add_test(
         NAME clash-native.version

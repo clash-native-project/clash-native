@@ -1,5 +1,41 @@
 # Implementation Log
 
+### 2026-09-17 — Use the selected HTTP and QUIC libraries
+
+- Use Boost.Beast for HTTP/1.1, nghttp2 for HTTP/2, and nghttp3 for HTTP/3
+  over ngtcp2 QUIC connections.
+- Removed obsolete generated build tooling together with its project scripts
+  and dependency documentation.
+- Resolve BoringSSL through vcpkg and fetch ngtcp2 through CMake FetchContent.
+- Preserve DNS deadlines, cancellation, TLS certificate validation, response
+  bounds, content-type checks, and DNS question validation at the transport
+  boundary.
+- Build and test on Windows x64 with standalone LLVM `clang-cl`, MSVC/UCRT,
+  vcpkg, and CMake FetchContent. CTest passed 107/107. This does not establish
+  successful DoQ or DoH/3 interoperability with an external server.
+- Passed `pixi run format-check` and `git diff --check`.
+
+### 2026-09-17 — Embed CA roots for encrypted DNS transports
+
+- Added the curl CA bundle snapshot and documented its source, license,
+  SHA-256, update procedure, and Mozilla-policy limitation.
+- Added generated C++ source so CMake embeds the PEM data in
+  `clash-native-core`; encrypted DNS transports load these roots rather than
+  relying on platform certificate paths.
+- Added certificate-verification regression tests for DoT and HTTPS DNS.
+
+### 2026-09-17 — Statically link the Windows MSVC runtime
+
+- Set CMake targets and the Windows vcpkg triplet to use the static MSVC CRT.
+- Disabled MSVC STL iterator debugging consistently with
+  `_HAS_ITERATOR_DEBUGGING=0` in CMake and vcpkg.
+- Linked the Windows synchronization import library required by static Debug
+  CRT atomic wait/notify support.
+- Built Windows x64 Debug and Release configurations. Inspected compile
+  parameters (`/MTd` for Debug and `/MT` for Release) and confirmed the
+  Release executable does not import MSVC/UCRT runtime DLLs; Windows system
+  DLLs remain.
+
 This file records completed implementation changes. It is intentionally
 separate from `docs/architecture.md`, which describes the project blueprint.
 
@@ -417,41 +453,17 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Added the direct spdlog include required by the proxy core translation unit.
 - Applied the repository's MSYS2 Clang format after the include correction.
 
-### 2026-09-16 — Vendored QUICHE build probe
-
-- Vendored Google QUICHE at commit
-  `364478046fe60979aae31cebb45bc6480a294688` under `third_party/quiche`.
-- Preserved the minimum Windows x64 MSYS2 UCRT64 Clang/clang-cl Bazel probe
-  adaptations required to build `//quiche:quiche_core`.
-- Recorded the upstream commit, vendored changes, temporary external-cache
-  limitations, and validation boundary in `docs/third-party/quiche.md`.
-- Added `scripts/build_quiche.py` to reproduce the validated Windows x64
-  QUICHE core build command without placing Bazel output symlinks in the
-  vendored source tree.
-- Made the script materialize and patch the generated `rules_cc` toolchain
-  source idempotently before building, covering the two host-specific Clang
-  configuration fixes required by the validated probe.
-
 ### 2026-09-16 — Pixi and clang-cl build alignment
 
-- Moved the maintained CMake and Ninja dependency to the Pixi workspace.
-- Updated the Windows CMake build entry point to use Pixi's tools with
-  standalone LLVM clang-cl and the installed x64 MSVC environment.
-- Kept MSYS2 Bash optional and scoped it to QUICHE Bazel shell actions only;
-  it is not a clash-native runtime dependency.
-- Updated the Windows and QUICHE build documentation. Full rebuild
-  validation is pending.
+- Moved the maintained CMake and Ninja dependencies to the Pixi workspace.
+- Updated the Windows build entry point to use Pixi with standalone LLVM
+  `clang-cl` and the installed x64 MSVC environment.
+- Updated the Windows build documentation; full rebuild validation was pending.
 
 ### 2026-09-16 — MSVC environment loader fix
 
 - Fixed Python's `cmd.exe /c` invocation so Visual Studio paths containing
   spaces are passed correctly while exporting the x64 MSVC environment.
-
-### 2026-09-16 — QUICHE script argument fix
-
-- Synchronized the optional Bazel Bash argument between the QUICHE build
-  helper and its rules_cc materialization call. The subsequent QUICHE rebuild
-  remains the validation step.
 
 ### 2026-09-16 — Pixi clang-format tooling
 
@@ -465,16 +477,6 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Applied the Pixi-managed clang-format configuration to the project source
   roots and verified `format-check` successfully.
 - Confirmed that vendored `third_party` sources are excluded from both tasks.
-
-### 2026-09-16 — QUICHE clang-cl build validation
-
-- Built `//quiche:quiche_core` successfully on Windows x86-64 with standalone
-  LLVM clang-cl, the installed MSVC environment, and ICU disabled.
-- Bazel reported the static artifact at
-  `bazel-out/x64_windows-fastbuild/bin/quiche/quiche_core.lib` under its
-  output base.
-- QUICHE still emits warnings because inherited `-std=c++20` and `-fno-rtti`
-  options are ignored by clang-cl; this build is not warning-clean.
 
 ### 2026-09-16 — CMake Windows path handling
 
@@ -691,117 +693,3 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Added regression coverage proving an invalid DNS transport enum is rejected before querying.
 
 - Applied clang-format after the DNS enum configuration validation changes; third-party sources remained excluded.
-
-### 2026-09-16 — Cross-query CNAME resolution
-
-- Extended AddressResolver to follow bounded CNAME chains across separate DNS responses, preserve the original question, bound the final TTL by the CNAME chain, and reject loops or excessive depth.
-- Added an AddressResolver operation registry and callback gate so multi-step resolution and cancellation remain exactly-once across asynchronous service shutdown.
-
-- Applied clang-format after the cross-query CNAME resolution changes; third-party sources remained excluded.
-
-- Added deterministic transport coverage proving AddressResolver performs a bounded follow-up query for a CNAME-only response, preserves the original question, and bounds TTL by the CNAME record.
-
-- Applied clang-format after adding cross-query CNAME transport coverage; third-party sources remained excluded.
-- Applied clang-format after the addressed datagram carrier and direct DNS dialer changes; third-party sources remained excluded.
-- Kept direct UDP datagram operations alive through their completion handlers so cancellation and
-  shutdown cannot invoke callbacks through a destroyed datagram adapter.
-- Applied clang-format after the direct UDP datagram lifetime fix; third-party sources remained
-  excluded.
-- Replaced one-shot DoT operations with a reusable TLS DNS session that preserves length framing,
-  supports concurrent transaction-ID dispatch, and keeps one total deadline per exchange.
-- Added the DoT session implementation with persistent TLS state, queued length-framed writes,
-  response-ID dispatch, bounded session retirement after connection failure, and exactly-once
-  cancellation/shutdown completion.
-- Applied clang-format after the reusable DoT session changes; third-party sources remained
-  excluded.
-- Adjusted the reusable DoT frame reader to use one shared byte-vector representation for both
-  two-byte lengths and variable-size response bodies.
-- Extended the DoT loopback fixture to retain accepted TLS connections and count connections and
-  queries, preparing reusable-session regression coverage without changing production behavior.
-- Added a DoT regression test that performs two exchanges and verifies they share one TLS
-  connection while both responses complete successfully.
-- Applied clang-format after the DoT persistent-session fixture and regression test changes;
-  third-party sources remained excluded.
-- Added explicit DoT fixture counters to assert that the reusable-session test observed one
-  accepted connection and two DNS queries.
-- Replaced the one-shot DoH2 operation implementation with a persistent HTTP/2 session design;
-  the implementation is being completed with stream-level state and multiplexed dispatch.
-- Implemented persistent DoH2 HTTP/2 session state with one TLS connection, concurrent request
-  streams, per-stream response validation, deadline cancellation, and session retirement on
-  connection failure.
-- Applied clang-format after the persistent DoH2 session implementation; third-party sources
-  remained excluded.
-- Retained the per-stream HTTP/2 header storage alongside each queued DoH2 exchange so nghttp2
-  receives stable header buffers during request submission.
-- Updated the DoH2 loopback fixture to track accepted connections and completed request streams,
-  and to retain per-stream request/response state for multiplexing tests.
-- Added a DoH2 multiplexing regression test that submits two DNS exchanges concurrently and
-  verifies both complete over one HTTP/2/TLS connection.
-- Applied clang-format after the DoH2 multiplexing fixture and regression test changes;
-  third-party sources remained excluded.
-- Added connection and query counters to the DoH2 multiplexing test failure context so session
-  progress can be distinguished from response-dispatch failures.
-- Applied clang-format after the DoH2 multiplexing diagnostics update; third-party sources
-  remained excluded.
-- Stabilized the DoH2 test server's per-stream data-provider state with shared ownership so
-  adding concurrent HTTP/2 streams cannot invalidate an existing response buffer.
-- Applied clang-format after stabilizing the DoH2 multiplexing fixture; third-party sources
-  remained excluded.
-- Fixed DoH2 client response dispatch by mapping HTTP/2 stream IDs to DNS transaction IDs, and
-  completed closed-stream cleanup without weakening exactly-once completion.
-- Applied clang-format after the DoH2 stream-dispatch fix; third-party sources remained excluded.
-- Integrated the resolver dependency graph into DNS configuration validation, exposed node lookup
-  helpers, rejected duplicate resolver roles, and validated transitive bootstrap independence from
-  all resolver roles.
-- Added graph tests for direct bootstrap dependencies, transitive resolver cycles, duplicate roles,
-  node inspection, and DNS-service validation before runtime use.
-- Applied clang-format after the resolver dependency graph validation and test changes; third-party
-  sources remained excluded.
-- Added explicit DoQ and DoH3 transport modes with path validation for DoH3 and a deterministic
-  unsupported transport result that records the Stage 4 QUICHE implementation boundary.
-- Added tests proving DoQ can be configured without opening a socket, returns an explicit QUICHE
-  boundary error when exchanged, and rejects invalid DoH3 paths.
-- Applied clang-format after adding the DoQ and DoH3 configuration-contract coverage; third-party
-  sources remained excluded.
-- Added response-aware upstream-group fallback for SERVFAIL and REFUSED while preserving
-  NXDOMAIN/NODATA as valid terminal DNS responses.
-- Added deterministic upstream-group coverage proving a SERVFAIL response triggers the next member
-  within the same query deadline and returns the successful fallback answer.
-- Applied clang-format after the response-aware upstream fallback changes; third-party sources
-  remained excluded.
-- Added the internal StreamHandleAdapter and direct DNS dialer factory needed for injected TLS
-  stream carriers without exposing transport-specific socket ownership to DoT or DoH2.
-- Refactored DoT session establishment to obtain a StreamHandle from DnsUpstreamDialer, perform
-  TLS over the adapter, and retain the existing reusable framing and transaction dispatch behavior.
-- Refactored DoH2 session establishment to use the same injected StreamHandle carrier and retain
-  HTTP/2 multiplexing and response validation independently of socket ownership.
-- Allowed configured DNS stream dialers for DoT and DoH2 now that both transports use the injected
-  StreamHandle carrier rather than requiring direct socket ownership.
-- Applied clang-format after connecting DoT and DoH2 to the injected stream carrier; third-party
-  sources remained excluded.
-- Corrected the DoH2 TLS setup helper to return failure status to the injected-carrier connection
-  path instead of proceeding after trust, SNI, or ALPN configuration failure.
-- Applied clang-format after the DoH2 TLS setup correction; third-party sources remained excluded.
-- Added an OutboundDnsUpstreamDialer that selects a named outbound registry entry for stream and
-  datagram carriers, and automatically installs it for named DNS egress policies during resolver
-  configuration.
-- Applied clang-format after adding the named outbound DNS dialer; third-party sources remained
-  excluded.
-- Fixed DNS upstream validation to capture the service instance explicitly while checking named
-  outbound references.
-- Added loopback regression coverage that wraps the direct dialer and verifies both DoT and DoH2
-  establish their carrier through the injected dialer exactly once.
-- Applied clang-format after adding injected-carrier regression coverage; third-party sources
-  remained excluded.
-- Kept local DNS TCP connections open after successful responses so the server can process
-  sequential length-framed queries on one connection.
-- Extended the local DNS TCP regression fixture and test to send and validate two queries over one
-  client connection.
-- Applied clang-format after the local DNS TCP persistence changes; third-party sources remained
-  excluded.
-- Added a persistent UDP DNS test fixture and outbound dependencies for end-to-end coverage of
-  named DNS egress through the configured outbound registry.
-- Added a resolver integration test proving a named outbound policy selects the registry-backed
-  DirectOutbound for a real Plain UDP DNS exchange.
-- Applied clang-format after adding the named-outbound Plain UDP integration coverage; third-party
-  sources remained excluded.

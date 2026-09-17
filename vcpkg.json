@@ -18,17 +18,24 @@
       "default-features": false
     },
     {
-      "name": "spdlog",
-      "version>=": "1.17.0",
-      "default-features": false
+      "name": "boost-beast",
+      "version>=": "1.92.0"
     },
     {
-      "name": "openssl",
-      "version>=": "3.6.0"
+      "name": "boringssl"
     },
     {
       "name": "nghttp2",
       "version>=": "1.70.0"
+    },
+    {
+      "name": "nghttp3",
+      "version>=": "1.18.0"
+    },
+    {
+      "name": "spdlog",
+      "version>=": "1.17.0",
+      "default-features": false
     },
     {
       "name": "gtest",

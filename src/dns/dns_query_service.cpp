@@ -208,7 +208,8 @@ core::Status DnsQueryService::validate() const {
 
     const auto validate_upstream = [this](const DnsUpstreamConfig &upstream,
                                           std::string_view name) -> core::Status {
-        if (upstream.endpoint.address().is_unspecified() || upstream.endpoint.port() == 0) {
+        if (upstream.endpoint.port() == 0 ||
+            (upstream.hostname.empty() && upstream.endpoint.address().is_unspecified())) {
             return core::fail({core::ErrorCode::configuration,
                                "DNS upstream has an invalid endpoint: " + std::string(name)});
         }
@@ -217,8 +218,8 @@ core::Status DnsQueryService::validate() const {
                                "DNS upstream has a non-positive timeout: " + std::string(name)});
         }
         if (upstream.mode != DnsTransportMode::plain && upstream.mode != DnsTransportMode::dot &&
-            upstream.mode != DnsTransportMode::doh2 && upstream.mode != DnsTransportMode::doq &&
-            upstream.mode != DnsTransportMode::doh3) {
+            upstream.mode != DnsTransportMode::doh1 && upstream.mode != DnsTransportMode::doh2 &&
+            upstream.mode != DnsTransportMode::doq && upstream.mode != DnsTransportMode::doh3) {
             return core::fail({core::ErrorCode::configuration,
                                "DNS upstream has an invalid transport mode: " + std::string(name)});
         }
@@ -257,10 +258,10 @@ core::Status DnsQueryService::validate() const {
                 {core::ErrorCode::configuration,
                  "DNS upstream has an invalid fallback TCP endpoint: " + std::string(name)});
         }
-        if (upstream.mode == DnsTransportMode::doh2 &&
+        if ((upstream.mode == DnsTransportMode::doh1 || upstream.mode == DnsTransportMode::doh2) &&
             (upstream.doh_path.empty() || upstream.doh_path.front() != '/')) {
             return core::fail({core::ErrorCode::configuration,
-                               "DoH2 path must be an absolute path: " + std::string(name)});
+                               "DoH path must be an absolute path: " + std::string(name)});
         }
         if (upstream.mode == DnsTransportMode::doh3 &&
             (upstream.doh_path.empty() || upstream.doh_path.front() != '/')) {

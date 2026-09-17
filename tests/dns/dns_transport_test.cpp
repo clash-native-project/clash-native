@@ -13,25 +13,29 @@
 #include <boost/asio/ip/udp.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
+#include <boost/asio/read_until.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/write.hpp>
+
+#include <nghttp2/nghttp2.h>
 
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
 #include <openssl/x509.h>
 
-#define NGHTTP2_NO_SSIZE_T
-#include <nghttp2/nghttp2.h>
-
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <functional>
 #include <future>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -691,6 +695,228 @@ class DotDnsTestServer final {
     std::atomic_int query_count_{0};
 };
 
+class Doh1DnsTestServer final {
+  public:
+    static std::unique_ptr<Doh1DnsTestServer>
+    create(boost::asio::io_context &context, std::string content_type = "application/dns-message",
+           int status_code = 200, bool chunked = false) {
+        const auto certificate = make_test_certificate();
+        if (!certificate) {
+            return nullptr;
+        }
+        return std::unique_ptr<Doh1DnsTestServer>(
+            new Doh1DnsTestServer(context, certificate->certificate, certificate->private_key,
+                                  std::move(content_type), status_code, chunked));
+    }
+
+    boost::asio::ip::tcp::endpoint endpoint() const noexcept { return acceptor_.local_endpoint(); }
+    int connection_count() const noexcept { return connection_count_.load(); }
+    int query_count() const noexcept { return query_count_.load(); }
+    bool request_valid() const noexcept { return request_valid_.load(); }
+
+    void start() {
+        gate_->store(true, std::memory_order_release);
+        accept();
+    }
+
+    void stop() noexcept {
+        gate_->store(false, std::memory_order_release);
+        boost::system::error_code ignored;
+        acceptor_.cancel(ignored);
+        acceptor_.close(ignored);
+    }
+
+  private:
+    using Stream = boost::asio::ssl::stream<boost::asio::ip::tcp::socket>;
+
+    Doh1DnsTestServer(boost::asio::io_context &context, std::string certificate,
+                      std::string private_key, std::string content_type, int status_code,
+                      bool chunked)
+        : certificate_(std::move(certificate)), private_key_(std::move(private_key)),
+          content_type_(std::move(content_type)), status_code_(status_code), chunked_(chunked),
+          ssl_context_(boost::asio::ssl::context::tls_server), acceptor_(context),
+          gate_(std::make_shared<std::atomic_bool>(false)) {
+        boost::system::error_code error;
+        ssl_context_.use_certificate_chain(boost::asio::buffer(certificate_), error);
+        if (error) {
+            throw std::system_error(error.value(), std::system_category());
+        }
+        ssl_context_.use_private_key(boost::asio::buffer(private_key_),
+                                     boost::asio::ssl::context::pem, error);
+        if (error) {
+            throw std::system_error(error.value(), std::system_category());
+        }
+        acceptor_.open(boost::asio::ip::tcp::v4(), error);
+        if (!error) {
+            acceptor_.set_option(boost::asio::socket_base::reuse_address(true), error);
+        }
+        if (!error) {
+            acceptor_.bind({boost::asio::ip::address_v4::loopback(), 0}, error);
+        }
+        if (!error) {
+            acceptor_.listen(boost::asio::socket_base::max_listen_connections, error);
+        }
+        if (error) {
+            throw std::system_error(error.value(), std::system_category());
+        }
+    }
+
+    void accept() {
+        auto stream = std::make_shared<Stream>(acceptor_.get_executor(), ssl_context_);
+        const auto gate = gate_;
+        acceptor_.async_accept(stream->next_layer(), [this, gate, stream](
+                                                         const boost::system::error_code &error) {
+            if (!gate->load(std::memory_order_acquire) || error) {
+                return;
+            }
+            ++connection_count_;
+            accept();
+            stream->async_handshake(boost::asio::ssl::stream_base::server,
+                                    [this, gate, stream](const boost::system::error_code &error) {
+                                        if (!gate->load(std::memory_order_acquire) || error) {
+                                            return;
+                                        }
+                                        read_request(stream);
+                                    });
+        });
+    }
+
+    void read_request(const std::shared_ptr<Stream> &stream) {
+        auto request = std::make_shared<std::string>();
+        const auto gate = gate_;
+        boost::asio::async_read_until(
+            *stream, boost::asio::dynamic_buffer(*request, 64 * 1024), "\r\n\r\n",
+            [this, gate, stream, request](const boost::system::error_code &error,
+                                          std::size_t header_size) {
+                if (!gate->load(std::memory_order_acquire) || error) {
+                    return;
+                }
+                const auto header_text = request->substr(0, header_size);
+                std::istringstream headers(header_text);
+                std::string request_line;
+                std::getline(headers, request_line);
+                std::size_t content_length = 0;
+                std::string line;
+                bool has_dns_content_type = false;
+                while (std::getline(headers, line)) {
+                    if (line == "\r" || line.empty()) {
+                        break;
+                    }
+                    if (line.back() == '\r') {
+                        line.pop_back();
+                    }
+                    const auto separator = line.find(':');
+                    if (separator == std::string::npos) {
+                        continue;
+                    }
+                    auto name = line.substr(0, separator);
+                    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char value) {
+                        return static_cast<char>(std::tolower(value));
+                    });
+                    auto value = line.substr(separator + 1);
+                    if (name == "content-length") {
+                        content_length = static_cast<std::size_t>(std::stoul(value));
+                    } else if (name == "content-type") {
+                        has_dns_content_type =
+                            value.find("application/dns-message") != std::string::npos;
+                    }
+                }
+                if (content_length == 0 || content_length > 0xffff) {
+                    return;
+                }
+                const auto separator = request_line.find(' ');
+                const auto path_end = separator == std::string::npos
+                                          ? std::string::npos
+                                          : request_line.find(' ', separator + 1);
+                request_valid_.store(
+                    separator != std::string::npos && path_end != std::string::npos &&
+                        request_line.substr(0, separator) == "POST" &&
+                        request_line.substr(separator + 1, path_end - separator - 1) ==
+                            "/dns-query" &&
+                        has_dns_content_type,
+                    std::memory_order_release);
+
+                const auto buffered_body = request->size() - header_size;
+                const auto missing_body =
+                    content_length > buffered_body ? content_length - buffered_body : 0;
+                request->resize(header_size + content_length);
+                if (missing_body == 0) {
+                    handle_request(stream, request, header_size, content_length);
+                    return;
+                }
+                boost::asio::async_read(
+                    *stream,
+                    boost::asio::buffer(request->data() + header_size + buffered_body,
+                                        missing_body),
+                    boost::asio::transfer_exactly(missing_body),
+                    [this, gate, stream, request, header_size,
+                     content_length](const boost::system::error_code &read_error, std::size_t) {
+                        if (!gate->load(std::memory_order_acquire) || read_error) {
+                            return;
+                        }
+                        handle_request(stream, request, header_size, content_length);
+                    });
+            });
+    }
+
+    void handle_request(const std::shared_ptr<Stream> &stream,
+                        const std::shared_ptr<std::string> &request, std::size_t header_size,
+                        std::size_t content_length) {
+        const auto *body_data =
+            reinterpret_cast<const std::uint8_t *>(request->data() + header_size);
+        const auto query = clash_native::dns::DnsMessageCodec::decode_query(
+            std::span<const std::uint8_t>(body_data, content_length));
+        if (!query) {
+            return;
+        }
+        clash_native::dns::DnsAnswer answer;
+        answer.question = query.value().question;
+        answer.addresses.push_back(boost::asio::ip::make_address("203.0.113.10"));
+        answer.ttl_seconds = 30;
+        const auto body =
+            clash_native::dns::DnsMessageCodec::encode_response(query.value(), answer);
+        if (!body) {
+            return;
+        }
+        ++query_count_;
+
+        auto response = std::make_shared<std::string>();
+        *response = "HTTP/1.1 " + std::to_string(status_code_) +
+                    (status_code_ == 200 ? " OK\r\n" : " Bad Gateway\r\n");
+        *response += "Content-Type: " + content_type_ + "\r\n";
+        if (chunked_) {
+            std::ostringstream chunk_size;
+            chunk_size << std::hex << body.value().size();
+            *response += "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            *response += chunk_size.str() + "\r\n";
+            response->append(reinterpret_cast<const char *>(body.value().data()),
+                             body.value().size());
+            *response += "\r\n0\r\n\r\n";
+        } else {
+            *response += "Content-Length: " + std::to_string(body.value().size()) +
+                         "\r\nConnection: close\r\n\r\n";
+            response->append(reinterpret_cast<const char *>(body.value().data()),
+                             body.value().size());
+        }
+        const auto gate = gate_;
+        boost::asio::async_write(
+            *stream, boost::asio::buffer(*response),
+            [gate, stream, response](const boost::system::error_code &, std::size_t) {});
+    }
+
+    std::string certificate_;
+    std::string private_key_;
+    std::string content_type_;
+    int status_code_;
+    bool chunked_;
+    boost::asio::ssl::context ssl_context_;
+    boost::asio::ip::tcp::acceptor acceptor_;
+    std::shared_ptr<std::atomic_bool> gate_;
+    std::atomic_int connection_count_{0};
+    std::atomic_int query_count_{0};
+    std::atomic_bool request_valid_{false};
+};
+
 class Doh2DnsTestServer final {
   public:
     static std::unique_ptr<Doh2DnsTestServer> create(boost::asio::io_context &context) {
@@ -726,21 +952,21 @@ class Doh2DnsTestServer final {
         Session(Doh2DnsTestServer &owner, std::shared_ptr<Stream> stream)
             : owner_(owner), stream_(std::move(stream)), gate_(owner.gate_) {}
 
-        ~Session() { nghttp2_session_del(session_); }
-
         void start() {
             nghttp2_session_callbacks *callbacks = nullptr;
             if (nghttp2_session_callbacks_new(&callbacks) != 0) {
+                close();
                 return;
             }
             nghttp2_session_callbacks_set_on_header_callback(callbacks, &on_header);
             nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, &on_data);
             nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, &on_frame);
             nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, &on_stream_close);
-            const auto result = nghttp2_session_server_new(&session_, callbacks, this);
+            const auto result = nghttp2_session_server_new2(&session_, callbacks, this, nullptr);
             nghttp2_session_callbacks_del(callbacks);
-            if (result != 0 ||
+            if (result != 0 || session_ == nullptr ||
                 nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, nullptr, 0) != 0) {
+                close();
                 return;
             }
             send_pending();
@@ -750,88 +976,73 @@ class Doh2DnsTestServer final {
         struct StreamState {
             std::vector<std::uint8_t> request_body;
             std::vector<std::uint8_t> response_body;
-            std::vector<nghttp2_nv> response_headers;
-            std::string content_length;
             std::size_t response_offset = 0;
             bool path_received = false;
             bool request_complete = false;
             bool response_submitted = false;
         };
 
-        static int on_header(nghttp2_session *, const nghttp2_frame *frame, const uint8_t *name,
-                             size_t name_length, const uint8_t *, size_t, uint8_t,
-                             void *user_data) {
-            auto *session = static_cast<Session *>(user_data);
-            if (frame->hd.stream_id == 0) {
-                return 0;
-            }
-            auto &state = session->streams_[frame->hd.stream_id];
+        static StreamState &stream_state(Session &self, std::int32_t stream_id) {
+            auto &state = self.streams_[stream_id];
             if (!state) {
                 state = std::make_shared<StreamState>();
             }
-            if (std::string_view(reinterpret_cast<const char *>(name), name_length) == ":path") {
-                state->path_received = true;
+            return *state;
+        }
+
+        static int on_header(nghttp2_session *, const nghttp2_frame *frame,
+                             const std::uint8_t *name, std::size_t name_length,
+                             const std::uint8_t *, std::size_t, std::uint8_t, void *user_data) {
+            auto &self = *static_cast<Session *>(user_data);
+            auto &state = stream_state(self, frame->hd.stream_id);
+            if (name_length == 5 && std::memcmp(name, ":path", 5) == 0) {
+                state.path_received = true;
             }
             return 0;
         }
 
-        static int on_data(nghttp2_session *, uint8_t, int32_t stream_id, const uint8_t *data,
-                           size_t length, void *user_data) {
-            auto *session = static_cast<Session *>(user_data);
-            if (stream_id == 0) {
-                return 0;
-            }
-            auto &state = session->streams_[stream_id];
-            if (!state) {
-                state = std::make_shared<StreamState>();
-            }
-            state->request_body.insert(state->request_body.end(), data, data + length);
+        static int on_data(nghttp2_session *, std::uint8_t, std::int32_t stream_id,
+                           const std::uint8_t *data, std::size_t length, void *user_data) {
+            auto &state = stream_state(*static_cast<Session *>(user_data), stream_id);
+            state.request_body.insert(state.request_body.end(), data, data + length);
             return 0;
         }
 
         static int on_frame(nghttp2_session *, const nghttp2_frame *frame, void *user_data) {
-            auto *session = static_cast<Session *>(user_data);
-            if (frame->hd.stream_id == 0) {
-                return 0;
-            }
-            auto &state = session->streams_[frame->hd.stream_id];
-            if (!state) {
-                state = std::make_shared<StreamState>();
-            }
-            if (frame->hd.type == NGHTTP2_DATA &&
+            if ((frame->hd.type == NGHTTP2_HEADERS || frame->hd.type == NGHTTP2_DATA) &&
                 (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0) {
-                state->request_complete = true;
+                stream_state(*static_cast<Session *>(user_data), frame->hd.stream_id)
+                    .request_complete = true;
             }
             return 0;
         }
 
-        static int on_stream_close(nghttp2_session *, int32_t stream_id, uint32_t,
+        static int on_stream_close(nghttp2_session *, std::int32_t stream_id, std::uint32_t,
                                    void *user_data) {
-            auto *session = static_cast<Session *>(user_data);
-            session->streams_.erase(stream_id);
+            static_cast<Session *>(user_data)->streams_.erase(stream_id);
             return 0;
         }
 
-        static nghttp2_ssize read_response(nghttp2_session *, int32_t, uint8_t *buffer,
-                                           size_t length, uint32_t *data_flags,
+        static nghttp2_ssize read_response(nghttp2_session *, std::int32_t, std::uint8_t *buffer,
+                                           std::size_t length, std::uint32_t *flags,
                                            nghttp2_data_source *source, void *) {
-            auto *state = static_cast<StreamState *>(source->ptr);
-            const auto remaining = state->response_body.size() - state->response_offset;
-            const auto size = std::min(length, remaining);
-            if (size > 0) {
-                std::memcpy(buffer, state->response_body.data() + state->response_offset, size);
-                state->response_offset += size;
+            auto &state = *static_cast<StreamState *>(source->ptr);
+            const auto remaining = state.response_body.size() - state.response_offset;
+            const auto copied = std::min(length, remaining);
+            if (copied != 0) {
+                std::copy_n(state.response_body.data() + state.response_offset, copied, buffer);
+                state.response_offset += copied;
             }
-            if (state->response_offset == state->response_body.size()) {
-                *data_flags = NGHTTP2_DATA_FLAG_EOF;
+            if (state.response_offset == state.response_body.size()) {
+                *flags |= NGHTTP2_DATA_FLAG_EOF;
             }
-            return static_cast<nghttp2_ssize>(size);
+            return static_cast<nghttp2_ssize>(copied);
         }
 
-        static nghttp2_nv header(std::string_view name, std::string_view value) {
-            return {const_cast<uint8_t *>(reinterpret_cast<const uint8_t *>(name.data())),
-                    const_cast<uint8_t *>(reinterpret_cast<const uint8_t *>(value.data())),
-                    name.size(), value.size(), NGHTTP2_NV_FLAG_NONE};
+        static nghttp2_nv header(const char *name, const char *value) {
+            return {reinterpret_cast<std::uint8_t *>(const_cast<char *>(name)),
+                    reinterpret_cast<std::uint8_t *>(const_cast<char *>(value)), std::strlen(name),
+                    std::strlen(value), NGHTTP2_NV_FLAG_NONE};
         }
 
         void submit_responses() {
@@ -857,15 +1068,15 @@ class Doh2DnsTestServer final {
                     continue;
                 }
                 state->response_body = encoded.value();
-                state->content_length = std::to_string(state->response_body.size());
-                state->response_headers = {header(":status", "200"),
-                                           header("content-type", "application/dns-message"),
-                                           header("content-length", state->content_length)};
+                const auto content_length = std::to_string(state->response_body.size());
+                auto response_headers = std::array{
+                    header(":status", "200"), header("content-type", "application/dns-message"),
+                    header("content-length", content_length.c_str())};
                 nghttp2_data_provider2 provider{};
                 provider.source.ptr = state.get();
                 provider.read_callback = &read_response;
-                if (nghttp2_submit_response2(session_, stream_id, state->response_headers.data(),
-                                             state->response_headers.size(), &provider) == 0) {
+                if (nghttp2_submit_response2(session_, stream_id, response_headers.data(),
+                                             response_headers.size(), &provider) == 0) {
                     state->response_submitted = true;
                     ++owner_.query_count_;
                 }
@@ -876,17 +1087,24 @@ class Doh2DnsTestServer final {
             if (session_ == nullptr || write_in_progress_) {
                 return;
             }
-            const uint8_t *data = nullptr;
-            const auto size = nghttp2_session_mem_send2(session_, &data);
-            if (size <= 0) {
-                if (size < 0) {
+            pending_write_.clear();
+            for (;;) {
+                const std::uint8_t *serialized = nullptr;
+                const auto length = nghttp2_session_mem_send2(session_, &serialized);
+                if (length < 0) {
                     close();
-                } else {
-                    read_request();
+                    return;
                 }
+                if (length == 0) {
+                    break;
+                }
+                pending_write_.insert(pending_write_.end(), serialized,
+                                      serialized + static_cast<std::size_t>(length));
+            }
+            if (pending_write_.empty()) {
+                read_request();
                 return;
             }
-            pending_write_.assign(data, data + size);
             write_in_progress_ = true;
             auto self = shared_from_this();
             boost::asio::async_write(*stream_, boost::asio::buffer(pending_write_),
@@ -922,7 +1140,7 @@ class Doh2DnsTestServer final {
                     }
                     const auto consumed =
                         nghttp2_session_mem_recv2(self->session_, self->read_buffer_.data(), size);
-                    if (consumed < 0) {
+                    if (consumed < 0 || static_cast<std::size_t>(consumed) != size) {
                         self->close();
                         return;
                     }
@@ -939,13 +1157,20 @@ class Doh2DnsTestServer final {
 
         Doh2DnsTestServer &owner_;
         std::shared_ptr<Stream> stream_;
+        nghttp2_session *session_ = nullptr;
         std::array<std::uint8_t, 16384> read_buffer_{};
         std::vector<std::uint8_t> pending_write_;
         std::shared_ptr<std::atomic_bool> gate_;
-        nghttp2_session *session_ = nullptr;
         std::unordered_map<std::int32_t, std::shared_ptr<StreamState>> streams_;
         bool write_in_progress_ = false;
         bool read_in_progress_ = false;
+
+      public:
+        ~Session() {
+            if (session_ != nullptr) {
+                nghttp2_session_del(session_);
+            }
+        }
     };
 
     Doh2DnsTestServer(boost::asio::io_context &context, std::string certificate,
@@ -1838,6 +2063,46 @@ TEST(DnsTransportTest, ExchangesOverDotWithTlsAndTcpFraming) {
     runtime.stop();
 }
 
+TEST(DnsTransportTest, RejectsUntrustedDotCertificate) {
+    clash_native::runtime::AsioRuntime runtime;
+    auto server = DotDnsTestServer::create(runtime.context());
+    ASSERT_NE(server, nullptr);
+    server->start();
+    runtime.start();
+
+    clash_native::dns::DnsUpstreamConfig config;
+    config.endpoint = {boost::asio::ip::address_v4::loopback(), 53};
+    config.tcp_endpoint = server->endpoint();
+    config.mode = clash_native::dns::DnsTransportMode::dot;
+    config.server_name = "localhost";
+    config.verify_peer = true;
+    const auto transport = clash_native::dns::make_asio_dns_transport(runtime, config);
+
+    const auto encoded = clash_native::dns::DnsMessageCodec::encode_query_packet(
+        {"dot-untrusted.example", clash_native::dns::DnsRecordType::a, 1}, 0x1244);
+    ASSERT_TRUE(encoded);
+    const auto query = clash_native::dns::DnsMessageCodec::decode_packet(encoded.value());
+    ASSERT_TRUE(query);
+
+    auto done =
+        std::make_shared<std::promise<clash_native::core::Result<clash_native::dns::DnsPacket>>>();
+    auto future = done->get_future();
+    transport->exchange({query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(2)},
+                        [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
+                            done->set_value(std::move(result));
+                        });
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    const auto result = future.get();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::carrier_handshake);
+    EXPECT_EQ(server->query_count(), 0);
+
+    transport->stop();
+    server->stop();
+    runtime.stop();
+}
+
 TEST(DnsTransportTest, ReusesDotTlsSessionForMultipleExchanges) {
     clash_native::runtime::AsioRuntime runtime;
     auto server = DotDnsTestServer::create(runtime.context());
@@ -1902,6 +2167,134 @@ TEST(DnsTransportTest, ReusesDotTlsSessionForMultipleExchanges) {
     runtime.stop();
 }
 
+TEST(DnsTransportTest, ExchangesOverDoh1WithContentLengthAndChunkedResponses) {
+    for (const bool chunked : {false, true}) {
+        clash_native::runtime::AsioRuntime runtime;
+        auto server =
+            Doh1DnsTestServer::create(runtime.context(), "application/dns-message", 200, chunked);
+        ASSERT_NE(server, nullptr);
+        server->start();
+        runtime.start();
+
+        clash_native::dns::DnsUpstreamConfig config;
+        config.endpoint = {boost::asio::ip::address_v4::loopback(), 443};
+        config.tcp_endpoint = server->endpoint();
+        config.mode = clash_native::dns::DnsTransportMode::doh1;
+        config.server_name = "localhost";
+        config.doh_path = "/dns-query";
+        config.verify_peer = false;
+        const auto transport = clash_native::dns::make_asio_dns_transport(runtime, config);
+
+        const auto encoded = clash_native::dns::DnsMessageCodec::encode_query_packet(
+            {"doh1.example", clash_native::dns::DnsRecordType::a, 1}, 0x5410);
+        ASSERT_TRUE(encoded);
+        const auto query = clash_native::dns::DnsMessageCodec::decode_packet(encoded.value());
+        ASSERT_TRUE(query);
+        auto done = std::make_shared<
+            std::promise<clash_native::core::Result<clash_native::dns::DnsPacket>>>();
+        auto future = done->get_future();
+        transport->exchange(
+            {query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(3)},
+            [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
+                done->set_value(std::move(result));
+            });
+
+        ASSERT_EQ(future.wait_for(std::chrono::seconds(4)), std::future_status::ready);
+        const auto result = future.get();
+        ASSERT_TRUE(result) << (result ? "" : result.error().context);
+        ASSERT_EQ(result.value().answers.size(), 1U);
+        EXPECT_EQ(result.value().answers.front().rdata,
+                  (std::vector<std::uint8_t>{203, 0, 113, 10}));
+        EXPECT_TRUE(server->request_valid());
+        EXPECT_EQ(server->query_count(), 1);
+
+        transport->stop();
+        server->stop();
+        runtime.stop();
+    }
+}
+
+TEST(DnsTransportTest, RejectsInvalidDoh1StatusAndContentType) {
+    const std::array<std::pair<std::string, int>, 2> invalid_responses = {
+        std::pair{"application/dns-message", 502}, std::pair{"text/plain", 200}};
+    for (const auto &[content_type, status_code] : invalid_responses) {
+        clash_native::runtime::AsioRuntime runtime;
+        auto server = Doh1DnsTestServer::create(runtime.context(), content_type, status_code);
+        ASSERT_NE(server, nullptr);
+        server->start();
+        runtime.start();
+
+        clash_native::dns::DnsUpstreamConfig config;
+        config.endpoint = {boost::asio::ip::address_v4::loopback(), 443};
+        config.tcp_endpoint = server->endpoint();
+        config.mode = clash_native::dns::DnsTransportMode::doh1;
+        config.server_name = "localhost";
+        config.verify_peer = false;
+        const auto transport = clash_native::dns::make_asio_dns_transport(runtime, config);
+        const auto encoded = clash_native::dns::DnsMessageCodec::encode_query_packet(
+            {"doh1-invalid.example", clash_native::dns::DnsRecordType::a, 1}, 0x5411);
+        ASSERT_TRUE(encoded);
+        const auto query = clash_native::dns::DnsMessageCodec::decode_packet(encoded.value());
+        ASSERT_TRUE(query);
+        auto done = std::make_shared<
+            std::promise<clash_native::core::Result<clash_native::dns::DnsPacket>>>();
+        auto future = done->get_future();
+        transport->exchange(
+            {query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(3)},
+            [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
+                done->set_value(std::move(result));
+            });
+
+        ASSERT_EQ(future.wait_for(std::chrono::seconds(4)), std::future_status::ready);
+        const auto result = future.get();
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::protocol_framing);
+        EXPECT_EQ(server->query_count(), 1);
+
+        transport->stop();
+        server->stop();
+        runtime.stop();
+    }
+}
+
+TEST(DnsTransportTest, RejectsUntrustedDoh1Certificate) {
+    clash_native::runtime::AsioRuntime runtime;
+    auto server = Doh1DnsTestServer::create(runtime.context());
+    ASSERT_NE(server, nullptr);
+    server->start();
+    runtime.start();
+
+    clash_native::dns::DnsUpstreamConfig config;
+    config.endpoint = {boost::asio::ip::address_v4::loopback(), 443};
+    config.tcp_endpoint = server->endpoint();
+    config.mode = clash_native::dns::DnsTransportMode::doh1;
+    config.server_name = "localhost";
+    config.verify_peer = true;
+    const auto transport = clash_native::dns::make_asio_dns_transport(runtime, config);
+    const auto encoded = clash_native::dns::DnsMessageCodec::encode_query_packet(
+        {"doh1-untrusted.example", clash_native::dns::DnsRecordType::a, 1}, 0x5412);
+    ASSERT_TRUE(encoded);
+    const auto query = clash_native::dns::DnsMessageCodec::decode_packet(encoded.value());
+    ASSERT_TRUE(query);
+    auto done =
+        std::make_shared<std::promise<clash_native::core::Result<clash_native::dns::DnsPacket>>>();
+    auto future = done->get_future();
+    transport->exchange({query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(3)},
+                        [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
+                            done->set_value(std::move(result));
+                        });
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(4)), std::future_status::ready);
+    const auto result = future.get();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::carrier_handshake);
+    EXPECT_EQ(server->query_count(), 0);
+
+    transport->stop();
+    server->stop();
+    runtime.stop();
+}
+
 TEST(DnsTransportTest, ExchangesOverDoh2WithHttp2AndDnsMediaType) {
     clash_native::runtime::AsioRuntime runtime;
     auto server = Doh2DnsTestServer::create(runtime.context());
@@ -1943,6 +2336,47 @@ TEST(DnsTransportTest, ExchangesOverDoh2WithHttp2AndDnsMediaType) {
 
     ASSERT_EQ(future.wait_for(std::chrono::seconds(3)), std::future_status::ready);
     EXPECT_EQ(dialer_calls->load(), 1);
+    transport->stop();
+    server->stop();
+    runtime.stop();
+}
+
+TEST(DnsTransportTest, RejectsUntrustedDoh2Certificate) {
+    clash_native::runtime::AsioRuntime runtime;
+    auto server = Doh2DnsTestServer::create(runtime.context());
+    ASSERT_NE(server, nullptr);
+    server->start();
+    runtime.start();
+
+    clash_native::dns::DnsUpstreamConfig config;
+    config.endpoint = {boost::asio::ip::address_v4::loopback(), 443};
+    config.tcp_endpoint = server->endpoint();
+    config.mode = clash_native::dns::DnsTransportMode::doh2;
+    config.server_name = "localhost";
+    config.doh_path = "/dns-query";
+    config.verify_peer = true;
+    const auto transport = clash_native::dns::make_asio_dns_transport(runtime, config);
+
+    const auto encoded = clash_native::dns::DnsMessageCodec::encode_query_packet(
+        {"doh2-untrusted.example", clash_native::dns::DnsRecordType::a, 1}, 0x2355);
+    ASSERT_TRUE(encoded);
+    const auto query = clash_native::dns::DnsMessageCodec::decode_packet(encoded.value());
+    ASSERT_TRUE(query);
+
+    auto done =
+        std::make_shared<std::promise<clash_native::core::Result<clash_native::dns::DnsPacket>>>();
+    auto future = done->get_future();
+    transport->exchange({query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(2)},
+                        [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
+                            done->set_value(std::move(result));
+                        });
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    const auto result = future.get();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::carrier_handshake);
+    EXPECT_EQ(server->query_count(), 0);
+
     transport->stop();
     server->stop();
     runtime.stop();
@@ -2009,7 +2443,7 @@ TEST(DnsTransportTest, MultiplexesDoh2ExchangesOnOneHttp2Session) {
     runtime.stop();
 }
 
-TEST(DnsTransportTest, ReportsQuicDnsAsUnsupportedUntilTheQuicheFoundationExists) {
+TEST(DnsTransportTest, FailsWhenQuicDnsUpstreamIsUnavailable) {
     clash_native::runtime::AsioRuntime runtime;
     runtime.start();
 
@@ -2034,8 +2468,9 @@ TEST(DnsTransportTest, ReportsQuicDnsAsUnsupportedUntilTheQuicheFoundationExists
     ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     const auto result = future.get();
     ASSERT_FALSE(result);
-    EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::unsupported);
-    EXPECT_NE(result.error().context.find("QUICHE"), std::string::npos);
+    EXPECT_TRUE(result.error().code == clash_native::core::ErrorCode::timeout ||
+                result.error().code == clash_native::core::ErrorCode::transport_io)
+        << result.error().context;
 
     transport->stop();
     runtime.stop();

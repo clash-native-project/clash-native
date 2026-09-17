@@ -22,6 +22,10 @@ TEST(ConnectionRegistryTest, TracksAndSnapshotsConnectionMetadata) {
 
     ASSERT_TRUE(registry.update_outbound(id, "group-a"));
     EXPECT_EQ(registry.find(id)->outbound_id, "group-a");
+    ASSERT_TRUE(registry.update_stats(id, 123, 456));
+    EXPECT_EQ(registry.find(id)->left_to_right_bytes, 123U);
+    EXPECT_EQ(registry.find(id)->right_to_left_bytes, 456U);
+    EXPECT_FALSE(registry.update_stats(id + 1, 1, 1));
     EXPECT_EQ(registry.snapshot().size(), 1U);
     EXPECT_TRUE(registry.remove(id));
     EXPECT_FALSE(registry.find(id));
