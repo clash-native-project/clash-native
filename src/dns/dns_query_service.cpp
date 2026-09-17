@@ -18,12 +18,19 @@ namespace clash_native::dns {
 
 namespace {
 
-std::string cache_key(const DnsQuestion &question, std::string_view upstream_group,
+std::string cache_key(const DnsPacket &query, std::string_view upstream_group,
                       std::uint64_t generation) {
-    return normalize_name(question.name) + "|" +
-           std::to_string(static_cast<std::uint16_t>(question.type)) + "|" +
-           std::to_string(question.class_code) + "|" + std::string(upstream_group) + "|" +
-           std::to_string(generation);
+    auto key = query.wire;
+    if (key.size() >= 2) {
+        key[0] = 0;
+        key[1] = 0;
+    }
+    std::string result(reinterpret_cast<const char *>(key.data()), key.size());
+    const auto group_size = static_cast<std::uint64_t>(upstream_group.size());
+    result.append(reinterpret_cast<const char *>(&group_size), sizeof(group_size));
+    result.append(upstream_group.data(), upstream_group.size());
+    result.append(reinterpret_cast<const char *>(&generation), sizeof(generation));
+    return result;
 }
 
 core::Error cancelled_error() { return {core::ErrorCode::cancelled, "DNS query was cancelled"}; }
@@ -41,17 +48,25 @@ std::optional<std::chrono::seconds> cache_ttl(const DnsPacket &packet,
     if (packet.response_code() == 3 || (packet.response_code() == 0 && packet.answers.empty())) {
         auto ttl = negative_cache_ttl.count();
         for (const auto &record : packet.authorities) {
-            if (record.type != static_cast<std::uint16_t>(DnsRecordType::soa) ||
-                record.rdata.size() < 4) {
+            if (record.type != static_cast<std::uint16_t>(DnsRecordType::soa)) {
                 continue;
             }
-            const auto minimum =
-                (static_cast<std::uint32_t>(record.rdata[record.rdata.size() - 4]) << 24) |
-                (static_cast<std::uint32_t>(record.rdata[record.rdata.size() - 3]) << 16) |
-                (static_cast<std::uint32_t>(record.rdata[record.rdata.size() - 2]) << 8) |
-                static_cast<std::uint32_t>(record.rdata.back());
+            std::optional<std::uint32_t> minimum;
+            if (record.soa) {
+                minimum = record.soa->minimum_ttl;
+            }
+            if (!minimum && record.rdata.size() >= 4) {
+                minimum =
+                    (static_cast<std::uint32_t>(record.rdata[record.rdata.size() - 4]) << 24) |
+                    (static_cast<std::uint32_t>(record.rdata[record.rdata.size() - 3]) << 16) |
+                    (static_cast<std::uint32_t>(record.rdata[record.rdata.size() - 2]) << 8) |
+                    static_cast<std::uint32_t>(record.rdata.back());
+            }
+            if (!minimum) {
+                continue;
+            }
             ttl = std::min<std::int64_t>(ttl, record.ttl_seconds);
-            ttl = std::min<std::int64_t>(ttl, minimum);
+            ttl = std::min<std::int64_t>(ttl, *minimum);
         }
         if (ttl <= 0) {
             return std::nullopt;
@@ -437,7 +452,7 @@ void DnsQueryService::query_on_owner(RequestId request_id, DnsPacket packet, Han
         }
     }
 
-    const auto key = cache_key(question, upstream_group, config_.cache_generation);
+    const auto key = cache_key(packet, upstream_group, config_.cache_generation);
     const auto now = std::chrono::steady_clock::now();
     if (const auto cached = cache_.find(key); cached != cache_.end()) {
         if (cached->second.expires > now) {

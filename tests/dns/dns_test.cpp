@@ -36,22 +36,31 @@ void append_u16(std::vector<std::uint8_t> &message, std::uint16_t value) {
 
 std::vector<std::uint8_t> response_for(std::span<const std::uint8_t> query, bool truncated,
                                        bool mismatched_question = false) {
-    std::vector<std::uint8_t> response(query.begin(), query.end());
-    if (mismatched_question && response.size() > 13) {
-        response[13] ^= 1;
-    }
-    response[2] = truncated ? 0x83 : 0x81;
-    response[3] = 0x80;
-    response[6] = 0;
-    response[7] = truncated ? 0 : 1;
     if (truncated) {
+        std::vector<std::uint8_t> response(query.begin(), query.end());
+        response[2] = 0x83;
+        response[3] = 0x80;
+        response[6] = 0;
+        response[7] = 0;
         return response;
     }
 
-    response.insert(response.end(), {0xc0, 0x0c});
-    append_u16(response, 1);
-    append_u16(response, 1);
-    response.insert(response.end(), {0, 0, 0, 60, 0, 4, 192, 0, 2, 1});
+    const auto packet = clash_native::dns::DnsMessageCodec::decode_packet(query);
+    if (!packet) {
+        return {};
+    }
+    clash_native::dns::DnsAnswer answer;
+    answer.question = packet.value().questions.front();
+    answer.addresses.push_back(boost::asio::ip::make_address("192.0.2.1"));
+    answer.ttl_seconds = 60;
+    auto encoded = clash_native::dns::DnsMessageCodec::encode_response(packet.value(), answer);
+    if (!encoded) {
+        return {};
+    }
+    auto response = std::move(encoded.value());
+    if (mismatched_question && response.size() > 13) {
+        response[13] ^= 1;
+    }
     return response;
 }
 
@@ -179,7 +188,7 @@ TEST(DnsCodecTest, EncodesAndDecodesIpv4Answers) {
 
     const auto response = response_for(query.value(), false);
     const auto decoded = clash_native::dns::DnsMessageCodec::decode_response(response, 0x1234);
-    ASSERT_TRUE(decoded);
+    ASSERT_TRUE(decoded) << (decoded ? "" : decoded.error().context);
     EXPECT_EQ(decoded.value().question.name, "example.com");
     ASSERT_EQ(decoded.value().addresses.size(), 1U);
     EXPECT_EQ(decoded.value().addresses.front().to_string(), "192.0.2.1");
@@ -225,7 +234,7 @@ TEST(DnsCodecTest, DecodesQueriesAndEncodesResponses) {
     ASSERT_TRUE(response);
     const auto decoded =
         clash_native::dns::DnsMessageCodec::decode_response(response.value(), 0x4321);
-    ASSERT_TRUE(decoded);
+    ASSERT_TRUE(decoded) << (decoded ? "" : decoded.error().context);
     ASSERT_EQ(decoded.value().addresses.size(), 1U);
     EXPECT_EQ(decoded.value().addresses.front().to_string(), "198.51.100.7");
 }
@@ -295,6 +304,59 @@ TEST(ResolverServiceTest, CoalescesEquivalentQueriesAndCachesTheAnswer) {
     ASSERT_EQ(cached_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
     EXPECT_EQ(server.tcp_queries(), 1);
 
+    server.stop();
+    runtime.stop();
+}
+
+TEST(ResolverServiceTest, SeparatesCacheEntriesByEdnsSemanticsButIgnoresTransactionId) {
+    clash_native::runtime::AsioRuntime runtime;
+    DnsTestServer server(runtime.context(), false);
+    server.start();
+    clash_native::dns::ResolverService resolver(
+        runtime, {server.endpoint(), std::chrono::milliseconds(500)});
+    runtime.start();
+
+    const auto make_edns_query = [](std::uint16_t id, bool dnssec_ok) {
+        auto wire = clash_native::dns::DnsMessageCodec::encode_query_packet(
+                        {"semantic-cache.example", clash_native::dns::DnsRecordType::a, 1}, id)
+                        .value();
+        wire[10] = 0;
+        wire[11] = 1;
+        wire.push_back(0);
+        append_u16(wire, static_cast<std::uint16_t>(clash_native::dns::DnsRecordType::opt));
+        append_u16(wire, 1232);
+        append_u16(wire, 0);
+        append_u16(wire, dnssec_ok ? 0x8000 : 0);
+        append_u16(wire, 0);
+        return clash_native::dns::DnsMessageCodec::decode_packet(wire, id);
+    };
+    const auto query_without_do = make_edns_query(0x1234, false);
+    const auto query_with_do = make_edns_query(0x2345, true);
+    const auto query_with_do_and_new_id = make_edns_query(0x3456, true);
+    ASSERT_TRUE(query_without_do);
+    ASSERT_TRUE(query_with_do);
+    ASSERT_TRUE(query_with_do_and_new_id);
+
+    const auto run_query = [&resolver](clash_native::dns::DnsPacket packet) {
+        auto done = std::make_shared<std::promise<void>>();
+        auto future = done->get_future();
+        resolver.query_service().query(
+            std::move(packet),
+            [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
+                EXPECT_TRUE(result) << (result ? "" : result.error().context);
+                done->set_value();
+            });
+        EXPECT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    };
+
+    run_query(query_without_do.value());
+    run_query(query_with_do.value());
+    EXPECT_EQ(server.udp_queries(), 2);
+    run_query(query_with_do_and_new_id.value());
+    EXPECT_EQ(server.udp_queries(), 2);
+    EXPECT_EQ(resolver.cache_size(), 2U);
+
+    resolver.stop();
     server.stop();
     runtime.stop();
 }

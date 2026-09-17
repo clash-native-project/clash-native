@@ -12,6 +12,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(boost_asio CONFIG REQUIRED)
 find_package(boost_beast CONFIG REQUIRED)
+find_package(c-ares CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 find_package(OpenSSL CONFIG REQUIRED)
 find_package(nghttp3 CONFIG REQUIRED)
@@ -150,6 +151,7 @@ target_link_libraries(clash-native-core
         tl::expected
     PRIVATE
         Boost::beast
+        c-ares::cares
         clash-native-boringssl
         clash-native-nghttp2
         ngtcp2_static

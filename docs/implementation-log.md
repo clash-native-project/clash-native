@@ -693,3 +693,39 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Added regression coverage proving an invalid DNS transport enum is rejected before querying.
 
 - Applied clang-format after the DNS enum configuration validation changes; third-party sources remained excluded.
+
+### 2026-09-17 — Stage 2 DNS parser and transport validation
+
+- Added c-ares through the vcpkg manifest and replaced handwritten DNS wire-message decoding with c-ares while preserving the original packet bytes, unknown record data, EDNS options, and SOA negative-cache TTL data.
+- Fixed DoQ stream FIN submission and added FakeIP, domain routing, and runtime snapshot reload regression coverage. Improved Windows allocation of shared UDP/TCP ports in the independent Go interop tests.
+- Validated the Windows x64 clang-cl/MSVC build with 109/109 CTest cases and the uncached Go interop suite against independent dnsproxy, including successful DoQ and DoH3 queries.
+
+### 2026-09-17 — c-ares typed address results
+
+- Kept A and AAAA values in the project DNS packet model as typed addresses obtained through c-ares RR getters, so address-answer projection no longer reparses the raw RDATA bytes.
+- Mapped c-ares typed fields for SOA, MX, TXT, and SRV records into the project packet model, with regression coverage for those record types.
+- Rebuilt with Windows x64 clang-cl/MSVC; all 110 CTest cases and the uncached Go interop suite passed.
+
+### 2026-09-17 — Generic c-ares resource record fields
+
+- Exposed every c-ares-supported RR field through a generic DNS packet model, including numeric, name, binary, repeated binary, and option values while retaining convenience fields for common records.
+- Added explicit SVCB, HTTPS, TLSA, NAPTR, HINFO, URI, CAA, and arbitrary numeric query-type support, with regression coverage for HTTPS service parameters and unknown RR fields.
+- Validated the Windows x64 clang-cl/MSVC build with 112/112 CTest cases and the uncached Go interop suite against independent dnsproxy, including DoQ and DoH3.
+
+### 2026-09-17 — Public encrypted DNS interoperability test
+
+- Extended the test host endpoint syntax to select DoT and DoH/2, and added an opt-in Go black-box test that sends independent DNS queries through Google and Cloudflare DoT/DoH plus Quad9 DoQ/DoH3 public resolvers.
+- Validated Windows x64 with clang-cl/MSVC: Google DoT/DoH2, Cloudflare DoH1, and Quad9 DoQ/DoH3 all returned a successful `example.com` A answer through the independent Go client. The public test stays disabled in normal runs unless `CLASH_NATIVE_DNS_LIVE=1` is set.
+
+### 2026-09-17 — DNS response correctness and QUIC session reuse
+
+- Enforced DoQ's zero DNS Message ID on the wire and restored the caller's ID after validating the response; expanded independent Go DoQ/DoH3 integration coverage to sequential reuse and parallel queries.
+- Changed DNS cache and in-flight keys to include the full query message except transaction ID, retaining upstream-group and generation isolation.
+- Preserved 12-bit extended response codes and query EDNS data in local error and FakeIP responses. Added c-ares based UDP RRset truncation that sets TC and respects the client's EDNS payload size (512 bytes when EDNS is absent).
+- Added a bounded idle QUIC session pool for sequential DoQ/DoH3 requests; connections retire after 30 seconds idle or on transport failure.
+- Validated with the Windows x64 clang-cl/MSVC build, CTest, uncached Go interoperability tests against independent dnsproxy, and public encrypted DNS upstream tests.
+
+### 2026-09-17 — Roadmap milestone sequencing
+
+- Moved DoQ and DoH over HTTP/3 implementation and validation into the Stage 2 DNS milestone, including the minimum QUIC/HTTP/3 foundation required by those DNS transports.
+- Kept Stage 4 focused on generalizing and validating QUIC for proxy protocols, and moved the user-facing CLI and configuration-file interface to Stage 7.

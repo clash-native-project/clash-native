@@ -112,8 +112,9 @@ class TcpDnsUpstream final {
 
 class UdpDnsUpstream final {
   public:
-    explicit UdpDnsUpstream(boost::asio::io_context &context)
-        : socket_(context, {boost::asio::ip::address_v4::loopback(), 0}) {}
+    explicit UdpDnsUpstream(boost::asio::io_context &context, std::size_t answer_count = 1)
+        : socket_(context, {boost::asio::ip::address_v4::loopback(), 0}),
+          answer_count_(answer_count) {}
 
     boost::asio::ip::udp::endpoint endpoint() const noexcept { return socket_.local_endpoint(); }
 
@@ -140,7 +141,9 @@ class UdpDnsUpstream final {
                 }
                 clash_native::dns::DnsAnswer answer;
                 answer.question = query.value().questions.front();
-                answer.addresses.push_back(boost::asio::ip::make_address("198.51.100.9"));
+                for (std::size_t index = 0; index < answer_count_; ++index) {
+                    answer.addresses.push_back(boost::asio::ip::make_address("198.51.100.9"));
+                }
                 answer.ttl_seconds = 10;
                 const auto response = clash_native::dns::DnsMessageCodec::encode_response(
                     {query.value().id, answer.question, query.value().recursion_desired()}, answer);
@@ -156,6 +159,7 @@ class UdpDnsUpstream final {
     boost::asio::ip::udp::socket socket_;
     boost::asio::ip::udp::endpoint sender_;
     std::array<std::uint8_t, 65535> query_buffer_{};
+    std::size_t answer_count_;
 };
 
 } // namespace
@@ -261,6 +265,45 @@ TEST(DnsServerTest, ForwardsUdpQueriesToResolverService) {
 
     client.close(error);
     ASSERT_FALSE(error) << error.message();
+    server.stop();
+    upstream.stop();
+    runtime.stop();
+}
+
+TEST(DnsServerTest, TruncatesOversizedUdpAnswersToTheClientsAdvertisedLimit) {
+    clash_native::runtime::AsioRuntime runtime;
+    UdpDnsUpstream upstream(runtime.context(), 80);
+    upstream.start();
+    clash_native::dns::ResolverService resolver(
+        runtime, {upstream.endpoint(), std::chrono::milliseconds(500)});
+    clash_native::dns::DnsServer server(runtime, resolver);
+    ASSERT_TRUE(server.start());
+    runtime.start();
+
+    boost::asio::ip::udp::socket client(runtime.context());
+    boost::system::error_code error;
+    client.open(boost::asio::ip::udp::v4(), error);
+    ASSERT_FALSE(error) << error.message();
+    client.bind({boost::asio::ip::address_v4::loopback(), 0}, error);
+    ASSERT_FALSE(error) << error.message();
+    const auto query = clash_native::dns::DnsMessageCodec::encode_query(
+        {"oversized.local.example", clash_native::dns::DnsRecordType::a, 1}, 0x3344);
+    ASSERT_TRUE(query);
+    client.send_to(boost::asio::buffer(query.value()), server.udp_endpoint(), 0, error);
+    ASSERT_FALSE(error) << error.message();
+
+    std::array<std::uint8_t, 65535> response{};
+    boost::asio::ip::udp::endpoint sender;
+    const auto size = client.receive_from(boost::asio::buffer(response), sender, 0, error);
+    ASSERT_FALSE(error) << error.message();
+    EXPECT_LE(size, 512U);
+    const auto packet = clash_native::dns::DnsMessageCodec::decode_packet(
+        std::span<const std::uint8_t>(response.data(), size), 0x3344);
+    ASSERT_TRUE(packet);
+    EXPECT_TRUE(packet.value().truncated());
+    EXPECT_TRUE(packet.value().answers.empty());
+
+    client.close(error);
     server.stop();
     upstream.stop();
     runtime.stop();

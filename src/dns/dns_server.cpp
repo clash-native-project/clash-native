@@ -26,6 +26,25 @@ core::Error listener_error(std::string operation, const boost::system::error_cod
             std::error_code(error.value(), std::system_category())};
 }
 
+std::size_t udp_payload_limit(const DnsPacket &query) {
+    const auto opt = std::find_if(
+        query.additionals.begin(), query.additionals.end(), [](const DnsResourceRecord &record) {
+            return record.type == static_cast<std::uint16_t>(DnsRecordType::opt);
+        });
+    if (opt == query.additionals.end()) {
+        return 512;
+    }
+    return std::max<std::size_t>(512, opt->class_code);
+}
+
+core::Result<std::vector<std::uint8_t>>
+limit_udp_response(const DnsPacket &query, core::Result<std::vector<std::uint8_t>> response) {
+    if (!response) {
+        return core::fail(response.error());
+    }
+    return DnsMessageCodec::truncate_udp_response(response.value(), udp_payload_limit(query));
+}
+
 std::optional<core::Result<std::vector<std::uint8_t>>>
 fake_ip_response(const DnsPacket &query, const std::shared_ptr<FakeIpStore> &store,
                  const std::function<bool(std::string_view)> &filter) {
@@ -39,12 +58,11 @@ fake_ip_response(const DnsPacket &query, const std::shared_ptr<FakeIpStore> &sto
         return DnsMessageCodec::encode_error_response(query, 2);
     }
 
-    const DnsQuery legacy_query{query.id, query.questions.front(), query.recursion_desired()};
     DnsAnswer answer;
     answer.question = query.questions.front();
     answer.addresses.push_back(address.value());
     answer.ttl_seconds = 60;
-    return DnsMessageCodec::encode_response(legacy_query, answer);
+    return DnsMessageCodec::encode_response(query, answer);
 }
 
 } // namespace
@@ -271,10 +289,11 @@ void DnsServer::close_tcp_socket(
 void DnsServer::resolve_udp(DnsPacket query, boost::asio::ip::udp::endpoint sender) {
     const auto gate = callback_gate_;
     if (const auto fake_response = fake_ip_response(query, fake_ip_store_, fake_ip_filter_)) {
-        if (!*fake_response || fake_response->value().size() > 0xffff) {
+        const auto response = limit_udp_response(query, *fake_response);
+        if (!response || response.value().size() > 0xffff) {
             return;
         }
-        auto payload = std::make_shared<std::vector<std::uint8_t>>(fake_response->value());
+        auto payload = std::make_shared<std::vector<std::uint8_t>>(response.value());
         udp_socket_.async_send_to(boost::asio::buffer(*payload), sender,
                                   [payload](const boost::system::error_code &, std::size_t) {});
         return;
@@ -289,9 +308,9 @@ void DnsServer::resolve_udp(DnsPacket query, boost::asio::ip::udp::endpoint send
                 return;
             }
             query_requests_.erase(*request_id);
-            const auto response = result
-                                      ? core::Result<std::vector<std::uint8_t>>(result.value().wire)
-                                      : DnsMessageCodec::encode_error_response(query, 2);
+            const auto response = limit_udp_response(
+                query, result ? core::Result<std::vector<std::uint8_t>>(result.value().wire)
+                              : DnsMessageCodec::encode_error_response(query, 2));
             if (!response || response.value().size() > 0xffff) {
                 return;
             }

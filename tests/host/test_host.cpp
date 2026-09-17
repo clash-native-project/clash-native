@@ -47,8 +47,12 @@ std::optional<clash_native::dns::DnsUpstreamConfig> parse_upstream_config(const 
     const auto scheme_separator = text.find("://");
     if (scheme_separator != std::string_view::npos) {
         const auto scheme = text.substr(0, scheme_separator);
-        if (scheme == "doh1") {
+        if (scheme == "dot") {
+            mode = clash_native::dns::DnsTransportMode::dot;
+        } else if (scheme == "doh1") {
             mode = clash_native::dns::DnsTransportMode::doh1;
+        } else if (scheme == "doh2") {
+            mode = clash_native::dns::DnsTransportMode::doh2;
         } else if (scheme == "doq") {
             mode = clash_native::dns::DnsTransportMode::doq;
         } else if (scheme == "doh3") {
@@ -61,6 +65,7 @@ std::optional<clash_native::dns::DnsUpstreamConfig> parse_upstream_config(const 
 
     std::string doh_path = "/dns-query";
     if (mode == clash_native::dns::DnsTransportMode::doh1 ||
+        mode == clash_native::dns::DnsTransportMode::doh2 ||
         mode == clash_native::dns::DnsTransportMode::doh3) {
         const auto path_separator = text.find('/');
         if (path_separator != std::string_view::npos) {
@@ -110,6 +115,7 @@ std::optional<clash_native::dns::DnsUpstreamConfig> parse_upstream_config(const 
     config.server_name = std::string(host);
     config.doh_path = std::move(doh_path);
     if (mode == clash_native::dns::DnsTransportMode::doh1 ||
+        mode == clash_native::dns::DnsTransportMode::doh2 ||
         mode == clash_native::dns::DnsTransportMode::doh3) {
         config.doh_authority = std::string(host);
         if (port != 443) {
@@ -140,8 +146,9 @@ int main(int argc, char **) {
             upstream_text) {
             auto upstream = parse_upstream_config(upstream_text->c_str());
             if (!upstream) {
-                throw std::runtime_error("CLASH_NATIVE_DNS_UPSTREAM must be address:port or a "
-                                         "supported doh1://, doq://, or doh3:// endpoint");
+                throw std::runtime_error(
+                    "CLASH_NATIVE_DNS_UPSTREAM must be address:port or a supported "
+                    "dot://, doh1://, doh2://, doq://, or doh3:// endpoint");
             }
             if (const auto verify_peer = environment_value("CLASH_NATIVE_DNS_VERIFY_PEER");
                 verify_peer &&

@@ -1520,9 +1520,9 @@ DNS implementation proceeds in independently testable milestones:
    graph.
 4. Add DoT and DoH over HTTP/2 after reusable TLS and HTTP/2 carriers can run
    over an injected `StreamHandle`.
-5. Add DoQ and DoH over HTTP/3 only after the Asio/ngtcp2 adapter and a real
-   HTTP/3 validation flow exist. Reuse the QUIC foundation while retaining
-   separate DoQ and DoH application adapters.
+5. Add DoQ and DoH over HTTP/3 in Stage 2, with the minimum Asio/ngtcp2,
+   nghttp3, and BoringSSL integration needed for DNS and independent HTTP/3
+   interoperability tests. Keep the DoQ and DoH application adapters separate.
 
 Each slice must include malformed-response, timeout, cancellation, reload, and
 shutdown tests appropriate to the behavior it introduces. TCP and DoT tests
@@ -1790,17 +1790,19 @@ validated on Windows. Stages 5 and 6 begin only after the portable core gate.
 - real DNS upstream and upstream-group objects with policy, fallback, health,
   bootstrap, and upstream egress routing;
 - DoT and DoH over HTTP/2 through reusable TLS and HTTP/2 carrier boundaries;
-- validated DoQ and DoH3 configuration/contracts, with implementation gated on
-  the Stage 4 ngtcp2 and HTTP/3 foundation;
+- DoQ and DoH over HTTP/3, including the ngtcp2, nghttp3, BoringSSL, and Asio
+  transport path required by DNS;
+- bounded QUIC session reuse, retirement, cancellation, and independent
+  interoperability tests for encrypted DNS transports;
 - local DNS service and FakeIP;
 - validated routing targets and independent rule-engine conformance tests;
 - immutable runtime snapshots and reload;
 - initial proxy groups and connection registry.
 
-Stage 2 exits without requiring a QUIC implementation, but it must not leave a
-resolver API or configuration model that requires a second DNS architecture
-when DoQ and DoH3 arrive. Plain, TLS, and HTTP/2 DNS behavior is part of the
-Stage 2 functional gate; QUIC-based DNS behavior is part of the Stage 4 gate.
+Stage 2 includes the QUIC/HTTP/3 foundation needed for DoQ and DoH3 DNS and
+does not defer those DNS transports to Stage 4. Its functional gate covers
+plain, TLS, HTTP/2, and QUIC-based DNS behavior. Stage 4 builds on the DNS
+QUIC foundation for proxy protocols and their stream/session requirements.
 
 ### Stage 3: encrypted stream protocols
 
@@ -1810,12 +1812,11 @@ Stage 2 functional gate; QUIC-based DNS behavior is part of the Stage 4 gate.
 
 ### Stage 4: QUIC-based protocols
 
-- ngtcp2, nghttp3, and BoringSSL build integration;
-- Asio UDP writer/alarm/visitor adapters;
-- a real QUIC/HTTP3 validation flow;
-- DoQ and DoH over HTTP/3 using the Stage 2 DNS transport and upstream
-  contracts;
-- pooled-session capacity, retirement, and 0-RTT replay-safety validation;
+- generalize and harden the ngtcp2/nghttp3/BoringSSL and Asio QUIC foundation
+  established for Stage 2 DNS;
+- a real QUIC/HTTP3 validation flow for proxy transports;
+- QUIC stream multiplexing, session capacity, retirement, and 0-RTT
+  replay-safety validation for proxy use;
 - selected QUIC-based proxy protocols.
 
 ### Portable core exit gate
@@ -1845,7 +1846,8 @@ already been validated.
 - build all dependencies with the selected Zig target;
 - rerun the complete portable core suite on Linux;
 - validate the Linux 3.10 and final-artifact requirements;
-- provide the initial standalone Linux process over clash-native-core.
+- provide the initial standalone Linux process over clash-native-core; the
+  user-facing CLI and configuration-file interface remain in Stage 7.
 
 ### Stage 6: native platform features
 
@@ -1855,8 +1857,10 @@ already been validated.
 - additional operating-system integrations only after their capability and
   lifecycle boundaries are defined.
 
-### Stage 7: frontend compatibility
+### Stage 7: CLI and frontend compatibility
 
+- user-facing standalone CLI and configuration-file loading;
+- process signals and service lifecycle controls;
 - standalone control service;
 - C API facade and language bindings;
 - optional Mihomo-compatible configuration or control translation layers.

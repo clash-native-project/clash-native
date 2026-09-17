@@ -30,8 +30,12 @@ class DnsMessageCodec final {
                                                    std::uint16_t expected_id);
     static core::Result<std::vector<std::uint8_t>> encode_response(const DnsQuery &query,
                                                                    const DnsAnswer &answer);
+    static core::Result<std::vector<std::uint8_t>> encode_response(const DnsPacket &query,
+                                                                   const DnsAnswer &answer);
     static core::Result<std::vector<std::uint8_t>> encode_error_response(const DnsPacket &query,
-                                                                         std::uint8_t code);
+                                                                         std::uint16_t code);
+    static core::Result<std::vector<std::uint8_t>>
+    truncate_udp_response(std::span<const std::uint8_t> response, std::size_t maximum_size);
 };
 
 } // namespace clash_native::dns

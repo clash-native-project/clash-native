@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -282,6 +284,66 @@ func TestDNSProcessWithIndependentDnsproxy(t *testing.T) {
 	}
 }
 
+func TestPublicEncryptedDNSUpstreams(t *testing.T) {
+	if os.Getenv("CLASH_NATIVE_DNS_LIVE") != "1" {
+		t.Skip("set CLASH_NATIVE_DNS_LIVE=1 to query public DNS providers")
+	}
+	testHost := os.Getenv("CLASH_NATIVE_TEST_HOST")
+	if testHost == "" {
+		t.Skip("CLASH_NATIVE_TEST_HOST is not set")
+	}
+
+	for _, test := range []struct {
+		name     string
+		upstream string
+	}{
+		{name: "dot-google", upstream: "dot://dns.google:853"},
+		{name: "doh1-cloudflare", upstream: "doh1://cloudflare-dns.com:443/dns-query"},
+		{name: "doh2-google", upstream: "doh2://dns.google:443/dns-query"},
+		{name: "doq-quad9", upstream: "doq://dns.quad9.net:853"},
+		{name: "doh3-quad9", upstream: "doh3://dns.quad9.net:443/dns-query"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			process, err := harness.StartWithEnv(ctx, testHost, map[string]string{
+				"CLASH_NATIVE_DNS_UPSTREAM": test.upstream,
+			})
+			if err != nil {
+				t.Fatalf("start test host with %s: %v", test.name, err)
+			}
+			defer stopProcess(t, process, "test host")
+			if _, err := harness.WaitForLine(ctx, process, readyPrefix); err != nil {
+				stdout, stderr := process.Output()
+				t.Fatalf("wait for test host: %v; stdout=%q stderr=%q", err, stdout, stderr)
+			}
+			dnsLine, err := harness.WaitForLine(ctx, process, dnsReadyPrefix)
+			if err != nil {
+				stdout, stderr := process.Output()
+				t.Fatalf("wait for DNS listener: %v; stdout=%q stderr=%q", err, stdout, stderr)
+			}
+			udpAddress, _, err := parseDNSReadyLine(dnsLine)
+			if err != nil {
+				t.Fatalf("parse test-host DNS listener: %v", err)
+			}
+
+			response := queryDNS(t, "udp", udpAddress, "example.com")
+			if response.Rcode != dns.RcodeSuccess || len(response.Answer) == 0 {
+				stdout, stderr := process.Output()
+				t.Fatalf("%s returned rcode %d and %d answers; stdout=%q stderr=%q",
+					test.name, response.Rcode, len(response.Answer), stdout, stderr)
+			}
+			for _, answer := range response.Answer {
+				if _, ok := answer.(*dns.A); ok {
+					t.Logf("%s resolved example.com: %s", test.name, answer)
+					return
+				}
+			}
+			t.Fatalf("%s returned no A record: %v", test.name, response.Answer)
+		})
+	}
+}
+
 func TestFakeIPProcessWithIndependentDnsproxy(t *testing.T) {
 	testHost := os.Getenv("CLASH_NATIVE_TEST_HOST")
 	if testHost == "" {
@@ -426,8 +488,23 @@ func TestDNSProcessWithIndependentDnsproxySecureTransports(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			hostsPath := filepath.Join(t.TempDir(), "hosts.txt")
-			const domain = "clash-native-secure-dnsproxy.test"
-			if err := os.WriteFile(hostsPath, []byte("192.0.2.73 "+domain+"\n"), 0o600); err != nil {
+			domains := []string{
+				"clash-native-secure-dnsproxy-a.test",
+				"clash-native-secure-dnsproxy-b.test",
+				"clash-native-secure-dnsproxy-c.test",
+				"clash-native-secure-dnsproxy-d.test",
+				"clash-native-secure-dnsproxy-e.test",
+				"clash-native-secure-dnsproxy-f.test",
+				"clash-native-secure-dnsproxy-g.test",
+				"clash-native-secure-dnsproxy-h.test",
+			}
+			var hosts strings.Builder
+			for _, domain := range domains {
+				hosts.WriteString("192.0.2.73 ")
+				hosts.WriteString(domain)
+				hosts.WriteByte('\n')
+			}
+			if err := os.WriteFile(hostsPath, []byte(hosts.String()), 0o600); err != nil {
 				t.Fatalf("write dnsproxy hosts file: %v", err)
 			}
 
@@ -484,22 +561,56 @@ func TestDNSProcessWithIndependentDnsproxySecureTransports(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					response := queryDNS(t, "udp", udpAddress, domain)
 					if verifyPeer {
+						response := queryDNS(t, "udp", udpAddress, domains[0])
 						if response.Rcode != dns.RcodeServerFailure {
 							t.Fatalf("untrusted dnsproxy certificate returned DNS rcode %d, expected SERVFAIL", response.Rcode)
 						}
 						return
 					}
-					if response.Rcode != dns.RcodeSuccess || len(response.Answer) != 1 {
-						testHostStdout, testHostStderr := testHostProcess.Output()
-						dnsproxyStdout, dnsproxyStderr := dnsproxyProcess.Output()
-						t.Fatalf("%s query returned rcode %d and %d answers; test-host stdout=%q stderr=%q; dnsproxy stdout=%q stderr=%q",
-							test.name, response.Rcode, len(response.Answer), testHostStdout, testHostStderr, dnsproxyStdout, dnsproxyStderr)
+					for _, domain := range domains[:3] {
+						response := queryDNS(t, "udp", udpAddress, domain)
+						if response.Rcode != dns.RcodeSuccess || len(response.Answer) != 1 {
+							testHostStdout, testHostStderr := testHostProcess.Output()
+							dnsproxyStdout, dnsproxyStderr := dnsproxyProcess.Output()
+							t.Fatalf("%s query for %s returned rcode %d and %d answers; test-host stdout=%q stderr=%q; dnsproxy stdout=%q stderr=%q",
+								test.name, domain, response.Rcode, len(response.Answer), testHostStdout, testHostStderr, dnsproxyStdout, dnsproxyStderr)
+						}
+						answer, ok := response.Answer[0].(*dns.A)
+						if !ok || answer.A.String() != "192.0.2.73" {
+							t.Fatalf("unexpected %s DNS answer for %s: %v", test.name, domain, response.Answer)
+						}
 					}
-					answer, ok := response.Answer[0].(*dns.A)
-					if !ok || answer.A.String() != "192.0.2.73" {
-						t.Fatalf("unexpected %s DNS answer: %v", test.name, response.Answer)
+					var wait sync.WaitGroup
+					errors := make(chan error, len(domains)-3)
+					for _, domain := range domains[3:] {
+						wait.Add(1)
+						go func(domain string) {
+							defer wait.Done()
+							message := new(dns.Msg)
+							message.SetQuestion(dns.Fqdn(domain), dns.TypeA)
+							client := &dns.Client{Net: "udp", Timeout: 5 * time.Second}
+							response, _, err := client.Exchange(message, udpAddress)
+							if err != nil {
+								errors <- fmt.Errorf("query %s: %w", domain, err)
+								return
+							}
+							if response.Rcode != dns.RcodeSuccess || len(response.Answer) != 1 {
+								errors <- fmt.Errorf("query %s returned rcode=%d answers=%d", domain,
+									response.Rcode, len(response.Answer))
+								return
+							}
+							address, ok := response.Answer[0].(*dns.A)
+							if !ok || address.A.String() != "192.0.2.73" {
+								errors <- fmt.Errorf("query %s returned an unexpected answer: %v", domain,
+									response.Answer)
+							}
+						}(domain)
+					}
+					wait.Wait()
+					close(errors)
+					for err := range errors {
+						t.Error(err)
 					}
 				})
 			}
@@ -569,21 +680,30 @@ func findDnsproxy(t *testing.T) string {
 
 func freeDNSPort(t *testing.T) int {
 	t.Helper()
-	for attempt := 0; attempt < 32; attempt++ {
-		udpListener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	var lastBindError error
+	for attempt := 0; attempt < 256; attempt++ {
+		candidate, err := rand.Int(rand.Reader, big.NewInt(10000))
 		if err != nil {
-			t.Fatalf("allocate DNS proxy UDP port: %v", err)
+			t.Fatalf("choose DNS proxy port: %v", err)
 		}
-		port := udpListener.LocalAddr().(*net.UDPAddr).Port
+		port := 20000 + int(candidate.Int64())
+		udpListener, err := net.ListenUDP("udp", &net.UDPAddr{
+			IP: net.IPv4(127, 0, 0, 1), Port: port,
+		})
+		if err != nil {
+			lastBindError = err
+			continue
+		}
 		tcpListener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 		if err == nil {
 			_ = tcpListener.Close()
 			_ = udpListener.Close()
 			return port
 		}
+		lastBindError = err
 		_ = udpListener.Close()
 	}
-	t.Fatal("could not reserve a shared UDP/TCP DNS proxy port")
+	t.Fatalf("could not reserve a shared UDP/TCP DNS proxy port after 256 attempts: %v", lastBindError)
 	return 0
 }
 
