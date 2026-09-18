@@ -28,6 +28,13 @@ int Application::run(const ApplicationOptions &options) {
     }
 
     proxy_server_.set_endpoint(*options.listen_endpoint);
+    proxy_server_.set_default_action(options.default_route_action);
+    for (const auto &rule : options.route_rules) {
+        proxy_server_.add_rule(rule);
+    }
+    if (options.outbound_registry) {
+        proxy_server_.set_outbound_registry(options.outbound_registry);
+    }
     if (options.dns_config) {
         resolver_ = std::make_shared<dns::ResolverService>(runtime_, *options.dns_config);
         if (const auto result = resolver_->validate(); !result) {
@@ -37,13 +44,13 @@ int Application::run(const ApplicationOptions &options) {
         if (options.fake_ip_store) {
             proxy_server_.set_fake_ip_store(options.fake_ip_store);
         }
+        proxy_server_.set_fake_ip_filter(options.fake_ip_filter);
         dns_server_ = std::make_unique<dns::DnsServer>(
-            runtime_, resolver_->query_service(),
+            runtime_, proxy_server_.runtime_snapshot_store(),
             options.dns_udp_endpoint.value_or(
                 boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 0)),
             options.dns_tcp_endpoint.value_or(
                 boost::asio::ip::tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0)));
-        dns_server_->set_fake_ip_store(options.fake_ip_store, options.fake_ip_filter);
     }
 
     boost::asio::signal_set signals(runtime_.context(), SIGINT, SIGTERM);
@@ -58,15 +65,6 @@ int Application::run(const ApplicationOptions &options) {
     });
 
     runtime_.start();
-    if (dns_server_) {
-        const auto start_result = dns_server_->start();
-        if (!start_result) {
-            signals.cancel();
-            dns_server_->stop();
-            runtime_.stop();
-            throw std::runtime_error(start_result.error().context);
-        }
-    }
     const auto start_result = proxy_server_.start();
     if (!start_result) {
         signals.cancel();
@@ -81,6 +79,17 @@ int Application::run(const ApplicationOptions &options) {
         throw std::runtime_error(error.context);
     }
 
+    if (dns_server_) {
+        const auto dns_start_result = dns_server_->start();
+        if (!dns_start_result) {
+            signals.cancel();
+            dns_server_->stop();
+            proxy_server_.stop();
+            runtime_.stop();
+            throw std::runtime_error(dns_start_result.error().context);
+        }
+    }
+
     const auto endpoint = proxy_server_.endpoint();
     std::cout << "SOCKS5 proxy listening on " << endpoint.address().to_string() << ":"
               << endpoint.port() << " (no authentication). Press Ctrl+C to stop.\n";
@@ -93,6 +102,10 @@ int Application::run(const ApplicationOptions &options) {
     proxy_server_.stop();
     runtime_.stop();
     return 0;
+}
+
+core::Status Application::reload(runtime::RuntimeSnapshotPtr snapshot) {
+    return proxy_server_.reload(std::move(snapshot));
 }
 
 } // namespace clash_native::app

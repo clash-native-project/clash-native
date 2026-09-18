@@ -1,19 +1,17 @@
-#include <clash_native/net/tls_stream.hpp>
+#include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/trojan_outbound.hpp>
+#include <clash_native/transport/tls_client.hpp>
 
-#include "dns/builtin_ca_bundle.hpp"
 #include "outbound_utils.hpp"
 #include "proxy_address.hpp"
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/ssl/host_name_verification.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/write.hpp>
 
 #include <openssl/evp.h>
-#include <openssl/ssl.h>
 
 #include <algorithm>
 #include <array>
@@ -56,12 +54,11 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
   public:
     TrojanConnectOperation(runtime::AsioRuntime &runtime,
                            std::shared_ptr<dns::ResolverService> resolver,
-                           TrojanOutboundConfig config,
-                           std::shared_ptr<boost::asio::ssl::context> tls_context,
-                           core::StreamRequest request, core::StreamOpenHandler handler)
+                           TrojanOutboundConfig config, core::StreamRequest request,
+                           core::StreamOpenHandler handler)
         : runtime_(runtime), resolver_(std::move(resolver)), config_(std::move(config)),
-          tls_context_(std::move(tls_context)), request_(std::move(request)),
-          stream_(std::make_shared<net::TlsStream::SslStream>(runtime.context(), *tls_context_)),
+          request_(std::move(request)),
+          socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.context())),
           timer_(runtime.context()), handler_(std::move(handler)) {}
 
     void start() {
@@ -72,11 +69,10 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                  "Trojan outbound ID, server, port, and password are required"}));
             return;
         }
-        timer_.expires_after(kConnectTimeout);
+        deadline_ = std::chrono::steady_clock::now() + kConnectTimeout;
+        timer_.expires_at(deadline_);
         timer_.async_wait([self = shared_from_this()](const boost::system::error_code &error) {
             if (!error) {
-                boost::system::error_code ignored;
-                self->stream_->next_layer().cancel(ignored);
                 self->finish(core::StreamOpenResult::failed(
                     {core::ErrorCode::timeout, "timed out opening Trojan TLS stream"}));
             }
@@ -103,7 +99,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         }
         auto self = shared_from_this();
         boost::asio::async_connect(
-            stream_->next_layer(), *endpoints,
+            *socket_, *endpoints,
             [self, endpoints](const boost::system::error_code &error,
                               const boost::asio::ip::tcp::endpoint &) {
                 if (error) {
@@ -119,30 +115,29 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     void start_tls() {
         const auto server_name =
             config_.server_name.empty() ? config_.server_host : config_.server_name;
-        boost::system::error_code address_error;
-        boost::asio::ip::make_address(server_name, address_error);
-        if (address_error &&
-            SSL_set_tlsext_host_name(stream_->native_handle(), server_name.c_str()) != 1) {
-            finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::carrier_handshake, "failed to configure Trojan TLS SNI"}));
-            return;
-        }
-        if (config_.verify_peer) {
-            stream_->set_verify_mode(boost::asio::ssl::verify_peer);
-            stream_->set_verify_callback(boost::asio::ssl::host_name_verification(server_name));
-        } else {
-            stream_->set_verify_mode(boost::asio::ssl::verify_none);
-        }
-
+        transport::TlsClientOptions options;
+        options.server_name = server_name;
+        options.verify_peer = config_.verify_peer;
+        options.trusted_ca_pem = config_.trusted_ca_pem;
+        options.deadline = deadline_;
         auto self = shared_from_this();
-        stream_->async_handshake(
-            boost::asio::ssl::stream_base::client, [self](const boost::system::error_code &error) {
-                if (error) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::carrier_handshake,
-                         "Trojan TLS handshake failed: " + error.message(), to_std_error(error)}));
+        auto plain_stream = std::make_unique<net::TcpStream>(std::move(*socket_));
+        socket_.reset();
+        tls_handshake_ = transport::async_tls_client_handshake(
+            std::move(plain_stream), std::move(options),
+            [self](core::Result<transport::TlsClientConnection> result) mutable {
+                self->tls_handshake_.reset();
+                if (self->completed_) {
+                    if (result && result->stream) {
+                        result->stream->close();
+                    }
                     return;
                 }
+                if (!result) {
+                    self->finish(core::StreamOpenResult::failed(result.error()));
+                    return;
+                }
+                self->tls_stream_ = std::move(result->stream);
                 self->write_request_header();
             });
     }
@@ -166,8 +161,8 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         wire->push_back('\n');
 
         auto self = shared_from_this();
-        boost::asio::async_write(
-            *stream_, boost::asio::buffer(*wire),
+        tls_stream_->async_write(
+            boost::asio::buffer(*wire),
             [self, wire](const boost::system::error_code &error, std::size_t) {
                 if (error) {
                     self->finish(core::StreamOpenResult::failed(
@@ -178,8 +173,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 self->completed_ = true;
                 self->cancel_timer();
                 auto handler = std::move(self->handler_);
-                handler(core::StreamOpenResult::opened(
-                    std::make_unique<net::TlsStream>(self->tls_context_, self->stream_)));
+                handler(core::StreamOpenResult::opened(std::move(self->tls_stream_)));
             });
     }
 
@@ -193,8 +187,16 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         cancel_timer();
         if (!result.succeeded()) {
             boost::system::error_code ignored;
-            stream_->next_layer().cancel(ignored);
-            stream_->next_layer().close(ignored);
+            if (tls_handshake_) {
+                tls_handshake_->cancel();
+            }
+            if (socket_) {
+                socket_->cancel(ignored);
+                socket_->close(ignored);
+            }
+            if (tls_stream_) {
+                tls_stream_->close();
+            }
         }
         auto handler = std::move(handler_);
         handler(std::move(result));
@@ -203,11 +205,13 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     runtime::AsioRuntime &runtime_;
     std::shared_ptr<dns::ResolverService> resolver_;
     TrojanOutboundConfig config_;
-    std::shared_ptr<boost::asio::ssl::context> tls_context_;
     core::StreamRequest request_;
-    std::shared_ptr<net::TlsStream::SslStream> stream_;
+    std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
+    std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
+    std::unique_ptr<core::StreamHandle> tls_stream_;
     boost::asio::steady_timer timer_;
     core::StreamOpenHandler handler_;
+    std::chrono::steady_clock::time_point deadline_{};
     bool completed_ = false;
 };
 
@@ -216,21 +220,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
 TrojanOutbound::TrojanOutbound(runtime::AsioRuntime &runtime, TrojanOutboundConfig config,
                                std::shared_ptr<dns::ResolverService> resolver)
     : runtime_(runtime), config_(std::move(config)), resolver_(std::move(resolver)),
-      tls_context_(
-          std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_client)),
-      descriptor_{config_.id, "trojan"} {
-    tls_context_->set_options(boost::asio::ssl::context::default_workarounds |
-                              boost::asio::ssl::context::no_sslv2 |
-                              boost::asio::ssl::context::no_sslv3);
-    if (config_.verify_peer) {
-        const auto roots = dns::detail::builtin_ca_bundle_pem();
-        tls_context_->add_certificate_authority(boost::asio::buffer(roots.data(), roots.size()));
-        if (!config_.trusted_ca_pem.empty()) {
-            tls_context_->add_certificate_authority(
-                boost::asio::buffer(config_.trusted_ca_pem.data(), config_.trusted_ca_pem.size()));
-        }
-    }
-}
+      descriptor_{config_.id, "trojan"} {}
 
 core::Status TrojanOutbound::validate() const {
     if (config_.id.empty() || config_.server_host.empty() || config_.server_port == 0 ||
@@ -247,7 +237,7 @@ core::OutboundCapabilities TrojanOutbound::capabilities() const noexcept { retur
 
 void TrojanOutbound::connect_stream(core::StreamRequest request, core::StreamOpenHandler handler) {
     auto operation = std::make_shared<TrojanConnectOperation>(
-        runtime_, resolver_, config_, tls_context_, std::move(request), std::move(handler));
+        runtime_, resolver_, config_, std::move(request), std::move(handler));
     operation->start();
 }
 

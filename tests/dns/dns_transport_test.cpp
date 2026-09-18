@@ -3,8 +3,10 @@
 #include <clash_native/dns/dns_query_service.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/dns/resolver_service.hpp>
+#include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
+#include <clash_native/transport/http_client.hpp>
 
 #include <gtest/gtest.h>
 
@@ -16,6 +18,8 @@
 #include <boost/asio/read_until.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/write.hpp>
+#include <boost/beast/core/flat_buffer.hpp>
+#include <boost/beast/http.hpp>
 
 #include <nghttp2/nghttp2.h>
 
@@ -1854,6 +1858,84 @@ TEST(DnsQueryServiceTest, EvictsLeastRecentlyUsedEntriesAtTheConfiguredCapacity)
     EXPECT_EQ(service.cache_size(), 1U);
     service.stop();
     runtime.stop();
+}
+
+TEST(HttpClientSessionTest, ReusesHttp11ConnectionForQueuedExchanges) {
+    namespace asio = boost::asio;
+    namespace http = boost::beast::http;
+    using tcp = asio::ip::tcp;
+
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    tcp::socket client(context);
+    client.connect(acceptor.local_endpoint());
+    tcp::socket peer(context);
+    acceptor.accept(peer);
+
+    auto server_result = std::make_shared<std::promise<std::vector<std::string>>>();
+    auto server_future = server_result->get_future();
+    std::thread server_thread([peer = std::move(peer), server_result]() mutable {
+        try {
+            std::vector<std::string> targets;
+            for (int index = 0; index < 2; ++index) {
+                boost::beast::flat_buffer buffer;
+                http::request<http::vector_body<std::uint8_t>> request;
+                boost::system::error_code error;
+                http::read(peer, buffer, request, error);
+                if (error) {
+                    throw boost::system::system_error(error);
+                }
+                targets.emplace_back(request.target());
+
+                http::response<http::string_body> response{http::status::ok, 11};
+                response.keep_alive(true);
+                response.body() = index == 0 ? "first" : "second";
+                response.prepare_payload();
+                http::write(peer, response, error);
+                if (error) {
+                    throw boost::system::system_error(error);
+                }
+            }
+            server_result->set_value(std::move(targets));
+        } catch (...) {
+            server_result->set_exception(std::current_exception());
+        }
+    });
+
+    auto session = clash_native::transport::make_http1_client_session(
+        std::make_unique<clash_native::net::TcpStream>(std::move(client)));
+    std::array<std::optional<clash_native::core::Result<clash_native::transport::HttpResponse>>, 2>
+        results;
+    for (std::size_t index = 0; index < results.size(); ++index) {
+        clash_native::transport::HttpRequest request;
+        request.method = "POST";
+        request.scheme = "http";
+        request.authority = "localhost";
+        request.target = index == 0 ? "/first" : "/second";
+        request.keep_alive = true;
+        const auto exchange_id = session->exchange(
+            std::move(request), std::chrono::steady_clock::now() + std::chrono::seconds(5),
+            [&results, index](auto result) { results[index] = std::move(result); });
+        EXPECT_NE(exchange_id, 0U);
+    }
+    context.run();
+    session->stop();
+    server_thread.join();
+
+    ASSERT_EQ(server_future.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    const auto targets = server_future.get();
+    ASSERT_EQ(targets.size(), 2U);
+    EXPECT_EQ(targets[0], "/first");
+    EXPECT_EQ(targets[1], "/second");
+    for (std::size_t index = 0; index < results.size(); ++index) {
+        ASSERT_TRUE(results[index].has_value());
+        ASSERT_TRUE(*results[index]) << results[index]->error().context;
+        EXPECT_EQ(results[index]->value().status, 200U);
+        const std::string expected = index == 0 ? "first" : "second";
+        EXPECT_EQ(
+            std::string(results[index]->value().body.begin(), results[index]->value().body.end()),
+            expected);
+    }
 }
 
 TEST(DnsTransportTest, ReusesTcpSessionAndDispatchesOutOfOrderResponses) {

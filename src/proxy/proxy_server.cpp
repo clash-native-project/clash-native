@@ -1,4 +1,5 @@
 #include <clash_native/net/tcp_stream.hpp>
+#include <clash_native/net/udp_stream.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
 #include <clash_native/proxy/tcp_relay.hpp>
 
@@ -416,7 +417,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         if (closed_.load(std::memory_order_acquire)) {
             return;
         }
-        udp_snapshot_ = owner_.snapshot_store_.load();
+        udp_snapshot_ = owner_.snapshot_store_->load();
         if (!udp_snapshot_) {
             send_socks_reply(0x01, false);
             return;
@@ -446,7 +447,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         }
 
         udp_relay_socket_ =
-            std::make_shared<boost::asio::ip::udp::socket>(owner_.runtime_.context());
+            std::make_shared<net::UdpStream>(owner_.runtime_.context().get_executor());
         udp_relay_socket_->open(
             bind_address.is_v4() ? boost::asio::ip::udp::v4() : boost::asio::ip::udp::v6(), error);
         if (!error) {
@@ -514,15 +515,16 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         }
         auto self = shared_from_this();
         udp_relay_socket_->async_receive_from(
-            boost::asio::buffer(udp_receive_buffer_), udp_packet_sender_,
-            [self](const boost::system::error_code &error, std::size_t size) {
+            boost::asio::buffer(udp_receive_buffer_),
+            [self](const boost::system::error_code &error, std::size_t size,
+                   boost::asio::ip::udp::endpoint sender) {
                 if (error) {
                     if (error != boost::asio::error::operation_aborted) {
                         self->close();
                     }
                     return;
                 }
-                if (!self->accept_udp_sender(self->udp_packet_sender_)) {
+                if (!self->accept_udp_sender(sender)) {
                     self->read_socks_udp_packet();
                     return;
                 }
@@ -822,9 +824,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
             remote_->close();
         }
         if (udp_relay_socket_) {
-            boost::system::error_code ignored;
-            udp_relay_socket_->cancel(ignored);
-            udp_relay_socket_->close(ignored);
+            udp_relay_socket_->close();
             udp_relay_socket_.reset();
         }
         for (auto &[key, path] : udp_paths_) {
@@ -871,9 +871,8 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     boost::asio::streambuf http_buffer_;
     std::vector<std::uint8_t> http_initial_data_;
     std::string http_response_;
-    std::shared_ptr<boost::asio::ip::udp::socket> udp_relay_socket_;
+    std::shared_ptr<net::UdpStream> udp_relay_socket_;
     boost::asio::ip::address udp_control_peer_ = boost::asio::ip::address_v4::any();
-    boost::asio::ip::udp::endpoint udp_packet_sender_;
     std::optional<boost::asio::ip::udp::endpoint> udp_client_endpoint_;
     std::uint16_t expected_udp_client_port_ = 0;
     std::array<std::uint8_t, 1> udp_control_probe_{};
@@ -890,6 +889,7 @@ ProxyServer::ProxyServer(runtime::AsioRuntime &runtime, boost::asio::ip::tcp::en
       reject_outbound_(std::make_shared<outbound::RejectOutbound>(runtime)),
       outbound_registry_(std::make_shared<outbound::OutboundRegistry>()),
       connection_registry_(std::make_shared<observability::ConnectionRegistry>()),
+      snapshot_store_(std::make_shared<runtime::RuntimeSnapshotStore>()),
       callback_gate_(std::make_shared<std::atomic_bool>(false)) {
     if (!outbound_registry_->add_outbound("direct", direct_outbound_) ||
         !outbound_registry_->add_outbound("reject", reject_outbound_)) {
@@ -936,6 +936,13 @@ void ProxyServer::set_fake_ip_store(std::shared_ptr<dns::FakeIpStore> store) {
     fake_ip_store_ = std::move(store);
 }
 
+void ProxyServer::set_fake_ip_filter(std::function<bool(std::string_view)> filter) {
+    if (running()) {
+        throw std::logic_error("Cannot change FakeIP configuration on a running proxy");
+    }
+    fake_ip_filter_ = std::move(filter);
+}
+
 void ProxyServer::set_outbound_registry(std::shared_ptr<outbound::OutboundRegistry> registry) {
     if (running()) {
         throw std::logic_error("Cannot change outbound registry on a running proxy");
@@ -975,10 +982,10 @@ core::Status ProxyServer::start() {
         return result;
     }
 
-    auto snapshot = std::make_shared<const runtime::RuntimeSnapshot>(
-        runtime::RuntimeSnapshot{next_snapshot_generation_++, router_.snapshot(),
-                                 outbound_registry_->snapshot(), resolver_, fake_ip_store_});
-    if (const auto result = snapshot_store_.publish(snapshot); !result) {
+    auto snapshot = std::make_shared<const runtime::RuntimeSnapshot>(runtime::RuntimeSnapshot{
+        next_snapshot_generation_++, router_.snapshot(), outbound_registry_->snapshot(), resolver_,
+        fake_ip_store_, fake_ip_filter_});
+    if (const auto result = snapshot_store_->publish(snapshot); !result) {
         spdlog::error("Proxy server runtime snapshot validation failed: {}",
                       result.error().context);
         running_ = false;
@@ -1077,12 +1084,17 @@ core::Status ProxyServer::reload(runtime::RuntimeSnapshotPtr snapshot) {
         replacement->generation = next_snapshot_generation_++;
         snapshot = std::move(replacement);
     }
-    if (const auto result = snapshot_store_.publish(std::move(snapshot)); !result) {
+    if (const auto result = snapshot_store_->publish(std::move(snapshot)); !result) {
         return result;
     }
     spdlog::info("Proxy server published runtime snapshot generation {}",
-                 snapshot_store_.load()->generation);
+                 snapshot_store_->load()->generation);
     return {};
+}
+
+std::shared_ptr<runtime::RuntimeSnapshotStore>
+ProxyServer::runtime_snapshot_store() const noexcept {
+    return snapshot_store_;
 }
 
 bool ProxyServer::running() const noexcept { return running_.load(); }
@@ -1132,7 +1144,7 @@ void ProxyServer::open_stream(
     core::ConnectionMetadata metadata,
     std::optional<observability::ConnectionRegistry::ConnectionId> connection_id,
     core::StreamOpenHandler handler) {
-    const auto snapshot = snapshot_store_.load();
+    const auto snapshot = snapshot_store_->load();
     if (!snapshot) {
         handler(core::StreamOpenResult::failed(
             {core::ErrorCode::configuration, "proxy runtime snapshot is not published"}));
@@ -1228,6 +1240,30 @@ void ProxyServer::route_stream(
     case router::RouteActionKind::direct:
         if (connection_id && connection_registry_) {
             connection_registry_->update_outbound(*connection_id, "direct");
+        }
+        if (metadata.destination.is_domain() && !context.destination_address &&
+            snapshot->resolver) {
+            const auto gate = callback_gate_;
+            auto destination = metadata.destination;
+            const auto domain = destination.domain();
+            outbound::detail::resolve_host(
+                runtime_, snapshot->resolver, domain,
+                [this, gate, destination = std::move(destination), handler = std::move(handler)](
+                    core::Result<outbound::detail::AddressList> result) mutable {
+                    if (!gate->load(std::memory_order_acquire)) {
+                        return;
+                    }
+                    if (!result || result.value().empty()) {
+                        handler(core::StreamOpenResult::failed(
+                            result ? core::Error{core::ErrorCode::resolution,
+                                                 "direct destination resolved to no addresses"}
+                                   : result.error()));
+                        return;
+                    }
+                    direct_outbound_->connect_stream(
+                        {std::move(destination), result.value().front()}, std::move(handler));
+                });
+            return;
         }
         direct_outbound_->connect_stream(
             {std::move(metadata.destination), context.destination_address}, std::move(handler));

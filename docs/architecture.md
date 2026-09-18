@@ -8,15 +8,16 @@ architectural and behavioral reference points, but its source tree is not part
 of this project.
 
 This document defines the intended boundaries of the project before the
-protocol surface becomes large. It is a blueprint, not a claim that the
-described system is already implemented or production-ready. The current
-implementation establishes only the initial CMake core/frontend boundary and
-the experimental SOCKS5 bootstrap path; the remaining modules are planned.
+protocol surface becomes large. It is a blueprint, not a claim that every
+described component is already implemented or production-ready. The current
+implementation includes ordinary SOCKS5 and HTTP CONNECT entry paths,
+stream/datagram outbound contracts, Direct, Reject, Shadowsocks, Trojan, and
+encrypted DNS transports. Current protocol code and tests remain the evidence for actual
+support; a planned boundary in this document is not implementation proof.
 
-The existing SOCKS5 listener is only a bootstrap test used to verify that the
-toolchain, Asio event loop, TCP connection establishment, and bidirectional
-relay work together. Its `ProxyServer::Session` structure is not a target
-architecture and must not be used as the template for future protocol code.
+The current `ProxyServer::Session` integration path is transitional. It must
+not become the base class or control-flow template for future inbound,
+outbound, carrier, or relay code.
 
 ## 2. Goals
 
@@ -99,7 +100,9 @@ policy: metadata / router / rules / groups / runtime snapshot
               |
 data plane: inbound / outbound / relay / DNS
               |
-protocols: SOCKS / HTTP / Shadowsocks / Trojan / QUIC-based protocols
+proxy protocols: SOCKS / HTTP proxy / Shadowsocks / Trojan / QUIC protocols
+              |
+carriers: TLS / HTTP 1-3 sessions / WebSocket / QUIC / KCP
               |
 I/O: TCP / UDP / resolver / timers / buffers
               |
@@ -120,7 +123,7 @@ independent boundary.
 | `base` | Dependency-light types, addresses, errors, IDs, and utilities |
 | `async` | stdexec integration, scopes, channels, and scheduler adapters |
 | `runtime` | Worker runtimes, blocking pool, lifecycle, and task ownership |
-| `net` | Portable TCP/UDP operations, buffers, timers, and resolver facade |
+| `net` | Portable stream/datagram handles, endpoint dialing, buffers, timers, and resolver facade |
 | `config` | Raw input model, validation, and immutable runtime descriptions |
 | `inbound` | Listener/session interfaces and inbound protocol implementations |
 | `metadata` | Normalized source, destination, network, and inbound information |
@@ -128,8 +131,8 @@ independent boundary.
 | `outbound` | Direct, reject, proxy, and proxy-group abstractions |
 | `relay` | TCP copying, half-close, backpressure, idle timeout, and accounting |
 | `dns` | Resolver policy, cache, hosts, and later enhanced DNS behavior |
+| `transport` | Reusable TLS, HTTP, WebSocket, QUIC, and KCP carrier engines and session pools |
 | `protocol` | Proxy handshakes and protocol-specific stream/packet transports |
-| `quic` | ngtcp2/nghttp3 ownership, UDP packet I/O, timers, and TLS adapters |
 | `platform` | Capability interfaces plus isolated operating-system backends |
 | `observability` | Logging facade, metrics, connection registry, and tracing hooks |
 
@@ -329,7 +332,8 @@ A concrete outbound is assembled from explicit components:
 
 ```text
 validated outbound description
-  -> proxy endpoint connector and dial policy
+  -> validated proxy-endpoint egress plan
+  -> endpoint dialer
   -> optional carrier transport
   -> protocol handshake/framing
   -> established stream or datagram handle
@@ -339,8 +343,9 @@ The responsibilities are:
 
 | Component | Responsibility |
 | --- | --- |
-| `EndpointConnector` | Resolve and connect to the proxy server through the selected dial policy |
-| `CarrierConnector` | Establish reusable carriers such as TLS, WebSocket, HTTP-based transport, or a multiplexed session |
+| `EndpointDialPlan` | Retain the already selected and cycle-validated direct or chained egress used to reach one proxy server |
+| `EndpointDialer` | Execute that plan for the requested proxy-server endpoint without performing traffic routing or outbound selection |
+| `CarrierConnector` | Compose the reusable carrier capabilities defined in Section 15, such as TLS, WebSocket, HTTP, QUIC, or KCP |
 | `ProtocolClient` | Authenticate, encode the requested destination, and install protocol framing |
 | `OutboundOrchestrator` | Apply deadlines, cancellation, cleanup, tracing, and common result conversion |
 
@@ -351,7 +356,7 @@ tests.
 
 A simple stream protocol normally performs:
 
-1. connect to its configured server through `EndpointConnector`;
+1. connect to its configured server through its prebound `EndpointDialer`;
 2. establish its configured carrier, such as TLS;
 3. execute its destination handshake through `ProtocolClient`;
 4. return the resulting `StreamHandle` to the common relay.
@@ -369,12 +374,24 @@ Common carrier components own carrier behavior only. They must not know about
 traffic rules, inbound types, frontend configuration syntax, or a particular
 proxy protocol's authentication fields.
 
-An `EndpointConnector` may use a physical Direct dial or delegate to a named
-outbound. This is how chained proxies are represented; it is not a separate
-socket API. The delegated operation uses normalized internal-flow metadata,
-retains every selected outbound for the operation lifetime, and appends each
-hop to the trace. A QUIC carrier requires a datagram-capable endpoint path,
-while an ordinary TLS carrier requires a stream-capable path.
+The traffic router selects an `Outbound` for the original application flow.
+It does not select an `EndpointDialer`, and the dialer does not re-run the
+router. After an outbound is selected, that outbound uses its immutable,
+validated `EndpointDialPlan` only to reach its own configured server endpoint.
+The plan either performs a physical Direct dial or delegates to one specific
+`Outbound` or outbound-group object retained from the active snapshot. This is
+how chained proxies are represented; the dial request does not contain an
+arbitrary outbound name for the dialer to resolve.
+
+For delegated dialing, the already selected upstream outbound receives a
+normalized internal-flow request whose destination is the downstream proxy
+server. That upstream may execute its own prevalidated endpoint plan, but it
+must not select the downstream outbound again. The configuration dependency
+graph rejects static cycles, while the runtime visited-outbound guard and
+bounded depth stop stale or dynamic recursion. Every delegated object is
+retained for the operation lifetime and each hop is appended to the trace.
+A QUIC carrier requires a datagram-capable endpoint plan, while an ordinary
+TLS carrier requires a stream-capable plan.
 
 Protocol construction uses an explicit registry assembled by core startup. A
 factory receives a typed, validated protocol description plus a narrow service
@@ -1249,8 +1266,10 @@ DNS question name
   -> selected DNS upstream group
 
 DNS upstream endpoint
-  -> DnsUpstreamDialer
+  -> DNS egress policy planner
   -> direct, named outbound, or normal traffic rules
+  -> immutable EndpointDialPlan
+  -> EndpointDialer
 ```
 
 These decisions must not be collapsed into one flag. Selecting a DNS server
@@ -1262,15 +1281,17 @@ sets, rule sets, and ordered first-match behavior. A compatibility frontend
 may later translate Mihomo-style `nameserver-policy` configuration into this
 internal model.
 
-`DnsUpstreamDialer` supports three explicit egress policies:
+DNS egress planning supports three explicit policies:
 
 - direct connection, optionally bound by a platform network capability;
 - a named outbound or outbound group;
 - the ordinary traffic router.
 
 The last option is equivalent in purpose to rule-aware DNS upstream dialing,
-but the internal API should express it as a dial policy instead of scattering
-special `respect-rules` checks through transports.
+but the planner invokes the router once and stores its selected outbound in the
+plan. `EndpointDialer` only executes that plan. The internal API should express
+this choice as an egress policy instead of scattering special `respect-rules`
+checks through transports.
 
 ### 14.4 Resolver roles and dependency cycles
 
@@ -1444,12 +1465,20 @@ immutable configuration generation for one server. `DnsUpstreamGroup` owns
 ordering, racing, retry eligibility, fallback, and health-based selection.
 Neither object performs application traffic routing directly.
 
-All transports obtain established stream or datagram carriers through
-`DnsUpstreamDialer`. Except for a physical Direct implementation behind that
-dialer, transports must not open raw Asio sockets themselves. A TLS, HTTP, or
-QUIC backend selected for this layer must support the required injected I/O or
-adapter boundary; a backend that insists on owning its sockets cannot provide
-named-outbound or rule-aware DNS egress and must not be presented as if it can.
+During migration, DNS transports obtain established stream or datagram handles
+through `DnsUpstreamDialer`. The target boundary is the shared
+`EndpointDialer` described in Section 15. DNS direct, named-outbound, and
+traffic-rule egress policies are resolved above it into an immutable
+`EndpointDialPlan`. A traffic-rule policy invokes `TrafficRouter` once with
+normalized internal DNS-egress metadata, freezes the resulting outbound or
+group in the plan, and only then calls the dialer. The dialer itself never
+performs DNS policy or traffic-rule selection.
+
+A DNS-specific adapter may construct that plan but must not be required by
+TLS, HTTP, QUIC, or other reusable carriers. Except for a physical Direct
+implementation behind the dialer, carriers must not open raw Asio sockets
+themselves. A backend that insists on owning its sockets cannot execute
+non-Direct endpoint plans and must not be presented as if it can.
 
 ### 14.8 FakeIP and mapping
 
@@ -1518,11 +1547,15 @@ DNS implementation proceeds in independently testable milestones:
 3. Implement real `DnsUpstream`, `DnsUpstreamGroup`, bootstrap, dial policies,
    addressed datagram handles, and the unified resolver/outbound dependency
    graph.
-4. Add DoT and DoH over HTTP/2 after reusable TLS and HTTP/2 carriers can run
-   over an injected `StreamHandle`.
-5. Add DoQ and DoH over HTTP/3 in Stage 2, with the minimum Asio/ngtcp2,
-   nghttp3, and BoringSSL integration needed for DNS and independent HTTP/3
-   interoperability tests. Keep the DoQ and DoH application adapters separate.
+4. Add DoT and DoH over HTTP/1.1 and HTTP/2 after reusable TLS, HTTP/1.1, and
+   HTTP/2 carriers can run over an injected `StreamHandle`.
+5. Extract the reusable Asio/ngtcp2/BoringSSL QUIC engine and nghttp3 HTTP/3
+   session, then implement DoQ and DoH over HTTP/3 as DNS application adapters
+   over them. This migration and the independent HTTP/3 interoperability tests
+   are Stage 2 work, not Stage 4 work.
+6. Complete the Section 15 DNS-decoupling gate before Stage 2 is considered
+   complete. Non-DNS HTTP and QUIC consumers validate and extend the same
+   carrier layer in Stage 4 rather than moving ownership out of DNS there.
 
 Each slice must include malformed-response, timeout, cancellation, reload, and
 shutdown tests appropriate to the behavior it introduces. TCP and DoT tests
@@ -1532,23 +1565,358 @@ response bounds, and multiplexing. DoQ tests cover Message ID zero, one query
 per stream, FIN handling, and stream cancellation. DoH3 reruns the shared DoH
 conformance cases over an HTTP/3 session.
 
-## 15. QUIC transport boundary
+## 15. Shared transport and carrier extraction plan
 
-The QUIC adapter owns one ngtcp2 connection and, for HTTP/3, one nghttp3
-connection. It uses the core's Asio-owned UDP datagram handle and timers; it
-does not create a second event loop or expose library callbacks to callers.
-BoringSSL supplies the QUIC-specific TLS callbacks through ngtcp2's crypto
-helper.
+### 15.1 Problem statement and current boundary
+
+The encrypted DNS implementations have validated useful protocol machinery,
+but the current source placement is not the final reusable boundary:
+
+| Capability | Current implementation placement | Target ownership |
+| --- | --- | --- |
+| Stream and datagram I/O | Core handles plus `net` TCP/TLS implementations and DNS-local adapters | `net` handles and a plan-bound `EndpointDialer` |
+| TLS for encrypted DNS | Partly reusable `TlsStream`, with additional DNS-local stream and TLS setup | One injected-stream TLS client connector in `transport` |
+| HTTP/1.1 client | DoH/1 transport using Boost.Beast | Reusable HTTP/1.1 client session and pool |
+| HTTP/2 client | DoH/2 transport owning nghttp2, TLS, multiplexing, and DNS response state | Reusable HTTP/2 client session; DoH remains a consumer |
+| QUIC and HTTP/3 | One DNS transport owns ngtcp2, BoringSSL, nghttp3, UDP I/O, pooling, and DoQ/DoH3 state | QUIC connection engine, HTTP/3 session, and separate DNS adapters |
+| DNS wire behavior | `DnsTransport` implementations | Remains in `dns`; it is not a generic carrier API |
+
+This coupling is acceptable as an implementation milestone but becomes a
+problem if proxy protocols copy it. It would duplicate TLS validation, HTTP
+framing, QUIC timers, flow control, session reuse, cancellation, and shutdown
+inside every consumer. It would also make a DNS-specific factory the accidental
+entry point for general proxy transports.
+
+The fix is not a universal `Protocol` or `Transport` base class. TCP byte
+streams, UDP datagrams, HTTP exchanges, WebSocket messages, QUIC streams and
+datagrams, and KCP reliable streams have different semantics. The shared layer
+is a small family of capability interfaces. DNS and proxy protocols compose
+only the capabilities they actually need.
+
+The existing engine-facing `Outbound` stream/datagram contract remains the
+stable boundary used by routing and relay. The new carrier interfaces sit
+inside outbound and DNS implementations; they do not replace `Outbound` or
+make DNS a proxy protocol.
+
+### 15.2 Layering and dependency direction
+
+The target stack is:
 
 ```text
-Asio UDP receive -> ngtcp2 packet input -> QUIC stream callbacks
-nghttp3 stream output -> ngtcp2 packet output -> Asio UDP send
+DNS consumers                         proxy protocol consumers
+  DNS/TCP framing                       Shadowsocks / Trojan / future protocols
+  DNS-over-HTTP mapping                 HTTP CONNECT / VMess / VLESS / MASQUE
+  DoQ mapping                           Hysteria / TUIC / other QUIC protocols
+             \                         /
+              application carrier capabilities
+              HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC
+                            |
+              connection/session capabilities
+              TLS, QUIC, KCP/mKCP, session pools
+                            |
+              EndpointDialer + StreamHandle/DatagramHandle
+                            |
+              Asio TCP/UDP and platform capabilities
+```
+
+Dependencies point downward. `transport` may depend on core handle, runtime,
+timer, crypto, and third-party protocol APIs. It must not depend on DNS packet
+types, DNS policy, routing rules, a concrete outbound protocol, or frontend
+configuration. `dns` and `protocol` may both depend on `transport`.
+
+This plan spans two roadmap gates. Stage 2 extracts the TLS, HTTP/1.1, HTTP/2,
+QUIC, and HTTP/3 machinery already exercised by DNS and migrates every
+encrypted DNS adapter to those shared capabilities. At the Stage 2 boundary,
+DNS no longer owns the underlying Beast, nghttp2, ngtcp2, BoringSSL, or nghttp3
+connection/session state. Stage 4 then uses non-DNS HTTP and QUIC consumers to
+validate, extend, and harden the same shared layer; it does not perform the
+initial move out of DNS.
+
+WebSocket/WSS and KCP/mKCP are included in the design so the shared boundaries
+do not block them later, but they are not implementation deliverables of this
+Stage 2/Stage 4 extraction. Their implementation starts with the first selected
+proxy protocol that needs each carrier.
+
+HTTP proxy semantics and an HTTP carrier are different consumers of shared
+HTTP machinery. Likewise, DoH3 and a future MASQUE protocol both use HTTP/3,
+but their methods, headers, body rules, stream lifetime, and error mapping stay
+in their application adapters.
+
+Directories are created only when a phase contains real implementation and
+tests. The intended module split does not justify adding empty `transport`,
+`http`, `quic`, `websocket`, or `kcp` trees in advance.
+
+### 15.3 Capability interfaces
+
+The exact C++ names and callback or sender forms are not frozen, but the
+responsibilities are.
+
+#### Endpoint dialing
+
+`EndpointDialer` is the shared lowest construction boundary for connecting one
+server endpoint. It is prebound to an immutable `EndpointDialPlan` and accepts
+only the endpoint, deadline, cancellation context, and trace context needed to
+execute that plan. It returns an established `StreamHandle` or
+`DatagramHandle`.
+
+The plan has already chosen one of these actions before dialing starts:
+
+- make a physical Direct connection, including the selected resolver and
+  optional platform network binding;
+- delegate to one specific `Outbound` or outbound-group object retained from
+  the active snapshot.
+
+The dialer does not accept an outbound ID, evaluate traffic rules, choose an
+outbound or group member, or apply fallback. Those decisions belong to
+configuration composition, `TrafficRouter`, the DNS egress planner, or the
+already selected group object.
+The plan carries a stable egress identity for pool isolation and tracing, not
+as a request to perform another selection.
+
+The responsibility boundary is therefore:
+
+```text
+application flow -> TrafficRouter -> selected Outbound
+selected Outbound -> its prevalidated EndpointDialPlan -> EndpointDialer
+EndpointDialer -> physical socket or already selected upstream Outbound
+```
+
+If the dialer delegates to an upstream outbound, the dependency graph and
+runtime visited-outbound guard described in Section 7.5 apply to the complete
+chain. An `EndpointDialer` must never re-enter the router for the original flow
+or discover another outbound from configuration by name.
+
+`DnsUpstreamDialer` becomes a DNS egress-planning adapter that resolves its
+policy to an `EndpointDialPlan`, or is removed once every required DNS egress
+mode can construct that plan directly. Reusable carriers never include a DNS
+header merely to obtain a connection.
+
+Before non-TCP stream implementations are returned through `StreamHandle`, its
+TCP-specific endpoint reporting must become transport-neutral or optional.
+Likewise, the datagram boundary must retain the destination and association
+semantics required by the caller instead of assuming that every carrier is a
+raw connected UDP socket.
+
+#### TLS
+
+A TLS client connector decorates an injected `StreamHandle` and returns another
+established stream plus negotiated metadata. Its configuration includes trust
+roots, verification mode, server name, ALPN offers, and handshake deadline.
+It owns TLS handshake and shutdown behavior but does not dial, choose DNS
+policy, build an HTTP request, or know a proxy password.
+
+The DNS-local `StreamHandleAdapter` and the current TCP-socket-specific TLS
+wrapper converge on this injected-stream implementation. DoT, DoH/1, DoH/2,
+Trojan, WSS, and future TLS-based protocols then share certificate, SNI, ALPN,
+cancellation, and error classification behavior.
+
+#### HTTP
+
+HTTP uses an exchange/session interface rather than pretending every version
+is one byte stream. The common semantic types cover request and response heads,
+streaming bodies, body limits, cancellation, and an optional tunnel result.
+Version-specific implementations own their wire state:
+
+- HTTP/1.1 owns serialization, parsing, keep-alive, upgrade, CONNECT, and a
+  non-multiplexed connection pool;
+- HTTP/2 owns nghttp2 state, concurrent request streams, flow control, GOAWAY,
+  reset, and session capacity;
+- HTTP/3 owns nghttp3 state over a supplied QUIC connection, QPACK/control
+  streams, flow control, and request-stream lifecycle.
+
+A small buffered helper may be used for bounded messages such as DoH, but the
+public carrier boundary must support streaming and full-duplex tunnel cases so
+it does not have to be replaced for proxy traffic. The DoH adapter builds and
+validates `application/dns-message` exchanges over that interface. It does not
+own Beast, nghttp2, or nghttp3 sessions.
+
+#### QUIC
+
+The QUIC connection engine owns one ngtcp2 connection, BoringSSL QUIC TLS
+state, Asio datagram I/O, loss/expiry timers, connection-level flow control,
+stream allocation, optional QUIC datagrams, and connection retirement. It
+exposes QUIC streams and datagram capability, not DNS exchanges.
+
+```text
+Asio datagram receive -> ngtcp2 packet input -> QUIC connection events
+application stream data -> ngtcp2 packet output -> Asio datagram send
 ngtcp2 expiry -> Asio steady timer -> ngtcp2 expiry handling
 ```
 
-Each connection and its ngtcp2/nghttp3 objects are confined to one Asio strand.
-Cancellation and shutdown must complete the exchange exactly once and release
-the datagram handle, timers, TLS objects, and protocol state on that strand.
+DoQ opens one bidirectional QUIC stream and applies DoQ length framing and DNS
+Message ID rules. HTTP/3 attaches an nghttp3 session to the QUIC connection.
+A native QUIC proxy protocol may use QUIC streams or datagrams directly without
+depending on either adapter.
+
+The engine is reusable infrastructure, not a promise that all QUIC protocols
+share a live connection. ALPN, server identity, transport parameters,
+congestion control, datagram support, authentication, and protocol-specific
+extensions are part of compatibility and pool identity.
+
+#### WebSocket and WSS
+
+This subsection defines a future compatibility boundary; WebSocket/WSS is not
+part of the current TLS/HTTP/QUIC extraction implementation scope.
+
+WebSocket is a message and control-frame protocol over an HTTP handshake. A
+`WebSocketChannel` preserves message boundaries, fragmentation, ping/pong,
+close, backpressure, and cancellation. A protocol may use an explicit
+byte-stream adapter only when its WebSocket mapping defines how messages are
+coalesced or split.
+
+The initial client handshake uses the shared HTTP/1.1 and TLS capabilities.
+WSS is TLS plus WebSocket, not a separate socket interface. Extended CONNECT
+over HTTP/2 or HTTP/3 is added only when a selected protocol requires it and
+the corresponding behavior has independent tests.
+
+#### KCP and mKCP
+
+This subsection likewise reserves the future KCP/mKCP boundary rather than
+adding KCP to the current extraction implementation scope.
+
+KCP consumes an injected `DatagramHandle`, owns ARQ sequence state,
+retransmission, congestion behavior, timers, windowing, and MTU limits, and
+produces a reliable ordered stream capability. It does not pass through the
+HTTP or QUIC interfaces.
+
+mKCP is a protocol-specific layer over the KCP engine. Its conversation IDs,
+masquerade headers, seeding, and configuration validation remain separate from
+generic KCP scheduling. A Shadowsocks KCP plugin or a VMess mKCP carrier then
+composes that capability without putting either proxy protocol into the KCP
+engine.
+
+### 15.4 Session pools and lifecycle
+
+Reusable connection state is owned outside DNS. At minimum, HTTP/1.1,
+HTTP/2, QUIC, and HTTP/3 need explicit pool or session-manager ownership.
+A pool key includes every property that can make reuse unsafe:
+
+- remote endpoint and address generation;
+- immutable endpoint-plan identity, including delegated outbound or group and
+  platform network binding;
+- server name, certificate policy, ALPN, and relevant TLS identity;
+- HTTP origin and version policy;
+- QUIC version, transport parameters, datagram capability, and protocol
+  options;
+- immutable configuration generation.
+
+Sessions are not shared merely because host and port match. DNS and proxy
+consumers may use the same pool implementation while retaining separate pools
+when their ALPN, authentication, egress, limits, or privacy requirements
+differ.
+
+Each session is confined to one owner runtime or strand and follows
+`connecting -> active -> retiring -> drained`. It advertises capacity, rejects
+new work after retirement, keeps child streams alive until completion, and
+releases callbacks, timers, crypto state, and injected handles only after
+cancellation has drained. Reload creates new pools and lets the old generation
+retire; it never mutates a live session in place.
+
+### 15.5 Consumer composition examples
+
+The intended compositions make the ownership boundary visible:
+
+```text
+DoT     = DNS length framing -> TLS -> stream dialer
+DoH/1   = DNS-over-HTTP -> HTTP/1.1 -> TLS -> stream dialer
+DoH/2   = DNS-over-HTTP -> HTTP/2 -> TLS -> stream dialer
+DoQ     = DoQ mapping -> QUIC stream -> datagram dialer
+DoH/3   = DNS-over-HTTP -> HTTP/3 -> QUIC -> datagram dialer
+
+Trojan  = Trojan handshake/framing -> TLS -> stream dialer
+WSS     = proxy protocol -> WebSocket -> HTTP/1.1 -> TLS -> stream dialer
+gRPC    = proxy protocol -> gRPC mapping -> HTTP/2 -> TLS -> stream dialer
+mKCP    = proxy protocol -> mKCP/KCP -> datagram dialer
+MASQUE  = CONNECT-UDP mapping -> HTTP/3 -> QUIC -> datagram dialer
+```
+
+These examples do not declare the named proxy protocols implemented. They show
+where their future application behavior belongs and which shared capabilities
+would be reused.
+
+### 15.6 Incremental extraction phases
+
+Extraction proceeds without a flag-day rewrite:
+
+Phases 1 through 4 are Stage 2 DNS migration work. Phase 5 is the Stage 4
+non-DNS generalization gate. Phase 6 is deferred beyond the current extraction.
+
+1. **Characterize the existing behavior.** Keep the current DNS and proxy
+   interoperability tests green; add narrow seams around TLS, HTTP/2, QUIC,
+   and HTTP/3 lifecycle behavior before moving ownership.
+2. **Generalize dialing and TLS.** Introduce transport-neutral dial context,
+   resolve DNS egress policy into `EndpointDialPlan` before calling
+   `EndpointDialer`, move the stream adapter out of DNS, and make TLS operate
+   over an injected stream. Convert DoT and Trojan first because they exercise
+   the same carrier with different consumers.
+3. **Extract HTTP/1.1 and HTTP/2 sessions.** Move Beast and nghttp2 ownership
+   into reusable clients, keep DNS-over-HTTP construction in `dns`, and rerun
+   all DoH/1 and DoH/2 conformance, pooling, and multiplexing cases.
+4. **Split QUIC from DoQ and HTTP/3.** Move ngtcp2/BoringSSL packet, timer,
+   stream, and connection state into the QUIC engine; put nghttp3 into an
+   HTTP/3 session; reduce DoQ and DoH3 to application adapters. Preserve the
+   current concurrent reuse, stream limits, cancellation, idle retirement, and
+   independent interoperability coverage.
+5. **Prove and extend proxy reuse.** In Stage 4, add at least one non-DNS HTTP
+   consumer and one selected QUIC proxy through the shared layer. One protocol
+   may satisfy both only when it genuinely exercises both the generic HTTP
+   session and QUIC connection boundaries. Any missing feature is added as a
+   capability with its own tests, not by exposing DNS internals or downcasting
+   the connection.
+6. **Deferred carrier implementations.** After the current extraction is
+   closed, implement WebSocket/WSS with the first selected WS-based proxy and
+   KCP/mKCP with the first selected KCP-based proxy. These are design inputs,
+   not work items in the current extraction. Do not build unused carrier
+   directories or claim support from a dependency-only test.
+
+Temporary adapters may coexist during a phase, but there is one owner for each
+live protocol state machine. New proxy implementations must not add another
+DNS-local or protocol-local HTTP/2, QUIC, or HTTP/3 stack while extraction is
+in progress.
+
+### 15.7 Validation and completion gates
+
+Validation reports two completion levels for the current work.
+
+**The Stage 2 DNS decoupling gate is complete** when:
+
+- DNS transport code contains DNS mapping, policy adaptation, and response
+  validation but no direct Beast, nghttp2, nghttp3, ngtcp2, or BoringSSL
+  connection ownership;
+- DoT, DoH/1, DoH/2, DoQ, and DoH/3 retain their current independent
+  interoperability, concurrency, timeout, cancellation, and trust checks;
+- DNS egress policy is frozen into a validated `EndpointDialPlan` before
+  carrier construction, with dependency-cycle and runtime recursion guards.
+
+This milestone may be reported as DNS migration complete, but it does not yet
+prove that the extracted interfaces are suitable for general proxy traffic.
+
+**The Stage 4 shared HTTP/QUIC generalization gate is complete** only when:
+
+- reusable carriers accept injected stream or datagram handles and execute
+  physical Direct plus at least one prebound non-Direct endpoint plan where
+  the capability allows it;
+- at least one non-DNS HTTP consumer and one selected non-DNS QUIC consumer
+  exercise the shared boundaries;
+- pool isolation, capacity, retirement, reload, shutdown, and child-handle
+  lifetime have deterministic tests;
+- no router, relay, frontend, or DNS policy change is required merely to add a
+  carrier-backed proxy protocol.
+
+The non-DNS consumer requirement is intentional. Stage 2 completes the move
+from DNS-owned stacks to shared carriers, but the overall generalization remains
+open until Stage 4 proxy-side use demonstrates that the interfaces are not
+still shaped around DNS exchanges.
+
+WebSocket/WSS and KCP/mKCP have separate future support gates and do not block
+completion of the current HTTP/QUIC extraction. Before either carrier is
+marked supported, WebSocket tests cover fragmentation, control frames, close,
+backpressure, and TLS failure; KCP tests cover loss, reordering, duplication,
+retransmit timing, MTU, cancellation, and shutdown.
+
+Library construction tests prove only that dependencies link. A carrier is
+supported only after its native adapter, runtime composition, failure paths,
+and independent wire interoperability are validated.
 
 ## 16. Platform boundary
 
@@ -1789,9 +2157,12 @@ validated on Windows. Stages 5 and 6 begin only after the portable core gate.
   truncation fallback, bounded cache, and in-flight query coalescing;
 - real DNS upstream and upstream-group objects with policy, fallback, health,
   bootstrap, and upstream egress routing;
-- DoT and DoH over HTTP/2 through reusable TLS and HTTP/2 carrier boundaries;
-- DoQ and DoH over HTTP/3, including the ngtcp2, nghttp3, BoringSSL, and Asio
-  transport path required by DNS;
+- DoT and DoH over HTTP/1.1 and HTTP/2 through reusable TLS, HTTP/1.1, and
+  HTTP/2 carrier boundaries;
+- extraction of the reusable ngtcp2/BoringSSL QUIC engine and nghttp3 HTTP/3
+  session, with DNS-specific connection/session ownership removed;
+- DoQ and DoH over HTTP/3 as DNS application adapters over the shared QUIC and
+  HTTP/3 layer;
 - bounded QUIC session reuse, retirement, cancellation, and independent
   interoperability tests for encrypted DNS transports;
 - local DNS service and FakeIP;
@@ -1799,10 +2170,12 @@ validated on Windows. Stages 5 and 6 begin only after the portable core gate.
 - immutable runtime snapshots and reload;
 - initial proxy groups and connection registry.
 
-Stage 2 includes the QUIC/HTTP/3 foundation needed for DoQ and DoH3 DNS and
-does not defer those DNS transports to Stage 4. Its functional gate covers
-plain, TLS, HTTP/2, and QUIC-based DNS behavior. Stage 4 builds on the DNS
-QUIC foundation for proxy protocols and their stream/session requirements.
+Stage 2 completes the Section 15 DNS-decoupling gate: encrypted DNS calls the
+shared TLS, HTTP/1.1, HTTP/2, QUIC, and HTTP/3 capabilities, and DNS code no
+longer owns the underlying HTTP or QUIC connection/session engines. Its
+functional gate covers plain UDP/TCP, DoT, DoH/1, DoH/2, DoQ, and DoH/3.
+Stage 4 builds on this already extracted foundation; it does not postpone the
+DNS migration.
 
 ### Stage 3: encrypted stream protocols
 
@@ -1812,12 +2185,24 @@ QUIC foundation for proxy protocols and their stream/session requirements.
 
 ### Stage 4: QUIC-based protocols
 
-- generalize and harden the ngtcp2/nghttp3/BoringSSL and Asio QUIC foundation
-  established for Stage 2 DNS;
-- a real QUIC/HTTP3 validation flow for proxy transports;
+- validate the shared carrier layer with at least one non-DNS HTTP consumer and
+  one selected non-DNS QUIC proxy protocol;
+- extend and harden the already extracted Asio/ngtcp2/BoringSSL QUIC engine and
+  nghttp3 HTTP/3 session for proxy stream/datagram requirements without forcing
+  incompatible protocols to share live sessions;
+- real QUIC and, where applicable, HTTP/3 validation flows for proxy traffic;
 - QUIC stream multiplexing, session capacity, retirement, and 0-RTT
   replay-safety validation for proxy use;
 - selected QUIC-based proxy protocols.
+
+The initial ownership move from DNS to the shared QUIC and HTTP/3 layer is a
+Stage 2 prerequisite. Stage 4 may add capabilities demanded by proxy protocols,
+but it must not introduce a second protocol-local QUIC or HTTP/3 stack.
+
+WebSocket/WSS and KCP/mKCP appear in Section 15 as design constraints only.
+They are not implementation work or Stage 4 completion claims. Their
+implementation phases are scheduled with the first selected proxy protocol
+that needs each carrier and use their separate Section 15 support gates.
 
 ### Portable core exit gate
 

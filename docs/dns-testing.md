@@ -117,6 +117,41 @@ the SOCKS5 proxy using that synthetic address. The earlier manual run used
 minimal PowerShell UDP and TCP clients; both received a 62-byte DNS response,
 preserved the query transaction ID `0x1234`, and contained `192.0.2.53`.
 
+## Composed Stage 2 policy, FakeIP, routing, and reload test
+
+`TestStage2PolicyFakeIPRoutingAndReloadComposition` exercises the composed
+runtime through real loopback sockets. It starts two independent `dnsproxy`
+processes with different hosts-file answers, then starts the C++ test host
+with a DNS policy rule, a FakeIP filter, a proxy domain rule, and a shared
+runtime snapshot store.
+
+The test verifies this sequence:
+
+1. An A query for `policy-route.test` returns `198.51.100.22` from the policy
+   upstream group rather than `192.0.2.11` from the default upstream.
+2. An A query for the FakeIP domain returns `198.18.0.1`; a SOCKS5 connection
+   using that address is reversed to the domain, matches the direct traffic
+   rule, and reaches a real loopback TCP echo service.
+3. The Go test sends `reload` to a loopback-only control endpoint exposed by
+   `clash-native-test-host` only when
+   `CLASH_NATIVE_TEST_STAGE2_COMPOSITION=1`. The host publishes generation 2
+   with a new DNS policy, a new FakeIP pool, and a reject default route.
+4. A query for `policy-route.test` now returns `192.0.2.11` from the default
+   upstream. A TCP DNS query for the FakeIP domain returns `198.19.0.1`; a new
+   SOCKS5 connection using that address receives the reject reply, while the
+   connection opened before reload continues relaying data.
+
+Run it from `tests/interop` after building the Windows test host:
+
+```powershell
+$env:CLASH_NATIVE_TEST_HOST = 'D:\Project\cpp\clash-native\build\windows-clang-cl-x64\clash-native-test-host.exe'
+go test -count=1 -run '^TestStage2PolicyFakeIPRoutingAndReloadComposition$' -v .
+```
+
+The test needs the independent `dnsproxy` executable described above. Its
+reload control listener is test-host-only and is bound to loopback on an
+ephemeral port.
+
 For clash-native integration, the automated topology is:
 
 ```text
@@ -158,8 +193,8 @@ Get-NetTCPConnection -LocalPort 15353 -ErrorAction SilentlyContinue
 
 ## Validation boundary
 
-This procedure proves an independent local DNS process boundary and real
-Windows loopback UDP/TCP exchange. It does not prove public-internet DNS
-reachability, bootstrap resolution of DNS server hostnames, DoQ or DoH3, or
-all DNS policy, FakeIP, routing, and reload paths through the standalone
-application. Those require separate tests.
+These tests prove independent local DNS process boundaries, real Windows
+loopback UDP/TCP exchange, one DNS-policy/FakeIP/traffic-route composition,
+and a snapshot reload that updates both DNS synthesis and new proxy
+connections. They do not prove public-internet reachability or every possible
+combination of DNS policies, routes, FakeIP filters, and reload generations.

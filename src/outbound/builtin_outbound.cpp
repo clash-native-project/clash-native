@@ -1,4 +1,5 @@
 #include <clash_native/net/tcp_stream.hpp>
+#include <clash_native/net/udp_stream.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
 
 #include <boost/asio/connect.hpp>
@@ -164,48 +165,6 @@ class DirectConnectOperation final : public std::enable_shared_from_this<DirectC
     bool completed_ = false;
 };
 
-class DirectDatagramHandle final : public core::DatagramHandle {
-  public:
-    explicit DirectDatagramHandle(std::shared_ptr<boost::asio::ip::udp::socket> socket)
-        : socket_(std::move(socket)) {}
-
-    void async_send_to(boost::asio::const_buffer buffer, boost::asio::ip::udp::endpoint destination,
-                       WriteHandler handler) override {
-        const auto socket = socket_;
-        socket->async_send_to(buffer, destination,
-                              [socket, handler = std::move(handler)](
-                                  const boost::system::error_code &error,
-                                  std::size_t size) mutable { handler(error, size); });
-    }
-
-    void async_receive_from(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        const auto socket = socket_;
-        const auto sender = std::make_shared<boost::asio::ip::udp::endpoint>();
-        socket->async_receive_from(
-            buffer, *sender,
-            [socket, sender, handler = std::move(handler)](const boost::system::error_code &error,
-                                                           std::size_t size) mutable {
-                handler(error, size, *sender);
-            });
-    }
-
-    boost::asio::any_io_executor executor() noexcept override { return socket_->get_executor(); }
-
-    void cancel() noexcept override {
-        boost::system::error_code ignored;
-        socket_->cancel(ignored);
-    }
-
-    void close() noexcept override {
-        boost::system::error_code ignored;
-        socket_->cancel(ignored);
-        socket_->close(ignored);
-    }
-
-  private:
-    std::shared_ptr<boost::asio::ip::udp::socket> socket_;
-};
-
 core::StreamOpenResult rejected_stream() {
     return core::StreamOpenResult::failed(
         {core::ErrorCode::rejected, "connection rejected by the reject outbound"});
@@ -243,7 +202,7 @@ void DirectOutbound::open_datagram(core::DatagramRequest request,
     }
 
     const auto address = request.initial_destination->address();
-    auto socket = std::make_shared<boost::asio::ip::udp::socket>(runtime_.context());
+    auto socket = std::make_unique<net::UdpStream>(runtime_.context().get_executor());
     boost::system::error_code error;
     socket->open(address.is_v4() ? boost::asio::ip::udp::v4() : boost::asio::ip::udp::v6(), error);
     if (!error) {
@@ -260,9 +219,8 @@ void DirectOutbound::open_datagram(core::DatagramRequest request,
         return;
     }
 
-    handler(
-        core::DatagramOpenResult::opened(std::make_unique<DirectDatagramHandle>(std::move(socket)),
-                                         core::DatagramSemantics::fixed_destination));
+    handler(core::DatagramOpenResult::opened(std::move(socket),
+                                             core::DatagramSemantics::fixed_destination));
 }
 
 RejectOutbound::RejectOutbound(runtime::AsioRuntime &runtime) : runtime_(runtime) {}

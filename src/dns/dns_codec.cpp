@@ -3,7 +3,6 @@
 #include <ares.h>
 
 #include <algorithm>
-#include <array>
 #include <cctype>
 #include <cstring>
 #include <limits>
@@ -96,82 +95,6 @@ std::uint16_t rr_type_code(const ares_dns_rr_t *rr) {
     const auto type = ares_dns_rr_get_type(rr);
     return type == ARES_REC_TYPE_RAW_RR ? ares_dns_rr_get_u16(rr, ARES_RR_RAW_RR_TYPE)
                                         : static_cast<std::uint16_t>(type);
-}
-
-std::uint16_t read_u16(std::span<const std::uint8_t> message, std::size_t offset) {
-    return static_cast<std::uint16_t>((message[offset] << 8) | message[offset + 1]);
-}
-
-std::uint32_t read_u32(std::span<const std::uint8_t> message, std::size_t offset) {
-    return (static_cast<std::uint32_t>(message[offset]) << 24) |
-           (static_cast<std::uint32_t>(message[offset + 1]) << 16) |
-           (static_cast<std::uint32_t>(message[offset + 2]) << 8) | message[offset + 3];
-}
-
-std::optional<std::size_t> skip_name(std::span<const std::uint8_t> message, std::size_t offset) {
-    auto cursor = offset;
-    std::optional<std::size_t> end;
-    std::size_t jumps = 0;
-    while (cursor < message.size()) {
-        const auto length = message[cursor];
-        if ((length & 0xc0) == 0xc0) {
-            if (cursor + 1 >= message.size() || ++jumps > message.size()) {
-                return std::nullopt;
-            }
-            if (!end) {
-                end = cursor + 2;
-            }
-            cursor = static_cast<std::size_t>(((length & 0x3f) << 8) | message[cursor + 1]);
-            continue;
-        }
-        if ((length & 0xc0) != 0 || cursor + 1 + length > message.size()) {
-            return std::nullopt;
-        }
-        cursor += 1 + length;
-        if (length == 0) {
-            return end.value_or(cursor);
-        }
-    }
-    return std::nullopt;
-}
-
-// c-ares exposes the OPT version, flags, and options but not its extended RCODE byte.
-std::optional<std::uint32_t> read_opt_ttl(std::span<const std::uint8_t> message) {
-    if (message.size() < 12) {
-        return std::nullopt;
-    }
-    std::size_t offset = 12;
-    const auto question_count = read_u16(message, 4);
-    const std::array<std::uint16_t, 3> section_counts{read_u16(message, 6), read_u16(message, 8),
-                                                      read_u16(message, 10)};
-    for (std::size_t index = 0; index < question_count; ++index) {
-        const auto next = skip_name(message, offset);
-        if (!next || *next + 4 > message.size()) {
-            return std::nullopt;
-        }
-        offset = *next + 4;
-    }
-    for (const auto count : section_counts) {
-        for (std::size_t index = 0; index < count; ++index) {
-            const auto next = skip_name(message, offset);
-            if (!next || *next + 10 > message.size()) {
-                return std::nullopt;
-            }
-            offset = *next;
-            const auto type = read_u16(message, offset);
-            const auto ttl = read_u32(message, offset + 4);
-            const auto data_length = read_u16(message, offset + 8);
-            offset += 10;
-            if (offset + data_length > message.size()) {
-                return std::nullopt;
-            }
-            if (type == static_cast<std::uint16_t>(DnsRecordType::opt)) {
-                return ttl;
-            }
-            offset += data_length;
-        }
-    }
-    return std::nullopt;
 }
 
 bool append_cares_fields(const ares_dns_rr_t *rr, ares_dns_rec_type_t parsed_type,
@@ -340,6 +263,14 @@ bool append_section(const ares_dns_record_t *dns_record, ares_dns_section_t sect
         record.ttl_seconds = ares_dns_rr_get_ttl(rr);
         if (record.type == static_cast<std::uint16_t>(DnsRecordType::opt)) {
             record.class_code = ares_dns_rr_get_u16(rr, ARES_RR_OPT_UDP_SIZE);
+            const auto response_code =
+                static_cast<std::uint16_t>(ares_dns_record_get_rcode(dns_record));
+            const auto extended_code = static_cast<std::uint32_t>((response_code >> 4) & 0xff);
+            const auto version =
+                static_cast<std::uint32_t>(ares_dns_rr_get_u8(rr, ARES_RR_OPT_VERSION));
+            const auto flags =
+                static_cast<std::uint32_t>(ares_dns_rr_get_u16(rr, ARES_RR_OPT_FLAGS));
+            record.ttl_seconds = (extended_code << 24) | (version << 16) | flags;
         }
 
         switch (record.type) {
@@ -534,16 +465,6 @@ core::Result<DnsPacket> DnsMessageCodec::decode_packet(std::span<const std::uint
         !append_section(dns_record.get(), ARES_SECTION_AUTHORITY, packet.authorities) ||
         !append_section(dns_record.get(), ARES_SECTION_ADDITIONAL, packet.additionals)) {
         return core::fail(codec_error("c-ares returned an invalid DNS resource record"));
-    }
-    const auto opt = std::find_if(
-        packet.additionals.begin(), packet.additionals.end(), [](const DnsResourceRecord &record) {
-            return record.type == static_cast<std::uint16_t>(DnsRecordType::opt);
-        });
-    if (opt != packet.additionals.end()) {
-        if (const auto ttl = read_opt_ttl(message)) {
-            opt->ttl_seconds = *ttl;
-            packet.extended_response_code = static_cast<std::uint8_t>(*ttl >> 24);
-        }
     }
     return packet;
 }

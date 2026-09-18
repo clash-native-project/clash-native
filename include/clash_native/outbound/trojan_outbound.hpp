@@ -4,8 +4,6 @@
 #include <clash_native/dns/resolver_service.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 
-#include <boost/asio/ssl/context.hpp>
-
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -37,7 +35,6 @@ class TrojanOutbound final : public core::Outbound {
     runtime::AsioRuntime &runtime_;
     TrojanOutboundConfig config_;
     std::shared_ptr<dns::ResolverService> resolver_;
-    std::shared_ptr<boost::asio::ssl::context> tls_context_;
     core::OutboundDescriptor descriptor_;
     core::OutboundCapabilities capabilities_{true, core::DatagramSemantics::unsupported,
                                              core::TargetRequirement::domain_or_ip,

@@ -1,21 +1,12 @@
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
+#include <clash_native/transport/http_client.hpp>
+#include <clash_native/transport/tls_client.hpp>
 
-#include "builtin_ca_bundle.hpp"
-#include "stream_handle_adapter.hpp"
-
-#include <boost/asio/buffer.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/ssl.hpp>
-#include <boost/asio/write.hpp>
-#include <boost/beast/core.hpp>
-#include <boost/beast/http.hpp>
-#include <boost/beast/ssl.hpp>
-
-#include <openssl/ssl.h>
+#include <boost/asio/steady_timer.hpp>
 
 #include <algorithm>
-#include <array>
 #include <cctype>
 #include <chrono>
 #include <memory>
@@ -24,27 +15,13 @@
 #include <system_error>
 #include <unordered_map>
 #include <utility>
-#include <vector>
 
 namespace clash_native::dns {
 
 namespace {
 
-namespace beast = boost::beast;
-namespace http = beast::http;
-
-core::Error io_error(std::string context, const boost::system::error_code &error) {
-    return {core::ErrorCode::transport_io, std::move(context),
-            std::error_code(error.value(), std::system_category())};
-}
-
 core::Error protocol_error(std::string context) {
     return {core::ErrorCode::protocol_framing, std::move(context)};
-}
-
-core::Error handshake_error(const boost::system::error_code &error) {
-    return {core::ErrorCode::carrier_handshake, "DoH/HTTP/1.1 TLS handshake failed",
-            std::error_code(error.value(), std::system_category())};
 }
 
 core::Error timeout_error() { return {core::ErrorCode::timeout, "DoH/HTTP/1.1 query timed out"}; }
@@ -85,6 +62,13 @@ bool matches_question(const DnsPacket &response, const DnsPacket &query) {
                       });
 }
 
+const std::string *find_header(const transport::HttpResponse &response, std::string_view name) {
+    const auto found = std::find_if(
+        response.headers.begin(), response.headers.end(),
+        [name](const transport::HttpHeader &header) { return lower_trimmed(header.name) == name; });
+    return found == response.headers.end() ? nullptr : &found->value;
+}
+
 } // namespace
 
 class Doh1DnsTransport final : public DnsTransport {
@@ -117,16 +101,10 @@ class Doh1DnsTransport final : public DnsTransport {
 
 class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Operation> {
   public:
-    using SslStream = beast::ssl_stream<StreamHandleAdapter>;
-    using Request = http::request<http::vector_body<std::uint8_t>>;
-    using RequestSerializer = http::request_serializer<http::vector_body<std::uint8_t>>;
-    using ResponseParser = http::response_parser<http::vector_body<std::uint8_t>>;
-
     Operation(Doh1DnsTransport &owner, ExchangeId exchange_id, DnsExchangeRequest request,
               Handler handler)
         : owner_(owner), exchange_id_(exchange_id), request_(std::move(request)),
-          handler_(std::move(handler)), timer_(owner.runtime_.context()),
-          ssl_context_(boost::asio::ssl::context::tls_client) {}
+          handler_(std::move(handler)), timer_(owner.runtime_.context()) {}
 
     void start() {
         if (std::chrono::steady_clock::now() >= request_.deadline) {
@@ -185,42 +163,6 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     Handler take_handler() { return std::move(handler_); }
 
   private:
-    bool configure_tls() {
-        boost::system::error_code error;
-        if (owner_.config_.verify_peer) {
-            const auto roots = detail::builtin_ca_bundle_pem();
-            ssl_context_.add_certificate_authority(boost::asio::buffer(roots.data(), roots.size()),
-                                                   error);
-            if (error) {
-                finish(core::fail(io_error("failed to load embedded DoH trust roots", error)));
-                return false;
-            }
-        }
-        ssl_stream_->set_verify_mode(owner_.config_.verify_peer ? boost::asio::ssl::verify_peer
-                                                                : boost::asio::ssl::verify_none);
-        const auto server_name = !owner_.config_.server_name.empty()
-                                     ? owner_.config_.server_name
-                                     : (!owner_.config_.hostname.empty()
-                                            ? owner_.config_.hostname
-                                            : owner_.config_.endpoint.address().to_string());
-        if (!server_name.empty() &&
-            SSL_set_tlsext_host_name(ssl_stream_->native_handle(), server_name.c_str()) != 1) {
-            finish(core::fail(
-                {core::ErrorCode::configuration, "failed to configure DoH/HTTP/1.1 server name"}));
-            return false;
-        }
-        if (owner_.config_.verify_peer) {
-            ssl_stream_->set_verify_callback(boost::asio::ssl::host_name_verification(server_name));
-        }
-        static constexpr unsigned char alpn[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
-        if (SSL_set_alpn_protos(ssl_stream_->native_handle(), alpn, sizeof(alpn)) != 0) {
-            finish(core::fail(
-                {core::ErrorCode::configuration, "failed to configure DoH/HTTP/1.1 ALPN"}));
-            return false;
-        }
-        return true;
-    }
-
     void connect() {
         const auto endpoint = owner_.config_.tcp_endpoint.value_or(boost::asio::ip::tcp::endpoint(
             owner_.config_.endpoint.address(),
@@ -241,163 +183,103 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
                                     "DoH/HTTP/1.1 dialer failed to open a stream"})));
                     return;
                 }
-                self->ssl_stream_ = std::make_unique<SslStream>(
-                    StreamHandleAdapter(std::move(result.handle)), self->ssl_context_);
-                if (self->configure_tls()) {
-                    self->handshake();
-                }
+                self->start_tls(std::move(result.handle));
             });
     }
 
-    void handshake() {
+    void start_tls(std::unique_ptr<core::StreamHandle> stream) {
+        const auto server_name = !owner_.config_.server_name.empty()
+                                     ? owner_.config_.server_name
+                                     : (!owner_.config_.hostname.empty()
+                                            ? owner_.config_.hostname
+                                            : owner_.config_.endpoint.address().to_string());
+        transport::TlsClientOptions options;
+        options.server_name = server_name;
+        options.verify_peer = owner_.config_.verify_peer;
+        options.alpn_protocols = {"http/1.1"};
+        options.deadline = request_.deadline;
         const auto self = shared_from_this();
-        ssl_stream_->async_handshake(
-            boost::asio::ssl::stream_base::client, [self](const boost::system::error_code &error) {
+        tls_handshake_ = transport::async_tls_client_handshake(
+            std::move(stream), std::move(options),
+            [self](core::Result<transport::TlsClientConnection> result) mutable {
+                self->tls_handshake_.reset();
                 if (self->completed_) {
+                    if (result && result->stream) {
+                        result->stream->close();
+                    }
                     return;
                 }
-                if (error) {
-                    self->finish(core::fail(handshake_error(error)));
+                if (!result) {
+                    self->finish(core::fail(result.error()));
                     return;
                 }
-                const unsigned char *protocol = nullptr;
-                unsigned int protocol_length = 0;
-                SSL_get0_alpn_selected(self->ssl_stream_->native_handle(), &protocol,
-                                       &protocol_length);
-                constexpr std::string_view expected = "http/1.1";
-                if (protocol_length != 0 &&
-                    (protocol_length != expected.size() ||
-                     !std::equal(protocol, protocol + protocol_length, expected.begin()))) {
+                if (!result->negotiated_alpn.empty() && result->negotiated_alpn != "http/1.1") {
                     self->finish(core::fail({core::ErrorCode::carrier_handshake,
                                              "DoH upstream did not negotiate HTTP/1.1"}));
                     return;
                 }
-                self->send_request();
+                self->start_http(std::move(result->stream));
             });
     }
 
-    void send_request() {
-        request_message_.version(11);
-        request_message_.method(http::verb::post);
-        request_message_.target(owner_.config_.doh_path);
-        request_message_.set(http::field::host, authority_);
-        request_message_.set(http::field::accept, "application/dns-message");
-        request_message_.set(http::field::content_type, "application/dns-message");
-        request_message_.keep_alive(false);
-        request_message_.body() = request_.query.wire;
-        request_message_.prepare_payload();
-
-        RequestSerializer serializer(request_message_);
-        boost::system::error_code error;
-        while (!serializer.is_done()) {
-            std::size_t serialized_size = 0;
-            serializer.next(error, [this, &serialized_size](boost::system::error_code &visit_error,
-                                                            const auto &buffers) {
-                if (visit_error) {
-                    return;
-                }
-                serialized_size = beast::buffer_bytes(buffers);
-                const auto offset = request_wire_.size();
-                request_wire_.resize(offset + serialized_size);
-                serialized_size = boost::asio::buffer_copy(
-                    boost::asio::buffer(request_wire_.data() + offset, serialized_size), buffers);
-            });
-            if (error || serialized_size == 0) {
-                finish(core::fail(protocol_error("failed to serialize DoH/HTTP/1.1 request")));
-                return;
-            }
-            serializer.consume(serialized_size);
+    void start_http(std::unique_ptr<core::StreamHandle> stream) {
+        http_session_ = transport::make_http1_client_session(std::move(stream));
+        if (!http_session_) {
+            finish(core::fail(
+                {core::ErrorCode::configuration, "failed to create an HTTP/1.1 client session"}));
+            return;
         }
 
+        transport::HttpRequest request;
+        request.method = "POST";
+        request.scheme = "https";
+        request.authority = authority_;
+        request.target = owner_.config_.doh_path;
+        request.headers = {{"accept", "application/dns-message"},
+                           {"content-type", "application/dns-message"}};
+        request.body = request_.query.wire;
+        request.response_body_limit = 0xffff;
+        request.keep_alive = false;
+
         const auto self = shared_from_this();
-        boost::asio::async_write(*ssl_stream_, boost::asio::buffer(request_wire_),
-                                 [self](const boost::system::error_code &error, std::size_t) {
-                                     if (self->completed_) {
-                                         return;
-                                     }
-                                     if (error) {
-                                         self->finish(core::fail(io_error(
-                                             "failed to send DoH/HTTP/1.1 request", error)));
-                                         return;
-                                     }
-                                     self->read_response();
-                                 });
+        http_exchange_id_ =
+            http_session_->exchange(std::move(request), request_.deadline,
+                                    [self](core::Result<transport::HttpResponse> response) mutable {
+                                        self->http_exchange_started_ = false;
+                                        if (self->completed_) {
+                                            return;
+                                        }
+                                        self->http_response(std::move(response));
+                                    });
+        http_exchange_started_ = true;
     }
 
-    void read_response() {
-        response_parser_.body_limit(0xffff);
-        response_parser_.eager(true);
-        read_response_chunk();
-    }
-
-    void read_response_chunk() {
-        const auto self = shared_from_this();
-        ssl_stream_->async_read_some(
-            boost::asio::buffer(read_buffer_),
-            [self](const boost::system::error_code &error, std::size_t size) {
-                if (self->completed_) {
-                    return;
-                }
-                if (error) {
-                    if (error == boost::asio::error::eof) {
-                        boost::system::error_code parse_error;
-                        self->response_parser_.put_eof(parse_error);
-                        if (!parse_error && self->response_parser_.is_done()) {
-                            self->finish_response();
-                            return;
-                        }
-                    }
-                    const bool framing_error = error == http::error::body_limit ||
-                                               error == http::error::partial_message ||
-                                               error == http::error::bad_chunk;
-                    self->finish(core::fail(
-                        framing_error ? protocol_error("DoH/HTTP/1.1 response framing failed")
-                                      : io_error("failed to read DoH/HTTP/1.1 response", error)));
-                    return;
-                }
-                boost::system::error_code parse_error;
-                (void)self->response_parser_.put(
-                    boost::asio::buffer(self->read_buffer_.data(), size), parse_error);
-                if (parse_error == http::error::need_more) {
-                    parse_error.clear();
-                }
-                if (parse_error) {
-                    self->finish(
-                        core::fail(protocol_error("DoH/HTTP/1.1 response framing failed")));
-                    return;
-                }
-                if (self->response_parser_.is_done()) {
-                    self->finish_response();
-                    return;
-                }
-                self->read_response_chunk();
-            });
-    }
-
-    void finish_response() {
-        const auto response = response_parser_.get();
-        if (response.version() != 11 || response.result() != http::status::ok) {
+    void http_response(core::Result<transport::HttpResponse> result) {
+        if (!result) {
+            finish(core::fail(result.error()));
+            return;
+        }
+        const auto &response = result.value();
+        if (response.version != 11 || response.status != 200) {
             finish(core::fail(protocol_error("DoH upstream returned an invalid HTTP response")));
             return;
         }
-        const auto content_type = response.find(http::field::content_type);
-        if (content_type == response.end()) {
+        const auto *content_type = find_header(response, "content-type");
+        if (content_type == nullptr) {
             finish(core::fail(protocol_error("DoH upstream returned an invalid content type")));
             return;
         }
-        auto media_type =
-            std::string_view(content_type->value().data(), content_type->value().size());
+        const auto media_type = std::string_view(*content_type);
         const auto parameter = media_type.find(';');
         if (lower_trimmed(media_type.substr(0, parameter)) != "application/dns-message") {
             finish(core::fail(protocol_error("DoH upstream returned an invalid content type")));
             return;
         }
-        const auto &body = response.body();
-        if (body.empty()) {
+        if (response.body.empty()) {
             finish(core::fail(protocol_error("DoH upstream returned an empty DNS message")));
             return;
         }
-        const auto decoded = DnsMessageCodec::decode_packet(body, request_.query.id);
+        const auto decoded = DnsMessageCodec::decode_packet(response.body, request_.query.id);
         if (!decoded) {
             finish(core::fail(decoded.error()));
             return;
@@ -414,11 +296,18 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
             return;
         }
         completed_ = true;
-        boost::system::error_code ignored;
-        timer_.cancel();
-        if (ssl_stream_) {
-            ssl_stream_->next_layer().close();
-            ssl_stream_.reset();
+        (void)timer_.cancel();
+        if (tls_handshake_) {
+            tls_handshake_->cancel();
+            tls_handshake_.reset();
+        }
+        if (http_session_) {
+            if (http_exchange_started_) {
+                http_session_->cancel(http_exchange_id_);
+                http_exchange_started_ = false;
+            }
+            http_session_->stop();
+            http_session_.reset();
         }
         owner_.complete(exchange_id_, std::move(result));
     }
@@ -428,13 +317,11 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     DnsExchangeRequest request_;
     Handler handler_;
     boost::asio::steady_timer timer_;
-    boost::asio::ssl::context ssl_context_;
-    std::unique_ptr<SslStream> ssl_stream_;
-    std::array<std::uint8_t, 16384> read_buffer_{};
-    Request request_message_;
-    std::vector<std::uint8_t> request_wire_;
-    ResponseParser response_parser_;
+    std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
+    std::shared_ptr<transport::HttpClientSession> http_session_;
+    transport::HttpClientSession::ExchangeId http_exchange_id_ = 0;
     std::string authority_;
+    bool http_exchange_started_ = false;
     bool completed_ = false;
 };
 

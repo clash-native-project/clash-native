@@ -1,6 +1,7 @@
 #include <clash_native/outbound/shadowsocks_outbound.hpp>
 
 #include <clash_native/net/tcp_stream.hpp>
+#include <clash_native/net/udp_stream.hpp>
 
 #include "outbound_utils.hpp"
 #include "proxy_address.hpp"
@@ -462,15 +463,15 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
   public:
     struct State : std::enable_shared_from_this<State> {
         State(runtime::AsioRuntime &runtime, std::shared_ptr<dns::ResolverService> resolver,
-              std::shared_ptr<boost::asio::ip::udp::socket> socket,
-              boost::asio::ip::udp::endpoint server, std::string method, std::string password)
+              std::shared_ptr<net::UdpStream> socket, boost::asio::ip::udp::endpoint server,
+              std::string method, std::string password)
             : runtime(runtime), resolver(std::move(resolver)), socket(std::move(socket)),
               server(std::move(server)), method(std::move(method)), password(std::move(password)) {}
 
         void send(boost::asio::const_buffer buffer, boost::asio::ip::udp::endpoint destination,
                   WriteHandler handler) {
             if (buffer.size() > max_datagram_size()) {
-                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                boost::asio::post(socket->executor(), [handler = std::move(handler)]() mutable {
                     handler(boost::asio::error::message_size, 0);
                 });
                 return;
@@ -480,21 +481,21 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
             auto address = detail::encode_proxy_address(target);
             const auto method_info = detail::shadowsocks_method(method);
             if (!address || !method_info) {
-                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                boost::asio::post(socket->executor(), [handler = std::move(handler)]() mutable {
                     handler(protocol_error(), 0);
                 });
                 return;
             }
             std::vector<std::uint8_t> salt(method_info.value().key_size);
             if (!detail::random_bytes(salt)) {
-                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                boost::asio::post(socket->executor(), [handler = std::move(handler)]() mutable {
                     handler(authentication_error(), 0);
                 });
                 return;
             }
             auto key = detail::derive_shadowsocks_subkey(method, password, salt);
             if (!key) {
-                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                boost::asio::post(socket->executor(), [handler = std::move(handler)]() mutable {
                     handler(authentication_error(), 0);
                 });
                 return;
@@ -506,14 +507,14 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
             std::array<std::uint8_t, 12> nonce{};
             auto ciphertext = detail::shadowsocks_encrypt(method, key.value(), nonce, plaintext);
             if (!ciphertext) {
-                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                boost::asio::post(socket->executor(), [handler = std::move(handler)]() mutable {
                     handler(authentication_error(), 0);
                 });
                 return;
             }
             salt.insert(salt.end(), ciphertext.value().begin(), ciphertext.value().end());
             if (salt.size() > kMaxEncryptedUdpDatagramSize) {
-                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                boost::asio::post(socket->executor(), [handler = std::move(handler)]() mutable {
                     handler(boost::asio::error::message_size, 0);
                 });
                 return;
@@ -529,7 +530,7 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
 
         void receive(boost::asio::mutable_buffer buffer, ReadHandler handler) {
             if (receive_in_progress) {
-                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                boost::asio::post(socket->executor(), [handler = std::move(handler)]() mutable {
                     handler(boost::asio::error::already_started, 0, {});
                 });
                 return;
@@ -538,36 +539,38 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
             output_buffer = buffer;
             receive_handler = std::move(handler);
             auto self = shared_from_this();
-            socket->async_receive_from(
-                boost::asio::buffer(receive_buffer), receive_sender,
-                [self](const boost::system::error_code &error, std::size_t size) {
-                    if (error) {
-                        self->finish_receive(error, 0, {});
-                        return;
-                    }
-                    if (self->receive_sender != self->server) {
-                        self->receive_next();
-                        return;
-                    }
-                    self->decode_response(size);
-                });
+            socket->async_receive_from(boost::asio::buffer(receive_buffer),
+                                       [self](const boost::system::error_code &error,
+                                              std::size_t size,
+                                              boost::asio::ip::udp::endpoint sender) {
+                                           if (error) {
+                                               self->finish_receive(error, 0, {});
+                                               return;
+                                           }
+                                           if (sender != self->server) {
+                                               self->receive_next();
+                                               return;
+                                           }
+                                           self->decode_response(size);
+                                       });
         }
 
         void receive_next() {
             auto self = shared_from_this();
-            socket->async_receive_from(
-                boost::asio::buffer(receive_buffer), receive_sender,
-                [self](const boost::system::error_code &error, std::size_t size) {
-                    if (error) {
-                        self->finish_receive(error, 0, {});
-                        return;
-                    }
-                    if (self->receive_sender != self->server) {
-                        self->receive_next();
-                        return;
-                    }
-                    self->decode_response(size);
-                });
+            socket->async_receive_from(boost::asio::buffer(receive_buffer),
+                                       [self](const boost::system::error_code &error,
+                                              std::size_t size,
+                                              boost::asio::ip::udp::endpoint sender) {
+                                           if (error) {
+                                               self->finish_receive(error, 0, {});
+                                               return;
+                                           }
+                                           if (sender != self->server) {
+                                               self->receive_next();
+                                               return;
+                                           }
+                                           self->decode_response(size);
+                                       });
         }
 
         void decode_response(std::size_t size) {
@@ -643,11 +646,7 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
             }
         }
 
-        void close() noexcept {
-            boost::system::error_code ignored;
-            socket->cancel(ignored);
-            socket->close(ignored);
-        }
+        void close() noexcept { socket->close(); }
 
         std::size_t max_datagram_size() const noexcept {
             return kMaxUdpWireSize - detail::shadowsocks_method(method).value().key_size -
@@ -656,12 +655,11 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
 
         runtime::AsioRuntime &runtime;
         std::shared_ptr<dns::ResolverService> resolver;
-        std::shared_ptr<boost::asio::ip::udp::socket> socket;
+        std::shared_ptr<net::UdpStream> socket;
         boost::asio::ip::udp::endpoint server;
         std::string method;
         std::string password;
         std::array<std::uint8_t, kMaxUdpWireSize> receive_buffer{};
-        boost::asio::ip::udp::endpoint receive_sender;
         boost::asio::mutable_buffer output_buffer;
         ReadHandler receive_handler;
         bool receive_in_progress = false;
@@ -679,9 +677,7 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
         state_->receive(buffer, std::move(handler));
     }
 
-    boost::asio::any_io_executor executor() noexcept override {
-        return state_->socket->get_executor();
-    }
+    boost::asio::any_io_executor executor() noexcept override { return state_->socket->executor(); }
 
     std::size_t max_datagram_size() const noexcept override { return state_->max_datagram_size(); }
 
@@ -748,7 +744,7 @@ void ShadowsocksOutbound::open_datagram(core::DatagramRequest, core::DatagramOpe
             }
             const auto server =
                 boost::asio::ip::udp::endpoint(result.value().front(), config.server_port);
-            auto socket = std::make_shared<boost::asio::ip::udp::socket>(runtime->context());
+            auto socket = std::make_shared<net::UdpStream>(runtime->context().get_executor());
             boost::system::error_code error;
             socket->open(server.protocol(), error);
             if (!error) {

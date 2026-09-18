@@ -22,6 +22,7 @@ class OutboundRegistry final {
     core::Status add_group(std::string id, std::vector<std::string> members);
     core::Status validate() const;
     core::Result<OutboundPtr> select(std::string_view id) const;
+    core::Result<core::OutboundCapabilities> capabilities(std::string_view id) const;
     std::vector<std::string> ids() const;
     Snapshot snapshot() const;
 
@@ -64,6 +65,8 @@ class OutboundRegistry final {
     };
 
     core::Status validate_group(std::string_view id, std::vector<std::string> &visiting) const;
+    core::Result<core::OutboundCapabilities>
+    capabilities_entry(std::string_view id, std::vector<std::string> &visiting) const;
     core::Result<OutboundPtr> select_entry(std::string_view id,
                                            std::vector<std::string> &visiting) const;
 

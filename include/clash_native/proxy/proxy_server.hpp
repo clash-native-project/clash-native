@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string_view>
 #include <unordered_set>
 
 namespace clash_native::proxy {
@@ -38,9 +39,11 @@ class ProxyServer {
     void add_rule(router::TrafficRule rule);
     void set_resolver(std::shared_ptr<dns::ResolverService> resolver);
     void set_fake_ip_store(std::shared_ptr<dns::FakeIpStore> store);
+    void set_fake_ip_filter(std::function<bool(std::string_view)> filter);
     void set_outbound_registry(std::shared_ptr<outbound::OutboundRegistry> registry);
     void set_connection_registry(std::shared_ptr<observability::ConnectionRegistry> registry);
     core::Status reload(runtime::RuntimeSnapshotPtr snapshot);
+    std::shared_ptr<runtime::RuntimeSnapshotStore> runtime_snapshot_store() const noexcept;
     core::Status start();
     void stop() noexcept;
     bool running() const noexcept;
@@ -78,10 +81,11 @@ class ProxyServer {
     std::shared_ptr<outbound::RejectOutbound> reject_outbound_;
     std::shared_ptr<outbound::OutboundRegistry> outbound_registry_;
     std::shared_ptr<observability::ConnectionRegistry> connection_registry_;
-    runtime::RuntimeSnapshotStore snapshot_store_;
+    std::shared_ptr<runtime::RuntimeSnapshotStore> snapshot_store_;
     std::uint64_t next_snapshot_generation_ = 1;
     std::shared_ptr<dns::ResolverService> resolver_;
     std::shared_ptr<dns::FakeIpStore> fake_ip_store_;
+    std::function<bool(std::string_view)> fake_ip_filter_;
     std::shared_ptr<std::atomic_bool> callback_gate_;
     std::unordered_set<dns::ResolverService::RequestId> resolver_requests_;
 };

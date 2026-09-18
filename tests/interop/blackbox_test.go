@@ -29,6 +29,7 @@ import (
 
 const readyPrefix = "clash-native-test-host ready "
 const dnsReadyPrefix = "clash-native-test-host dns-ready "
+const controlReadyPrefix = "clash-native-test-host control-ready "
 
 func TestSocks5ProcessWithIndependentTCPEndpoint(t *testing.T) {
 	executable := os.Getenv("CLASH_NATIVE_TEST_HOST")
@@ -455,6 +456,134 @@ func TestFakeIPProcessWithIndependentDnsproxy(t *testing.T) {
 	}
 }
 
+func TestStage2PolicyFakeIPRoutingAndReloadComposition(t *testing.T) {
+	testHost := os.Getenv("CLASH_NATIVE_TEST_HOST")
+	if testHost == "" {
+		t.Skip("CLASH_NATIVE_TEST_HOST is not set")
+	}
+	dnsproxy := findDnsproxy(t)
+	echo, err := endpoints.StartTCPEcho()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+
+	const fakeDomain = "clash-native-stage2-fake.test"
+	const policyDomain = "policy-route.test"
+	defaultHosts := filepath.Join(t.TempDir(), "default-hosts.txt")
+	policyHosts := filepath.Join(t.TempDir(), "policy-hosts.txt")
+	if err := os.WriteFile(defaultHosts, []byte("127.0.0.1 "+fakeDomain+"\n192.0.2.11 "+policyDomain+"\n"), 0o600); err != nil {
+		t.Fatalf("write default DNS hosts file: %v", err)
+	}
+	if err := os.WriteFile(policyHosts, []byte("198.51.100.22 "+policyDomain+"\n"), 0o600); err != nil {
+		t.Fatalf("write policy DNS hosts file: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	startDnsproxy := func(hostsPath string) (*harness.Process, string) {
+		t.Helper()
+		port := freeDNSPort(t)
+		address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+		process, startErr := harness.Start(ctx, dnsproxy,
+			"--listen=127.0.0.1",
+			"--port="+strconv.Itoa(port),
+			"--upstream=127.0.0.1:9",
+			"--hosts-file-enabled",
+			"--hosts-files="+hostsPath,
+			"--verbose")
+		if startErr != nil {
+			t.Fatalf("start independent dnsproxy: %v", startErr)
+		}
+		if waitErr := waitForTCPListener(ctx, address); waitErr != nil {
+			stdout, stderr := process.Output()
+			t.Fatalf("wait for dnsproxy listener: %v; stdout=%q stderr=%q", waitErr, stdout, stderr)
+		}
+		return process, address
+	}
+	defaultProcess, defaultAddress := startDnsproxy(defaultHosts)
+	defer stopProcess(t, defaultProcess, "default dnsproxy")
+	policyProcess, policyAddress := startDnsproxy(policyHosts)
+	defer stopProcess(t, policyProcess, "policy dnsproxy")
+
+	process, err := harness.StartWithEnv(ctx, testHost, map[string]string{
+		"CLASH_NATIVE_DNS_UPSTREAM":            defaultAddress,
+		"CLASH_NATIVE_DNS_POLICY_UPSTREAM":     policyAddress,
+		"CLASH_NATIVE_FAKE_IP_DOMAIN":          fakeDomain,
+		"CLASH_NATIVE_TEST_STAGE2_COMPOSITION": "1",
+	})
+	if err != nil {
+		t.Fatalf("start Stage 2 composition host: %v", err)
+	}
+	defer stopProcess(t, process, "Stage 2 composition host")
+	proxyLine, err := harness.WaitForLine(ctx, process, readyPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyAddress := strings.TrimPrefix(proxyLine, readyPrefix)
+	dnsLine, err := harness.WaitForLine(ctx, process, dnsReadyPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	udpAddress, tcpAddress, err := parseDNSReadyLine(dnsLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlLine, err := harness.WaitForLine(ctx, process, controlReadyPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlAddress := strings.TrimPrefix(controlLine, controlReadyPrefix+"tcp=")
+
+	policyResponse := queryDNS(t, "udp", udpAddress, policyDomain)
+	assertSingleA(t, policyResponse, "198.51.100.22")
+
+	fakeResponse := queryDNS(t, "udp", udpAddress, fakeDomain)
+	fakeIP := assertSingleA(t, fakeResponse, "198.18.0.1")
+	_, echoPortText, err := net.SplitHostPort(echo.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	echoPort, err := strconv.Atoi(echoPortText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstConnection, firstReply := socks5ConnectAddress(t, proxyAddress, fakeIP, echoPort)
+	defer firstConnection.Close()
+	if firstReply != 0 {
+		stdout, stderr := process.Output()
+		t.Fatalf("initial FakeIP route returned SOCKS5 error %d; stdout=%q stderr=%q", firstReply,
+			stdout, stderr)
+	}
+	assertEcho(t, firstConnection, "route-before-reload")
+
+	control, err := net.DialTimeout("tcp", controlAddress, 2*time.Second)
+	if err != nil {
+		t.Fatalf("connect to reload control: %v", err)
+	}
+	if _, err := fmt.Fprintln(control, "reload"); err != nil {
+		_ = control.Close()
+		t.Fatalf("send reload command: %v", err)
+	}
+	_ = control.SetReadDeadline(time.Now().Add(3 * time.Second))
+	reloadResponse, err := bufio.NewReader(control).ReadString('\n')
+	_ = control.Close()
+	if err != nil || reloadResponse != "OK 2\n" {
+		t.Fatalf("reload returned %q, %v; expected generation 2", reloadResponse, err)
+	}
+
+	updatedPolicyResponse := queryDNS(t, "udp", udpAddress, policyDomain)
+	assertSingleA(t, updatedPolicyResponse, "192.0.2.11")
+	updatedFakeResponse := queryDNS(t, "tcp", tcpAddress, fakeDomain)
+	updatedFakeIP := assertSingleA(t, updatedFakeResponse, "198.19.0.1")
+	rejectedConnection, updatedRouteReply := socks5ConnectAddress(t, proxyAddress, updatedFakeIP, echoPort)
+	_ = rejectedConnection.Close()
+	if updatedRouteReply != 2 {
+		t.Fatalf("new FakeIP route returned SOCKS5 error %d, expected reject code 2", updatedRouteReply)
+	}
+	assertEcho(t, firstConnection, "existing-route-after-reload")
+}
+
 func TestDNSProcessWithIndependentDnsproxySecureTransports(t *testing.T) {
 	testHost := os.Getenv("CLASH_NATIVE_TEST_HOST")
 	if testHost == "" {
@@ -469,8 +598,18 @@ func TestDNSProcessWithIndependentDnsproxySecureTransports(t *testing.T) {
 		listener func(int) []string
 	}{
 		{
+			name:     "dot",
+			upstream: func(port int) string { return "dot://localhost:" + strconv.Itoa(port) },
+			listener: func(port int) []string { return []string{"--tls-port=" + strconv.Itoa(port)} },
+		},
+		{
 			name:     "doh1",
 			upstream: func(port int) string { return "doh1://localhost:" + strconv.Itoa(port) + "/dns-query" },
+			listener: func(port int) []string { return []string{"--https-port=" + strconv.Itoa(port)} },
+		},
+		{
+			name:     "doh2",
+			upstream: func(port int) string { return "doh2://localhost:" + strconv.Itoa(port) + "/dns-query" },
 			listener: func(port int) []string { return []string{"--https-port=" + strconv.Itoa(port)} },
 		},
 		{
@@ -532,6 +671,13 @@ func TestDNSProcessWithIndependentDnsproxySecureTransports(t *testing.T) {
 			if err := waitForTCPListener(ctx, plainAddress); err != nil {
 				stdout, stderr := dnsproxyProcess.Output()
 				t.Fatalf("wait for dnsproxy listener: %v; stdout=%q stderr=%q", err, stdout, stderr)
+			}
+			if test.name == "dot" || test.name == "doh1" || test.name == "doh2" {
+				transportAddress := net.JoinHostPort("127.0.0.1", strconv.Itoa(transportPort))
+				if err := waitForTCPListener(ctx, transportAddress); err != nil {
+					stdout, stderr := dnsproxyProcess.Output()
+					t.Fatalf("wait for %s listener: %v; stdout=%q stderr=%q", test.name, err, stdout, stderr)
+				}
 			}
 
 			for _, verifyPeer := range []bool{false, true} {
@@ -784,25 +930,64 @@ func readBytes(t *testing.T, reader io.Reader, data []byte) {
 
 func readSocks5Reply(t *testing.T, reader io.Reader) {
 	t.Helper()
-	header := make([]byte, 4)
-	readBytes(t, reader, header)
-	if header[0] != 5 || header[1] != 0 {
-		t.Fatalf("unexpected SOCKS5 reply header: %v", header)
+	if code := readSocks5ReplyCode(t, reader); code != 0 {
+		t.Fatalf("SOCKS5 request failed with reply code %d", code)
 	}
+}
 
-	remaining := 0
-	switch header[3] {
-	case 1:
-		remaining = 6
-	case 3:
-		length := make([]byte, 1)
-		readBytes(t, reader, length)
-		remaining = int(length[0]) + 2
-	case 4:
-		remaining = 18
-	default:
-		t.Fatalf("unexpected SOCKS5 address type: %d", header[3])
+func assertSingleA(t *testing.T, response *dns.Msg, expected string) net.IP {
+	t.Helper()
+	if response.Rcode != dns.RcodeSuccess {
+		t.Fatalf("DNS query returned rcode %d", response.Rcode)
 	}
+	if len(response.Answer) != 1 {
+		t.Fatalf("DNS query returned %d answers, expected one", len(response.Answer))
+	}
+	answer, ok := response.Answer[0].(*dns.A)
+	if !ok {
+		t.Fatalf("DNS answer has type %T, expected A", response.Answer[0])
+	}
+	if got := answer.A.String(); got != expected {
+		t.Fatalf("DNS query returned %s, expected %s", got, expected)
+	}
+	return append(net.IP(nil), answer.A...)
+}
 
-	readBytes(t, reader, make([]byte, remaining))
+func socks5ConnectAddress(t *testing.T, proxyAddress string, target net.IP,
+	port int) (net.Conn, byte) {
+	t.Helper()
+	client, err := net.DialTimeout("tcp", proxyAddress, 2*time.Second)
+	if err != nil {
+		t.Fatalf("connect to SOCKS5 proxy: %v", err)
+	}
+	writeBytes(t, client, []byte{5, 1, 0})
+	methodResponse := make([]byte, 2)
+	readBytes(t, client, methodResponse)
+	if string(methodResponse) != string([]byte{5, 0}) {
+		_ = client.Close()
+		t.Fatalf("unexpected SOCKS5 method response: %v", methodResponse)
+	}
+	ipv4 := target.To4()
+	if ipv4 == nil || port <= 0 || port > 65535 {
+		_ = client.Close()
+		t.Fatalf("SOCKS5 test target is invalid: %s:%d", target, port)
+	}
+	request := []byte{5, 1, 0, 1, ipv4[0], ipv4[1], ipv4[2], ipv4[3],
+		byte(port >> 8), byte(port)}
+	writeBytes(t, client, request)
+	return client, readSocks5ReplyCode(t, client)
+}
+
+func assertEcho(t *testing.T, connection net.Conn, payload string) {
+	t.Helper()
+	if err := connection.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte(payload)
+	writeBytes(t, connection, data)
+	echoed := make([]byte, len(data))
+	readBytes(t, connection, echoed)
+	if string(echoed) != payload {
+		t.Fatalf("echo returned %q, expected %q", echoed, payload)
+	}
 }

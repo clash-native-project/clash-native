@@ -118,6 +118,8 @@ add_library(clash-native-core STATIC
     src/dns/dot_dns_transport.cpp
     src/dns/doh1_dns_transport.cpp
     src/dns/doh2_dns_transport.cpp
+    src/dns/doq_dns_transport.cpp
+    src/dns/doh3_dns_transport.cpp
     src/dns/quic_dns_transport.cpp
     src/dns/dns_server.cpp
     src/dns/fake_ip_store.cpp
@@ -125,6 +127,13 @@ add_library(clash-native-core STATIC
     src/dns/system_resolver.cpp
     src/net/tcp_stream.cpp
     src/net/tls_stream.cpp
+    src/net/udp_stream.cpp
+    src/transport/http1_client.cpp
+    src/transport/http2_client.cpp
+    src/transport/http3_client.cpp
+    src/transport/endpoint_dialer.cpp
+    src/transport/quic_client.cpp
+    src/transport/tls_client.cpp
     src/outbound/shadowsocks_crypto.cpp
     src/outbound/shadowsocks_outbound.cpp
     src/outbound/trojan_outbound.cpp
@@ -234,6 +243,8 @@ if(BUILD_TESTING)
         tests/runtime/asio_runtime_test.cpp
         tests/runtime/runtime_snapshot_test.cpp
         tests/runtime/runtime_set_test.cpp
+        tests/transport/endpoint_dialer_test.cpp
+        tests/transport/udp_stream_test.cpp
     )
 
     target_include_directories(clash-native-tests

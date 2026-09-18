@@ -183,20 +183,49 @@ DnsQueryService::DnsQueryService(runtime::AsioRuntime &runtime, DnsResolverConfi
     if (!config_.transport_factory) {
         config_.transport_factory = default_transport_factory();
     }
-    const auto install_named_outbound_dialer = [this](DnsUpstreamConfig &upstream) {
-        if (upstream.dial_policy.kind == DnsDialPolicyKind::named_outbound && !upstream.dialer &&
-            config_.outbound_registry && !upstream.dial_policy.outbound_id.empty()) {
-            upstream.dialer = make_outbound_dns_upstream_dialer(runtime_, config_.outbound_registry,
-                                                                upstream.dial_policy.outbound_id);
+    const auto install_egress_dialer = [this](DnsUpstreamConfig &upstream) {
+        if (upstream.egress_hostname.empty()) {
+            upstream.egress_hostname =
+                !upstream.hostname.empty() ? upstream.hostname : upstream.server_name;
+        }
+        if (!upstream.dialer) {
+            if (upstream.dial_policy.kind == DnsDialPolicyKind::direct) {
+                upstream.dialer = make_direct_dns_upstream_dialer(runtime_);
+            } else if (upstream.dial_policy.kind == DnsDialPolicyKind::named_outbound) {
+                transport::EndpointDialRequirements requirements;
+                switch (upstream.mode) {
+                case DnsTransportMode::plain:
+                    requirements = {true, true};
+                    break;
+                case DnsTransportMode::dot:
+                case DnsTransportMode::doh1:
+                case DnsTransportMode::doh2:
+                    requirements = {true, false};
+                    break;
+                case DnsTransportMode::doq:
+                case DnsTransportMode::doh3:
+                    requirements = {false, true};
+                    break;
+                }
+                upstream.dialer = make_outbound_dns_upstream_dialer(
+                    runtime_, config_.outbound_registry, upstream.dial_policy.outbound_id,
+                    requirements);
+            } else if (upstream.dial_policy.kind == DnsDialPolicyKind::traffic_rules) {
+                upstream.dialer = make_traffic_rules_dns_upstream_dialer(
+                    runtime_, config_.outbound_registry, config_.traffic_router,
+                    upstream.egress_hostname);
+            }
         }
     };
-    install_named_outbound_dialer(config_.default_upstream);
+    install_egress_dialer(config_.default_upstream);
     for (auto &[name, upstream] : config_.upstream_groups) {
-        install_named_outbound_dialer(upstream);
+        (void)name;
+        install_egress_dialer(upstream);
     }
     for (auto &[name, group] : config_.group_configs) {
+        (void)name;
         for (auto &upstream : group.members) {
-            install_named_outbound_dialer(upstream);
+            install_egress_dialer(upstream);
         }
     }
     default_group_ = std::make_shared<DnsUpstreamGroup>(
@@ -217,6 +246,19 @@ DnsQueryService::~DnsQueryService() { stop(); }
 core::Status DnsQueryService::validate() const {
     if (config_.dependency_graph) {
         if (const auto result = config_.dependency_graph->validate(); !result) {
+            return result;
+        }
+    }
+    if (config_.outbound_registry) {
+        if (const auto result = config_.outbound_registry->validate(); !result) {
+            return result;
+        }
+    }
+
+    if (config_.traffic_router) {
+        const auto outbound_ids = config_.outbound_registry ? config_.outbound_registry->ids()
+                                                            : std::vector<std::string>{};
+        if (const auto result = config_.traffic_router->validate(outbound_ids); !result) {
             return result;
         }
     }
@@ -250,11 +292,44 @@ core::Status DnsQueryService::validate() const {
                                "named DNS outbound requires an outbound ID: " + std::string(name)});
         }
         if (upstream.dial_policy.kind == DnsDialPolicyKind::named_outbound &&
+            !config_.outbound_registry) {
+            return core::fail(
+                {core::ErrorCode::configuration,
+                 "named DNS outbound requires an outbound registry: " + std::string(name)});
+        }
+        if (upstream.dial_policy.kind == DnsDialPolicyKind::named_outbound &&
             config_.outbound_registry) {
             const auto ids = config_.outbound_registry->ids();
             if (std::find(ids.begin(), ids.end(), upstream.dial_policy.outbound_id) == ids.end()) {
                 return core::fail({core::ErrorCode::configuration,
                                    "DNS upstream references an unknown outbound: " +
+                                       upstream.dial_policy.outbound_id});
+            }
+            transport::EndpointDialRequirements requirements;
+            switch (upstream.mode) {
+            case DnsTransportMode::plain:
+                requirements = {true, true};
+                break;
+            case DnsTransportMode::dot:
+            case DnsTransportMode::doh1:
+            case DnsTransportMode::doh2:
+                requirements = {true, false};
+                break;
+            case DnsTransportMode::doq:
+            case DnsTransportMode::doh3:
+                requirements = {false, true};
+                break;
+            }
+            const auto capabilities =
+                config_.outbound_registry->capabilities(upstream.dial_policy.outbound_id);
+            if (!capabilities) {
+                return core::fail(capabilities.error());
+            }
+            if ((requirements.stream && !capabilities->stream) ||
+                (requirements.datagram &&
+                 capabilities->datagram == core::DatagramSemantics::unsupported)) {
+                return core::fail({core::ErrorCode::configuration,
+                                   "DNS outbound lacks the required transport capability: " +
                                        upstream.dial_policy.outbound_id});
             }
         }
@@ -286,6 +361,12 @@ core::Status DnsQueryService::validate() const {
         if (upstream.dial_policy.kind != DnsDialPolicyKind::direct && !upstream.dialer) {
             return core::fail({core::ErrorCode::configuration,
                                "DNS upstream dial policy requires a dialer: " + std::string(name)});
+        }
+        if (upstream.dial_policy.kind == DnsDialPolicyKind::traffic_rules &&
+            !config_.traffic_router) {
+            return core::fail(
+                {core::ErrorCode::configuration,
+                 "DNS traffic-rule egress requires a traffic router: " + std::string(name)});
         }
         return {};
     };

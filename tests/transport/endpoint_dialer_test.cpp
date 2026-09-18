@@ -1,0 +1,138 @@
+#include <clash_native/dns/dns_transport.hpp>
+#include <clash_native/outbound/outbound_registry.hpp>
+#include <clash_native/router/traffic_router.hpp>
+#include <clash_native/transport/endpoint_dialer.hpp>
+
+#include <gtest/gtest.h>
+
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/address.hpp>
+
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+class RecordingOutbound final : public clash_native::core::Outbound {
+  public:
+    explicit RecordingOutbound(std::string id) : descriptor_{std::move(id), "recording"} {}
+
+    const clash_native::core::OutboundDescriptor &descriptor() const noexcept override {
+        return descriptor_;
+    }
+
+    clash_native::core::OutboundCapabilities capabilities() const noexcept override {
+        return {true, clash_native::core::DatagramSemantics::multi_destination,
+                clash_native::core::TargetRequirement::domain_or_ip,
+                clash_native::core::TargetRequirement::domain_or_ip};
+    }
+
+    void connect_stream(clash_native::core::StreamRequest request,
+                        clash_native::core::StreamOpenHandler handler) override {
+        ++stream_calls;
+        if (request.dial_trace) {
+            stream_trace = request.dial_trace->outbound_ids;
+        }
+        handler(clash_native::core::StreamOpenResult::unsupported());
+    }
+
+    void open_datagram(clash_native::core::DatagramRequest request,
+                       clash_native::core::DatagramOpenHandler handler) override {
+        ++datagram_calls;
+        if (request.dial_trace) {
+            datagram_trace = request.dial_trace->outbound_ids;
+        }
+        handler(clash_native::core::DatagramOpenResult::unsupported());
+    }
+
+    int stream_calls = 0;
+    int datagram_calls = 0;
+    std::vector<std::string> stream_trace;
+    std::vector<std::string> datagram_trace;
+
+  private:
+    clash_native::core::OutboundDescriptor descriptor_;
+};
+
+} // namespace
+
+TEST(EndpointDialerTest, PropagatesOutboundTraceToTheSelectedTarget) {
+    boost::asio::io_context context;
+    auto outbound = std::make_shared<RecordingOutbound>("proxy");
+    clash_native::outbound::OutboundRegistry registry;
+    ASSERT_TRUE(registry.add_outbound("proxy", outbound));
+    const auto plan = clash_native::transport::EndpointDialPlan::from_registry(
+        registry.snapshot(), "proxy", {.stream = true});
+    ASSERT_TRUE(plan);
+
+    clash_native::transport::EndpointDialer dialer(context.get_executor(), plan.value());
+    bool completed = false;
+    dialer.connect_stream(
+        {clash_native::core::Destination::address(boost::asio::ip::make_address("192.0.2.1"), 443),
+         std::nullopt},
+        [&completed](clash_native::core::StreamOpenResult result) {
+            completed = true;
+            EXPECT_EQ(result.status, clash_native::core::OpenStatus::unsupported);
+        });
+
+    EXPECT_TRUE(completed);
+    EXPECT_EQ(outbound->stream_calls, 1);
+    EXPECT_EQ(outbound->stream_trace, (std::vector<std::string>{"proxy"}));
+}
+
+TEST(EndpointDialerTest, RejectsRuntimeOutboundCyclesBeforeOpeningAHandle) {
+    boost::asio::io_context context;
+    auto outbound = std::make_shared<RecordingOutbound>("proxy");
+    clash_native::outbound::OutboundRegistry registry;
+    ASSERT_TRUE(registry.add_outbound("proxy", outbound));
+    const auto plan = clash_native::transport::EndpointDialPlan::from_registry(
+        registry.snapshot(), "proxy", {.stream = true});
+    ASSERT_TRUE(plan);
+
+    clash_native::transport::EndpointDialer dialer(context.get_executor(), plan.value());
+    bool completed = false;
+    clash_native::core::StreamRequest request{
+        clash_native::core::Destination::address(boost::asio::ip::make_address("192.0.2.1"), 443),
+        std::nullopt};
+    request.dial_trace = std::make_shared<const clash_native::core::EndpointDialTrace>(
+        clash_native::core::EndpointDialTrace{{"proxy"}});
+    dialer.connect_stream(
+        std::move(request), [&completed](clash_native::core::StreamOpenResult result) {
+            completed = true;
+            ASSERT_FALSE(result.succeeded());
+            ASSERT_TRUE(result.error);
+            EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::configuration);
+        });
+    context.run();
+
+    EXPECT_TRUE(completed);
+    EXPECT_EQ(outbound->stream_calls, 0);
+}
+
+TEST(EndpointDialerTest, ResolvesDnsTrafficRulesBeforeOpeningDatagramCarrier) {
+    clash_native::runtime::AsioRuntime runtime;
+    auto outbound = std::make_shared<RecordingOutbound>("resolver-proxy");
+    clash_native::outbound::OutboundRegistry registry;
+    ASSERT_TRUE(registry.add_outbound("resolver-proxy", outbound));
+
+    clash_native::router::TrafficRouter router(clash_native::router::RouteAction::reject());
+    router.add_rule({"dns-egress", clash_native::router::RuleKind::domain_suffix, "example.net", 0,
+                     0, false, clash_native::router::RouteAction::named("resolver-proxy")});
+    auto dialer = clash_native::dns::make_traffic_rules_dns_upstream_dialer(
+        runtime, registry.snapshot(), router.snapshot(), "dns.example.net");
+
+    bool completed = false;
+    dialer->open_datagram({clash_native::core::Destination::address(
+                              boost::asio::ip::make_address("192.0.2.53"), 853)},
+                          [&completed](clash_native::core::DatagramOpenResult result) {
+                              completed = true;
+                              EXPECT_EQ(result.status, clash_native::core::OpenStatus::unsupported);
+                          });
+
+    EXPECT_TRUE(completed);
+    EXPECT_EQ(outbound->datagram_calls, 1);
+    EXPECT_EQ(outbound->datagram_trace, (std::vector<std::string>{"resolver-proxy"}));
+    runtime.stop();
+}

@@ -112,13 +112,15 @@ TEST(DnsPacketTest, RetainsExtendedResponseCodesFromEdns) {
     response.push_back(0);
     append_u16(response, static_cast<std::uint16_t>(clash_native::dns::DnsRecordType::opt));
     append_u16(response, 1232);
-    append_u32(response, 0x01000000);
+    append_u32(response, 0x01018000);
     append_u16(response, 0);
 
     const auto packet = clash_native::dns::DnsMessageCodec::decode_packet(response, 0x1234);
     ASSERT_TRUE(packet);
     EXPECT_EQ(packet.value().response_code(), 23U);
     EXPECT_EQ(packet.value().extended_response_code, 1U);
+    ASSERT_EQ(packet.value().additionals.size(), 1U);
+    EXPECT_EQ(packet.value().additionals.front().ttl_seconds, 0x01018000U);
     const auto answer = clash_native::dns::DnsMessageCodec::to_address_answer(packet.value());
     ASSERT_TRUE(answer);
     EXPECT_EQ(answer.value().response_code, 23U);

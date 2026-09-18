@@ -690,7 +690,7 @@ TEST(ResolverServiceTest, RejectsUnsupportedDnsDialPolicyBeforeQuerying) {
     const auto result = resolver.validate();
     ASSERT_FALSE(result);
     EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::configuration);
-    EXPECT_NE(result.error().context.find("dialer"), std::string::npos);
+    EXPECT_NE(result.error().context.find("registry"), std::string::npos);
 }
 
 TEST(ResolverServiceTest, RejectsInvalidDnsEnumConfigurationBeforeQuerying) {

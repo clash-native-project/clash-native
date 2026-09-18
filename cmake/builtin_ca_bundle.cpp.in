@@ -1,6 +1,6 @@
-#include "dns/builtin_ca_bundle.hpp"
+#include "transport/builtin_ca_bundle.hpp"
 
-namespace clash_native::dns::detail {
+namespace clash_native::transport::detail {
 
 std::string_view builtin_ca_bundle_pem() noexcept {
     static constexpr char bundle[] = R"CLASH_CA_BUNDLE(
@@ -8,4 +8,4 @@ std::string_view builtin_ca_bundle_pem() noexcept {
     return {bundle, sizeof(bundle) - 1};
 }
 
-} // namespace clash_native::dns::detail
+} // namespace clash_native::transport::detail

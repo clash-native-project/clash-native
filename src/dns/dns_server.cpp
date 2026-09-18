@@ -75,9 +75,23 @@ DnsServer::DnsServer(runtime::AsioRuntime &runtime, ResolverService &resolver,
 DnsServer::DnsServer(runtime::AsioRuntime &runtime, DnsQueryService &query_service,
                      boost::asio::ip::udp::endpoint udp_endpoint,
                      boost::asio::ip::tcp::endpoint tcp_endpoint)
-    : runtime_(runtime), query_service_(query_service), udp_socket_(runtime.context()),
-      tcp_acceptor_(runtime.context()), udp_endpoint_(udp_endpoint), tcp_endpoint_(tcp_endpoint),
+    : runtime_(runtime), query_service_(&query_service),
+      udp_socket_(runtime.context().get_executor()), tcp_acceptor_(runtime.context()),
+      udp_endpoint_(udp_endpoint), tcp_endpoint_(tcp_endpoint),
       callback_gate_(std::make_shared<std::atomic_bool>(false)) {}
+
+DnsServer::DnsServer(runtime::AsioRuntime &runtime,
+                     std::shared_ptr<runtime::RuntimeSnapshotStore> snapshot_store,
+                     boost::asio::ip::udp::endpoint udp_endpoint,
+                     boost::asio::ip::tcp::endpoint tcp_endpoint)
+    : runtime_(runtime), snapshot_store_(std::move(snapshot_store)),
+      udp_socket_(runtime.context().get_executor()), tcp_acceptor_(runtime.context()),
+      udp_endpoint_(udp_endpoint), tcp_endpoint_(tcp_endpoint),
+      callback_gate_(std::make_shared<std::atomic_bool>(false)) {
+    if (!snapshot_store_) {
+        throw std::invalid_argument("DNS server requires a runtime snapshot store");
+    }
+}
 
 DnsServer::~DnsServer() { stop(); }
 
@@ -109,7 +123,7 @@ core::Status DnsServer::start() {
     if (error) {
         spdlog::error("DNS server failed to open local listeners: {}", error.message());
         boost::system::error_code ignored;
-        udp_socket_.close(ignored);
+        udp_socket_.close();
         tcp_acceptor_.close(ignored);
         return core::fail(listener_error("open the local DNS server", error));
     }
@@ -121,7 +135,7 @@ core::Status DnsServer::start() {
     if (error) {
         spdlog::error("DNS server failed to query local listener endpoints: {}", error.message());
         boost::system::error_code ignored;
-        udp_socket_.close(ignored);
+        udp_socket_.close();
         tcp_acceptor_.close(ignored);
         return core::fail(listener_error("query the local DNS server endpoint", error));
     }
@@ -167,14 +181,16 @@ void DnsServer::set_fake_ip_store(std::shared_ptr<FakeIpStore> store,
 }
 
 void DnsServer::stop_on_owner() noexcept {
-    for (const auto request_id : query_requests_) {
-        query_service_.cancel(request_id);
+    for (const auto &[token, request] : query_requests_) {
+        (void)token;
+        if (request.query_service != nullptr && request.request_id != 0) {
+            request.query_service->cancel(request.request_id);
+        }
     }
     query_requests_.clear();
 
     boost::system::error_code ignored;
-    udp_socket_.cancel(ignored);
-    udp_socket_.close(ignored);
+    udp_socket_.close();
     tcp_acceptor_.cancel(ignored);
     tcp_acceptor_.close(ignored);
     for (const auto &socket : tcp_sockets_) {
@@ -191,14 +207,19 @@ boost::asio::ip::udp::endpoint DnsServer::udp_endpoint() const noexcept { return
 
 boost::asio::ip::tcp::endpoint DnsServer::tcp_endpoint() const noexcept { return tcp_endpoint_; }
 
+runtime::RuntimeSnapshotPtr DnsServer::current_snapshot() const noexcept {
+    return snapshot_store_ ? snapshot_store_->load() : nullptr;
+}
+
 void DnsServer::receive_udp() {
     if (!running_.load(std::memory_order_acquire)) {
         return;
     }
     const auto gate = callback_gate_;
     udp_socket_.async_receive_from(
-        boost::asio::buffer(udp_buffer_), udp_sender_,
-        [this, gate](const boost::system::error_code &error, std::size_t size) {
+        boost::asio::buffer(udp_buffer_),
+        [this, gate](const boost::system::error_code &error, std::size_t size,
+                     boost::asio::ip::udp::endpoint sender) {
             if (!gate->load(std::memory_order_acquire)) {
                 return;
             }
@@ -206,7 +227,7 @@ void DnsServer::receive_udp() {
                 const auto query = DnsMessageCodec::decode_packet(
                     std::span<const std::uint8_t>(udp_buffer_.data(), size));
                 if (query) {
-                    resolve_udp(std::move(query.value()), udp_sender_);
+                    resolve_udp(std::move(query.value()), std::move(sender));
                 }
             }
             if (gate->load(std::memory_order_acquire)) {
@@ -288,7 +309,10 @@ void DnsServer::close_tcp_socket(
 
 void DnsServer::resolve_udp(DnsPacket query, boost::asio::ip::udp::endpoint sender) {
     const auto gate = callback_gate_;
-    if (const auto fake_response = fake_ip_response(query, fake_ip_store_, fake_ip_filter_)) {
+    const auto snapshot = current_snapshot();
+    const auto &fake_store = snapshot ? snapshot->fake_ip_store : fake_ip_store_;
+    const auto &fake_filter = snapshot ? snapshot->fake_ip_filter : fake_ip_filter_;
+    if (const auto fake_response = fake_ip_response(query, fake_store, fake_filter)) {
         const auto response = limit_udp_response(query, *fake_response);
         if (!response || response.value().size() > 0xffff) {
             return;
@@ -298,16 +322,32 @@ void DnsServer::resolve_udp(DnsPacket query, boost::asio::ip::udp::endpoint send
                                   [payload](const boost::system::error_code &, std::size_t) {});
         return;
     }
+    auto resolver_owner = snapshot ? snapshot->resolver : resolver_owner_;
+    auto *query_service =
+        snapshot && resolver_owner != nullptr ? &resolver_owner->query_service() : query_service_;
+    if (query_service == nullptr) {
+        const auto response =
+            limit_udp_response(query, DnsMessageCodec::encode_error_response(query, 2));
+        if (response) {
+            auto payload = std::make_shared<std::vector<std::uint8_t>>(response.value());
+            udp_socket_.async_send_to(boost::asio::buffer(*payload), sender,
+                                      [payload](const boost::system::error_code &, std::size_t) {});
+        }
+        return;
+    }
+    const auto token = next_query_request_id_++;
+    query_requests_.emplace(token, PendingQuery{resolver_owner, query_service, 0});
     const auto request_id = std::make_shared<DnsQueryService::RequestId>();
     const auto query_copy = query;
-    *request_id = query_service_.query(
+    *request_id = query_service->query(
         std::move(query),
-        [this, gate, request_id, query = query_copy,
+        [this, gate, token, resolver_owner, query = query_copy,
          sender](core::Result<DnsPacket> result) mutable {
+            (void)resolver_owner;
             if (!gate->load(std::memory_order_acquire)) {
                 return;
             }
-            query_requests_.erase(*request_id);
+            query_requests_.erase(token);
             const auto response = limit_udp_response(
                 query, result ? core::Result<std::vector<std::uint8_t>>(result.value().wire)
                               : DnsMessageCodec::encode_error_response(query, 2));
@@ -319,12 +359,17 @@ void DnsServer::resolve_udp(DnsPacket query, boost::asio::ip::udp::endpoint send
                                       [payload](const boost::system::error_code &, std::size_t) {});
         },
         runtime_.scheduler());
-    query_requests_.insert(*request_id);
+    if (const auto pending = query_requests_.find(token); pending != query_requests_.end()) {
+        pending->second.request_id = *request_id;
+    }
 }
 
 void DnsServer::resolve_tcp(std::shared_ptr<boost::asio::ip::tcp::socket> socket, DnsPacket query) {
     const auto gate = callback_gate_;
-    if (const auto fake_response = fake_ip_response(query, fake_ip_store_, fake_ip_filter_)) {
+    const auto snapshot = current_snapshot();
+    const auto &fake_store = snapshot ? snapshot->fake_ip_store : fake_ip_store_;
+    const auto &fake_filter = snapshot ? snapshot->fake_ip_filter : fake_ip_filter_;
+    if (const auto fake_response = fake_ip_response(query, fake_store, fake_filter)) {
         if (!*fake_response || fake_response->value().size() > 0xffff) {
             close_tcp_socket(socket);
             return;
@@ -345,16 +390,44 @@ void DnsServer::resolve_tcp(std::shared_ptr<boost::asio::ip::tcp::socket> socket
             });
         return;
     }
+    auto resolver_owner = snapshot ? snapshot->resolver : resolver_owner_;
+    auto *query_service =
+        snapshot && resolver_owner != nullptr ? &resolver_owner->query_service() : query_service_;
+    if (query_service == nullptr) {
+        const auto response = DnsMessageCodec::encode_error_response(query, 2);
+        if (!response || response.value().size() > 0xffff) {
+            close_tcp_socket(socket);
+            return;
+        }
+        auto frame = std::make_shared<std::vector<std::uint8_t>>();
+        frame->reserve(2 + response.value().size());
+        frame->push_back(static_cast<std::uint8_t>(response.value().size() >> 8));
+        frame->push_back(static_cast<std::uint8_t>(response.value().size() & 0xff));
+        frame->insert(frame->end(), response.value().begin(), response.value().end());
+        boost::asio::async_write(
+            *socket, boost::asio::buffer(*frame),
+            [this, gate, socket, frame](const boost::system::error_code &error, std::size_t) {
+                if (!gate->load(std::memory_order_acquire) || error) {
+                    close_tcp_socket(socket);
+                    return;
+                }
+                read_tcp_query(socket);
+            });
+        return;
+    }
+    const auto token = next_query_request_id_++;
+    query_requests_.emplace(token, PendingQuery{resolver_owner, query_service, 0});
     const auto request_id = std::make_shared<DnsQueryService::RequestId>();
     const auto query_copy = query;
-    *request_id = query_service_.query(
+    *request_id = query_service->query(
         std::move(query),
-        [this, gate, request_id, socket = std::move(socket),
+        [this, gate, token, resolver_owner, socket = std::move(socket),
          query = query_copy](core::Result<DnsPacket> result) mutable {
+            (void)resolver_owner;
             if (!gate->load(std::memory_order_acquire)) {
                 return;
             }
-            query_requests_.erase(*request_id);
+            query_requests_.erase(token);
             const auto response = result
                                       ? core::Result<std::vector<std::uint8_t>>(result.value().wire)
                                       : DnsMessageCodec::encode_error_response(query, 2);
@@ -378,7 +451,9 @@ void DnsServer::resolve_tcp(std::shared_ptr<boost::asio::ip::tcp::socket> socket
                 });
         },
         runtime_.scheduler());
-    query_requests_.insert(*request_id);
+    if (const auto pending = query_requests_.find(token); pending != query_requests_.end()) {
+        pending->second.request_id = *request_id;
+    }
 }
 
 } // namespace clash_native::dns

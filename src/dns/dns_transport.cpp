@@ -1,13 +1,10 @@
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
-#include <clash_native/net/tcp_stream.hpp>
+#include <clash_native/outbound/builtin_outbound.hpp>
 
-#include <boost/asio/connect.hpp>
-#include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/steady_timer.hpp>
-#include <boost/asio/write.hpp>
 
 #include <algorithm>
 #include <array>
@@ -45,184 +42,193 @@ core::Error cancelled_error() {
     return {core::ErrorCode::cancelled, "DNS upstream query was cancelled"};
 }
 
-class DirectDnsDatagramHandle final : public core::DatagramHandle {
+class PlannedDnsUpstreamDialer final : public DnsUpstreamDialer {
   public:
-    explicit DirectDnsDatagramHandle(std::shared_ptr<boost::asio::ip::udp::socket> socket)
-        : socket_(std::move(socket)) {}
-
-    void async_send_to(boost::asio::const_buffer buffer, boost::asio::ip::udp::endpoint destination,
-                       WriteHandler handler) override {
-        const auto socket = socket_;
-        socket->async_send_to(buffer, destination,
-                              [socket, handler = std::move(handler)](
-                                  const boost::system::error_code &error,
-                                  std::size_t size) mutable { handler(error, size); });
+    PlannedDnsUpstreamDialer(runtime::AsioRuntime &runtime,
+                             core::Result<transport::EndpointDialPlan> plan)
+        : runtime_(runtime) {
+        if (!plan) {
+            plan_error_ = plan.error();
+            return;
+        }
+        endpoint_dialer_ = std::make_shared<transport::EndpointDialer>(
+            runtime_.context().get_executor(), std::move(plan).value());
     }
-
-    void async_receive_from(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        const auto socket = socket_;
-        const auto sender = std::make_shared<boost::asio::ip::udp::endpoint>();
-        socket->async_receive_from(
-            buffer, *sender,
-            [socket, sender, handler = std::move(handler)](const boost::system::error_code &error,
-                                                           std::size_t size) mutable {
-                handler(error, size, *sender);
-            });
-    }
-
-    boost::asio::any_io_executor executor() noexcept override { return socket_->get_executor(); }
-
-    void cancel() noexcept override {
-        boost::system::error_code ignored;
-        socket_->cancel(ignored);
-    }
-
-    void close() noexcept override {
-        boost::system::error_code ignored;
-        socket_->cancel(ignored);
-        socket_->close(ignored);
-    }
-
-  private:
-    std::shared_ptr<boost::asio::ip::udp::socket> socket_;
-};
-
-class DirectDnsUpstreamDialer final : public DnsUpstreamDialer {
-  public:
-    explicit DirectDnsUpstreamDialer(runtime::AsioRuntime &runtime) : runtime_(runtime) {}
 
     void connect_stream(core::StreamRequest request, Handler handler) override {
-        if (!request.destination.is_address()) {
-            boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
-                handler(core::StreamOpenResult::failed(
-                    {core::ErrorCode::configuration,
-                     "direct DNS stream dialing requires an IP address"}));
-            });
+        if (endpoint_dialer_) {
+            endpoint_dialer_->connect_stream(std::move(request), std::move(handler));
             return;
         }
-
-        auto socket = std::make_shared<boost::asio::ip::tcp::socket>(runtime_.context());
-        boost::system::error_code error;
-        socket->open(request.destination.address().is_v4() ? boost::asio::ip::tcp::v4()
-                                                           : boost::asio::ip::tcp::v6(),
-                     error);
-        if (error) {
-            boost::asio::post(runtime_.context(), [handler = std::move(handler), error]() mutable {
-                handler(core::StreamOpenResult::failed(
-                    upstream_error("failed to open direct DNS TCP socket", error)));
-            });
-            return;
-        }
-
-        const boost::asio::ip::tcp::endpoint endpoint(request.destination.address(),
-                                                      request.destination.port());
-        socket->async_connect(
-            endpoint, [socket, handler = std::move(handler)](
-                          const boost::system::error_code &connect_error) mutable {
-                if (connect_error) {
-                    handler(core::StreamOpenResult::failed(upstream_error(
-                        "failed to connect direct DNS TCP upstream", connect_error)));
-                    return;
-                }
-                handler(core::StreamOpenResult::opened(
-                    std::make_unique<net::TcpStream>(std::move(*socket))));
-            });
+        const auto error = plan_error_.value_or(
+            core::Error{core::ErrorCode::configuration, "DNS endpoint dial plan is missing"});
+        boost::asio::post(runtime_.context(), [handler = std::move(handler), error]() mutable {
+            handler(core::StreamOpenResult::failed(error));
+        });
     }
 
     void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) override {
-        if (!request.initial_destination || !request.initial_destination->is_address()) {
-            boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
-                handler(core::DatagramOpenResult::failed(
-                    {core::ErrorCode::configuration,
-                     "direct DNS datagram dialing requires an IP address"}));
-            });
+        if (endpoint_dialer_) {
+            endpoint_dialer_->open_datagram(std::move(request), std::move(handler));
             return;
         }
-
-        const auto address = request.initial_destination->address();
-        auto socket = std::make_shared<boost::asio::ip::udp::socket>(runtime_.context());
-        boost::system::error_code error;
-        socket->open(address.is_v4() ? boost::asio::ip::udp::v4() : boost::asio::ip::udp::v6(),
-                     error);
-        if (!error) {
-            const auto local_address =
-                address.is_v4() ? boost::asio::ip::address(boost::asio::ip::address_v4::any())
-                                : boost::asio::ip::address(boost::asio::ip::address_v6::any());
-            socket->bind({local_address, 0}, error);
-        }
-        if (error) {
-            boost::asio::post(runtime_.context(), [handler = std::move(handler), error]() mutable {
-                handler(core::DatagramOpenResult::failed(
-                    upstream_error("failed to open direct DNS UDP socket", error)));
-            });
-            return;
-        }
-
-        handler(core::DatagramOpenResult::opened(
-            std::make_unique<DirectDnsDatagramHandle>(std::move(socket)),
-            core::DatagramSemantics::fixed_destination));
+        const auto error = plan_error_.value_or(
+            core::Error{core::ErrorCode::configuration, "DNS endpoint dial plan is missing"});
+        boost::asio::post(runtime_.context(), [handler = std::move(handler), error]() mutable {
+            handler(core::DatagramOpenResult::failed(error));
+        });
     }
 
   private:
     runtime::AsioRuntime &runtime_;
+    std::shared_ptr<transport::EndpointDialer> endpoint_dialer_;
+    std::optional<core::Error> plan_error_;
+};
+
+class TrafficRulesDnsUpstreamDialer final : public DnsUpstreamDialer {
+  public:
+    TrafficRulesDnsUpstreamDialer(runtime::AsioRuntime &runtime,
+                                  outbound::OutboundRegistry::Snapshot registry,
+                                  router::TrafficRouter::Snapshot traffic_router,
+                                  std::string egress_hostname)
+        : runtime_(runtime), registry_(std::move(registry)),
+          traffic_router_(std::move(traffic_router)), egress_hostname_(std::move(egress_hostname)),
+          direct_outbound_(std::make_shared<outbound::DirectOutbound>(runtime_)) {}
+
+    void connect_stream(core::StreamRequest request, Handler handler) override {
+        const auto plan =
+            make_plan(request.destination, core::Network::tcp, request.resolved_address);
+        if (!plan) {
+            post_stream_error(std::move(handler), plan.error());
+            return;
+        }
+        transport::EndpointDialer dialer(runtime_.context().get_executor(), plan.value());
+        dialer.connect_stream(std::move(request), std::move(handler));
+    }
+
+    void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) override {
+        if (!request.initial_destination) {
+            post_datagram_error(
+                std::move(handler),
+                {core::ErrorCode::configuration, "DNS egress request has no destination", {}});
+            return;
+        }
+        const auto plan = make_plan(*request.initial_destination, core::Network::udp, std::nullopt);
+        if (!plan) {
+            post_datagram_error(std::move(handler), plan.error());
+            return;
+        }
+        transport::EndpointDialer dialer(runtime_.context().get_executor(), plan.value());
+        dialer.open_datagram(std::move(request), std::move(handler));
+    }
+
+  private:
+    void post_stream_error(Handler handler, core::Error error) const {
+        boost::asio::post(runtime_.context(),
+                          [handler = std::move(handler), error = std::move(error)]() mutable {
+                              handler(core::StreamOpenResult::failed(std::move(error)));
+                          });
+    }
+
+    void post_datagram_error(core::DatagramOpenHandler handler, core::Error error) const {
+        boost::asio::post(runtime_.context(),
+                          [handler = std::move(handler), error = std::move(error)]() mutable {
+                              handler(core::DatagramOpenResult::failed(std::move(error)));
+                          });
+    }
+
+    core::Result<transport::EndpointDialPlan>
+    make_plan(const core::Destination &destination, core::Network network,
+              std::optional<boost::asio::ip::address> resolved_address) const {
+        if (!traffic_router_) {
+            return core::fail(
+                {core::ErrorCode::configuration, "DNS traffic router is missing", {}});
+        }
+        if (!resolved_address && destination.is_address()) {
+            resolved_address = destination.address();
+        }
+
+        const auto route_destination =
+            egress_hostname_.empty()
+                ? destination
+                : core::Destination::domain(egress_hostname_, destination.port());
+        core::ConnectionMetadata metadata{network, std::nullopt, route_destination, "dns-egress",
+                                          "dns",   std::nullopt, std::nullopt};
+        router::RoutingContext context;
+        if (resolved_address) {
+            context.destination_lookup = router::LookupState::resolved;
+            context.destination_address = *resolved_address;
+            context.destination_addresses.push_back(*resolved_address);
+        }
+
+        const auto evaluation = traffic_router_->evaluate(metadata, context);
+        const auto *matched = std::get_if<router::Matched>(&evaluation);
+        if (matched == nullptr) {
+            return core::fail({core::ErrorCode::configuration,
+                               "DNS egress route requires metadata that is not available",
+                               {}});
+        }
+        switch (matched->decision.action.kind) {
+        case router::RouteActionKind::direct:
+            return transport::EndpointDialPlan::from_outbound(
+                direct_outbound_, "direct",
+                {network == core::Network::tcp, network == core::Network::udp});
+        case router::RouteActionKind::reject:
+            return core::fail(
+                {core::ErrorCode::rejected, "DNS egress was rejected by traffic rules", {}});
+        case router::RouteActionKind::named:
+            return transport::EndpointDialPlan::from_registry(
+                registry_, matched->decision.action.target,
+                {network == core::Network::tcp, network == core::Network::udp});
+        }
+        return core::fail(
+            {core::ErrorCode::configuration, "DNS egress route returned an invalid action", {}});
+    }
+
+    runtime::AsioRuntime &runtime_;
+    outbound::OutboundRegistry::Snapshot registry_;
+    router::TrafficRouter::Snapshot traffic_router_;
+    std::string egress_hostname_;
+    std::shared_ptr<core::Outbound> direct_outbound_;
 };
 
 } // namespace
 
-OutboundDnsUpstreamDialer::OutboundDnsUpstreamDialer(runtime::AsioRuntime &runtime,
-                                                     outbound::OutboundRegistry::Snapshot registry,
-                                                     std::string outbound_id)
-    : runtime_(runtime), registry_(std::move(registry)), outbound_id_(std::move(outbound_id)) {}
+OutboundDnsUpstreamDialer::OutboundDnsUpstreamDialer(
+    runtime::AsioRuntime &runtime, outbound::OutboundRegistry::Snapshot registry,
+    std::string outbound_id, transport::EndpointDialRequirements requirements)
+    : runtime_(runtime) {
+    const auto plan = transport::EndpointDialPlan::from_registry(
+        std::move(registry), std::move(outbound_id), requirements);
+    if (!plan) {
+        plan_error_ = plan.error();
+        return;
+    }
+    endpoint_dialer_ = std::make_shared<transport::EndpointDialer>(
+        runtime_.context().get_executor(), plan.value());
+}
 
 void OutboundDnsUpstreamDialer::connect_stream(core::StreamRequest request, Handler handler) {
-    if (!registry_) {
-        boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
-            handler(core::StreamOpenResult::failed(
-                {core::ErrorCode::configuration, "DNS outbound registry is missing"}));
+    if (plan_error_) {
+        const auto error = *plan_error_;
+        boost::asio::post(runtime_.context(), [handler = std::move(handler), error]() mutable {
+            handler(core::StreamOpenResult::failed(error));
         });
         return;
     }
-    const auto selected = registry_->select(outbound_id_);
-    if (!selected) {
-        boost::asio::post(runtime_.context(),
-                          [handler = std::move(handler), error = selected.error()]() mutable {
-                              handler(core::StreamOpenResult::failed(error));
-                          });
-        return;
-    }
-    if (!selected.value()->capabilities().stream) {
-        boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
-            handler(core::StreamOpenResult::unsupported());
-        });
-        return;
-    }
-    selected.value()->connect_stream(std::move(request), std::move(handler));
+    endpoint_dialer_->connect_stream(std::move(request), std::move(handler));
 }
 
 void OutboundDnsUpstreamDialer::open_datagram(core::DatagramRequest request,
                                               core::DatagramOpenHandler handler) {
-    if (!registry_) {
-        boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
-            handler(core::DatagramOpenResult::failed(
-                {core::ErrorCode::configuration, "DNS outbound registry is missing"}));
+    if (plan_error_) {
+        const auto error = *plan_error_;
+        boost::asio::post(runtime_.context(), [handler = std::move(handler), error]() mutable {
+            handler(core::DatagramOpenResult::failed(error));
         });
         return;
     }
-    const auto selected = registry_->select(outbound_id_);
-    if (!selected) {
-        boost::asio::post(runtime_.context(),
-                          [handler = std::move(handler), error = selected.error()]() mutable {
-                              handler(core::DatagramOpenResult::failed(error));
-                          });
-        return;
-    }
-    if (selected.value()->capabilities().datagram == core::DatagramSemantics::unsupported) {
-        boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
-            handler(core::DatagramOpenResult::unsupported());
-        });
-        return;
-    }
-    selected.value()->open_datagram(std::move(request), std::move(handler));
+    endpoint_dialer_->open_datagram(std::move(request), std::move(handler));
 }
 
 class AsioDnsTransport final : public DnsTransport {
@@ -234,7 +240,7 @@ class AsioDnsTransport final : public DnsTransport {
     AsioDnsTransport(runtime::AsioRuntime &runtime, DnsUpstreamConfig config)
         : runtime_(runtime), config_(std::move(config)) {
         if (!config_.dialer) {
-            config_.dialer = std::make_shared<DirectDnsUpstreamDialer>(runtime_);
+            config_.dialer = make_direct_dns_upstream_dialer(runtime_);
         }
     }
 
@@ -266,8 +272,7 @@ class AsioDnsTransport::TcpSession final
 
     TcpSession(runtime::AsioRuntime &runtime, boost::asio::ip::tcp::endpoint endpoint,
                std::shared_ptr<DnsUpstreamDialer> dialer)
-        : runtime_(runtime), endpoint_(endpoint), dialer_(std::move(dialer)),
-          socket_(runtime.context()) {}
+        : runtime_(runtime), endpoint_(endpoint), dialer_(std::move(dialer)) {}
 
     void exchange(std::uint16_t query_id, std::vector<std::uint8_t> query,
                   std::chrono::steady_clock::time_point deadline, Handler handler) {
@@ -345,48 +350,30 @@ class AsioDnsTransport::TcpSession final
 
         connecting_ = true;
         const auto generation = connection_generation_;
-        if (dialer_) {
-            auto self = shared_from_this();
-            dialer_->connect_stream(
-                {core::Destination::address(endpoint_.address(), endpoint_.port()), std::nullopt},
-                [self, generation](core::StreamOpenResult result) mutable {
-                    if (generation != self->connection_generation_ || self->stopped_) {
-                        if (result.handle) {
-                            result.handle->close();
-                        }
-                        return;
-                    }
-                    if (!result.succeeded()) {
-                        self->connection_failed(result.error.value_or(core::Error{
-                                                    core::ErrorCode::endpoint_connection,
-                                                    "DNS upstream dialer failed to open a stream"}),
-                                                generation);
-                        return;
-                    }
-                    self->stream_ = std::move(result.handle);
-                    self->on_connected(generation);
-                });
-            return;
-        }
-
-        boost::system::error_code error;
-        socket_.open(endpoint_.protocol(), error);
-        if (error) {
-            connection_failed(upstream_error("failed to open DNS TCP socket", error), generation);
+        if (!dialer_) {
+            connection_failed(
+                {core::ErrorCode::configuration, "DNS upstream stream dialer is not configured"},
+                generation);
             return;
         }
         auto self = shared_from_this();
-        socket_.async_connect(
-            endpoint_, [self, generation](const boost::system::error_code &connect_error) {
+        dialer_->connect_stream(
+            {core::Destination::address(endpoint_.address(), endpoint_.port()), std::nullopt},
+            [self, generation](core::StreamOpenResult result) mutable {
                 if (generation != self->connection_generation_ || self->stopped_) {
+                    if (result.handle) {
+                        result.handle->close();
+                    }
                     return;
                 }
-                if (connect_error) {
-                    self->connection_failed(
-                        upstream_error("failed to connect to DNS TCP upstream", connect_error),
-                        generation);
+                if (!result.succeeded()) {
+                    self->connection_failed(result.error.value_or(core::Error{
+                                                core::ErrorCode::endpoint_connection,
+                                                "DNS upstream dialer failed to open a stream"}),
+                                            generation);
                     return;
                 }
+                self->stream_ = std::move(result.handle);
                 self->on_connected(generation);
             });
     }
@@ -435,11 +422,7 @@ class AsioDnsTransport::TcpSession final
             }
             self->flush_writes(generation);
         };
-        if (stream_) {
-            stream_->async_write(boost::asio::buffer(pending->frame), on_write);
-        } else {
-            boost::asio::async_write(socket_, boost::asio::buffer(pending->frame), on_write);
-        }
+        stream_->async_write(boost::asio::buffer(pending->frame), on_write);
     }
 
     void read_frame(std::uint64_t generation) {
@@ -513,13 +496,8 @@ class AsioDnsTransport::TcpSession final
             }
             self->read_exact(buffer, next_offset, generation, std::move(handler));
         };
-        if (stream_) {
-            stream_->async_read_some(
-                boost::asio::buffer(buffer->data() + offset, buffer->size() - offset), on_read);
-        } else {
-            socket_.async_read_some(
-                boost::asio::buffer(buffer->data() + offset, buffer->size() - offset), on_read);
-        }
+        stream_->async_read_some(
+            boost::asio::buffer(buffer->data() + offset, buffer->size() - offset), on_read);
     }
 
     void dispatch_response(std::vector<std::uint8_t> response, std::uint64_t generation) {
@@ -593,15 +571,11 @@ class AsioDnsTransport::TcpSession final
             stream_->close();
             stream_.reset();
         }
-        boost::system::error_code ignored;
-        socket_.cancel(ignored);
-        socket_.close(ignored);
     }
 
     runtime::AsioRuntime &runtime_;
     boost::asio::ip::tcp::endpoint endpoint_;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
-    boost::asio::ip::tcp::socket socket_;
     std::unique_ptr<core::StreamHandle> stream_;
     std::unordered_map<std::uint16_t, PendingPtr> pending_;
     std::deque<std::uint16_t> write_queue_;
@@ -954,15 +928,23 @@ std::shared_ptr<DnsTransport> make_asio_dns_transport(runtime::AsioRuntime &runt
 }
 
 std::shared_ptr<DnsUpstreamDialer> make_direct_dns_upstream_dialer(runtime::AsioRuntime &runtime) {
-    return std::make_shared<DirectDnsUpstreamDialer>(runtime);
+    auto outbound = std::make_shared<outbound::DirectOutbound>(runtime);
+    auto plan = transport::EndpointDialPlan::from_outbound(std::move(outbound), "direct");
+    return std::make_shared<PlannedDnsUpstreamDialer>(runtime, std::move(plan));
 }
 
-std::shared_ptr<DnsUpstreamDialer>
-make_outbound_dns_upstream_dialer(runtime::AsioRuntime &runtime,
-                                  outbound::OutboundRegistry::Snapshot registry,
-                                  std::string outbound_id) {
+std::shared_ptr<DnsUpstreamDialer> make_outbound_dns_upstream_dialer(
+    runtime::AsioRuntime &runtime, outbound::OutboundRegistry::Snapshot registry,
+    std::string outbound_id, transport::EndpointDialRequirements requirements) {
     return std::make_shared<OutboundDnsUpstreamDialer>(runtime, std::move(registry),
-                                                       std::move(outbound_id));
+                                                       std::move(outbound_id), requirements);
+}
+
+std::shared_ptr<DnsUpstreamDialer> make_traffic_rules_dns_upstream_dialer(
+    runtime::AsioRuntime &runtime, outbound::OutboundRegistry::Snapshot registry,
+    router::TrafficRouter::Snapshot traffic_router, std::string egress_hostname) {
+    return std::make_shared<TrafficRulesDnsUpstreamDialer>(
+        runtime, std::move(registry), std::move(traffic_router), std::move(egress_hostname));
 }
 
 } // namespace clash_native::dns

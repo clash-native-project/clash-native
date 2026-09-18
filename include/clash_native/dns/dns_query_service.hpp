@@ -5,6 +5,7 @@
 #include <clash_native/dns/dns_upstream.hpp>
 #include <clash_native/dns/resolver_graph.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
+#include <clash_native/router/traffic_router.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -30,12 +31,14 @@ struct DnsResolverConfig {
                       std::chrono::seconds negative_cache_ttl = std::chrono::seconds(5),
                       std::uint64_t cache_generation = 0,
                       std::shared_ptr<const ResolverDependencyGraph> dependency_graph = nullptr,
-                      outbound::OutboundRegistry::Snapshot outbound_registry = nullptr)
+                      outbound::OutboundRegistry::Snapshot outbound_registry = nullptr,
+                      router::TrafficRouter::Snapshot traffic_router = nullptr)
         : default_upstream(std::move(default_upstream)),
           upstream_groups(std::move(upstream_groups)), policy_router(std::move(policy_router)),
           transport_factory(std::move(transport_factory)), group_configs(std::move(group_configs)),
           dependency_graph(std::move(dependency_graph)),
-          outbound_registry(std::move(outbound_registry)) {
+          outbound_registry(std::move(outbound_registry)),
+          traffic_router(std::move(traffic_router)) {
         this->cache_capacity = cache_capacity;
         this->negative_cache_ttl = negative_cache_ttl;
         this->cache_generation = cache_generation;
@@ -51,6 +54,7 @@ struct DnsResolverConfig {
     std::uint64_t cache_generation = 0;
     std::shared_ptr<const ResolverDependencyGraph> dependency_graph;
     outbound::OutboundRegistry::Snapshot outbound_registry;
+    router::TrafficRouter::Snapshot traffic_router;
 };
 
 class DnsQueryService final {

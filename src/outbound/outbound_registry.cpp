@@ -76,6 +76,57 @@ core::Status OutboundRegistry::validate() const {
     return {};
 }
 
+core::Result<core::OutboundCapabilities>
+OutboundRegistry::capabilities_entry(std::string_view id,
+                                     std::vector<std::string> &visiting) const {
+    const auto outbound = outbounds_.find(std::string(id));
+    if (outbound != outbounds_.end()) {
+        return outbound->second->capabilities();
+    }
+
+    const auto group = groups_.find(std::string(id));
+    if (group == groups_.end()) {
+        return core::fail(configuration_error("unknown outbound target: " + std::string(id)));
+    }
+    if (std::find(visiting.begin(), visiting.end(), id) != visiting.end()) {
+        return core::fail(
+            configuration_error("outbound group dependency cycle at: " + std::string(id)));
+    }
+
+    visiting.emplace_back(id);
+    core::OutboundCapabilities combined{};
+    combined.stream = true;
+    combined.datagram = core::DatagramSemantics::multi_destination;
+    for (const auto &member : group->second.members) {
+        const auto member_capabilities = capabilities_entry(member, visiting);
+        if (!member_capabilities) {
+            visiting.pop_back();
+            return core::fail(member_capabilities.error());
+        }
+        const auto &capabilities = member_capabilities.value();
+        combined.stream = combined.stream && capabilities.stream;
+        if (capabilities.datagram == core::DatagramSemantics::unsupported) {
+            combined.datagram = core::DatagramSemantics::unsupported;
+        } else if (capabilities.datagram == core::DatagramSemantics::fixed_destination &&
+                   combined.datagram != core::DatagramSemantics::unsupported) {
+            combined.datagram = core::DatagramSemantics::fixed_destination;
+        }
+        if (capabilities.stream_target == core::TargetRequirement::ip_required) {
+            combined.stream_target = core::TargetRequirement::ip_required;
+        }
+        if (capabilities.datagram_target == core::TargetRequirement::ip_required) {
+            combined.datagram_target = core::TargetRequirement::ip_required;
+        }
+    }
+    visiting.pop_back();
+    return combined;
+}
+
+core::Result<core::OutboundCapabilities> OutboundRegistry::capabilities(std::string_view id) const {
+    std::vector<std::string> visiting;
+    return capabilities_entry(id, visiting);
+}
+
 core::Result<OutboundRegistry::OutboundPtr>
 OutboundRegistry::select_entry(std::string_view id, std::vector<std::string> &visiting) const {
     const auto outbound = outbounds_.find(std::string(id));

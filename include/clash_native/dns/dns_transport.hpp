@@ -4,7 +4,9 @@
 #include <clash_native/core/result.hpp>
 #include <clash_native/dns/dns_types.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
+#include <clash_native/router/traffic_router.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
+#include <clash_native/transport/endpoint_dialer.hpp>
 
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ip/udp.hpp>
@@ -46,15 +48,16 @@ class OutboundDnsUpstreamDialer final : public DnsUpstreamDialer {
   public:
     OutboundDnsUpstreamDialer(runtime::AsioRuntime &runtime,
                               outbound::OutboundRegistry::Snapshot registry,
-                              std::string outbound_id);
+                              std::string outbound_id,
+                              transport::EndpointDialRequirements requirements = {});
 
     void connect_stream(core::StreamRequest request, Handler handler) override;
     void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) override;
 
   private:
     runtime::AsioRuntime &runtime_;
-    outbound::OutboundRegistry::Snapshot registry_;
-    std::string outbound_id_;
+    std::shared_ptr<transport::EndpointDialer> endpoint_dialer_;
+    std::optional<core::Error> plan_error_;
 };
 
 enum class DnsTransportMode {
@@ -81,6 +84,8 @@ struct DnsUpstreamConfig {
     std::string doh_authority;
     DnsDialPolicy dial_policy;
     std::shared_ptr<DnsUpstreamDialer> dialer;
+    // Retained for DNS egress routing when a bootstrap address is used.
+    std::string egress_hostname;
     // When set, the endpoint address is resolved by the explicit bootstrap resolver.
     std::string hostname;
     std::shared_ptr<BootstrapResolver> bootstrap_resolver;
@@ -103,10 +108,12 @@ class DnsTransport {
 };
 
 std::shared_ptr<DnsUpstreamDialer> make_direct_dns_upstream_dialer(runtime::AsioRuntime &runtime);
-std::shared_ptr<DnsUpstreamDialer>
-make_outbound_dns_upstream_dialer(runtime::AsioRuntime &runtime,
-                                  outbound::OutboundRegistry::Snapshot registry,
-                                  std::string outbound_id);
+std::shared_ptr<DnsUpstreamDialer> make_outbound_dns_upstream_dialer(
+    runtime::AsioRuntime &runtime, outbound::OutboundRegistry::Snapshot registry,
+    std::string outbound_id, transport::EndpointDialRequirements requirements = {});
+std::shared_ptr<DnsUpstreamDialer> make_traffic_rules_dns_upstream_dialer(
+    runtime::AsioRuntime &runtime, outbound::OutboundRegistry::Snapshot registry,
+    router::TrafficRouter::Snapshot traffic_router, std::string egress_hostname);
 
 std::shared_ptr<DnsTransport> make_asio_dns_transport(runtime::AsioRuntime &runtime,
                                                       DnsUpstreamConfig config);

@@ -16,6 +16,7 @@
 #include <string>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace clash_native::core {
 
@@ -78,13 +79,19 @@ struct OutboundCapabilities {
     TargetRequirement datagram_target = TargetRequirement::domain_or_ip;
 };
 
+struct EndpointDialTrace {
+    std::vector<std::string> outbound_ids;
+};
+
 struct StreamRequest {
     Destination destination;
     std::optional<boost::asio::ip::address> resolved_address;
+    std::shared_ptr<const EndpointDialTrace> dial_trace;
 };
 
 struct DatagramRequest {
     std::optional<Destination> initial_destination;
+    std::shared_ptr<const EndpointDialTrace> dial_trace;
 };
 
 class StreamHandle {

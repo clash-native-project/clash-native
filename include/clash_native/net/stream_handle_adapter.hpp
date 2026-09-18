@@ -7,9 +7,11 @@
 #include <boost/system/error_code.hpp>
 
 #include <memory>
+#include <utility>
 
-namespace clash_native::dns {
+namespace clash_native::net {
 
+// Adapts the project stream contract to the Asio read/write stream concepts.
 class StreamHandleAdapter final {
   public:
     using executor_type = boost::asio::any_io_executor;
@@ -33,15 +35,15 @@ class StreamHandleAdapter final {
         handle_->async_write(buffer, std::move(handler));
     }
 
+    boost::asio::ip::tcp::endpoint local_endpoint(boost::system::error_code &error) const noexcept {
+        return handle_->local_endpoint(error);
+    }
+
+    void shutdown_send(boost::system::error_code &error) noexcept { handle_->shutdown_send(error); }
+
     void close() noexcept {
         if (handle_) {
             handle_->close();
-        }
-    }
-
-    void shutdown_send(boost::system::error_code &error) noexcept {
-        if (handle_) {
-            handle_->shutdown_send(error);
         }
     }
 
@@ -49,4 +51,4 @@ class StreamHandleAdapter final {
     std::unique_ptr<core::StreamHandle> handle_;
 };
 
-} // namespace clash_native::dns
+} // namespace clash_native::net

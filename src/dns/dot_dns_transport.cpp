@@ -1,16 +1,11 @@
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
-
-#include "builtin_ca_bundle.hpp"
-#include "stream_handle_adapter.hpp"
+#include <clash_native/transport/tls_client.hpp>
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
-#include <boost/asio/ssl.hpp>
 #include <boost/asio/write.hpp>
-
-#include <openssl/ssl.h>
 
 #include <algorithm>
 #include <array>
@@ -31,11 +26,6 @@ namespace {
 
 core::Error io_error(std::string context, const boost::system::error_code &error) {
     return {core::ErrorCode::transport_io, std::move(context),
-            std::error_code(error.value(), std::system_category())};
-}
-
-core::Error handshake_error(const boost::system::error_code &error) {
-    return {core::ErrorCode::carrier_handshake, "DoT TLS handshake failed",
             std::error_code(error.value(), std::system_category())};
 }
 
@@ -89,8 +79,7 @@ class DotDnsTransport::Session final
     Session(runtime::AsioRuntime &runtime, boost::asio::ip::tcp::endpoint endpoint,
             std::string server_name, bool verify_peer, std::shared_ptr<DnsUpstreamDialer> dialer)
         : runtime_(runtime), endpoint_(endpoint), server_name_(std::move(server_name)),
-          verify_peer_(verify_peer), ssl_context_(boost::asio::ssl::context::tls_client),
-          dialer_(std::move(dialer)) {}
+          verify_peer_(verify_peer), dialer_(std::move(dialer)) {}
 
     void exchange(std::uint16_t query_id, std::vector<std::uint8_t> query,
                   std::chrono::steady_clock::time_point deadline, Handler handler) {
@@ -164,34 +153,6 @@ class DotDnsTransport::Session final
                           });
     }
 
-    bool configure_tls() {
-        boost::system::error_code error;
-        if (verify_peer_) {
-            const auto trust_roots = detail::builtin_ca_bundle_pem();
-            ssl_context_.add_certificate_authority(
-                boost::asio::buffer(trust_roots.data(), trust_roots.size()), error);
-            if (error) {
-                connection_failed(io_error("failed to load embedded DoT trust roots", error),
-                                  connection_generation_);
-                return false;
-            }
-        }
-        ssl_stream_->set_verify_mode(verify_peer_ ? boost::asio::ssl::verify_peer
-                                                  : boost::asio::ssl::verify_none);
-        if (!server_name_.empty() &&
-            SSL_set_tlsext_host_name(ssl_stream_->native_handle(), server_name_.c_str()) != 1) {
-            connection_failed(
-                {core::ErrorCode::configuration, "failed to configure DoT server name"},
-                connection_generation_);
-            return false;
-        }
-        if (verify_peer_) {
-            ssl_stream_->set_verify_callback(
-                boost::asio::ssl::host_name_verification(server_name_));
-        }
-        return true;
-    }
-
     void connect_if_needed() {
         if (stopped_ || retired_ || connected_ || connecting_ || pending_.empty()) {
             return;
@@ -216,30 +177,29 @@ class DotDnsTransport::Session final
                         generation);
                     return;
                 }
-                self->ssl_stream_ = std::make_unique<SslStream>(
-                    StreamHandleAdapter(std::move(result.handle)), self->ssl_context_);
-                if (self->configure_tls()) {
-                    self->handshake(generation);
-                }
-            });
-    }
-
-    void handshake(std::uint64_t generation) {
-        auto self = shared_from_this();
-        ssl_stream_->async_handshake(
-            boost::asio::ssl::stream_base::client,
-            [self, generation](const boost::system::error_code &error) {
-                if (generation != self->connection_generation_ || self->stopped_) {
-                    return;
-                }
-                if (error) {
-                    self->connection_failed(handshake_error(error), generation);
-                    return;
-                }
-                self->connecting_ = false;
-                self->connected_ = true;
-                self->read_frame(generation);
-                self->flush_writes(generation);
+                transport::TlsClientOptions options;
+                options.server_name = self->server_name_;
+                options.verify_peer = self->verify_peer_;
+                self->tls_handshake_ = transport::async_tls_client_handshake(
+                    std::move(result.handle), std::move(options),
+                    [self, generation](core::Result<transport::TlsClientConnection> tls) mutable {
+                        self->tls_handshake_.reset();
+                        if (generation != self->connection_generation_ || self->stopped_) {
+                            if (tls && tls->stream) {
+                                tls->stream->close();
+                            }
+                            return;
+                        }
+                        if (!tls) {
+                            self->connection_failed(tls.error(), generation);
+                            return;
+                        }
+                        self->tls_stream_ = std::move(tls->stream);
+                        self->connecting_ = false;
+                        self->connected_ = true;
+                        self->read_frame(generation);
+                        self->flush_writes(generation);
+                    });
             });
     }
 
@@ -262,8 +222,8 @@ class DotDnsTransport::Session final
         const auto pending = pending_.at(query_id);
         write_in_progress_ = true;
         auto self = shared_from_this();
-        boost::asio::async_write(
-            *ssl_stream_, boost::asio::buffer(pending->frame),
+        tls_stream_->async_write(
+            boost::asio::buffer(pending->frame),
             [self, pending, query_id, generation](const boost::system::error_code &error,
                                                   std::size_t) {
                 if (generation != self->connection_generation_ || self->stopped_) {
@@ -333,7 +293,7 @@ class DotDnsTransport::Session final
             return;
         }
         auto self = shared_from_this();
-        ssl_stream_->async_read_some(
+        tls_stream_->async_read_some(
             boost::asio::buffer(buffer->data() + offset, buffer->size() - offset),
             [self, buffer, offset, generation, handler = std::move(handler)](
                 const boost::system::error_code &error, std::size_t size) mutable {
@@ -388,6 +348,10 @@ class DotDnsTransport::Session final
         write_queue_.erase(std::remove(write_queue_.begin(), write_queue_.end(), query_id),
                            write_queue_.end());
         pending->timer.cancel();
+        if (pending_.empty() && connecting_) {
+            retired_ = true;
+            close_connection();
+        }
         if (pending->handler) {
             auto handler = std::move(pending->handler);
             handler(core::fail(std::move(error)));
@@ -426,9 +390,13 @@ class DotDnsTransport::Session final
         write_in_progress_ = false;
         read_in_progress_ = false;
         boost::system::error_code ignored;
-        if (ssl_stream_) {
-            ssl_stream_->next_layer().close();
-            ssl_stream_.reset();
+        if (tls_handshake_) {
+            tls_handshake_->cancel();
+            tls_handshake_.reset();
+        }
+        if (tls_stream_) {
+            tls_stream_->close();
+            tls_stream_.reset();
         }
     }
 
@@ -436,10 +404,9 @@ class DotDnsTransport::Session final
     boost::asio::ip::tcp::endpoint endpoint_;
     std::string server_name_;
     bool verify_peer_;
-    boost::asio::ssl::context ssl_context_;
-    using SslStream = boost::asio::ssl::stream<StreamHandleAdapter>;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
-    std::unique_ptr<SslStream> ssl_stream_;
+    std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
+    std::unique_ptr<core::StreamHandle> tls_stream_;
     std::unordered_map<std::uint16_t, PendingPtr> pending_;
     std::deque<std::uint16_t> write_queue_;
     std::uint64_t connection_generation_ = 0;

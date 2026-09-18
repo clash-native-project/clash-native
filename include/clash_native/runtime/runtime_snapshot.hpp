@@ -8,7 +8,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <string_view>
 
 namespace clash_native::runtime {
 
@@ -18,6 +20,7 @@ struct RuntimeSnapshot {
     outbound::OutboundRegistry::Snapshot outbounds;
     std::shared_ptr<dns::ResolverService> resolver;
     std::shared_ptr<dns::FakeIpStore> fake_ip_store;
+    std::function<bool(std::string_view)> fake_ip_filter;
 
     core::Status validate() const {
         if (!router || !outbounds) {

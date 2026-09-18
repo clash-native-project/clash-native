@@ -1,5 +1,30 @@
 # Implementation Log
 
+### 2026-09-18 — Extract shared HTTP/1.1 and HTTP/2 client sessions
+
+- Added a common HTTP request/response exchange API over injected streams. HTTP/1.1 now owns Beast framing, body limits, cancellation, deadlines, and ordered keep-alive exchanges; HTTP/2 owns nghttp2 framing, concurrent streams, bounded response bodies, cancellation/reset, and GOAWAY retirement.
+- Migrated DoH/1 and DoH/2 so DNS keeps `application/dns-message` construction and validation while transport owns HTTP serialization, parsing, and multiplexing. Added a loopback test proving queued HTTP/1.1 exchanges reuse one keep-alive connection.
+- Fixed a DoH/3 setup race by creating nghttp3 state as soon as the QUIC handshake completes, before processing any HTTP/3 streams from the same datagram.
+- Validated Windows x64 Release with standalone clang-cl/MSVC and vcpkg: CTest 119/119; full Go interop against independent DNSProxy and Mihomo processes; `go vet ./...`; DoH/3 DNSProxy interop repeated 10 times; and independent DoQ/DoH3 concurrent-stream tests.
+- The current HTTP API supports bounded buffered exchanges. Streaming bodies, full-duplex CONNECT/upgrade tunnels, and a reusable cross-protocol session pool remain unimplemented extraction work.
+
+### 2026-09-18 — Extract shared injected-stream TLS client
+
+- Added an asynchronous TLS client connector over injected `StreamHandle` instances, centralizing trust roots, peer and server-name verification, ALPN, cancellation, handshake deadlines, and error classification.
+- Moved the Asio stream adapter and embedded CA bundle ownership out of DNS, then migrated DoT, DoH/1.1, DoH/2, and Trojan to the shared TLS client. DoQ and DoH/3 retain their QUIC-specific TLS engine.
+- Extended the independent Go DNSProxy interoperability test to cover DoT and DoH/2, including successful queries with verification disabled and rejection of the test server's untrusted certificate when enabled.
+- Validated Windows x64 with clang-cl/MSVC and vcpkg: CTest 118/118, full Go interop, independent DNSProxy secure transports, public encrypted DNS upstreams, and real Mihomo server interoperability passed. Formatting checks passed.
+
+### 2026-09-18 — Shared transport and carrier extraction plan
+
+- Documented the staged extraction of TLS, HTTP/1.1, HTTP/2, QUIC, and HTTP/3 from DNS-specific implementations into reusable carrier capabilities.
+- Defined separate extension boundaries for WebSocket/WSS and KCP/mKCP, including session ownership, pooling, consumer composition, and validation gates.
+- Kept `DnsTransport` as a DNS application adapter and the existing `Outbound` stream/datagram contract as the engine-facing protocol boundary.
+- Clarified that `EndpointDialer` executes an immutable, preselected endpoint egress plan and never performs traffic routing or outbound lookup.
+- Marked WebSocket/WSS and KCP/mKCP as design constraints rather than current extraction deliverables, and separated DNS migration from the non-DNS proof required to close HTTP/QUIC generalization.
+- Made shared TLS/HTTP/QUIC extraction and DNS migration a Stage 2 requirement, leaving Stage 4 to validate and extend the shared layer with non-DNS consumers.
+- Added DoH/1 explicitly to the Stage 2 encrypted-DNS deliverables and functional gate.
+
 ### 2026-09-18 — Shadowsocks encrypted UDP size limit
 
 - Reject Shadowsocks UDP datagrams whose encrypted wire payload exceeds 1500 bytes with `message_size`, and log size-limit errors from the SOCKS UDP relay.
@@ -793,3 +818,33 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 
 - Recorded the observed Windows loopback loss rates for concurrent oversized UDP datagrams, the successful sequential size checks, and the limits of the current evidence in `docs/known-issues.md`.
 - Kept the cause unresolved and deferred implementation changes; the loopback measurements do not establish IP-fragmentation loss or a fixed 13 KB limit.
+
+### 2026-09-18 — Shared TLS, HTTP, QUIC, and endpoint dialing
+
+- Added reusable TLS, HTTP/1.1, HTTP/2, HTTP/3, and QUIC client boundaries, then reduced the encrypted DNS transports to DNS framing, request mapping, and response validation over those shared components.
+- Added immutable endpoint dial plans with stream/datagram capability checks, traffic-rule egress planning, outbound-chain tracing, and runtime cycle/depth guards. Removed DNS TCP transport's raw-socket fallback so upstream connections use the planned dialer.
+- Validated the Windows x64 clang-cl/MSVC build and all 122 CTest cases, the uncached Go interoperability suite, independent dnsproxy coverage for DoT/DoH1/DoH2/DoQ/DoH3, and single-connection concurrent DoQ/DoH3 multiplexing.
+
+### 2026-09-18 — Composed DNS policy, FakeIP, proxy routing, and reload
+
+- Made `ProxyServer` and `DnsServer` share the same atomic runtime snapshot. Each DNS request captures one resolver/FakeIP generation, so reload changes DNS synthesis and proxy routing together while in-flight requests and established proxy sessions retain their prior owners.
+- Exposed route rules, default action, outbound registry, FakeIP filter, and snapshot reload through the application API without adding CLI configuration. Direct domain routes now resolve against the resolver held by the request's snapshot.
+- Added an independent Go integration that starts two dnsproxy processes and verifies policy-group selection, FakeIP synthesis, SOCKS5 domain routing to a real echo endpoint, snapshot reload, new-generation DNS/routing behavior, and an established connection surviving reload. Documented the topology and command in `docs/dns-testing.md`.
+
+### 2026-09-18 — c-ares OPT projection and reload policy coverage
+
+- Removed the remaining handwritten DNS wire walker for OPT metadata. The c-ares packet RCODE and OPT version/flags getters now provide the extended response code and OPT TTL fields used by local responses.
+- Extended the independent Go composition scenario to verify DNS policy-group selection changes on reload, alongside FakeIP pool and proxy route changes.
+- Validated Windows x64 with standalone clang-cl/MSVC and vcpkg: 122/122 CTest cases, the uncached Go interoperability suite with independent dnsproxy enabled, ten repeated composed reload runs, `go vet ./...`, formatting, and `git diff --check` passed. Public DNS and Mihomo tests remained opt-in and were skipped.
+
+### 2026-09-18 — Split DoQ and DoH/3 DNS transports
+
+- Moved DoQ stream framing and QUIC event handling into `doq_dns_transport.cpp`, and DoH/3 HTTP request/response handling into `doh3_dns_transport.cpp`.
+- Kept the QUIC session pool, exchange lifecycle, deadlines, cancellation, and shared connection management in `quic_dns_transport.cpp` through a private internal declaration header.
+- Validated with the Windows x64 clang-cl/MSVC build and 122/122 CTest cases. The uncached Go interoperability suite passed with the independent dnsproxy fixture, including ten repeated DoQ/DoH3 single-connection multiplexing runs.
+
+### 2026-09-18 — Extract UDP stream adapter
+
+- Added `net::UdpStream` as the Asio UDP socket adapter for `core::DatagramHandle`, including socket setup, async send/receive, executor access, local endpoint lookup, cancellation, close, and RAII shutdown.
+- Replaced the direct outbound's private datagram wrapper and migrated the DNS listener, SOCKS UDP relay, and Shadowsocks datagram socket to the shared adapter while keeping their protocol behavior in the owning layers.
+- Added a loopback test for datagram send/receive and peer endpoint reporting. Validated the Windows x64 clang-cl/MSVC Release build, 123/123 CTest cases, and uncached Go interoperability tests against independent DNS and proxy peers.

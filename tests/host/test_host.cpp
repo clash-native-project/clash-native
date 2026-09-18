@@ -1,3 +1,4 @@
+#include <clash_native/dns/dns_policy_router.hpp>
 #include <clash_native/dns/dns_server.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
 #include <clash_native/outbound/shadowsocks_outbound.hpp>
@@ -5,8 +6,12 @@
 #include <clash_native/proxy/proxy_server.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 
+#include <boost/asio/buffer.hpp>
 #include <boost/asio/ip/address.hpp>
+#include <boost/asio/read_until.hpp>
 #include <boost/asio/signal_set.hpp>
+#include <boost/asio/streambuf.hpp>
+#include <boost/asio/write.hpp>
 
 #include <charconv>
 #include <chrono>
@@ -17,12 +22,15 @@
 #include <functional>
 #include <future>
 #include <iostream>
+#include <istream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 
 namespace {
 
@@ -220,6 +228,110 @@ std::optional<clash_native::dns::DnsUpstreamConfig> parse_upstream_config(const 
     return config;
 }
 
+class Stage2ReloadControl final : public std::enable_shared_from_this<Stage2ReloadControl> {
+  public:
+    Stage2ReloadControl(clash_native::runtime::AsioRuntime &runtime,
+                        clash_native::proxy::ProxyServer &proxy,
+                        std::shared_ptr<clash_native::dns::ResolverService> resolver)
+        : runtime_(runtime), proxy_(proxy), resolver_(std::move(resolver)),
+          acceptor_(runtime.context()) {
+        boost::system::error_code error;
+        acceptor_.open(boost::asio::ip::tcp::v4(), error);
+        if (!error) {
+            acceptor_.set_option(boost::asio::socket_base::reuse_address(true), error);
+        }
+        if (!error) {
+            acceptor_.bind({boost::asio::ip::address_v4::loopback(), 0}, error);
+        }
+        if (!error) {
+            acceptor_.listen(boost::asio::socket_base::max_listen_connections, error);
+        }
+        if (error) {
+            throw std::system_error(error, "failed to start test reload control listener");
+        }
+        endpoint_ = acceptor_.local_endpoint(error);
+        if (error) {
+            throw std::system_error(error, "failed to query test reload control endpoint");
+        }
+    }
+
+    boost::asio::ip::tcp::endpoint endpoint() const noexcept { return endpoint_; }
+
+    void start() { accept(); }
+
+    void stop() noexcept {
+        boost::system::error_code ignored;
+        acceptor_.cancel(ignored);
+        acceptor_.close(ignored);
+    }
+
+  private:
+    void accept() {
+        if (!acceptor_.is_open()) {
+            return;
+        }
+        auto socket = std::make_shared<boost::asio::ip::tcp::socket>(runtime_.context());
+        const auto self = shared_from_this();
+        acceptor_.async_accept(*socket, [self, socket](const boost::system::error_code &error) {
+            if (!error) {
+                self->read_command(socket);
+            }
+            self->accept();
+        });
+    }
+
+    void read_command(const std::shared_ptr<boost::asio::ip::tcp::socket> &socket) {
+        auto buffer = std::make_shared<boost::asio::streambuf>();
+        const auto self = shared_from_this();
+        boost::asio::async_read_until(
+            *socket, *buffer, '\n',
+            [self, socket, buffer](const boost::system::error_code &error, std::size_t) {
+                std::string response = "ERR invalid command\n";
+                if (!error) {
+                    std::istream input(buffer.get());
+                    std::string command;
+                    std::getline(input, command);
+                    if (command == "reload") {
+                        response = self->reload_snapshot();
+                    }
+                }
+                auto payload = std::make_shared<std::string>(std::move(response));
+                boost::asio::async_write(
+                    *socket, boost::asio::buffer(*payload),
+                    [socket, payload](const boost::system::error_code &, std::size_t) {
+                        boost::system::error_code ignored;
+                        socket->shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored);
+                        socket->close(ignored);
+                    });
+            });
+    }
+
+    std::string reload_snapshot() {
+        const auto current = proxy_.runtime_snapshot_store()->load();
+        if (!current) {
+            return "ERR runtime snapshot is not published\n";
+        }
+        auto router = std::make_shared<clash_native::router::TrafficRouter>(
+            clash_native::router::RouteAction::reject());
+        auto fake_ip_store = std::make_shared<clash_native::dns::FakeIpStore>(
+            boost::asio::ip::make_address_v4("198.19.0.0"), 24, 254);
+        auto replacement = std::make_shared<const clash_native::runtime::RuntimeSnapshot>(
+            clash_native::runtime::RuntimeSnapshot{
+                current->generation + 1, router->snapshot(), current->outbounds, resolver_,
+                std::move(fake_ip_store), current->fake_ip_filter});
+        if (const auto result = proxy_.reload(std::move(replacement)); !result) {
+            return "ERR " + result.error().context + "\n";
+        }
+        return "OK " + std::to_string(current->generation + 1) + "\n";
+    }
+
+    clash_native::runtime::AsioRuntime &runtime_;
+    clash_native::proxy::ProxyServer &proxy_;
+    std::shared_ptr<clash_native::dns::ResolverService> resolver_;
+    boost::asio::ip::tcp::acceptor acceptor_;
+    boost::asio::ip::tcp::endpoint endpoint_;
+};
+
 } // namespace
 
 int main(int argc, char **) {
@@ -231,9 +343,13 @@ int main(int argc, char **) {
     try {
         clash_native::runtime::AsioRuntime runtime;
         std::shared_ptr<clash_native::dns::ResolverService> resolver;
+        std::shared_ptr<clash_native::dns::ResolverService> reload_resolver;
         std::unique_ptr<clash_native::dns::DnsServer> dns_server;
         std::shared_ptr<clash_native::dns::FakeIpStore> fake_ip_store;
         std::function<bool(std::string_view)> fake_ip_filter;
+        const auto stage2_composition = environment_value("CLASH_NATIVE_TEST_STAGE2_COMPOSITION");
+        const bool run_stage2_composition = stage2_composition && *stage2_composition == "1";
+        const auto fake_ip_domain = environment_value("CLASH_NATIVE_FAKE_IP_DOMAIN");
         if (const auto upstream_text = environment_value("CLASH_NATIVE_DNS_UPSTREAM");
             upstream_text) {
             auto upstream = parse_upstream_config(upstream_text->c_str());
@@ -247,16 +363,47 @@ int main(int argc, char **) {
                 (*verify_peer == "0" || *verify_peer == "false" || *verify_peer == "FALSE")) {
                 upstream->verify_peer = false;
             }
+            const auto default_upstream_for_reload = *upstream;
 
+            std::unordered_map<std::string, clash_native::dns::DnsUpstreamConfig> upstream_groups;
+            std::shared_ptr<const clash_native::dns::DnsPolicyRouter> policy_router;
+            if (const auto policy_upstream_text =
+                    environment_value("CLASH_NATIVE_DNS_POLICY_UPSTREAM");
+                policy_upstream_text) {
+                auto policy_upstream = parse_upstream_config(policy_upstream_text->c_str());
+                if (!policy_upstream) {
+                    throw std::runtime_error(
+                        "CLASH_NATIVE_DNS_POLICY_UPSTREAM must be a supported DNS endpoint");
+                }
+                upstream_groups.emplace("policy", std::move(*policy_upstream));
+                auto mutable_policy =
+                    std::make_shared<clash_native::dns::DnsPolicyRouter>("default");
+                mutable_policy->add_rule({"stage2-policy-group",
+                                          clash_native::dns::DnsPolicyRuleKind::exact,
+                                          "policy-route.test", "policy"});
+                policy_router = std::move(mutable_policy);
+            }
+            if (run_stage2_composition && (!fake_ip_domain || !policy_router)) {
+                throw std::runtime_error(
+                    "Stage 2 composition requires FakeIP and a DNS policy upstream");
+            }
+            clash_native::dns::DnsResolverConfig config(
+                std::move(*upstream), std::move(upstream_groups), std::move(policy_router));
             resolver =
-                std::make_shared<clash_native::dns::ResolverService>(runtime, std::move(*upstream));
-            dns_server = std::make_unique<clash_native::dns::DnsServer>(
-                runtime, *resolver,
-                boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 0),
-                boost::asio::ip::tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+                std::make_shared<clash_native::dns::ResolverService>(runtime, std::move(config));
+            if (run_stage2_composition) {
+                auto reload_policy =
+                    std::make_shared<clash_native::dns::DnsPolicyRouter>("default");
+                reload_policy->add_rule({"stage2-policy-after-reload",
+                                         clash_native::dns::DnsPolicyRuleKind::exact,
+                                         "policy-route.test", "default"});
+                clash_native::dns::DnsResolverConfig reload_config(default_upstream_for_reload, {},
+                                                                   std::move(reload_policy));
+                reload_resolver = std::make_shared<clash_native::dns::ResolverService>(
+                    runtime, std::move(reload_config));
+            }
         }
-        if (const auto fake_ip_domain = environment_value("CLASH_NATIVE_FAKE_IP_DOMAIN");
-            fake_ip_domain) {
+        if (fake_ip_domain) {
             if (fake_ip_domain->empty()) {
                 throw std::runtime_error("CLASH_NATIVE_FAKE_IP_DOMAIN must not be empty");
             }
@@ -266,9 +413,6 @@ int main(int argc, char **) {
             fake_ip_filter = [domain](std::string_view name) {
                 return clash_native::dns::normalize_name(name) == domain;
             };
-        }
-        if (dns_server) {
-            dns_server->set_fake_ip_store(fake_ip_store, fake_ip_filter);
         }
 
         clash_native::proxy::ProxyServer proxy(runtime,
@@ -288,14 +432,36 @@ int main(int argc, char **) {
                 runtime, resolver, *outbound_kind, *outbound_server, *outbound_password));
             proxy.set_default_action(clash_native::router::RouteAction::named("test-proxy"));
         }
+        if (run_stage2_composition) {
+            proxy.set_default_action(clash_native::router::RouteAction::reject());
+            proxy.add_rule({"stage2-fakeip-direct", clash_native::router::RuleKind::domain,
+                            *fake_ip_domain, 0, 0, false,
+                            clash_native::router::RouteAction::direct()});
+        }
         if (fake_ip_store) {
             proxy.set_fake_ip_store(fake_ip_store);
+        }
+        proxy.set_fake_ip_filter(fake_ip_filter);
+        if (resolver) {
+            dns_server = std::make_unique<clash_native::dns::DnsServer>(
+                runtime, proxy.runtime_snapshot_store(),
+                boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 0),
+                boost::asio::ip::tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+        }
+        std::shared_ptr<Stage2ReloadControl> reload_control;
+        if (run_stage2_composition) {
+            reload_control =
+                std::make_shared<Stage2ReloadControl>(runtime, proxy, std::move(reload_resolver));
         }
         boost::asio::signal_set signals(runtime.context(), SIGINT, SIGTERM);
         std::promise<void> stopped;
         auto stopped_future = stopped.get_future();
 
-        signals.async_wait([&proxy, &dns_server, &stopped](const boost::system::error_code &, int) {
+        signals.async_wait([&proxy, &dns_server, &reload_control,
+                            &stopped](const boost::system::error_code &, int) {
+            if (reload_control) {
+                reload_control->stop();
+            }
             if (dns_server) {
                 dns_server->stop();
             }
@@ -304,17 +470,6 @@ int main(int argc, char **) {
         });
 
         runtime.start();
-        if (dns_server) {
-            const auto dns_start_result = dns_server->start();
-            if (!dns_start_result) {
-                runtime.stop();
-                const auto &error = dns_start_result.error();
-                if (error.cause) {
-                    throw std::system_error(error.cause, error.context);
-                }
-                throw std::runtime_error(error.context);
-            }
-        }
         const auto start_result = proxy.start();
         if (!start_result) {
             if (dns_server) {
@@ -326,6 +481,21 @@ int main(int argc, char **) {
                 throw std::system_error(error.cause, error.context);
             }
             throw std::runtime_error(error.context);
+        }
+        if (dns_server) {
+            const auto dns_start_result = dns_server->start();
+            if (!dns_start_result) {
+                proxy.stop();
+                runtime.stop();
+                const auto &error = dns_start_result.error();
+                if (error.cause) {
+                    throw std::system_error(error.cause, error.context);
+                }
+                throw std::runtime_error(error.context);
+            }
+        }
+        if (reload_control) {
+            reload_control->start();
         }
 
         const auto endpoint = proxy.endpoint();
@@ -339,9 +509,18 @@ int main(int argc, char **) {
                       << " tcp=" << tcp_endpoint.address().to_string() << ":" << tcp_endpoint.port()
                       << std::endl;
         }
+        if (reload_control) {
+            const auto control_endpoint = reload_control->endpoint();
+            std::cout << "clash-native-test-host control-ready tcp="
+                      << control_endpoint.address().to_string() << ":" << control_endpoint.port()
+                      << std::endl;
+        }
 
         stopped_future.wait();
         signals.cancel();
+        if (reload_control) {
+            reload_control->stop();
+        }
         if (dns_server) {
             dns_server->stop();
         }
