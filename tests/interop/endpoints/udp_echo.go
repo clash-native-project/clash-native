@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 )
 
 type UDPEcho struct {
-	conn *net.UDPConn
-	wg   sync.WaitGroup
-	once sync.Once
+	conn    *net.UDPConn
+	wg      sync.WaitGroup
+	once    sync.Once
+	packets atomic.Uint64
 }
 
 func StartUDPEcho() (*UDPEcho, error) {
@@ -26,6 +28,8 @@ func StartUDPEcho() (*UDPEcho, error) {
 
 func (e *UDPEcho) Addr() *net.UDPAddr { return e.conn.LocalAddr().(*net.UDPAddr) }
 
+func (e *UDPEcho) ReceivedPackets() uint64 { return e.packets.Load() }
+
 func (e *UDPEcho) serve() {
 	defer e.wg.Done()
 	buffer := make([]byte, 65535)
@@ -34,6 +38,7 @@ func (e *UDPEcho) serve() {
 		if err != nil {
 			return
 		}
+		e.packets.Add(1)
 		if _, err := e.conn.WriteToUDP(buffer[:size], peer); err != nil {
 			return
 		}

@@ -1,5 +1,57 @@
 # Implementation Log
 
+### 2026-09-18 — Shadowsocks encrypted UDP size limit
+
+- Reject Shadowsocks UDP datagrams whose encrypted wire payload exceeds 1500 bytes with `message_size`, and log size-limit errors from the SOCKS UDP relay.
+- Added C++ boundary and rejection checks for all supported AEAD methods and a Go peer round trip at the exact 1500-byte encrypted datagram boundary.
+- Reduced the real Mihomo UDP interoperability payload to 1200 bytes so Shadowsocks framing stays within the outbound limit.
+- Validated Windows x64 with clang-cl/MSVC: 118/118 CTest cases, the full Go interoperability suite, and the real Mihomo server interoperability test passed.
+
+### 2026-09-18 — Real Mihomo server interoperability
+
+- Added an opt-in process integration test that starts Mihomo with temporary Shadowsocks and Trojan inbound listeners and verifies traffic through the C++ outbound.
+- Covered all three supported Shadowsocks AEAD methods over TCP and UDP, plus Trojan TLS certificate acceptance and rejection.
+- Kept the Mihomo UDP payload at 13 KiB to fit its current 16 KiB Windows packet read buffer; the independent Go peer continues to cover 60 KiB UDP payloads.
+
+### 2026-09-17 — Encrypted outbound foundations
+
+- Added asynchronous Shadowsocks AEAD TCP/UDP outbound foundations for AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305, plus a reusable TLS stream adapter and Trojan TCP/TLS outbound handshake.
+- Added c-ares-backed hostname resolution for outbound server endpoints; Go interoperability peers and SOCKS5 UDP ASSOCIATE are recorded below.
+
+### 2026-09-17 — SOCKS5 UDP association and independent Go peers
+
+- Added SOCKS5 UDP ASSOCIATE handling with control-channel lifetime, client endpoint pinning, destination parsing, route selection, c-ares resolution, and UDP response framing through outbound datagram handles.
+- Added test-host outbound injection and independent Go Shadowsocks AEAD TCP/UDP and Trojan TCP/TLS peers for end-to-end protocol tests.
+
+### 2026-09-18 — Outbound interoperability diagnostics
+
+- Log outbound stream-open failures with their classified cause and include test-host output when an independent Go interoperability test fails, so SOCKS5's generic failure reply does not hide protocol-stage errors.
+- Preserve Boost.Asio's TLS handshake message in the Trojan error context instead of exposing only the lossy standard-library error code.
+- Issue the Trojan Go fixture's localhost server certificate from a separate test CA, allowing trusted-chain and untrusted-chain behavior to be tested accurately.
+
+### 2026-09-18 — SOCKS5 UDP buffer lifetime
+
+- Fixed an argument-evaluation-order bug that could move the shared UDP payload before constructing its Asio buffer, causing an access violation before Shadowsocks datagrams were sent.
+- Fixed the same call-argument ordering hazard for domain-form SOCKS5 UDP targets by copying the resolver before moving the runtime snapshot into its callback.
+- Used Windows Debugging Tools stack traces to confirm both crash sites before fixing the lifetime hazards.
+- Changed the independent Go Shadowsocks fixture to allocate UDP first and retry when Windows TCP/UDP excluded-port ranges prevent sharing its port.
+- Corrected Shadowsocks' maximum datagram payload calculation for the longest domain-form target and enlarged the UDP interop payload to 60 KB.
+
+### 2026-09-18 — c-ares hostname interoperability coverage
+
+- Added a local independent Go DNS authority and used it to resolve test-only proxy and destination hostnames through the C++ c-ares-backed resolver in Shadowsocks and Trojan integration tests.
+- Updated the independent Go protocol peers to map reserved `.test` target names to loopback so they can relay the domain-form address they receive without relying on the machine's DNS configuration.
+
+### 2026-09-18 — TCP half-close interoperability
+
+- Updated the independent Go relay fixtures to drain both stream directions before closing and added client half-close checks to Shadowsocks TCP and Trojan TCP/TLS tests.
+
+### 2026-09-18 — Windows x64 encrypted outbound validation
+
+- Built with standalone LLVM clang-cl using the MSVC toolchain and vcpkg `x64-windows-clang-cl`; all 117 CTest cases passed.
+- The complete Go interoperability suite passed against the Release C++ test host. Focused outbound tests passed ten repeated runs, covering Shadowsocks TCP/UDP for all three supported AEAD methods, 60 KB UDP payloads, c-ares hostname resolution, TCP half-close, and Trojan TLS trusted/untrusted certificate behavior.
+- `go vet ./...`, clang-format checks, and `git diff --check` passed.
+
 ### 2026-09-17 — Use the selected HTTP and QUIC libraries
 
 - Use Boost.Beast for HTTP/1.1, nghttp2 for HTTP/2, and nghttp3 for HTTP/3

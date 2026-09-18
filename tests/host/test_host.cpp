@@ -1,4 +1,7 @@
 #include <clash_native/dns/dns_server.hpp>
+#include <clash_native/outbound/outbound_registry.hpp>
+#include <clash_native/outbound/shadowsocks_outbound.hpp>
+#include <clash_native/outbound/trojan_outbound.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 
@@ -10,9 +13,11 @@
 #include <csignal>
 #include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -35,6 +40,93 @@ std::optional<std::string> environment_value(const char *name) {
     const auto *value = std::getenv(name);
     return value == nullptr ? std::nullopt : std::optional<std::string>(value);
 #endif
+}
+
+struct HostPort {
+    std::string host;
+    std::uint16_t port = 0;
+};
+
+HostPort parse_host_port(std::string_view text) {
+    std::string_view host;
+    std::string_view port_text;
+    if (!text.empty() && text.front() == '[') {
+        const auto closing = text.find(']');
+        if (closing == std::string_view::npos || closing + 1 >= text.size() ||
+            text[closing + 1] != ':') {
+            throw std::runtime_error("outbound server must be formatted as host:port");
+        }
+        host = text.substr(1, closing - 1);
+        port_text = text.substr(closing + 2);
+    } else {
+        const auto separator = text.rfind(':');
+        if (separator == std::string_view::npos || separator == 0 || separator + 1 == text.size()) {
+            throw std::runtime_error("outbound server must be formatted as host:port");
+        }
+        host = text.substr(0, separator);
+        port_text = text.substr(separator + 1);
+    }
+    unsigned int port = 0;
+    const auto parsed =
+        std::from_chars(port_text.data(), port_text.data() + port_text.size(), port);
+    if (host.empty() || parsed.ec != std::errc{} ||
+        parsed.ptr != port_text.data() + port_text.size() || port == 0 || port > 65535) {
+        throw std::runtime_error("outbound server must be formatted as host:port");
+    }
+    return {std::string(host), static_cast<std::uint16_t>(port)};
+}
+
+std::shared_ptr<clash_native::outbound::OutboundRegistry>
+test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
+                       std::shared_ptr<clash_native::dns::ResolverService> resolver,
+                       const std::string &kind, const std::string &server_text,
+                       const std::string &password) {
+    const auto server = parse_host_port(server_text);
+    auto registry = std::make_shared<clash_native::outbound::OutboundRegistry>();
+    if (kind == "shadowsocks") {
+        const auto method = environment_value("CLASH_NATIVE_TEST_OUTBOUND_METHOD");
+        if (!method) {
+            throw std::runtime_error("CLASH_NATIVE_TEST_OUTBOUND_METHOD is required");
+        }
+        auto outbound = std::make_shared<clash_native::outbound::ShadowsocksOutbound>(
+            runtime,
+            clash_native::outbound::ShadowsocksOutboundConfig{"test-proxy", server.host,
+                                                              server.port, *method, password},
+            std::move(resolver));
+        if (const auto result = outbound->validate(); !result) {
+            throw std::runtime_error(result.error().context);
+        }
+        if (const auto result = registry->add_outbound("test-proxy", std::move(outbound));
+            !result) {
+            throw std::runtime_error(result.error().context);
+        }
+    } else if (kind == "trojan") {
+        std::string ca_pem;
+        if (const auto ca_path = environment_value("CLASH_NATIVE_TEST_OUTBOUND_CA_FILE"); ca_path) {
+            std::ifstream file(*ca_path, std::ios::binary);
+            if (!file) {
+                throw std::runtime_error("failed to read Trojan test CA file");
+            }
+            ca_pem.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+        }
+        const auto server_name = environment_value("CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME");
+        auto outbound = std::make_shared<clash_native::outbound::TrojanOutbound>(
+            runtime,
+            clash_native::outbound::TrojanOutboundConfig{
+                "test-proxy", server.host, server.port, password, server_name.value_or(server.host),
+                std::move(ca_pem), true},
+            std::move(resolver));
+        if (const auto result = outbound->validate(); !result) {
+            throw std::runtime_error(result.error().context);
+        }
+        if (const auto result = registry->add_outbound("test-proxy", std::move(outbound));
+            !result) {
+            throw std::runtime_error(result.error().context);
+        }
+    } else {
+        throw std::runtime_error("unsupported CLASH_NATIVE_TEST_OUTBOUND protocol");
+    }
+    return registry;
 }
 
 std::optional<clash_native::dns::DnsUpstreamConfig> parse_upstream_config(const char *value) {
@@ -183,6 +275,18 @@ int main(int argc, char **) {
                                                {boost::asio::ip::address_v4::loopback(), 0});
         if (resolver) {
             proxy.set_resolver(resolver);
+        }
+        const auto outbound_kind = environment_value("CLASH_NATIVE_TEST_OUTBOUND");
+        if (outbound_kind) {
+            const auto outbound_server = environment_value("CLASH_NATIVE_TEST_OUTBOUND_SERVER");
+            const auto outbound_password = environment_value("CLASH_NATIVE_TEST_OUTBOUND_PASSWORD");
+            if (!outbound_server || !outbound_password) {
+                throw std::runtime_error(
+                    "CLASH_NATIVE_TEST_OUTBOUND_SERVER and _PASSWORD are required");
+            }
+            proxy.set_outbound_registry(test_outbound_registry(
+                runtime, resolver, *outbound_kind, *outbound_server, *outbound_password));
+            proxy.set_default_action(clash_native::router::RouteAction::named("test-proxy"));
         }
         if (fake_ip_store) {
             proxy.set_fake_ip_store(fake_ip_store);

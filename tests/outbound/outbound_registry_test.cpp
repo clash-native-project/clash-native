@@ -1,6 +1,9 @@
 #include <clash_native/outbound/builtin_outbound.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
+#include <clash_native/outbound/shadowsocks_outbound.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
+
+#include <boost/asio/error.hpp>
 
 #include <gtest/gtest.h>
 
@@ -146,5 +149,91 @@ TEST(DirectOutboundTest, OpensAnIpDatagramForDnsEgress) {
     handle->close();
     boost::system::error_code ignored;
     receiver.close(ignored);
+    runtime.stop();
+}
+
+TEST(ShadowsocksOutboundTest, RejectsEncryptedUdpDatagramsLargerThan1500Bytes) {
+    struct Method {
+        const char *name;
+        std::size_t key_size;
+    };
+    constexpr std::array methods{Method{"aes-128-gcm", 16}, Method{"aes-256-gcm", 32},
+                                 Method{"chacha20-ietf-poly1305", 32}};
+    constexpr std::size_t encrypted_limit = 1500;
+    constexpr std::size_t aead_tag_size = 16;
+    constexpr std::size_t ipv4_proxy_address_size = 1 + 4 + 2;
+
+    clash_native::runtime::AsioRuntime runtime;
+    runtime.start();
+
+    for (const auto &method : methods) {
+        boost::asio::ip::udp::socket server(runtime.context(),
+                                            {boost::asio::ip::address_v4::loopback(), 0});
+        clash_native::outbound::ShadowsocksOutbound outbound(
+            runtime, {"test-shadowsocks", "127.0.0.1", server.local_endpoint().port(), method.name,
+                      "test-password"});
+
+        auto opened_promise =
+            std::make_shared<std::promise<clash_native::core::DatagramOpenResult>>();
+        auto opened_future = opened_promise->get_future();
+        outbound.open_datagram({}, [opened_promise](clash_native::core::DatagramOpenResult result) {
+            opened_promise->set_value(std::move(result));
+        });
+        ASSERT_EQ(opened_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+        auto opened = opened_future.get();
+        ASSERT_TRUE(opened.succeeded());
+        auto handle = std::move(opened.handle);
+
+        const auto destination =
+            boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 53);
+        const auto payload_at_limit =
+            encrypted_limit - method.key_size - ipv4_proxy_address_size - aead_tag_size;
+
+        auto receive_promise = std::make_shared<std::promise<std::size_t>>();
+        auto receive_future = receive_promise->get_future();
+        std::array<std::uint8_t, encrypted_limit + 1> received{};
+        boost::asio::ip::udp::endpoint sender;
+        server.async_receive_from(
+            boost::asio::buffer(received), sender,
+            [receive_promise](const boost::system::error_code &error, std::size_t size) {
+                receive_promise->set_value(error ? 0 : size);
+            });
+
+        std::vector<std::uint8_t> payload(payload_at_limit, 0x5a);
+        auto send_promise =
+            std::make_shared<std::promise<std::pair<boost::system::error_code, std::size_t>>>();
+        auto send_future = send_promise->get_future();
+        handle->async_send_to(
+            boost::asio::buffer(payload), destination,
+            [send_promise](const boost::system::error_code &error, std::size_t size) {
+                send_promise->set_value({error, size});
+            });
+        ASSERT_EQ(send_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+        const auto [send_error, sent_size] = send_future.get();
+        EXPECT_FALSE(send_error);
+        EXPECT_EQ(sent_size, payload.size());
+        ASSERT_EQ(receive_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+        EXPECT_EQ(receive_future.get(), encrypted_limit);
+
+        payload.push_back(0x5a);
+        auto oversized_promise =
+            std::make_shared<std::promise<std::pair<boost::system::error_code, std::size_t>>>();
+        auto oversized_future = oversized_promise->get_future();
+        handle->async_send_to(
+            boost::asio::buffer(payload), destination,
+            [oversized_promise](const boost::system::error_code &error, std::size_t size) {
+                oversized_promise->set_value({error, size});
+            });
+        ASSERT_EQ(oversized_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+        const auto [oversized_error, oversized_sent_size] = oversized_future.get();
+        EXPECT_EQ(oversized_error, boost::asio::error::message_size);
+        EXPECT_EQ(oversized_sent_size, 0U);
+
+        boost::system::error_code available_error;
+        EXPECT_EQ(server.available(available_error), 0U);
+        EXPECT_FALSE(available_error);
+        handle->close();
+    }
+
     runtime.stop();
 }

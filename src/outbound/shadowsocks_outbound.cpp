@@ -1,0 +1,776 @@
+#include <clash_native/outbound/shadowsocks_outbound.hpp>
+
+#include <clash_native/net/tcp_stream.hpp>
+
+#include "outbound_utils.hpp"
+#include "proxy_address.hpp"
+#include "shadowsocks_crypto.hpp"
+
+#include <boost/asio/bind_executor.hpp>
+#include <boost/asio/buffer.hpp>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/post.hpp>
+#include <boost/asio/read.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/write.hpp>
+#include <boost/system/errc.hpp>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <optional>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+namespace clash_native::outbound {
+
+namespace {
+
+constexpr std::size_t kAeadTagSize = 16;
+constexpr std::size_t kMaxChunkPayload = 0x3fff;
+constexpr std::size_t kMaxUdpWireSize = 65507;
+// Counts the Shadowsocks UDP payload (salt + ciphertext), not the IP or UDP headers.
+constexpr std::size_t kMaxEncryptedUdpDatagramSize = 1500;
+constexpr std::size_t kMaxProxyAddressSize = 1 + 1 + 255 + 2;
+constexpr auto kConnectTimeout = std::chrono::seconds(15);
+
+boost::system::error_code protocol_error() {
+    return boost::system::errc::make_error_code(boost::system::errc::protocol_error);
+}
+
+boost::system::error_code authentication_error() {
+    return boost::system::errc::make_error_code(boost::system::errc::permission_denied);
+}
+
+std::vector<std::uint8_t> append_tcp_record(std::string_view method,
+                                            std::span<const std::uint8_t> key,
+                                            std::array<std::uint8_t, 12> &nonce,
+                                            std::span<const std::uint8_t> payload) {
+    const auto payload_size = static_cast<std::uint16_t>(payload.size());
+    const std::array<std::uint8_t, 2> length{static_cast<std::uint8_t>(payload_size >> 8),
+                                             static_cast<std::uint8_t>(payload_size & 0xff)};
+    auto encrypted_length = detail::shadowsocks_encrypt(method, key, nonce, length);
+    detail::increment_nonce(nonce);
+    auto encrypted_payload = detail::shadowsocks_encrypt(method, key, nonce, payload);
+    detail::increment_nonce(nonce);
+    if (!encrypted_length || !encrypted_payload) {
+        return {};
+    }
+    std::vector<std::uint8_t> result;
+    result.reserve(encrypted_length.value().size() + encrypted_payload.value().size());
+    result.insert(result.end(), encrypted_length.value().begin(), encrypted_length.value().end());
+    result.insert(result.end(), encrypted_payload.value().begin(), encrypted_payload.value().end());
+    return result;
+}
+
+class ShadowsocksStreamHandle final : public core::StreamHandle {
+  private:
+    struct State : std::enable_shared_from_this<State> {
+        State(std::shared_ptr<boost::asio::ip::tcp::socket> socket, std::string method,
+              std::string password, std::vector<std::uint8_t> key,
+              std::array<std::uint8_t, 12> write_nonce)
+            : socket(std::move(socket)), method(std::move(method)), password(std::move(password)),
+              key(std::move(key)), write_nonce(write_nonce) {}
+
+        void write(boost::asio::const_buffer buffer, WriteHandler handler) {
+            if (write_in_progress) {
+                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                    handler(boost::asio::error::already_started, 0);
+                });
+                return;
+            }
+            if (buffer.size() == 0) {
+                boost::asio::post(socket->get_executor(),
+                                  [handler = std::move(handler)]() mutable { handler({}, 0); });
+                return;
+            }
+
+            const auto *data = static_cast<const std::uint8_t *>(buffer.data());
+            std::vector<std::uint8_t> encoded;
+            const auto size = buffer.size();
+            for (std::size_t offset = 0; offset < size;) {
+                const auto chunk_size = std::min(kMaxChunkPayload, size - offset);
+                auto chunk =
+                    append_tcp_record(method, key, write_nonce,
+                                      std::span<const std::uint8_t>(data + offset, chunk_size));
+                if (chunk.empty()) {
+                    boost::asio::post(
+                        socket->get_executor(),
+                        [handler = std::move(handler)]() mutable { handler(protocol_error(), 0); });
+                    return;
+                }
+                encoded.insert(encoded.end(), chunk.begin(), chunk.end());
+                offset += chunk_size;
+            }
+
+            write_in_progress = true;
+            auto self = shared_from_this();
+            auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(encoded));
+            boost::asio::async_write(
+                *socket, boost::asio::buffer(*wire),
+                [self, wire, handler = std::move(handler),
+                 size](const boost::system::error_code &error, std::size_t) mutable {
+                    self->write_in_progress = false;
+                    handler(error, error ? 0 : size);
+                });
+        }
+
+        void read(boost::asio::mutable_buffer buffer, ReadHandler handler) {
+            if (read_in_progress) {
+                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                    handler(boost::asio::error::already_started, 0);
+                });
+                return;
+            }
+            if (buffer.size() == 0) {
+                boost::asio::post(socket->get_executor(),
+                                  [handler = std::move(handler)]() mutable { handler({}, 0); });
+                return;
+            }
+            if (pending_offset < pending_plaintext.size()) {
+                copy_pending(buffer, std::move(handler));
+                return;
+            }
+
+            read_in_progress = true;
+            read_buffer = buffer;
+            read_handler = std::move(handler);
+            if (!read_key_ready) {
+                receive_salt();
+            } else {
+                receive_length();
+            }
+        }
+
+        void close() noexcept {
+            boost::system::error_code ignored;
+            socket->cancel(ignored);
+            socket->shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored);
+            socket->close(ignored);
+        }
+
+        void receive_salt() {
+            const auto method_info = detail::shadowsocks_method(method);
+            if (!method_info) {
+                finish_read(protocol_error(), 0);
+                return;
+            }
+            auto self = shared_from_this();
+            receive_salt_buffer.resize(method_info.value().key_size);
+            boost::asio::async_read(*socket, boost::asio::buffer(receive_salt_buffer),
+                                    [self](const boost::system::error_code &error, std::size_t) {
+                                        if (error) {
+                                            self->finish_read(error, 0);
+                                            return;
+                                        }
+                                        auto key_result = detail::derive_shadowsocks_subkey(
+                                            self->method, self->password,
+                                            self->receive_salt_buffer);
+                                        if (!key_result) {
+                                            self->finish_read(authentication_error(), 0);
+                                            return;
+                                        }
+                                        self->read_key = std::move(key_result.value());
+                                        self->read_key_ready = true;
+                                        self->receive_length();
+                                    });
+        }
+
+        void receive_length() {
+            auto self = shared_from_this();
+            boost::asio::async_read(
+                *socket, boost::asio::buffer(encrypted_length),
+                [self](const boost::system::error_code &error, std::size_t) {
+                    if (error) {
+                        self->finish_read(error, 0);
+                        return;
+                    }
+                    const auto length = detail::shadowsocks_decrypt(
+                        self->method, self->read_key, self->read_nonce, self->encrypted_length);
+                    if (!length || length.value().size() != 2) {
+                        self->finish_read(authentication_error(), 0);
+                        return;
+                    }
+                    detail::increment_nonce(self->read_nonce);
+                    const auto payload_size =
+                        (static_cast<std::size_t>(length.value()[0]) << 8) | length.value()[1];
+                    if (payload_size == 0 || payload_size > kMaxChunkPayload) {
+                        self->finish_read(protocol_error(), 0);
+                        return;
+                    }
+                    self->receive_payload(payload_size);
+                });
+        }
+
+        void receive_payload(std::size_t payload_size) {
+            auto self = shared_from_this();
+            encrypted_payload.resize(payload_size + kAeadTagSize);
+            boost::asio::async_read(
+                *socket, boost::asio::buffer(encrypted_payload),
+                [self](const boost::system::error_code &error, std::size_t) {
+                    if (error) {
+                        self->finish_read(error, 0);
+                        return;
+                    }
+                    auto plaintext = detail::shadowsocks_decrypt(
+                        self->method, self->read_key, self->read_nonce, self->encrypted_payload);
+                    if (!plaintext || plaintext.value().empty()) {
+                        self->finish_read(authentication_error(), 0);
+                        return;
+                    }
+                    detail::increment_nonce(self->read_nonce);
+                    self->pending_plaintext = std::move(plaintext.value());
+                    self->pending_offset = 0;
+                    self->copy_pending(self->read_buffer, std::move(self->read_handler));
+                });
+        }
+
+        void copy_pending(boost::asio::mutable_buffer buffer, ReadHandler handler) {
+            const auto remaining = pending_plaintext.size() - pending_offset;
+            const auto copied = std::min(buffer.size(), remaining);
+            std::memcpy(buffer.data(), pending_plaintext.data() + pending_offset, copied);
+            pending_offset += copied;
+            if (pending_offset == pending_plaintext.size()) {
+                pending_plaintext.clear();
+                pending_offset = 0;
+            }
+            read_in_progress = false;
+            handler({}, copied);
+        }
+
+        void finish_read(const boost::system::error_code &error, std::size_t size) {
+            read_in_progress = false;
+            auto handler = std::move(read_handler);
+            if (handler) {
+                handler(error, size);
+            }
+        }
+
+        std::shared_ptr<boost::asio::ip::tcp::socket> socket;
+        std::string method;
+        std::string password;
+        std::vector<std::uint8_t> key;
+        std::array<std::uint8_t, 12> write_nonce{};
+        std::array<std::uint8_t, 12> read_nonce{};
+        std::vector<std::uint8_t> receive_salt_buffer;
+        std::vector<std::uint8_t> read_key;
+        std::vector<std::uint8_t> encrypted_length = std::vector<std::uint8_t>(2 + kAeadTagSize);
+        std::vector<std::uint8_t> encrypted_payload;
+        std::vector<std::uint8_t> pending_plaintext;
+        std::size_t pending_offset = 0;
+        boost::asio::mutable_buffer read_buffer;
+        ReadHandler read_handler;
+        bool read_key_ready = false;
+        bool read_in_progress = false;
+        bool write_in_progress = false;
+    };
+
+  public:
+    ShadowsocksStreamHandle(std::shared_ptr<boost::asio::ip::tcp::socket> socket,
+                            std::string method, std::string password, std::vector<std::uint8_t> key,
+                            std::array<std::uint8_t, 12> write_nonce)
+        : state_(std::make_shared<State>(std::move(socket), std::move(method), std::move(password),
+                                         std::move(key), write_nonce)) {}
+
+    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+        state_->read(buffer, std::move(handler));
+    }
+
+    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
+        state_->write(buffer, std::move(handler));
+    }
+
+    boost::asio::any_io_executor executor() noexcept override {
+        return state_->socket->get_executor();
+    }
+
+    boost::asio::ip::tcp::endpoint
+    local_endpoint(boost::system::error_code &error) const noexcept override {
+        return state_->socket->local_endpoint(error);
+    }
+
+    void shutdown_send(boost::system::error_code &error) noexcept override {
+        state_->socket->shutdown(boost::asio::ip::tcp::socket::shutdown_send, error);
+    }
+
+    void close() noexcept override { state_->close(); }
+
+  private:
+    std::shared_ptr<State> state_;
+};
+
+class ShadowsocksConnectOperation final
+    : public std::enable_shared_from_this<ShadowsocksConnectOperation> {
+  public:
+    ShadowsocksConnectOperation(runtime::AsioRuntime &runtime,
+                                std::shared_ptr<dns::ResolverService> resolver,
+                                ShadowsocksOutboundConfig config, core::StreamRequest request,
+                                core::StreamOpenHandler handler)
+        : runtime_(runtime), resolver_(std::move(resolver)), config_(std::move(config)),
+          request_(std::move(request)),
+          socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.context())),
+          timer_(runtime.context()), handler_(std::move(handler)) {}
+
+    void start() {
+        const auto validation = validate_config();
+        if (!validation) {
+            finish(core::StreamOpenResult::failed(validation.error()));
+            return;
+        }
+        timer_.expires_after(kConnectTimeout);
+        timer_.async_wait([self = shared_from_this()](const boost::system::error_code &error) {
+            if (!error) {
+                if (self->resolver_ && self->resolver_request_id_) {
+                    self->resolver_->cancel(*self->resolver_request_id_);
+                    self->resolver_request_id_.reset();
+                }
+                boost::system::error_code ignored;
+                self->socket_->cancel(ignored);
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::timeout, "timed out opening Shadowsocks TCP stream"}));
+            }
+        });
+        detail::resolve_host(runtime_, resolver_, config_.server_host,
+                             [self = shared_from_this()](core::Result<detail::AddressList> result) {
+                                 self->resolved(std::move(result));
+                             });
+    }
+
+  private:
+    core::Status validate_config() const {
+        if (config_.id.empty() || config_.server_host.empty() || config_.server_port == 0 ||
+            config_.password.empty()) {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks outbound ID, server, port, and password are required"});
+        }
+        const auto method = detail::shadowsocks_method(config_.method);
+        if (!method) {
+            return core::fail(method.error());
+        }
+        return {};
+    }
+
+    void resolved(core::Result<detail::AddressList> result) {
+        if (completed_) {
+            return;
+        }
+        if (!result) {
+            finish(core::StreamOpenResult::failed(result.error()));
+            return;
+        }
+        auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
+        endpoints->reserve(result.value().size());
+        for (const auto &address : result.value()) {
+            endpoints->emplace_back(address, config_.server_port);
+        }
+        auto self = shared_from_this();
+        boost::asio::async_connect(
+            *socket_, *endpoints,
+            [self, endpoints](const boost::system::error_code &error,
+                              const boost::asio::ip::tcp::endpoint &) {
+                if (error) {
+                    self->finish(core::StreamOpenResult::failed(
+                        {core::ErrorCode::endpoint_connection,
+                         "failed to connect to Shadowsocks server", detail::to_std_error(error)}));
+                    return;
+                }
+                self->send_initial_request();
+            });
+    }
+
+    void send_initial_request() {
+        const auto method = detail::shadowsocks_method(config_.method);
+        std::vector<std::uint8_t> salt(method.value().key_size);
+        if (!detail::random_bytes(salt)) {
+            finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::authentication, "failed to generate Shadowsocks salt"}));
+            return;
+        }
+        auto key = detail::derive_shadowsocks_subkey(config_.method, config_.password, salt);
+        auto address = detail::encode_proxy_address(request_.destination);
+        if (!key || !address) {
+            finish(core::StreamOpenResult::failed(!key ? key.error() : address.error()));
+            return;
+        }
+        write_nonce_ = {};
+        auto record = append_tcp_record(config_.method, key.value(), write_nonce_, address.value());
+        if (record.empty()) {
+            finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::authentication, "failed to encrypt Shadowsocks destination"}));
+            return;
+        }
+        salt.insert(salt.end(), record.begin(), record.end());
+        auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(salt));
+        auto self = shared_from_this();
+        boost::asio::async_write(
+            *socket_, boost::asio::buffer(*wire),
+            [self, wire, key = std::move(key.value())](const boost::system::error_code &error,
+                                                       std::size_t) mutable {
+                if (error) {
+                    self->finish(core::StreamOpenResult::failed(
+                        {core::ErrorCode::transport_io, "failed to write Shadowsocks TCP request",
+                         detail::to_std_error(error)}));
+                    return;
+                }
+                auto handler = std::move(self->handler_);
+                self->cancel_timer();
+                self->completed_ = true;
+                handler(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
+                    self->socket_, self->config_.method, self->config_.password, std::move(key),
+                    self->write_nonce_)));
+            });
+    }
+
+    void cancel_timer() noexcept { timer_.cancel(); }
+
+    void finish(core::StreamOpenResult result) {
+        if (completed_) {
+            return;
+        }
+        completed_ = true;
+        cancel_timer();
+        if (resolver_ && resolver_request_id_) {
+            resolver_->cancel(*resolver_request_id_);
+            resolver_request_id_.reset();
+        }
+        if (!result.succeeded()) {
+            boost::system::error_code ignored;
+            socket_->close(ignored);
+        }
+        auto handler = std::move(handler_);
+        handler(std::move(result));
+    }
+
+    runtime::AsioRuntime &runtime_;
+    std::shared_ptr<dns::ResolverService> resolver_;
+    ShadowsocksOutboundConfig config_;
+    core::StreamRequest request_;
+    std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
+    boost::asio::steady_timer timer_;
+    core::StreamOpenHandler handler_;
+    std::array<std::uint8_t, 12> write_nonce_{};
+    std::optional<dns::ResolverService::RequestId> resolver_request_id_;
+    bool completed_ = false;
+};
+
+class ShadowsocksDatagramHandle final : public core::DatagramHandle {
+  public:
+    struct State : std::enable_shared_from_this<State> {
+        State(runtime::AsioRuntime &runtime, std::shared_ptr<dns::ResolverService> resolver,
+              std::shared_ptr<boost::asio::ip::udp::socket> socket,
+              boost::asio::ip::udp::endpoint server, std::string method, std::string password)
+            : runtime(runtime), resolver(std::move(resolver)), socket(std::move(socket)),
+              server(std::move(server)), method(std::move(method)), password(std::move(password)) {}
+
+        void send(boost::asio::const_buffer buffer, boost::asio::ip::udp::endpoint destination,
+                  WriteHandler handler) {
+            if (buffer.size() > max_datagram_size()) {
+                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                    handler(boost::asio::error::message_size, 0);
+                });
+                return;
+            }
+            const auto target =
+                core::Destination::address(destination.address(), destination.port());
+            auto address = detail::encode_proxy_address(target);
+            const auto method_info = detail::shadowsocks_method(method);
+            if (!address || !method_info) {
+                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                    handler(protocol_error(), 0);
+                });
+                return;
+            }
+            std::vector<std::uint8_t> salt(method_info.value().key_size);
+            if (!detail::random_bytes(salt)) {
+                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                    handler(authentication_error(), 0);
+                });
+                return;
+            }
+            auto key = detail::derive_shadowsocks_subkey(method, password, salt);
+            if (!key) {
+                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                    handler(authentication_error(), 0);
+                });
+                return;
+            }
+            std::vector<std::uint8_t> plaintext = std::move(address.value());
+            const auto payload_size = buffer.size();
+            const auto *payload = static_cast<const std::uint8_t *>(buffer.data());
+            plaintext.insert(plaintext.end(), payload, payload + payload_size);
+            std::array<std::uint8_t, 12> nonce{};
+            auto ciphertext = detail::shadowsocks_encrypt(method, key.value(), nonce, plaintext);
+            if (!ciphertext) {
+                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                    handler(authentication_error(), 0);
+                });
+                return;
+            }
+            salt.insert(salt.end(), ciphertext.value().begin(), ciphertext.value().end());
+            if (salt.size() > kMaxEncryptedUdpDatagramSize) {
+                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                    handler(boost::asio::error::message_size, 0);
+                });
+                return;
+            }
+            auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(salt));
+            auto self = shared_from_this();
+            socket->async_send_to(boost::asio::buffer(*wire), server,
+                                  [self, wire, handler = std::move(handler), payload_size](
+                                      const boost::system::error_code &error, std::size_t) mutable {
+                                      handler(error, error ? 0 : payload_size);
+                                  });
+        }
+
+        void receive(boost::asio::mutable_buffer buffer, ReadHandler handler) {
+            if (receive_in_progress) {
+                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                    handler(boost::asio::error::already_started, 0, {});
+                });
+                return;
+            }
+            receive_in_progress = true;
+            output_buffer = buffer;
+            receive_handler = std::move(handler);
+            auto self = shared_from_this();
+            socket->async_receive_from(
+                boost::asio::buffer(receive_buffer), receive_sender,
+                [self](const boost::system::error_code &error, std::size_t size) {
+                    if (error) {
+                        self->finish_receive(error, 0, {});
+                        return;
+                    }
+                    if (self->receive_sender != self->server) {
+                        self->receive_next();
+                        return;
+                    }
+                    self->decode_response(size);
+                });
+        }
+
+        void receive_next() {
+            auto self = shared_from_this();
+            socket->async_receive_from(
+                boost::asio::buffer(receive_buffer), receive_sender,
+                [self](const boost::system::error_code &error, std::size_t size) {
+                    if (error) {
+                        self->finish_receive(error, 0, {});
+                        return;
+                    }
+                    if (self->receive_sender != self->server) {
+                        self->receive_next();
+                        return;
+                    }
+                    self->decode_response(size);
+                });
+        }
+
+        void decode_response(std::size_t size) {
+            const auto method_info = detail::shadowsocks_method(method);
+            if (!method_info || size < method_info.value().key_size + kAeadTagSize) {
+                finish_receive(protocol_error(), 0, {});
+                return;
+            }
+            const auto salt =
+                std::span<const std::uint8_t>(receive_buffer.data(), method_info.value().key_size);
+            auto key = detail::derive_shadowsocks_subkey(method, password, salt);
+            if (!key) {
+                finish_receive(authentication_error(), 0, {});
+                return;
+            }
+            std::array<std::uint8_t, 12> nonce{};
+            const auto ciphertext =
+                std::span<const std::uint8_t>(receive_buffer.data() + method_info.value().key_size,
+                                              size - method_info.value().key_size);
+            auto plaintext = detail::shadowsocks_decrypt(method, key.value(), nonce, ciphertext);
+            if (!plaintext) {
+                finish_receive(authentication_error(), 0, {});
+                return;
+            }
+            auto address = detail::decode_proxy_address(plaintext.value());
+            if (!address) {
+                finish_receive(protocol_error(), 0, {});
+                return;
+            }
+            const auto payload_offset = address.value().size;
+            const auto payload_size = plaintext.value().size() - payload_offset;
+            if (address.value().destination.is_address()) {
+                const auto endpoint = boost::asio::ip::udp::endpoint(
+                    address.value().destination.address(), address.value().destination.port());
+                complete_payload(plaintext.value(), payload_offset, payload_size, endpoint);
+                return;
+            }
+
+            const auto destination = address.value().destination;
+            auto self = shared_from_this();
+            detail::resolve_host(
+                runtime, resolver, destination.domain(),
+                [self, plaintext = std::move(plaintext.value()), payload_offset, payload_size,
+                 port = destination.port()](core::Result<detail::AddressList> result) mutable {
+                    if (!result || result.value().empty()) {
+                        self->finish_receive(boost::asio::error::host_not_found, 0, {});
+                        return;
+                    }
+                    self->complete_payload(
+                        plaintext, payload_offset, payload_size,
+                        boost::asio::ip::udp::endpoint(result.value().front(), port));
+                });
+        }
+
+        void complete_payload(const std::vector<std::uint8_t> &plaintext, std::size_t offset,
+                              std::size_t size, boost::asio::ip::udp::endpoint sender) {
+            if (size > output_buffer.size()) {
+                finish_receive(boost::asio::error::message_size, 0, {});
+                return;
+            }
+            if (size != 0) {
+                std::memcpy(output_buffer.data(), plaintext.data() + offset, size);
+            }
+            finish_receive({}, size, std::move(sender));
+        }
+
+        void finish_receive(const boost::system::error_code &error, std::size_t size,
+                            boost::asio::ip::udp::endpoint sender) {
+            receive_in_progress = false;
+            auto handler = std::move(receive_handler);
+            if (handler) {
+                handler(error, size, std::move(sender));
+            }
+        }
+
+        void close() noexcept {
+            boost::system::error_code ignored;
+            socket->cancel(ignored);
+            socket->close(ignored);
+        }
+
+        std::size_t max_datagram_size() const noexcept {
+            return kMaxUdpWireSize - detail::shadowsocks_method(method).value().key_size -
+                   kMaxProxyAddressSize - kAeadTagSize;
+        }
+
+        runtime::AsioRuntime &runtime;
+        std::shared_ptr<dns::ResolverService> resolver;
+        std::shared_ptr<boost::asio::ip::udp::socket> socket;
+        boost::asio::ip::udp::endpoint server;
+        std::string method;
+        std::string password;
+        std::array<std::uint8_t, kMaxUdpWireSize> receive_buffer{};
+        boost::asio::ip::udp::endpoint receive_sender;
+        boost::asio::mutable_buffer output_buffer;
+        ReadHandler receive_handler;
+        bool receive_in_progress = false;
+    };
+
+  public:
+    explicit ShadowsocksDatagramHandle(std::shared_ptr<State> state) : state_(std::move(state)) {}
+
+    void async_send_to(boost::asio::const_buffer buffer, boost::asio::ip::udp::endpoint destination,
+                       WriteHandler handler) override {
+        state_->send(buffer, std::move(destination), std::move(handler));
+    }
+
+    void async_receive_from(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+        state_->receive(buffer, std::move(handler));
+    }
+
+    boost::asio::any_io_executor executor() noexcept override {
+        return state_->socket->get_executor();
+    }
+
+    std::size_t max_datagram_size() const noexcept override { return state_->max_datagram_size(); }
+
+    void cancel() noexcept override { state_->close(); }
+
+    void close() noexcept override { state_->close(); }
+
+  private:
+    std::shared_ptr<State> state_;
+};
+
+} // namespace
+
+ShadowsocksOutbound::ShadowsocksOutbound(runtime::AsioRuntime &runtime,
+                                         ShadowsocksOutboundConfig config,
+                                         std::shared_ptr<dns::ResolverService> resolver)
+    : runtime_(runtime), config_(std::move(config)), resolver_(std::move(resolver)),
+      descriptor_{config_.id, "shadowsocks"} {}
+
+core::Status ShadowsocksOutbound::validate() const {
+    if (config_.id.empty() || config_.server_host.empty() || config_.server_port == 0 ||
+        config_.password.empty()) {
+        return core::fail({core::ErrorCode::configuration,
+                           "Shadowsocks outbound ID, server, port, and password are required"});
+    }
+    const auto method = detail::shadowsocks_method(config_.method);
+    return method ? core::Status{} : core::Status(core::fail(method.error()));
+}
+
+const core::OutboundDescriptor &ShadowsocksOutbound::descriptor() const noexcept {
+    return descriptor_;
+}
+
+core::OutboundCapabilities ShadowsocksOutbound::capabilities() const noexcept {
+    return capabilities_;
+}
+
+void ShadowsocksOutbound::connect_stream(core::StreamRequest request,
+                                         core::StreamOpenHandler handler) {
+    auto operation = std::make_shared<ShadowsocksConnectOperation>(
+        runtime_, resolver_, config_, std::move(request), std::move(handler));
+    operation->start();
+}
+
+void ShadowsocksOutbound::open_datagram(core::DatagramRequest, core::DatagramOpenHandler handler) {
+    if (const auto validation = validate(); !validation) {
+        boost::asio::post(runtime_.context(),
+                          [handler = std::move(handler), error = validation.error()]() mutable {
+                              handler(core::DatagramOpenResult::failed(std::move(error)));
+                          });
+        return;
+    }
+
+    detail::resolve_host(
+        runtime_, resolver_, config_.server_host,
+        [runtime = &runtime_, config = config_, resolver = resolver_,
+         handler = std::move(handler)](core::Result<detail::AddressList> result) mutable {
+            if (!result || result.value().empty()) {
+                handler(core::DatagramOpenResult::failed(
+                    result ? core::Error{core::ErrorCode::resolution,
+                                         "Shadowsocks server hostname resolved to no addresses"}
+                           : result.error()));
+                return;
+            }
+            const auto server =
+                boost::asio::ip::udp::endpoint(result.value().front(), config.server_port);
+            auto socket = std::make_shared<boost::asio::ip::udp::socket>(runtime->context());
+            boost::system::error_code error;
+            socket->open(server.protocol(), error);
+            if (!error) {
+                socket->bind({server.address().is_v4()
+                                  ? boost::asio::ip::address(boost::asio::ip::address_v4::any())
+                                  : boost::asio::ip::address(boost::asio::ip::address_v6::any()),
+                              0},
+                             error);
+            }
+            if (error) {
+                handler(core::DatagramOpenResult::failed({core::ErrorCode::transport_io,
+                                                          "failed to open Shadowsocks UDP socket",
+                                                          detail::to_std_error(error)}));
+                return;
+            }
+            auto state = std::make_shared<ShadowsocksDatagramHandle::State>(
+                *runtime, std::move(resolver), std::move(socket), server, config.method,
+                config.password);
+            handler(core::DatagramOpenResult::opened(
+                std::make_unique<ShadowsocksDatagramHandle>(std::move(state)),
+                core::DatagramSemantics::multi_destination));
+        });
+}
+
+} // namespace clash_native::outbound

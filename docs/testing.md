@@ -40,3 +40,31 @@ primitive; it is not a packet relay bus between I/O workers.
 - A passing Windows test run proves only the exercised Windows paths. It does
   not prove deferred 32-bit x86, Linux, Zig, musl, TUN, routing, or router
   hardware behavior.
+
+## Mihomo server interoperability
+
+`TestMihomoActualServerInteroperability` starts a real Mihomo process using a
+temporary configuration and loopback listeners. It tests the C++ outbound
+against Mihomo's Shadowsocks TCP/UDP listeners for AES-128-GCM, AES-256-GCM,
+and ChaCha20-Poly1305, and against its Trojan TCP/TLS listener. The Trojan
+cases verify both a trusted certificate and rejection of an untrusted one.
+
+Build Mihomo from its source checkout, then run the opt-in integration test
+from `tests/interop` with both executable paths set:
+
+```powershell
+# From D:\Project\golang\mihomo
+go build -o D:\Project\cpp\clash-native\build\windows-clang-cl-x64\mihomo-interop.exe .
+
+# From D:\Project\cpp\clash-native\tests\interop
+$env:MIHOMO_EXECUTABLE = 'D:\Project\cpp\clash-native\build\windows-clang-cl-x64\mihomo-interop.exe'
+$env:CLASH_NATIVE_TEST_HOST = 'D:\Project\cpp\clash-native\build\windows-clang-cl-x64\clash-native-test-host.exe'
+go test -count=1 -run '^TestMihomoActualServerInteroperability$' -v .
+```
+
+The Mihomo UDP case uses a 1200-byte payload so the encrypted Shadowsocks UDP
+payload remains within the outbound's 1500-byte limit. This counts the salt
+and ciphertext passed to the UDP socket, excluding IP and UDP headers; it is
+not a guarantee that the complete IP packet fits a 1500-byte path MTU. The
+independent Go peer test verifies exact-limit delivery and rejection above the
+limit for all supported AEAD methods.

@@ -124,6 +124,10 @@ add_library(clash-native-core STATIC
     src/dns/resolver_graph.cpp
     src/dns/system_resolver.cpp
     src/net/tcp_stream.cpp
+    src/net/tls_stream.cpp
+    src/outbound/shadowsocks_crypto.cpp
+    src/outbound/shadowsocks_outbound.cpp
+    src/outbound/trojan_outbound.cpp
     src/outbound/builtin_outbound.cpp
     src/outbound/outbound_registry.cpp
     src/observability/connection_registry.cpp

@@ -49,6 +49,8 @@ class ProxyServer {
   private:
     class Session;
     using SessionPtr = std::shared_ptr<Session>;
+    using DatagramRouteHandler =
+        std::function<void(core::DatagramOpenResult, boost::asio::ip::udp::endpoint)>;
 
     void accept();
     void open_stream(core::ConnectionMetadata metadata,
@@ -58,6 +60,10 @@ class ProxyServer {
                       router::RoutingContext context, std::size_t start,
                       std::optional<observability::ConnectionRegistry::ConnectionId> connection_id,
                       core::StreamOpenHandler handler);
+    void open_datagram(runtime::RuntimeSnapshotPtr snapshot, core::ConnectionMetadata metadata,
+                       DatagramRouteHandler handler);
+    void route_datagram(runtime::RuntimeSnapshotPtr snapshot, core::ConnectionMetadata metadata,
+                        router::RoutingContext context, DatagramRouteHandler handler);
     void stop_on_owner() noexcept;
     void remove_session(const SessionPtr &session) noexcept;
 

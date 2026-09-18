@@ -2,6 +2,9 @@
 #include <clash_native/proxy/proxy_server.hpp>
 #include <clash_native/proxy/tcp_relay.hpp>
 
+#include "outbound/outbound_utils.hpp"
+#include "outbound/proxy_address.hpp"
+
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/read.hpp>
@@ -26,6 +29,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -37,7 +41,9 @@ constexpr std::uint8_t kSocksVersion = 0x05;
 constexpr std::uint8_t kNoAuthentication = 0x00;
 constexpr std::uint8_t kNoAcceptableMethods = 0xff;
 constexpr std::uint8_t kConnectCommand = 0x01;
+constexpr std::uint8_t kUdpAssociateCommand = 0x03;
 constexpr auto kHandshakeTimeout = std::chrono::seconds(10);
+constexpr std::size_t kMaxUdpPathsPerAssociation = 128;
 
 core::Error listener_error(std::string_view operation, const boost::system::error_code &error) {
     return {core::ErrorCode::transport_io, fmt::format("failed to {} proxy listener", operation),
@@ -128,6 +134,14 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     void stop() noexcept { close(); }
 
   private:
+    struct UdpPath {
+        std::string key;
+        std::shared_ptr<core::DatagramHandle> handle;
+        boost::asio::ip::udp::endpoint target;
+        boost::asio::ip::udp::endpoint response_source;
+        std::vector<std::uint8_t> receive_buffer;
+    };
+
     enum class Protocol {
         socks5,
         http,
@@ -234,7 +248,8 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
                                         return;
                                     }
 
-                                    if (self->request_header_[1] != kConnectCommand) {
+                                    if (self->request_header_[1] != kConnectCommand &&
+                                        self->request_header_[1] != kUdpAssociateCommand) {
                                         self->send_socks_reply(0x07, false);
                                         return;
                                     }
@@ -292,6 +307,11 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     }
 
     void open_socks_target() {
+        if (request_header_[1] == kUdpAssociateCommand) {
+            open_socks_udp_association();
+            return;
+        }
+
         const auto port = request_port();
         switch (request_header_[3]) {
         case 0x01: {
@@ -392,12 +412,302 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
             [self](core::StreamOpenResult result) { self->handle_open_result(std::move(result)); });
     }
 
+    void open_socks_udp_association() {
+        if (closed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        udp_snapshot_ = owner_.snapshot_store_.load();
+        if (!udp_snapshot_) {
+            send_socks_reply(0x01, false);
+            return;
+        }
+
+        boost::system::error_code error;
+        const auto peer = client_.remote_endpoint(error);
+        if (error) {
+            send_socks_reply(0x01, false);
+            return;
+        }
+        udp_control_peer_ = peer.address();
+        if (request_body_.size() >= 2) {
+            expected_udp_client_port_ = request_port();
+        }
+
+        auto local = client_.local_endpoint(error);
+        if (error) {
+            send_socks_reply(0x01, false);
+            return;
+        }
+        auto bind_address = local.address();
+        if (bind_address.is_unspecified()) {
+            bind_address = peer.address().is_v4()
+                               ? boost::asio::ip::address(boost::asio::ip::address_v4::any())
+                               : boost::asio::ip::address(boost::asio::ip::address_v6::any());
+        }
+
+        udp_relay_socket_ =
+            std::make_shared<boost::asio::ip::udp::socket>(owner_.runtime_.context());
+        udp_relay_socket_->open(
+            bind_address.is_v4() ? boost::asio::ip::udp::v4() : boost::asio::ip::udp::v6(), error);
+        if (!error) {
+            udp_relay_socket_->bind({bind_address, 0}, error);
+        }
+        if (error) {
+            udp_relay_socket_.reset();
+            send_socks_reply(0x01, false);
+            return;
+        }
+
+        send_socks_udp_associate_reply(udp_relay_socket_->local_endpoint(error));
+        if (error) {
+            close();
+        }
+    }
+
+    void send_socks_udp_associate_reply(const boost::asio::ip::udp::endpoint &endpoint) {
+        if (closed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        reply_[0] = kSocksVersion;
+        reply_[1] = 0x00;
+        reply_[2] = 0x00;
+        std::size_t reply_size = 0;
+        if (endpoint.address().is_v4()) {
+            reply_[3] = 0x01;
+            const auto bytes = endpoint.address().to_v4().to_bytes();
+            std::copy(bytes.begin(), bytes.end(), reply_.begin() + 4);
+            reply_[8] = static_cast<std::uint8_t>(endpoint.port() >> 8);
+            reply_[9] = static_cast<std::uint8_t>(endpoint.port() & 0xff);
+            reply_size = 10;
+        } else {
+            reply_[3] = 0x04;
+            const auto bytes = endpoint.address().to_v6().to_bytes();
+            std::copy(bytes.begin(), bytes.end(), reply_.begin() + 4);
+            reply_[20] = static_cast<std::uint8_t>(endpoint.port() >> 8);
+            reply_[21] = static_cast<std::uint8_t>(endpoint.port() & 0xff);
+            reply_size = 22;
+        }
+
+        auto self = shared_from_this();
+        boost::asio::async_write(client_, boost::asio::buffer(reply_.data(), reply_size),
+                                 [self](const boost::system::error_code &error, std::size_t) {
+                                     if (error) {
+                                         self->close();
+                                         return;
+                                     }
+                                     self->cancel_handshake_timer();
+                                     self->read_udp_control();
+                                     self->read_socks_udp_packet();
+                                 });
+    }
+
+    void read_udp_control() {
+        auto self = shared_from_this();
+        client_.async_read_some(
+            boost::asio::buffer(udp_control_probe_),
+            [self](const boost::system::error_code &, std::size_t) { self->close(); });
+    }
+
+    void read_socks_udp_packet() {
+        if (closed_.load(std::memory_order_acquire) || !udp_relay_socket_) {
+            return;
+        }
+        auto self = shared_from_this();
+        udp_relay_socket_->async_receive_from(
+            boost::asio::buffer(udp_receive_buffer_), udp_packet_sender_,
+            [self](const boost::system::error_code &error, std::size_t size) {
+                if (error) {
+                    if (error != boost::asio::error::operation_aborted) {
+                        self->close();
+                    }
+                    return;
+                }
+                if (!self->accept_udp_sender(self->udp_packet_sender_)) {
+                    self->read_socks_udp_packet();
+                    return;
+                }
+                self->process_socks_udp_packet(size);
+                self->read_socks_udp_packet();
+            });
+    }
+
+    bool accept_udp_sender(const boost::asio::ip::udp::endpoint &sender) {
+        if (sender.address() != udp_control_peer_) {
+            return false;
+        }
+        if (!udp_client_endpoint_) {
+            if (expected_udp_client_port_ != 0 && sender.port() != expected_udp_client_port_) {
+                return false;
+            }
+            udp_client_endpoint_ = sender;
+            return true;
+        }
+        return *udp_client_endpoint_ == sender;
+    }
+
+    void process_socks_udp_packet(std::size_t size) {
+        if (size < 4 || udp_receive_buffer_[0] != 0 || udp_receive_buffer_[1] != 0 ||
+            udp_receive_buffer_[2] != 0) {
+            return;
+        }
+        const auto packet = std::span<const std::uint8_t>(udp_receive_buffer_.data(), size);
+        auto decoded = outbound::detail::decode_proxy_address(packet, 3);
+        if (!decoded || decoded.value().destination.port() == 0) {
+            return;
+        }
+        const auto payload_offset = 3 + decoded.value().size;
+        auto payload = std::make_shared<std::vector<std::uint8_t>>(
+            udp_receive_buffer_.begin() + static_cast<std::ptrdiff_t>(payload_offset),
+            udp_receive_buffer_.begin() + static_cast<std::ptrdiff_t>(size));
+        auto key_bytes = outbound::detail::encode_proxy_address(decoded.value().destination);
+        if (!key_bytes) {
+            return;
+        }
+        const std::string key(reinterpret_cast<const char *>(key_bytes.value().data()),
+                              key_bytes.value().size());
+        const auto existing = udp_paths_.find(key);
+        if (existing != udp_paths_.end()) {
+            send_udp_payload(existing->second, std::move(payload));
+            return;
+        }
+
+        auto pending = pending_udp_packets_.find(key);
+        if (pending != pending_udp_packets_.end()) {
+            pending->second.push_back(std::move(payload));
+            return;
+        }
+        if (udp_paths_.size() + pending_udp_packets_.size() >= kMaxUdpPathsPerAssociation) {
+            return;
+        }
+        pending_udp_packets_.emplace(
+            key, std::vector<std::shared_ptr<std::vector<std::uint8_t>>>{payload});
+
+        const auto sender = *udp_client_endpoint_;
+        core::ConnectionMetadata metadata{
+            core::Network::udp,
+            boost::asio::ip::tcp::endpoint(sender.address(), sender.port()),
+            decoded.value().destination,
+            "socks5",
+            "socks5",
+            {},
+            {}};
+        auto self = shared_from_this();
+        owner_.open_datagram(udp_snapshot_, std::move(metadata),
+                             [self, key](core::DatagramOpenResult result,
+                                         boost::asio::ip::udp::endpoint target) mutable {
+                                 if (self->closed_.load(std::memory_order_acquire)) {
+                                     if (result.handle) {
+                                         result.handle->close();
+                                     }
+                                     return;
+                                 }
+                                 auto packets = self->pending_udp_packets_.find(key);
+                                 if (packets == self->pending_udp_packets_.end()) {
+                                     if (result.handle) {
+                                         result.handle->close();
+                                     }
+                                     return;
+                                 }
+                                 auto payloads = std::move(packets->second);
+                                 self->pending_udp_packets_.erase(packets);
+                                 if (!result.succeeded()) {
+                                     return;
+                                 }
+                                 auto path = std::make_shared<UdpPath>();
+                                 path->key = key;
+                                 path->handle = std::shared_ptr<core::DatagramHandle>(
+                                     std::move(result.handle));
+                                 path->target = target;
+                                 path->receive_buffer.resize(path->handle->max_datagram_size());
+                                 self->udp_paths_.emplace(key, path);
+                                 self->receive_udp_response(path);
+                                 for (auto &packet : payloads) {
+                                     self->send_udp_payload(path, std::move(packet));
+                                 }
+                             });
+    }
+
+    void send_udp_payload(const std::shared_ptr<UdpPath> &path,
+                          std::shared_ptr<std::vector<std::uint8_t>> payload) {
+        auto self = shared_from_this();
+        const auto payload_buffer = boost::asio::buffer(*payload);
+        path->handle->async_send_to(
+            payload_buffer, path->target,
+            [self, path, payload](const boost::system::error_code &error, std::size_t) {
+                if (error && error != boost::asio::error::operation_aborted &&
+                    !self->closed_.load(std::memory_order_acquire)) {
+                    if (error == boost::asio::error::message_size) {
+                        spdlog::warn(
+                            "Proxy outbound UDP datagram exceeds the supported size limit");
+                    }
+                    const auto found = self->udp_paths_.find(path->key);
+                    if (found != self->udp_paths_.end() && found->second == path) {
+                        path->handle->close();
+                        self->udp_paths_.erase(found);
+                    }
+                }
+            });
+    }
+
+    void receive_udp_response(const std::shared_ptr<UdpPath> &path) {
+        if (closed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        auto self = shared_from_this();
+        path->handle->async_receive_from(
+            boost::asio::buffer(path->receive_buffer),
+            [self, path](const boost::system::error_code &error, std::size_t size,
+                         boost::asio::ip::udp::endpoint source) {
+                if (error) {
+                    if (error != boost::asio::error::operation_aborted &&
+                        !self->closed_.load(std::memory_order_acquire)) {
+                        const auto found = self->udp_paths_.find(path->key);
+                        if (found != self->udp_paths_.end() && found->second == path) {
+                            self->udp_paths_.erase(found);
+                        }
+                    }
+                    return;
+                }
+                self->send_socks_udp_response(
+                    source, std::span<const std::uint8_t>(path->receive_buffer.data(), size));
+                self->receive_udp_response(path);
+            });
+    }
+
+    void send_socks_udp_response(boost::asio::ip::udp::endpoint source,
+                                 std::span<const std::uint8_t> payload) {
+        if (closed_.load(std::memory_order_acquire) || !udp_client_endpoint_) {
+            return;
+        }
+        auto address = outbound::detail::encode_proxy_address(
+            core::Destination::address(source.address(), source.port()));
+        if (!address) {
+            return;
+        }
+        auto packet = std::make_shared<std::vector<std::uint8_t>>();
+        packet->reserve(3 + address.value().size() + payload.size());
+        packet->insert(packet->end(), {0, 0, 0});
+        packet->insert(packet->end(), address.value().begin(), address.value().end());
+        packet->insert(packet->end(), payload.begin(), payload.end());
+        auto self = shared_from_this();
+        udp_relay_socket_->async_send_to(
+            boost::asio::buffer(*packet), *udp_client_endpoint_,
+            [self, packet](const boost::system::error_code &, std::size_t) {});
+    }
+
     void handle_open_result(core::StreamOpenResult result) {
         if (closed_.load(std::memory_order_acquire)) {
             return;
         }
         cancel_handshake_timer();
         if (!result.succeeded()) {
+            if (result.error) {
+                spdlog::warn("Proxy outbound stream open failed ({}): {}{}",
+                             core::to_string(result.error->code), result.error->context,
+                             result.error->cause
+                                 ? fmt::format(": {}", result.error->cause.message())
+                                 : std::string{});
+            }
             if (protocol_ == Protocol::socks5) {
                 send_socks_reply(socks_error_code(result.error), false);
             } else {
@@ -511,6 +821,19 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         if (remote_) {
             remote_->close();
         }
+        if (udp_relay_socket_) {
+            boost::system::error_code ignored;
+            udp_relay_socket_->cancel(ignored);
+            udp_relay_socket_->close(ignored);
+            udp_relay_socket_.reset();
+        }
+        for (auto &[key, path] : udp_paths_) {
+            (void)key;
+            path->handle->close();
+        }
+        udp_paths_.clear();
+        pending_udp_packets_.clear();
+        udp_snapshot_.reset();
 
         if (connection_id_ && owner_.connection_registry_) {
             owner_.connection_registry_->remove(*connection_id_);
@@ -548,6 +871,17 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     boost::asio::streambuf http_buffer_;
     std::vector<std::uint8_t> http_initial_data_;
     std::string http_response_;
+    std::shared_ptr<boost::asio::ip::udp::socket> udp_relay_socket_;
+    boost::asio::ip::address udp_control_peer_ = boost::asio::ip::address_v4::any();
+    boost::asio::ip::udp::endpoint udp_packet_sender_;
+    std::optional<boost::asio::ip::udp::endpoint> udp_client_endpoint_;
+    std::uint16_t expected_udp_client_port_ = 0;
+    std::array<std::uint8_t, 1> udp_control_probe_{};
+    std::array<std::uint8_t, 65507> udp_receive_buffer_{};
+    runtime::RuntimeSnapshotPtr udp_snapshot_;
+    std::unordered_map<std::string, std::shared_ptr<UdpPath>> udp_paths_;
+    std::unordered_map<std::string, std::vector<std::shared_ptr<std::vector<std::uint8_t>>>>
+        pending_udp_packets_;
 };
 
 ProxyServer::ProxyServer(runtime::AsioRuntime &runtime, boost::asio::ip::tcp::endpoint endpoint)
@@ -926,6 +1260,118 @@ void ProxyServer::route_stream(
         }
         return;
     }
+}
+
+void ProxyServer::open_datagram(runtime::RuntimeSnapshotPtr snapshot,
+                                core::ConnectionMetadata metadata, DatagramRouteHandler handler) {
+    if (!snapshot) {
+        handler(core::DatagramOpenResult::failed(
+                    {core::ErrorCode::configuration, "proxy runtime snapshot is not published"}),
+                {});
+        return;
+    }
+    if (snapshot->fake_ip_store && metadata.destination.is_address() &&
+        metadata.destination.address().is_v4()) {
+        if (const auto domain =
+                snapshot->fake_ip_store->reverse(metadata.destination.address().to_v4())) {
+            metadata.destination = core::Destination::domain(*domain, metadata.destination.port());
+        }
+    }
+
+    router::RoutingContext context;
+    if (metadata.destination.is_address()) {
+        context.destination_lookup = router::LookupState::resolved;
+        context.destination_address = metadata.destination.address();
+        context.destination_addresses.push_back(metadata.destination.address());
+        route_datagram(std::move(snapshot), std::move(metadata), std::move(context),
+                       std::move(handler));
+        return;
+    }
+
+    const auto gate = callback_gate_;
+    const auto domain = metadata.destination.domain();
+    auto resolver = snapshot->resolver;
+    outbound::detail::resolve_host(
+        runtime_, std::move(resolver), domain,
+        [this, gate, snapshot = std::move(snapshot), metadata = std::move(metadata),
+         handler = std::move(handler)](core::Result<outbound::detail::AddressList> result) mutable {
+            if (!gate->load(std::memory_order_acquire)) {
+                return;
+            }
+            if (!result || result.value().empty()) {
+                handler(core::DatagramOpenResult::failed(
+                            result ? core::Error{core::ErrorCode::resolution,
+                                                 "UDP destination resolved to no addresses"}
+                                   : result.error()),
+                        {});
+                return;
+            }
+            router::RoutingContext context;
+            context.destination_lookup = router::LookupState::resolved;
+            context.destination_addresses = std::move(result.value());
+            context.destination_address = context.destination_addresses.front();
+            route_datagram(std::move(snapshot), std::move(metadata), std::move(context),
+                           std::move(handler));
+        });
+}
+
+void ProxyServer::route_datagram(runtime::RuntimeSnapshotPtr snapshot,
+                                 core::ConnectionMetadata metadata, router::RoutingContext context,
+                                 DatagramRouteHandler handler) {
+    const auto evaluation = snapshot->router->evaluate(metadata, context);
+    const auto *matched = std::get_if<router::Matched>(&evaluation);
+    if (!matched) {
+        handler(
+            core::DatagramOpenResult::failed(
+                {core::ErrorCode::resolution, "UDP routing requires destination IP enrichment"}),
+            {});
+        return;
+    }
+
+    const auto destination_address =
+        context.destination_address
+            ? context.destination_address
+            : (metadata.destination.is_address()
+                   ? std::optional<boost::asio::ip::address>(metadata.destination.address())
+                   : std::nullopt);
+    if (!destination_address) {
+        handler(core::DatagramOpenResult::failed(
+                    {core::ErrorCode::resolution, "UDP destination has no resolved address"}),
+                {});
+        return;
+    }
+    const boost::asio::ip::udp::endpoint target(*destination_address, metadata.destination.port());
+    const core::DatagramRequest request{
+        core::Destination::address(target.address(), target.port())};
+    std::shared_ptr<core::Outbound> outbound;
+    switch (matched->decision.action.kind) {
+    case router::RouteActionKind::direct:
+        outbound = direct_outbound_;
+        break;
+    case router::RouteActionKind::reject:
+        outbound = reject_outbound_;
+        break;
+    case router::RouteActionKind::named:
+        if (!snapshot->outbounds) {
+            handler(core::DatagramOpenResult::failed(
+                        {core::ErrorCode::configuration, "proxy outbound registry is missing"}),
+                    target);
+            return;
+        }
+        {
+            const auto selected = snapshot->outbounds->select(matched->decision.action.target);
+            if (!selected) {
+                handler(core::DatagramOpenResult::failed(selected.error()), target);
+                return;
+            }
+            outbound = selected.value();
+        }
+        break;
+    }
+    outbound->open_datagram(
+        request, [handler = std::move(handler), target](core::DatagramOpenResult result) mutable {
+            handler(std::move(result), target);
+        });
 }
 
 void ProxyServer::remove_session(const SessionPtr &session) noexcept {
