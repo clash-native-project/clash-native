@@ -1,3 +1,4 @@
+#include <clash_native/core/base64.hpp>
 #include <clash_native/transport/grpc_client.hpp>
 
 #include <boost/asio/dispatch.hpp>
@@ -5,7 +6,6 @@
 #include <boost/asio/post.hpp>
 
 #include <algorithm>
-#include <array>
 #include <cctype>
 #include <charconv>
 #include <cmath>
@@ -19,9 +19,6 @@ namespace {
 
 constexpr std::size_t kReadBufferSize = 16 * 1024;
 constexpr unsigned int kMaxGrpcStatus = 16;
-constexpr std::string_view kBase64Alphabet =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 core::Error make_error(core::ErrorCode code, std::string context) {
     return core::Error{code, std::move(context), {}};
 }
@@ -48,65 +45,6 @@ bool is_metadata_name(std::string_view name) {
 
 bool is_binary_metadata(std::string_view name) {
     return name.size() >= 4 && name.substr(name.size() - 4) == "-bin";
-}
-
-std::string base64_encode(std::string_view input) {
-    std::string result;
-    result.reserve(((input.size() + 2) / 3) * 4);
-    for (std::size_t offset = 0; offset < input.size(); offset += 3) {
-        const auto first = static_cast<unsigned char>(input[offset]);
-        const auto second =
-            offset + 1 < input.size() ? static_cast<unsigned char>(input[offset + 1]) : 0U;
-        const auto third =
-            offset + 2 < input.size() ? static_cast<unsigned char>(input[offset + 2]) : 0U;
-        const auto bits = (static_cast<std::uint32_t>(first) << 16U) |
-                          (static_cast<std::uint32_t>(second) << 8U) |
-                          static_cast<std::uint32_t>(third);
-        result.push_back(kBase64Alphabet[(bits >> 18U) & 0x3fU]);
-        result.push_back(kBase64Alphabet[(bits >> 12U) & 0x3fU]);
-        result.push_back(offset + 1 < input.size() ? kBase64Alphabet[(bits >> 6U) & 0x3fU] : '=');
-        result.push_back(offset + 2 < input.size() ? kBase64Alphabet[bits & 0x3fU] : '=');
-    }
-    return result;
-}
-
-std::optional<std::string> base64_decode(std::string_view input) {
-    if (input.size() % 4 != 0) {
-        return std::nullopt;
-    }
-    std::array<int, 256> values{};
-    values.fill(-1);
-    for (std::size_t index = 0; index < kBase64Alphabet.size(); ++index) {
-        values[static_cast<unsigned char>(kBase64Alphabet[index])] = static_cast<int>(index);
-    }
-
-    std::string result;
-    result.reserve((input.size() / 4) * 3);
-    for (std::size_t offset = 0; offset < input.size(); offset += 4) {
-        const auto a = values[static_cast<unsigned char>(input[offset])];
-        const auto b = values[static_cast<unsigned char>(input[offset + 1])];
-        const auto c =
-            input[offset + 2] == '=' ? -2 : values[static_cast<unsigned char>(input[offset + 2])];
-        const auto d =
-            input[offset + 3] == '=' ? -2 : values[static_cast<unsigned char>(input[offset + 3])];
-        const bool last = offset + 4 == input.size();
-        if (a < 0 || b < 0 || c == -1 || d == -1 || (!last && (c == -2 || d == -2)) ||
-            (c == -2 && d != -2)) {
-            return std::nullopt;
-        }
-        const auto bits = (static_cast<std::uint32_t>(a) << 18U) |
-                          (static_cast<std::uint32_t>(b) << 12U) |
-                          (static_cast<std::uint32_t>(std::max(c, 0)) << 6U) |
-                          static_cast<std::uint32_t>(std::max(d, 0));
-        result.push_back(static_cast<char>((bits >> 16U) & 0xffU));
-        if (c != -2) {
-            result.push_back(static_cast<char>((bits >> 8U) & 0xffU));
-        }
-        if (d != -2) {
-            result.push_back(static_cast<char>(bits & 0xffU));
-        }
-    }
-    return result;
 }
 
 std::optional<std::string> percent_decode(std::string_view input) {
@@ -165,7 +103,7 @@ std::vector<GrpcMetadata> application_metadata(const std::vector<HttpHeader> &he
         }
         auto value = header.value;
         if (is_binary_metadata(name)) {
-            auto decoded = base64_decode(value);
+            auto decoded = core::base64_decode(value);
             if (!decoded) {
                 continue;
             }
@@ -493,7 +431,7 @@ void GrpcClientCall::start() {
     request.request.headers.push_back({"te", "trailers"});
     for (const auto &metadata : options_.metadata) {
         request.request.headers.push_back({metadata.name, is_binary_metadata(metadata.name)
-                                                              ? base64_encode(metadata.value)
+                                                              ? core::base64_encode(metadata.value)
                                                               : metadata.value});
     }
     if (options_.deadline) {

@@ -1,5 +1,13 @@
 # Implementation Log
 
+### 2026-09-19 — Centralize Base64 through BoringSSL
+
+- Added a shared core Base64 wrapper backed by BoringSSL's standard padded
+  encoder and strict decoder.
+- Replaced the HTTP proxy Basic authentication and gRPC binary metadata
+  implementations with the shared wrapper and added standard, binary, and
+  malformed input coverage.
+
 ### 2026-09-19 — Replace the gRPC C++ runtime with a Protobuf/HTTP2 client
 
 - Removed the upstream gRPC C++ runtime, its zlib-only direct dependency, and

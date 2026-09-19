@@ -107,6 +107,7 @@ set(BUILD_TESTING "${CLASH_NATIVE_BUILD_TESTING}" CACHE BOOL "Build clash-native
 
 add_library(clash-native-core STATIC
     "${PROJECT_BINARY_DIR}/generated/builtin_ca_bundle.cpp"
+    src/core/base64.cpp
     src/dns/dns_codec.cpp
     src/dns/dns_policy_router.cpp
     src/dns/dns_query_service.cpp
@@ -249,6 +250,7 @@ if(BUILD_TESTING)
     )
 
     add_executable(clash-native-tests
+        tests/core/base64_test.cpp
         tests/core/channel_test.cpp
         tests/core/error_test.cpp
         tests/core/outbound_contract_test.cpp

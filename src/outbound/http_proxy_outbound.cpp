@@ -1,3 +1,4 @@
+#include <clash_native/core/base64.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/http_proxy_outbound.hpp>
 #include <clash_native/transport/http_client.hpp>
@@ -28,28 +29,6 @@ constexpr auto kConnectTimeout = std::chrono::seconds(15);
 
 std::error_code to_std_error(const boost::system::error_code &error) {
     return {error.value(), std::system_category()};
-}
-
-std::string base64_encode(std::string_view input) {
-    constexpr std::string_view alphabet =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string output;
-    output.reserve(((input.size() + 2) / 3) * 4);
-    for (std::size_t index = 0; index < input.size(); index += 3) {
-        const auto first = static_cast<unsigned char>(input[index]);
-        const auto second =
-            index + 1 < input.size() ? static_cast<unsigned char>(input[index + 1]) : 0;
-        const auto third =
-            index + 2 < input.size() ? static_cast<unsigned char>(input[index + 2]) : 0;
-        const auto value = (static_cast<std::uint32_t>(first) << 16) |
-                           (static_cast<std::uint32_t>(second) << 8) |
-                           static_cast<std::uint32_t>(third);
-        output.push_back(alphabet[(value >> 18) & 0x3f]);
-        output.push_back(alphabet[(value >> 12) & 0x3f]);
-        output.push_back(index + 1 < input.size() ? alphabet[(value >> 6) & 0x3f] : '=');
-        output.push_back(index + 2 < input.size() ? alphabet[value & 0x3f] : '=');
-    }
-    return output;
 }
 
 std::string destination_authority(const core::Destination &destination) {
@@ -272,7 +251,7 @@ class HttpProxyConnectOperation final
         if (!config_.username.empty()) {
             tunnel.headers.push_back(
                 {"proxy-authorization",
-                 "Basic " + base64_encode(config_.username + ':' + config_.password)});
+                 "Basic " + core::base64_encode(config_.username + ':' + config_.password)});
         }
         auto self = shared_from_this();
         session_->open_tunnel(
