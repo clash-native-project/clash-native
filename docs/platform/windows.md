@@ -23,8 +23,12 @@ pixi run python scripts/build.py --build-type Release --llvm-root "C:\Program Fi
 
 The CMake build script resolves CMake and Ninja from the Pixi environment and
 uses standalone LLVM `clang-cl` with the MSVC toolchain. ngtcp2 is acquired by
-CMake FetchContent; HTTP, TLS, and QUIC dependencies are otherwise resolved by
-the vcpkg manifest. This Windows profile does not use MSYS2 or auxiliary build systems.
+CMake FetchContent; HTTP, TLS, QUIC, and Protobuf dependencies are
+otherwise resolved by the vcpkg manifest. The gRPC client wire protocol is
+implemented over the existing HTTP/2 session and uses Protobuf serialization;
+the upstream gRPC C++ runtime is not linked.
+The manifest constrains package versions against the pinned vcpkg baseline.
+This Windows profile does not use MSYS2 or auxiliary build systems.
 Static CRT linkage does not remove Windows operating-system DLL dependencies;
 the executable still uses Windows networking, diagnostics, kernel, and
 synchronization APIs.

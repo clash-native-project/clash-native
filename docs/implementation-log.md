@@ -1,5 +1,21 @@
 # Implementation Log
 
+### 2026-09-19 — Replace the gRPC C++ runtime with a Protobuf/HTTP2 client
+
+- Removed the upstream gRPC C++ runtime, its zlib-only direct dependency, and
+  the local gRPC vcpkg overlay.
+- Added an asynchronous gRPC client wire layer over the existing HTTP/2
+  session. It serializes `google::protobuf::MessageLite` values into the
+  standard five-byte gRPC message envelope, supports metadata, deadlines,
+  trailers, trailers-only status responses, incremental message reads,
+  bidirectional half-close, cancellation, and identity message framing;
+  compressed message encodings are rejected explicitly.
+- Added an independent grpc-go TLS interoperability
+  fixture covering unary metadata and trailers, a trailers-only non-OK status,
+  binary metadata, and bidirectional streaming. The client remains a wire
+  implementation rather than a generated service API; message compression and
+  service-specific generated bindings are not included.
+
 ### 2026-09-18 — Record local proxy listener security scope
 
 - Documented that local HTTP and SOCKS5 listeners currently use plaintext connections without inbound authentication, and distinguished destination TLS through HTTP `CONNECT` from TLS to the proxy itself.

@@ -16,6 +16,7 @@ find_package(c-ares CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 find_package(OpenSSL CONFIG REQUIRED)
 find_package(nghttp3 CONFIG REQUIRED)
+find_package(protobuf CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(tl-expected CONFIG REQUIRED)
 find_package(Threads REQUIRED)
@@ -131,6 +132,7 @@ add_library(clash-native-core STATIC
     src/transport/http1_client.cpp
     src/transport/http2_client.cpp
     src/transport/http3_client.cpp
+    src/transport/grpc_client.cpp
     src/transport/endpoint_dialer.cpp
     src/transport/quic_client.cpp
     src/transport/tls_client.cpp
@@ -162,6 +164,7 @@ target_link_libraries(clash-native-core
     PUBLIC
         Boost::asio
         Threads::Threads
+        protobuf::libprotobuf
         tl::expected
     PRIVATE
         Boost::beast
@@ -230,6 +233,17 @@ if(BUILD_TESTING)
     target_compile_features(clash-native-http-tunnel-client PRIVATE cxx_std_20)
 
     target_link_libraries(clash-native-http-tunnel-client
+        PRIVATE
+            clash-native-core
+    )
+
+    add_executable(clash-native-grpc-client
+        tests/host/grpc_client.cpp
+    )
+
+    target_compile_features(clash-native-grpc-client PRIVATE cxx_std_20)
+
+    target_link_libraries(clash-native-grpc-client
         PRIVATE
             clash-native-core
     )
