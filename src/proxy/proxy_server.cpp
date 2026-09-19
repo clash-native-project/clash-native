@@ -2,41 +2,57 @@
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
 #include <clash_native/proxy/tcp_relay.hpp>
+#include <clash_native/transport/http_client.hpp>
 
 #include "outbound/outbound_utils.hpp"
 #include "outbound/proxy_address.hpp"
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/dispatch.hpp>
+#include <boost/asio/error.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
-#include <boost/asio/read_until.hpp>
 #include <boost/asio/steady_timer.hpp>
-#include <boost/asio/streambuf.hpp>
 #include <boost/asio/write.hpp>
+#include <boost/beast/core/flat_buffer.hpp>
+#include <boost/beast/http.hpp>
 #include <fmt/format.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <semaphore>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace clash_native::proxy {
 
 namespace {
+
+namespace http = boost::beast::http;
+
+template <class StringView> std::string_view as_std_view(const StringView &value) {
+    return {value.data(), value.size()};
+}
+
+template <class StringView> std::string copy_view(const StringView &value) {
+    return std::string(value.data(), value.size());
+}
 
 constexpr std::uint8_t kSocksVersion = 0x05;
 constexpr std::uint8_t kNoAuthentication = 0x00;
@@ -99,6 +115,367 @@ std::optional<core::Destination> parse_http_authority(std::string_view authority
     }
     return core::Destination::domain(std::string(host), *port);
 }
+
+struct ParsedHttpTarget {
+    core::Destination destination;
+    std::string authority;
+    std::string origin_target;
+    bool empty_path_and_query = false;
+};
+
+bool is_http_token_character(unsigned char character) {
+    constexpr std::string_view punctuation = "!#$%&'*+-.^_`|~";
+    return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+           (character >= '0' && character <= '9') ||
+           punctuation.find(static_cast<char>(character)) != std::string_view::npos;
+}
+
+bool is_http_token(std::string_view value) {
+    return !value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char character) {
+        return is_http_token_character(character);
+    });
+}
+
+std::string lowercase_ascii(std::string_view value) {
+    std::string result(value);
+    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return result;
+}
+
+bool is_http_header(std::string_view name, std::string_view expected) {
+    return name.size() == expected.size() &&
+           std::equal(name.begin(), name.end(), expected.begin(),
+                      [](unsigned char actual, unsigned char wanted) {
+                          return static_cast<unsigned char>(std::tolower(actual)) == wanted;
+                      });
+}
+
+std::string_view trim_http_whitespace(std::string_view value) {
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+        value.remove_prefix(1);
+    }
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+        value.remove_suffix(1);
+    }
+    return value;
+}
+
+bool collect_connection_options(const http::fields &fields,
+                                std::unordered_set<std::string> &options) {
+    for (const auto &field : fields) {
+        if (!is_http_header(as_std_view(field.name_string()), "connection")) {
+            continue;
+        }
+        auto value = as_std_view(field.value());
+        while (true) {
+            const auto comma = value.find(',');
+            const auto option = trim_http_whitespace(value.substr(0, comma));
+            if (!is_http_token(option)) {
+                return false;
+            }
+            options.emplace(lowercase_ascii(option));
+            if (comma == std::string_view::npos) {
+                break;
+            }
+            value.remove_prefix(comma + 1);
+        }
+    }
+    return true;
+}
+
+bool is_hop_by_hop_or_proxy_header(std::string_view name,
+                                   const std::unordered_set<std::string> &connection_options) {
+    if (connection_options.contains(lowercase_ascii(name))) {
+        return true;
+    }
+    constexpr std::array<std::string_view, 8> names{
+        "connection",          "keep-alive", "proxy-connection",  "proxy-authenticate",
+        "proxy-authorization", "te",         "transfer-encoding", "upgrade"};
+    return std::any_of(names.begin(), names.end(), [name](std::string_view expected) {
+        return is_http_header(name, expected);
+    });
+}
+
+bool is_forbidden_trailer_field(std::string_view name) {
+    constexpr std::array<std::string_view, 17> names{"authorization",
+                                                     "connection",
+                                                     "content-encoding",
+                                                     "content-length",
+                                                     "content-range",
+                                                     "content-type",
+                                                     "host",
+                                                     "keep-alive",
+                                                     "proxy-authenticate",
+                                                     "proxy-authorization",
+                                                     "te",
+                                                     "trailer",
+                                                     "transfer-encoding",
+                                                     "upgrade",
+                                                     "www-authenticate",
+                                                     "cache-control",
+                                                     "expect"};
+    return std::any_of(names.begin(), names.end(), [name](std::string_view expected) {
+        return is_http_header(name, expected);
+    });
+}
+
+bool collect_declared_trailers(const http::fields &fields,
+                               const std::unordered_set<std::string> &connection_options,
+                               std::unordered_set<std::string> &declared_trailers,
+                               std::vector<std::string> &trailer_names) {
+    for (const auto &field : fields) {
+        if (!is_http_header(as_std_view(field.name_string()), "trailer")) {
+            continue;
+        }
+        auto value = as_std_view(field.value());
+        while (true) {
+            const auto comma = value.find(',');
+            const auto name = trim_http_whitespace(value.substr(0, comma));
+            if (!is_http_token(name)) {
+                return false;
+            }
+            const auto normalized = lowercase_ascii(name);
+            if (is_forbidden_trailer_field(normalized) || connection_options.contains(normalized)) {
+                return false;
+            }
+            if (declared_trailers.emplace(normalized).second) {
+                trailer_names.push_back(normalized);
+            }
+            if (comma == std::string_view::npos) {
+                break;
+            }
+            value.remove_prefix(comma + 1);
+        }
+    }
+    return true;
+}
+
+std::optional<ParsedHttpTarget> parse_http_absolute_target(std::string_view target) {
+    if (target.size() < 7 || target.find_first_of("\\\r\n\t ") != std::string_view::npos ||
+        target.find('#') != std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    const auto scheme_end = target.find("://");
+    if (scheme_end == std::string_view::npos ||
+        lowercase_ascii(target.substr(0, scheme_end)) != "http") {
+        return std::nullopt;
+    }
+    target.remove_prefix(scheme_end + 3);
+    const auto target_end = target.find_first_of("/?");
+    const auto authority = target.substr(0, target_end);
+    if (authority.empty() || authority.find('@') != std::string_view::npos ||
+        authority.find_first_of("\\\r\n\t ") != std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    std::string_view host;
+    std::string_view port_text;
+    bool explicit_port = false;
+    if (authority.front() == '[') {
+        const auto closing = authority.find(']');
+        if (closing == std::string_view::npos || closing == 1) {
+            return std::nullopt;
+        }
+        host = authority.substr(1, closing - 1);
+        if (closing + 1 < authority.size()) {
+            if (authority[closing + 1] != ':') {
+                return std::nullopt;
+            }
+            explicit_port = true;
+            port_text = authority.substr(closing + 2);
+        }
+    } else {
+        const auto colon = authority.find(':');
+        if (colon != std::string_view::npos) {
+            if (authority.find(':', colon + 1) != std::string_view::npos) {
+                return std::nullopt;
+            }
+            host = authority.substr(0, colon);
+            explicit_port = true;
+            port_text = authority.substr(colon + 1);
+        } else {
+            host = authority;
+        }
+    }
+    if (host.empty() || host.find_first_of("[]@%") != std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    std::uint16_t port = 80;
+    if (explicit_port) {
+        const auto parsed_port = parse_port(port_text);
+        if (!parsed_port) {
+            return std::nullopt;
+        }
+        port = *parsed_port;
+    }
+
+    boost::system::error_code address_error;
+    const auto address = boost::asio::ip::make_address(host, address_error);
+    auto destination = address_error ? core::Destination::domain(std::string(host), port)
+                                     : core::Destination::address(address, port);
+
+    std::string origin_target;
+    if (target_end == std::string_view::npos) {
+        origin_target = "/";
+    } else {
+        const auto suffix = target.substr(target_end);
+        if (suffix.front() == '?') {
+            origin_target.reserve(suffix.size() + 1);
+            origin_target.push_back('/');
+            origin_target.append(suffix);
+        } else {
+            origin_target.assign(suffix);
+        }
+    }
+    if (origin_target.empty() || origin_target.front() != '/') {
+        return std::nullopt;
+    }
+    for (std::size_t index = 0; index < origin_target.size(); ++index) {
+        if (origin_target[index] == '%' &&
+            (index + 2 >= origin_target.size() ||
+             !std::isxdigit(static_cast<unsigned char>(origin_target[index + 1])) ||
+             !std::isxdigit(static_cast<unsigned char>(origin_target[index + 2])))) {
+            return std::nullopt;
+        }
+    }
+    return ParsedHttpTarget{std::move(destination), std::string(authority),
+                            std::move(origin_target), target_end == std::string_view::npos};
+}
+
+class ProxyRequestBodyStream final : public transport::HttpBodyStream,
+                                     public std::enable_shared_from_this<ProxyRequestBodyStream> {
+  public:
+    using Parser = http::request_parser<http::buffer_body>;
+    using ByteHandler = std::function<void(std::size_t)>;
+
+    ProxyRequestBodyStream(boost::asio::ip::tcp::socket &socket, boost::beast::flat_buffer &buffer,
+                           std::shared_ptr<Parser> parser, std::size_t initial_header_count,
+                           std::unordered_set<std::string> declared_trailers,
+                           ByteHandler byte_handler)
+        : socket_(socket), buffer_(buffer), parser_(std::move(parser)),
+          executor_(socket_.get_executor()), initial_header_count_(initial_header_count),
+          declared_trailers_(std::move(declared_trailers)), byte_handler_(std::move(byte_handler)) {
+    }
+
+    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+        const auto self = shared_from_this();
+        boost::asio::dispatch(executor_, [self, buffer, handler = std::move(handler)]() mutable {
+            if (self->cancelled_) {
+                self->post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
+                return;
+            }
+            if (self->reading_) {
+                self->post_read(std::move(handler), boost::asio::error::already_started, 0);
+                return;
+            }
+            if (self->parser_->is_done()) {
+                self->post_read(std::move(handler), boost::asio::error::eof, 0);
+                return;
+            }
+            if (buffer.size() == 0) {
+                self->post_read(std::move(handler), {}, 0);
+                return;
+            }
+
+            self->reading_ = true;
+            auto &body = self->parser_->get().body();
+            body.data = buffer.data();
+            body.size = buffer.size();
+            http::async_read_some(
+                self->socket_, self->buffer_, *self->parser_,
+                [self, buffer, handler = std::move(handler)](const boost::system::error_code &error,
+                                                             std::size_t) mutable {
+                    self->reading_ = false;
+                    auto &parsed_body = self->parser_->get().body();
+                    const auto size = buffer.size() - parsed_body.size;
+                    if (size != 0 && self->byte_handler_) {
+                        self->byte_handler_(size);
+                    }
+                    if (error == http::error::need_buffer) {
+                        if (size != 0) {
+                            self->post_read(std::move(handler), {}, size);
+                        } else {
+                            self->retry_read(buffer, std::move(handler));
+                        }
+                    } else if (error) {
+                        spdlog::warn("HTTP forward proxy request body parse failed: {}",
+                                     error.message());
+                        self->post_read(std::move(handler), error, 0);
+                    } else if (size != 0) {
+                        self->post_read(std::move(handler), {}, size);
+                    } else if (self->parser_->is_done()) {
+                        self->post_read(std::move(handler), boost::asio::error::eof, 0);
+                    } else {
+                        self->retry_read(buffer, std::move(handler));
+                    }
+                });
+        });
+    }
+
+    std::vector<transport::HttpHeader> trailers() const override {
+        std::vector<transport::HttpHeader> result;
+        if (!parser_->is_done()) {
+            return result;
+        }
+        const auto &fields = parser_->get().base();
+        auto field = fields.begin();
+        for (std::size_t index = 0; index < initial_header_count_ && field != fields.end();
+             ++index, ++field) {
+        }
+        for (; field != fields.end(); ++field) {
+            const auto name = as_std_view(field->name_string());
+            const auto normalized = lowercase_ascii(name);
+            if (!declared_trailers_.contains(normalized) ||
+                is_forbidden_trailer_field(normalized)) {
+                continue;
+            }
+            result.push_back({copy_view(field->name_string()), copy_view(field->value())});
+        }
+        return result;
+    }
+
+    void cancel() noexcept override {
+        const auto self = shared_from_this();
+        boost::asio::dispatch(executor_, [self] {
+            if (self->cancelled_) {
+                return;
+            }
+            self->cancelled_ = true;
+            boost::system::error_code ignored;
+            self->socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_receive, ignored);
+        });
+    }
+
+  private:
+    void retry_read(boost::asio::mutable_buffer buffer, ReadHandler handler) {
+        auto self = shared_from_this();
+        boost::asio::post(executor_, [self, buffer, handler = std::move(handler)]() mutable {
+            self->async_read_some(buffer, std::move(handler));
+        });
+    }
+
+    void post_read(ReadHandler handler, boost::system::error_code error, std::size_t size) {
+        boost::asio::post(executor_, [handler = std::move(handler), error, size]() mutable {
+            if (handler) {
+                handler(error, size);
+            }
+        });
+    }
+
+    boost::asio::ip::tcp::socket &socket_;
+    boost::beast::flat_buffer &buffer_;
+    std::shared_ptr<Parser> parser_;
+    boost::asio::any_io_executor executor_;
+    std::size_t initial_header_count_ = 0;
+    std::unordered_set<std::string> declared_trailers_;
+    ByteHandler byte_handler_;
+    bool reading_ = false;
+    bool cancelled_ = false;
+};
 
 std::uint8_t socks_error_code(const std::optional<core::Error> &error) {
     if (!error) {
@@ -176,15 +553,12 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
                                         return;
                                     }
 
-                                    if (self->protocol_byte_[0] == 'C') {
-                                        self->protocol_ = Protocol::http;
-                                        self->http_buffer_.sputc(
-                                            static_cast<char>(self->protocol_byte_[0]));
-                                        self->read_http_headers();
-                                        return;
-                                    }
-
-                                    self->close();
+                                    self->protocol_ = Protocol::http;
+                                    auto prepared = self->http_buffer_.prepare(1);
+                                    boost::asio::buffer_copy(
+                                        prepared, boost::asio::buffer(self->protocol_byte_));
+                                    self->http_buffer_.commit(1);
+                                    self->read_http_headers();
                                 });
     }
 
@@ -340,50 +714,187 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     }
 
     void read_http_headers() {
+        http_request_parser_ = std::make_shared<ProxyRequestBodyStream::Parser>();
+        http_request_parser_->header_limit(64 * 1024);
+        http_request_parser_->body_limit((std::numeric_limits<std::uint64_t>::max)());
+        http_request_parser_->merge_all_trailers(true);
         auto self = shared_from_this();
-        boost::asio::async_read_until(
-            client_, http_buffer_, "\r\n\r\n",
+        http::async_read_header(
+            client_, http_buffer_, *http_request_parser_,
             [self](const boost::system::error_code &error, std::size_t) {
                 if (error) {
-                    self->close();
+                    const auto status = error == http::error::header_limit ? 431 : 400;
+                    self->send_http_forward_response(
+                        status, status == 431 ? "Request Header Fields Too Large" : "Bad Request");
                     return;
                 }
 
-                const std::string request(boost::asio::buffers_begin(self->http_buffer_.data()),
-                                          boost::asio::buffers_end(self->http_buffer_.data()));
-                self->http_buffer_.consume(self->http_buffer_.size());
-
-                const auto header_end = request.find("\r\n\r\n");
-                const auto line_end = request.find("\r\n");
-                if (header_end == std::string::npos || line_end == std::string::npos) {
-                    self->send_http_response(400, "Bad Request", false);
-                    return;
-                }
-
-                std::istringstream line(request.substr(0, line_end));
-                std::string method;
-                std::string authority;
-                std::string version;
-                line >> method >> authority >> version;
+                const auto &request = self->http_request_parser_->get();
+                const auto method = copy_view(request.method_string());
                 if (method != "CONNECT") {
-                    self->send_http_response(405, "Method Not Allowed", false);
+                    self->begin_http_forward();
                     return;
                 }
-                if (version != "HTTP/1.1" && version != "HTTP/1.0") {
-                    self->send_http_response(400, "Bad Request", false);
+                if (request.version() != 10 && request.version() != 11) {
+                    self->send_http_forward_response(400, "Bad Request");
                     return;
                 }
 
+                const auto authority = copy_view(request.target());
                 const auto destination = parse_http_authority(authority);
                 if (!destination) {
-                    self->send_http_response(400, "Bad Request", false);
+                    self->send_http_forward_response(400, "Bad Request");
                     return;
                 }
 
-                const auto body_offset = header_end + 4;
-                self->http_initial_data_.assign(request.begin() + body_offset, request.end());
+                const auto buffered = self->http_buffer_.size();
+                self->http_initial_data_.resize(buffered);
+                if (buffered != 0) {
+                    boost::asio::buffer_copy(boost::asio::buffer(self->http_initial_data_),
+                                             self->http_buffer_.data());
+                    self->http_buffer_.consume(buffered);
+                }
                 self->open_target(*destination);
             });
+    }
+
+    void begin_http_forward() {
+        const auto &request = http_request_parser_->get();
+        if (request.version() != 11) {
+            send_http_forward_response(505, "HTTP Version Not Supported");
+            return;
+        }
+
+        const auto target_text = copy_view(request.target());
+        if (target_text == "*" && request.method() == http::verb::options) {
+            send_http_forward_response(200, "OK", "Allow: CONNECT, OPTIONS\r\n");
+            return;
+        }
+        const auto parsed_target = parse_http_absolute_target(target_text);
+        if (!parsed_target) {
+            const auto scheme_end = target_text.find("://");
+            if (scheme_end != std::string::npos &&
+                lowercase_ascii(std::string_view(target_text).substr(0, scheme_end)) != "http") {
+                send_http_forward_response(501, "Not Implemented");
+            } else {
+                send_http_forward_response(400, "Bad Request");
+            }
+            return;
+        }
+
+        std::unordered_set<std::string> connection_options;
+        if (!collect_connection_options(request.base(), connection_options)) {
+            send_http_forward_response(400, "Bad Request");
+            return;
+        }
+        for (const auto &option : connection_options) {
+            if (option == "content-length" || option == "host" || option == "transfer-encoding") {
+                send_http_forward_response(400, "Bad Request");
+                return;
+            }
+        }
+
+        std::unordered_set<std::string> declared_trailers;
+        std::vector<std::string> trailer_names;
+        if (!collect_declared_trailers(request.base(), connection_options, declared_trailers,
+                                       trailer_names)) {
+            send_http_forward_response(400, "Bad Request");
+            return;
+        }
+
+        bool expects_continue = false;
+        for (const auto &field : request.base()) {
+            if (is_http_header(as_std_view(field.name_string()), "expect")) {
+                if (lowercase_ascii(trim_http_whitespace(as_std_view(field.value()))) !=
+                    "100-continue") {
+                    send_http_forward_response(417, "Expectation Failed");
+                    return;
+                }
+                expects_continue = true;
+            }
+        }
+
+        bool has_upgrade = false;
+        for (const auto &field : request.base()) {
+            if (is_http_header(as_std_view(field.name_string()), "upgrade") &&
+                !field.value().empty()) {
+                has_upgrade = true;
+            }
+        }
+        if (has_upgrade || connection_options.contains("upgrade")) {
+            send_http_forward_response(501, "Not Implemented");
+            return;
+        }
+
+        http_forward_request_ = {};
+        http_forward_request_.request.method = copy_view(request.method_string());
+        http_forward_request_method_ = http_forward_request_.request.method;
+        http_forward_request_.request.scheme = "http";
+        http_forward_request_.request.authority = parsed_target->authority;
+        http_forward_request_.request.target = parsed_target->origin_target;
+        if (request.method() == http::verb::options && parsed_target->empty_path_and_query) {
+            http_forward_request_.request.target = "*";
+        }
+        http_forward_request_.request.keep_alive = false;
+        if (const auto content_length = http_request_parser_->content_length()) {
+            http_forward_request_.content_length = *content_length;
+        }
+        if (http_request_parser_->is_done()) {
+            http_forward_request_.content_length = 0;
+        } else {
+            const auto header_count = static_cast<std::size_t>(
+                std::distance(request.base().begin(), request.base().end()));
+            http_request_body_ = std::make_shared<ProxyRequestBodyStream>(
+                client_, http_buffer_, http_request_parser_, header_count,
+                std::move(declared_trailers),
+                [this](std::size_t size) { http_forward_request_bytes_ += size; });
+            http_forward_request_.body = http_request_body_;
+        }
+
+        for (const auto &field : request.base()) {
+            const auto name = as_std_view(field.name_string());
+            if (is_http_header(name, "host") || is_http_header(name, "content-length") ||
+                is_http_header(name, "expect") || is_http_header(name, "trailer") ||
+                is_hop_by_hop_or_proxy_header(name, connection_options)) {
+                continue;
+            }
+            http_forward_request_.request.headers.push_back(
+                {std::string(name), copy_view(field.value())});
+        }
+        http_forward_request_.request.headers.push_back({"Host", parsed_target->authority});
+
+        if (http_forward_request_.body && !trailer_names.empty()) {
+            std::string value;
+            for (const auto &name : trailer_names) {
+                if (!value.empty()) {
+                    value.append(", ");
+                }
+                value.append(name);
+            }
+            http_forward_request_.request.headers.push_back({"Trailer", std::move(value)});
+        }
+
+        if (expects_continue) {
+            auto self = shared_from_this();
+            interim_http_response_ = "HTTP/1.1 100 Continue\r\n\r\n";
+            boost::asio::async_write(
+                client_, boost::asio::buffer(interim_http_response_),
+                [self, destination = parsed_target->destination](
+                    const boost::system::error_code &error, std::size_t) mutable {
+                    if (error) {
+                        self->close();
+                        return;
+                    }
+                    self->open_http_forward_target(std::move(destination));
+                });
+            return;
+        }
+        open_http_forward_target(parsed_target->destination);
+    }
+
+    void open_http_forward_target(core::Destination destination) {
+        http_forward_ = true;
+        open_target(std::move(destination));
     }
 
     void open_target(core::Destination destination) {
@@ -712,6 +1223,10 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
             }
             if (protocol_ == Protocol::socks5) {
                 send_socks_reply(socks_error_code(result.error), false);
+            } else if (http_forward_) {
+                const auto status =
+                    result.error && result.error->code == core::ErrorCode::rejected ? 403 : 502;
+                send_http_forward_response(status, status == 403 ? "Forbidden" : "Bad Gateway");
             } else {
                 const auto status =
                     result.error && result.error->code == core::ErrorCode::rejected ? 403 : 502;
@@ -723,9 +1238,217 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         remote_ = std::move(result.handle);
         if (protocol_ == Protocol::socks5) {
             send_socks_reply(0x00, true);
+        } else if (http_forward_) {
+            start_http_forward_exchange();
         } else {
             send_http_response(200, "Connection Established", true);
         }
+    }
+
+    void start_http_forward_exchange() {
+        http_session_ = transport::make_http1_client_session(std::move(remote_));
+        if (!http_session_) {
+            send_http_forward_response(502, "Bad Gateway");
+            return;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+        auto self = shared_from_this();
+        http_exchange_id_ = http_session_->exchange_streaming(
+            std::move(http_forward_request_), deadline,
+            [self](core::Result<transport::HttpStreamingResponse> result) mutable {
+                self->handle_http_forward_response(std::move(result));
+            });
+    }
+
+    void handle_http_forward_response(core::Result<transport::HttpStreamingResponse> result) {
+        if (closed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (!result) {
+            const auto status = result.error().code == core::ErrorCode::rejected ? 403 : 502;
+            send_http_forward_response(status, status == 403 ? "Forbidden" : "Bad Gateway");
+            return;
+        }
+
+        http_forward_response_ = std::move(result.value());
+        const auto status = http_forward_response_.response.status;
+        if (status < 200 || status == 101 || status > 599) {
+            send_http_forward_response(502, "Bad Gateway");
+            return;
+        }
+
+        const bool has_body = !http_forward_request_method_is("HEAD") && status != 204 &&
+                              status != 205 && status != 304 &&
+                              static_cast<bool>(http_forward_response_.body);
+        http_response_ =
+            build_http_forward_response_headers(http_forward_response_.response, has_body);
+        auto self = shared_from_this();
+        boost::asio::async_write(
+            client_, boost::asio::buffer(http_response_),
+            [self, has_body](const boost::system::error_code &error, std::size_t size) {
+                if (error) {
+                    self->close();
+                    return;
+                }
+                self->http_forward_response_bytes_ += size;
+                if (!has_body) {
+                    if (self->http_forward_response_.body) {
+                        self->http_forward_response_.body->cancel();
+                    }
+                    self->finish_http_forward();
+                    return;
+                }
+                self->read_http_forward_response_body();
+            });
+    }
+
+    bool http_forward_request_method_is(std::string_view method) const noexcept {
+        return http_forward_request_method_ == method;
+    }
+
+    std::string build_http_forward_response_headers(const transport::HttpResponse &response,
+                                                    bool has_body) {
+        std::unordered_set<std::string> connection_options;
+        for (const auto &header : response.headers) {
+            if (!is_http_header(header.name, "connection")) {
+                continue;
+            }
+            std::string_view value(header.value);
+            while (true) {
+                const auto comma = value.find(',');
+                const auto option = trim_http_whitespace(value.substr(0, comma));
+                if (is_http_token(option)) {
+                    connection_options.emplace(lowercase_ascii(option));
+                }
+                if (comma == std::string_view::npos) {
+                    break;
+                }
+                value.remove_prefix(comma + 1);
+            }
+        }
+
+        const auto reason = http::obsolete_reason(static_cast<http::status>(response.status));
+        std::string output = fmt::format("HTTP/1.1 {} {}\r\n", response.status, copy_view(reason));
+        const bool preserve_content_length =
+            http_forward_request_method_is("HEAD") || response.status == 304;
+        for (const auto &header : response.headers) {
+            if (is_hop_by_hop_or_proxy_header(header.name, connection_options) ||
+                (is_http_header(header.name, "content-length") && !preserve_content_length)) {
+                continue;
+            }
+            output.append(header.name);
+            output.append(": ");
+            output.append(header.value);
+            output.append("\r\n");
+        }
+        if (has_body) {
+            output.append("Transfer-Encoding: chunked\r\n");
+        }
+        output.append("Connection: close\r\nProxy-Agent: clash-native\r\n\r\n");
+        return output;
+    }
+
+    void read_http_forward_response_body() {
+        if (closed_.load(std::memory_order_acquire) || !http_forward_response_.body) {
+            finish_http_forward();
+            return;
+        }
+        auto self = shared_from_this();
+        http_forward_response_.body->async_read_some(
+            boost::asio::buffer(http_forward_response_buffer_),
+            [self](const boost::system::error_code &error, std::size_t size) {
+                if (self->closed_.load(std::memory_order_acquire)) {
+                    return;
+                }
+                if (error == boost::asio::error::eof) {
+                    self->write_http_forward_response_trailers();
+                    return;
+                }
+                if (error) {
+                    spdlog::warn("HTTP forward proxy upstream response body read failed: {}",
+                                 error.message());
+                    self->close();
+                    return;
+                }
+                if (size == 0) {
+                    boost::asio::post(self->client_.get_executor(),
+                                      [self] { self->read_http_forward_response_body(); });
+                    return;
+                }
+
+                auto framed = std::make_shared<std::vector<std::uint8_t>>();
+                const auto chunk_size = fmt::format("{:x}\r\n", size);
+                framed->reserve(chunk_size.size() + size + 2);
+                framed->insert(framed->end(), chunk_size.begin(), chunk_size.end());
+                framed->insert(framed->end(), self->http_forward_response_buffer_.begin(),
+                               self->http_forward_response_buffer_.begin() + size);
+                framed->insert(framed->end(), {'\r', '\n'});
+                boost::asio::async_write(
+                    self->client_, boost::asio::buffer(*framed),
+                    [self, framed](const boost::system::error_code &write_error,
+                                   std::size_t written) {
+                        if (write_error) {
+                            self->close();
+                            return;
+                        }
+                        self->http_forward_response_bytes_ += written;
+                        self->read_http_forward_response_body();
+                    });
+            });
+    }
+
+    void write_http_forward_response_trailers() {
+        std::string final_chunk = "0\r\n";
+        if (http_forward_response_.body) {
+            std::unordered_set<std::string> no_connection_options;
+            for (const auto &trailer : http_forward_response_.body->trailers()) {
+                if (!is_http_token(trailer.name) ||
+                    is_hop_by_hop_or_proxy_header(trailer.name, no_connection_options) ||
+                    is_http_header(trailer.name, "content-length") ||
+                    is_http_header(trailer.name, "host")) {
+                    continue;
+                }
+                final_chunk.append(trailer.name);
+                final_chunk.append(": ");
+                final_chunk.append(trailer.value);
+                final_chunk.append("\r\n");
+            }
+        }
+        final_chunk.append("\r\n");
+        http_response_ = std::move(final_chunk);
+        auto self = shared_from_this();
+        boost::asio::async_write(client_, boost::asio::buffer(http_response_),
+                                 [self](const boost::system::error_code &error, std::size_t size) {
+                                     if (error) {
+                                         self->close();
+                                         return;
+                                     }
+                                     self->http_forward_response_bytes_ += size;
+                                     self->finish_http_forward();
+                                 });
+    }
+
+    void finish_http_forward() {
+        if (connection_id_ && owner_.connection_registry_) {
+            owner_.connection_registry_->update_stats(*connection_id_, http_forward_request_bytes_,
+                                                      http_forward_response_bytes_);
+        }
+        close();
+    }
+
+    void send_http_forward_response(int status, std::string_view reason,
+                                    std::string_view extra_headers = {}) {
+        if (closed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        http_response_ =
+            fmt::format("HTTP/1.1 {} {}\r\n{}Content-Length: 0\r\nConnection: close\r\n"
+                        "Proxy-Agent: clash-native\r\n\r\n",
+                        status, reason, extra_headers);
+        auto self = shared_from_this();
+        boost::asio::async_write(
+            client_, boost::asio::buffer(http_response_),
+            [self](const boost::system::error_code &, std::size_t) { self->close(); });
     }
 
     void send_socks_reply(std::uint8_t reply, bool start_relay) {
@@ -823,6 +1546,21 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         if (remote_) {
             remote_->close();
         }
+        if (http_request_body_) {
+            http_request_body_->cancel();
+            http_request_body_.reset();
+        }
+        if (http_forward_response_.body) {
+            http_forward_response_.body->cancel();
+            http_forward_response_.body.reset();
+        }
+        if (http_session_) {
+            if (http_exchange_id_ != 0) {
+                http_session_->cancel(http_exchange_id_);
+            }
+            http_session_->stop();
+            http_session_.reset();
+        }
         if (udp_relay_socket_) {
             udp_relay_socket_->close();
             udp_relay_socket_.reset();
@@ -859,6 +1597,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     std::optional<observability::ConnectionRegistry::ConnectionId> connection_id_;
     std::atomic_bool closed_{false};
     Protocol protocol_ = Protocol::socks5;
+    bool http_forward_ = false;
 
     std::array<std::uint8_t, 1> protocol_byte_{};
     std::array<std::uint8_t, 2> method_header_{};
@@ -868,7 +1607,18 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     std::array<std::uint8_t, 1> domain_length_{};
     std::vector<std::uint8_t> request_body_;
     std::array<std::uint8_t, 22> reply_{};
-    boost::asio::streambuf http_buffer_;
+    boost::beast::flat_buffer http_buffer_;
+    std::shared_ptr<ProxyRequestBodyStream::Parser> http_request_parser_;
+    std::shared_ptr<ProxyRequestBodyStream> http_request_body_;
+    transport::HttpStreamingRequest http_forward_request_;
+    std::string http_forward_request_method_;
+    std::shared_ptr<transport::HttpClientSession> http_session_;
+    transport::HttpClientSession::ExchangeId http_exchange_id_ = 0;
+    transport::HttpStreamingResponse http_forward_response_;
+    std::array<std::uint8_t, 16 * 1024> http_forward_response_buffer_{};
+    std::uint64_t http_forward_request_bytes_ = 0;
+    std::uint64_t http_forward_response_bytes_ = 0;
+    std::string interim_http_response_;
     std::vector<std::uint8_t> http_initial_data_;
     std::string http_response_;
     std::shared_ptr<net::UdpStream> udp_relay_socket_;

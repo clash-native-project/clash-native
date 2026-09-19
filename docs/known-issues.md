@@ -32,3 +32,21 @@ This is not evidence that ordinary-sized DNS queries fail, nor does it establish
 ### Deferred investigation
 
 When this issue is resumed, preserve a repeatable Go burst probe, record send and receive counts separately, inspect the effective socket receive-buffer size, and exercise the C++ DNS UDP listener independently from QUIC. Test pacing and burst sizes separately, then validate large packets over a real network interface before attributing loss to IP fragmentation. No production behavior change is made as part of this issue record.
+
+## Local HTTP and SOCKS5 proxy listeners are plaintext and unauthenticated
+
+- **Status:** Accepted for the current local-proxy scope; inbound TLS and authentication are not implemented.
+- **Scope:** The local HTTP listener accepts plaintext HTTP/1.1, and the SOCKS5 listener negotiates only the no-authentication method. Neither listener wraps the client-to-proxy connection in TLS.
+
+For HTTPS destinations, the HTTP listener supports `CONNECT`; TLS then runs between the client and destination inside that tunnel. This does not encrypt the client-to-proxy hop. The TLS and Basic authentication options on an upstream HTTP proxy outbound are separate capabilities and do not add TLS or authentication to the local listeners.
+
+This is recorded as a scope limitation, not a current blocker for local use. Revisit it if the listeners are intended to serve remote clients.
+
+## HTTP/3 is not integrated as a proxy endpoint
+
+- **Status:** Deferred; the HTTP/3 client transport is implemented, but proxy ingress and HTTP-proxy outbound integration are not.
+- **Scope:** The local proxy listener and the HTTP proxy outbound node.
+
+The shared HTTP/3 client session supports buffered and streaming HTTP exchanges, CONNECT, and Extended CONNECT over QUIC. It is used by DoH/3 and has independent Go QUIC interoperability coverage, including concurrent streamed request and response bodies with trailers. This transport support does not make the local proxy listener or the HTTP proxy outbound speak HTTP/3.
+
+The local proxy listener currently accepts HTTP/1.1 over TCP. The HTTP proxy outbound uses HTTP/1.1 over TCP for plaintext endpoints, and negotiates HTTP/2 or HTTP/1.1 over TLS for TLS endpoints. It does not use QUIC or HTTP/3. Consequently, clients cannot connect to this project as an HTTP/3 proxy, and an HTTP/3 upstream proxy cannot currently be selected as an outbound. DoH/3 support is separate from both proxy paths.

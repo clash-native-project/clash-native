@@ -300,8 +300,22 @@ def main() -> int:
             environment["CLASH_NATIVE_TEST_HOST"] = str(
                 build_dir / "clash-native-test-host.exe"
             )
+            environment["CLASH_NATIVE_HTTP_TUNNEL_CLIENT"] = str(
+                build_dir / "clash-native-http-tunnel-client.exe"
+            )
+            environment["CLASH_NATIVE_GRPC_CLIENT"] = str(
+                build_dir / "clash-native-grpc-client.exe"
+            )
+            # Go's HTTP/2 server disables Extended CONNECT by default.
+            godebug = [
+                setting
+                for setting in environment.get("GODEBUG", "").split(",")
+                if setting and setting.split("=", 1)[0] != "http2xconnect"
+            ]
+            godebug.append("http2xconnect=1")
+            environment["GODEBUG"] = ",".join(godebug)
             run(
-                [str(go), "test", "./..."],
+                [str(go), "test", "-count=1", "./..."],
                 environment,
                 cwd=PROJECT_ROOT / "tests" / "interop",
             )

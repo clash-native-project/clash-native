@@ -1,3 +1,5 @@
+#include "http_body_stream.hpp"
+#include "http_tunnel_stream.hpp"
 #include <clash_native/transport/http_client.hpp>
 
 #include <boost/asio/any_io_executor.hpp>
@@ -9,14 +11,18 @@
 #include <boost/beast/http.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <charconv>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string_view>
 #include <system_error>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 
 namespace clash_native::transport {
 
@@ -24,7 +30,10 @@ namespace {
 
 namespace http = boost::beast::http;
 using HttpMessage = http::request<http::vector_body<std::uint8_t>>;
+using HttpTunnelMessage = http::request<http::empty_body>;
+using HttpStreamingMessage = http::request<http::empty_body>;
 using HttpResponseParser = http::response_parser<http::vector_body<std::uint8_t>>;
+using HttpStreamingResponseParser = http::response_parser<http::buffer_body>;
 
 // Beast's composed HTTP operations copy their stream and accept buffer
 // sequences, while StreamHandle exposes a unique owner and single buffers.
@@ -92,8 +101,174 @@ class Http1StreamAdapter {
         }
     }
 
+    std::shared_ptr<core::StreamHandle> take_handle() noexcept {
+        return std::exchange(handle_, {});
+    }
+
   private:
     std::shared_ptr<core::StreamHandle> handle_;
+};
+
+class Http1TunnelState final : public std::enable_shared_from_this<Http1TunnelState> {
+  public:
+    Http1TunnelState(std::shared_ptr<core::StreamHandle> stream, std::vector<std::uint8_t> buffered)
+        : stream_(std::move(stream)), buffered_(std::move(buffered)) {}
+
+    void async_read_some(boost::asio::mutable_buffer buffer,
+                         core::StreamHandle::ReadHandler handler) {
+        const auto self = shared_from_this();
+        if (buffer.size() == 0) {
+            post_read(std::move(handler), {}, 0);
+            return;
+        }
+        if (closed_) {
+            post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
+            return;
+        }
+        if (read_in_progress_) {
+            post_read(std::move(handler), boost::asio::error::already_started, 0);
+            return;
+        }
+        if (buffered_offset_ < buffered_.size()) {
+            const auto size = boost::asio::buffer_copy(
+                buffer, boost::asio::buffer(buffered_.data() + buffered_offset_,
+                                            buffered_.size() - buffered_offset_));
+            buffered_offset_ += size;
+            post_read(std::move(handler), {}, size);
+            return;
+        }
+        read_in_progress_ = true;
+        stream_->async_read_some(
+            buffer, [self, handler = std::move(handler)](const boost::system::error_code &error,
+                                                         std::size_t size) mutable {
+                self->read_in_progress_ = false;
+                if (handler) {
+                    handler(error, size);
+                }
+            });
+    }
+
+    void async_write(boost::asio::const_buffer buffer, core::StreamHandle::WriteHandler handler) {
+        const auto self = shared_from_this();
+        if (closed_ || local_closed_) {
+            post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
+            return;
+        }
+        if (write_in_progress_) {
+            post_write(std::move(handler), boost::asio::error::already_started, 0);
+            return;
+        }
+        if (buffer.size() == 0) {
+            post_write(std::move(handler), {}, 0);
+            return;
+        }
+        auto bytes = std::make_shared<std::vector<std::uint8_t>>(buffer.size());
+        boost::asio::buffer_copy(boost::asio::buffer(*bytes), buffer);
+        write_in_progress_ = true;
+        stream_->async_write(boost::asio::buffer(*bytes),
+                             [self, bytes, handler = std::move(handler)](
+                                 const boost::system::error_code &error, std::size_t size) mutable {
+                                 (void)bytes;
+                                 self->write_in_progress_ = false;
+                                 self->post_write(std::move(handler), error, size);
+                                 if (self->shutdown_requested_ && !self->closed_) {
+                                     self->shutdown_requested_ = false;
+                                     self->local_closed_ = true;
+                                     boost::system::error_code ignored;
+                                     self->stream_->shutdown_send(ignored);
+                                 }
+                             });
+    }
+
+    boost::asio::any_io_executor executor() noexcept { return stream_->executor(); }
+
+    boost::asio::ip::tcp::endpoint local_endpoint(boost::system::error_code &error) const noexcept {
+        return stream_->local_endpoint(error);
+    }
+
+    void shutdown_send(boost::system::error_code &error) noexcept {
+        error.clear();
+        if (closed_ || local_closed_) {
+            return;
+        }
+        if (write_in_progress_) {
+            shutdown_requested_ = true;
+            return;
+        }
+        local_closed_ = true;
+        stream_->shutdown_send(error);
+    }
+
+    void close() noexcept {
+        if (closed_) {
+            return;
+        }
+        closed_ = true;
+        local_closed_ = true;
+        buffered_.clear();
+        buffered_offset_ = 0;
+        stream_->close();
+    }
+
+  private:
+    void post_read(core::StreamHandle::ReadHandler handler, boost::system::error_code error,
+                   std::size_t size) {
+        boost::asio::post(stream_->executor(),
+                          [handler = std::move(handler), error, size]() mutable {
+                              if (handler) {
+                                  handler(error, size);
+                              }
+                          });
+    }
+
+    void post_write(core::StreamHandle::WriteHandler handler, boost::system::error_code error,
+                    std::size_t size) {
+        boost::asio::post(stream_->executor(),
+                          [handler = std::move(handler), error, size]() mutable {
+                              if (handler) {
+                                  handler(error, size);
+                              }
+                          });
+    }
+
+    std::shared_ptr<core::StreamHandle> stream_;
+    std::vector<std::uint8_t> buffered_;
+    std::size_t buffered_offset_ = 0;
+    bool read_in_progress_ = false;
+    bool write_in_progress_ = false;
+    bool shutdown_requested_ = false;
+    bool local_closed_ = false;
+    bool closed_ = false;
+};
+
+class Http1TunnelStream final : public core::StreamHandle {
+  public:
+    explicit Http1TunnelStream(std::shared_ptr<Http1TunnelState> state)
+        : state_(std::move(state)) {}
+
+    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+        state_->async_read_some(buffer, std::move(handler));
+    }
+
+    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
+        state_->async_write(buffer, std::move(handler));
+    }
+
+    boost::asio::any_io_executor executor() noexcept override { return state_->executor(); }
+
+    boost::asio::ip::tcp::endpoint
+    local_endpoint(boost::system::error_code &error) const noexcept override {
+        return state_->local_endpoint(error);
+    }
+
+    void shutdown_send(boost::system::error_code &error) noexcept override {
+        state_->shutdown_send(error);
+    }
+
+    void close() noexcept override { state_->close(); }
+
+  private:
+    std::shared_ptr<Http1TunnelState> state_;
 };
 
 core::Error io_error(std::string context, const boost::system::error_code &error) {
@@ -133,15 +308,40 @@ bool is_token(std::string_view value) {
     });
 }
 
-bool is_host_header(std::string_view name) {
-    if (name.size() != 4) {
-        return false;
-    }
-    constexpr std::string_view expected = "host";
-    return std::equal(name.begin(), name.end(), expected.begin(),
+bool is_header_name(std::string_view name, std::string_view expected) {
+    return name.size() == expected.size() &&
+           std::equal(name.begin(), name.end(), expected.begin(),
                       [](unsigned char actual, unsigned char wanted) {
                           return static_cast<unsigned char>(std::tolower(actual)) == wanted;
                       });
+}
+
+bool is_host_header(std::string_view name) { return is_header_name(name, "host"); }
+
+bool is_forbidden_trailer_name(std::string_view name) {
+    return is_header_name(name, "content-length") || is_header_name(name, "transfer-encoding") ||
+           is_header_name(name, "host") || is_header_name(name, "trailer") ||
+           is_header_name(name, "connection") || is_header_name(name, "proxy-authorization");
+}
+
+bool valid_trailer_declaration(std::string_view value) {
+    while (true) {
+        const auto separator = value.find(',');
+        auto name = value.substr(0, separator);
+        const auto first = name.find_first_not_of(" \t");
+        const auto last = name.find_last_not_of(" \t");
+        if (first == std::string_view::npos) {
+            return false;
+        }
+        name = name.substr(first, last - first + 1);
+        if (!is_token(name) || is_forbidden_trailer_name(name)) {
+            return false;
+        }
+        if (separator == std::string_view::npos) {
+            return true;
+        }
+        value.remove_prefix(separator + 1);
+    }
 }
 
 core::Result<HttpMessage> make_message(const HttpRequest &request) {
@@ -171,6 +371,172 @@ core::Result<HttpMessage> make_message(const HttpRequest &request) {
     message.body() = request.body;
     message.prepare_payload();
     return message;
+}
+
+core::Result<HttpStreamingMessage> make_streaming_message(const HttpStreamingRequest &request) {
+    if (!is_token(request.request.method) || request.request.target.empty() ||
+        has_uri_whitespace(request.request.target) ||
+        has_uri_whitespace(request.request.authority)) {
+        return core::fail(core::Error{core::ErrorCode::configuration,
+                                      "HTTP/1.1 method, target, or authority is invalid"});
+    }
+    if (request.body && !request.request.body.empty()) {
+        return core::fail(core::Error{core::ErrorCode::configuration,
+                                      "HTTP/1.1 streaming request cannot have a buffered body"});
+    }
+    if (!request.body && request.content_length &&
+        *request.content_length != request.request.body.size()) {
+        return core::fail(core::Error{core::ErrorCode::configuration,
+                                      "HTTP/1.1 buffered request body does not match its "
+                                      "content length"});
+    }
+
+    HttpStreamingMessage message;
+    message.method_string(request.request.method);
+    message.target(request.request.target);
+    message.version(11);
+    bool has_host = false;
+    bool has_trailer_declaration = false;
+    for (const auto &header : request.request.headers) {
+        if (!is_token(header.name) || has_http_control(header.value)) {
+            return core::fail(core::Error{core::ErrorCode::configuration,
+                                          "HTTP/1.1 header contains invalid characters"});
+        }
+        if (is_header_name(header.name, "content-length") ||
+            is_header_name(header.name, "transfer-encoding")) {
+            return core::fail(core::Error{core::ErrorCode::configuration,
+                                          "HTTP/1.1 streaming framing headers are managed by the "
+                                          "transport"});
+        }
+        if (is_header_name(header.name, "trailer")) {
+            if (!valid_trailer_declaration(header.value)) {
+                return core::fail(core::Error{core::ErrorCode::configuration,
+                                              "HTTP/1.1 Trailer declaration is invalid"});
+            }
+            has_trailer_declaration = true;
+        }
+        has_host = has_host || is_host_header(header.name);
+        message.insert(header.name, header.value);
+    }
+    if (has_trailer_declaration && (!request.body || request.content_length.has_value())) {
+        return core::fail(core::Error{core::ErrorCode::configuration,
+                                      "HTTP/1.1 trailers require an unknown-length body stream"});
+    }
+    if (!request.request.authority.empty() && !has_host) {
+        message.set(http::field::host, request.request.authority);
+    }
+    message.keep_alive(request.request.keep_alive);
+    if (request.body && request.content_length) {
+        message.content_length(*request.content_length);
+    } else if (request.body) {
+        message.chunked(true);
+    } else {
+        message.content_length(request.request.body.size());
+    }
+    return message;
+}
+
+core::Result<HttpTunnelMessage> make_tunnel_message(const HttpTunnelRequest &request) {
+    if (request.authority.empty() || has_uri_whitespace(request.authority)) {
+        return core::fail(
+            core::Error{core::ErrorCode::configuration, "HTTP/1.1 tunnel authority is invalid"});
+    }
+    if (request.mode == HttpTunnelMode::upgrade &&
+        (request.target.empty() || has_uri_whitespace(request.target) ||
+         !is_token(request.protocol))) {
+        return core::fail(core::Error{core::ErrorCode::configuration,
+                                      "HTTP/1.1 Upgrade target or protocol is invalid"});
+    }
+
+    HttpTunnelMessage message;
+    message.method(request.mode == HttpTunnelMode::connect ? http::verb::connect : http::verb::get);
+    message.target(request.mode == HttpTunnelMode::connect ? request.authority : request.target);
+    message.version(11);
+
+    bool has_host = false;
+    for (const auto &header : request.headers) {
+        if (!is_token(header.name) || has_http_control(header.value)) {
+            return core::fail(core::Error{core::ErrorCode::configuration,
+                                          "HTTP/1.1 tunnel header contains invalid characters"});
+        }
+        const auto name = std::string_view(header.name);
+        const bool connection_header =
+            name.size() == 10 &&
+            std::equal(name.begin(), name.end(), "connection",
+                       [](unsigned char actual, unsigned char wanted) {
+                           return static_cast<unsigned char>(std::tolower(actual)) == wanted;
+                       });
+        const bool upgrade_header =
+            name.size() == 7 &&
+            std::equal(name.begin(), name.end(), "upgrade",
+                       [](unsigned char actual, unsigned char wanted) {
+                           return static_cast<unsigned char>(std::tolower(actual)) == wanted;
+                       });
+        if (connection_header || upgrade_header || is_header_name(name, "content-length") ||
+            is_header_name(name, "transfer-encoding")) {
+            return core::fail(core::Error{core::ErrorCode::configuration,
+                                          "HTTP/1.1 tunnel framing, Connection, and Upgrade "
+                                          "headers are managed by the transport"});
+        }
+        has_host = has_host || is_host_header(header.name);
+        message.insert(header.name, header.value);
+    }
+    if (!has_host) {
+        message.set(http::field::host, request.authority);
+    }
+    if (request.mode == HttpTunnelMode::upgrade) {
+        message.set(http::field::connection, "Upgrade");
+        message.set(http::field::upgrade, request.protocol);
+    }
+    return message;
+}
+
+const std::string *find_header(const HttpResponse &response, std::string_view name) {
+    for (const auto &header : response.headers) {
+        if (header.name.size() == name.size() &&
+            std::equal(header.name.begin(), header.name.end(), name.begin(),
+                       [](unsigned char actual, unsigned char wanted) {
+                           return static_cast<unsigned char>(std::tolower(actual)) == wanted;
+                       })) {
+            return &header.value;
+        }
+    }
+    return nullptr;
+}
+
+bool contains_header_token(std::string_view value, std::string_view token) {
+    while (!value.empty()) {
+        const auto separator = value.find(',');
+        auto item = value.substr(0, separator);
+        const auto first = item.find_first_not_of(" \t");
+        const auto last = item.find_last_not_of(" \t");
+        if (first != std::string_view::npos) {
+            item = item.substr(first, last - first + 1);
+            if (item.size() == token.size() &&
+                std::equal(item.begin(), item.end(), token.begin(),
+                           [](unsigned char actual, unsigned char wanted) {
+                               return static_cast<unsigned char>(std::tolower(actual)) == wanted;
+                           })) {
+                return true;
+            }
+        }
+        if (separator == std::string_view::npos) {
+            break;
+        }
+        value.remove_prefix(separator + 1);
+    }
+    return false;
+}
+
+bool tunnel_accepted(const HttpTunnelRequest &request, const HttpResponse &response) {
+    if (request.mode == HttpTunnelMode::connect) {
+        return response.status >= 200 && response.status < 300;
+    }
+    const auto *upgrade = find_header(response, "upgrade");
+    const auto *connection = find_header(response, "connection");
+    return response.status == 101 && upgrade != nullptr && connection != nullptr &&
+           contains_header_token(*upgrade, request.protocol) &&
+           contains_header_token(*connection, "upgrade");
 }
 
 HttpResponse make_response(http::response<http::vector_body<std::uint8_t>> message) {
@@ -234,18 +600,95 @@ class Http1ClientSession final : public HttpClientSession,
         return exchange_id;
     }
 
+    ExchangeId exchange_streaming(HttpStreamingRequest request,
+                                  std::chrono::steady_clock::time_point deadline,
+                                  StreamingHandler handler) override {
+        const auto exchange_id = next_exchange_id();
+        if (stopped_ || retired_) {
+            post_streaming_result(
+                std::move(handler),
+                core::fail(core::Error{core::ErrorCode::cancelled,
+                                       "HTTP/1.1 session is not accepting requests"}));
+            return exchange_id;
+        }
+        const auto message = make_streaming_message(request);
+        if (!message) {
+            post_streaming_result(std::move(handler), core::fail(message.error()));
+            return exchange_id;
+        }
+        if (deadline <= std::chrono::steady_clock::now()) {
+            post_streaming_result(std::move(handler), core::fail(timeout_error()));
+            return exchange_id;
+        }
+
+        auto pending = std::make_shared<Pending>(executor_);
+        pending->is_streaming = true;
+        pending->streaming_request = std::move(request);
+        pending->streaming_message = std::move(message.value());
+        pending->streaming_handler = std::move(handler);
+        pending->timer.expires_at(deadline);
+        const auto self = shared_from_this();
+        pending->timer.async_wait([self, exchange_id](const boost::system::error_code &error) {
+            if (!error) {
+                self->expire(exchange_id);
+            }
+        });
+        pending_.emplace(exchange_id, std::move(pending));
+        queue_.push_back(exchange_id);
+        start_next();
+        return exchange_id;
+    }
+
+    ExchangeId open_tunnel(HttpTunnelRequest request,
+                           std::chrono::steady_clock::time_point deadline,
+                           TunnelHandler handler) override {
+        const auto exchange_id = next_exchange_id();
+        if (stopped_ || retired_) {
+            post_tunnel_result(
+                std::move(handler),
+                core::fail(core::Error{core::ErrorCode::cancelled,
+                                       "HTTP/1.1 session is not accepting requests"}));
+            return exchange_id;
+        }
+        const auto message = make_tunnel_message(request);
+        if (!message) {
+            post_tunnel_result(std::move(handler), core::fail(message.error()));
+            return exchange_id;
+        }
+        if (deadline <= std::chrono::steady_clock::now()) {
+            post_tunnel_result(std::move(handler), core::fail(timeout_error()));
+            return exchange_id;
+        }
+
+        auto pending = std::make_shared<Pending>(executor_);
+        pending->is_tunnel = true;
+        pending->tunnel_request = std::move(request);
+        pending->message = std::move(message.value());
+        pending->tunnel_handler = std::move(handler);
+        pending->timer.expires_at(deadline);
+        const auto self = shared_from_this();
+        pending->timer.async_wait([self, exchange_id](const boost::system::error_code &error) {
+            if (!error) {
+                self->expire(exchange_id);
+            }
+        });
+        pending_.emplace(exchange_id, std::move(pending));
+        queue_.push_back(exchange_id);
+        start_next();
+        return exchange_id;
+    }
+
     void cancel(ExchangeId exchange_id) noexcept override {
         const auto found = pending_.find(exchange_id);
         if (found == pending_.end()) {
             return;
         }
         if (active_id_ == exchange_id) {
-            retire_all(exchange_id, core::fail(cancelled_error()),
-                       core::fail(core::Error{core::ErrorCode::cancelled,
-                                              "HTTP/1.1 connection was retired"}));
+            retire_all(exchange_id, cancelled_error(),
+                       core::Error{core::ErrorCode::cancelled, "HTTP/1.1 connection was retired"});
             return;
         }
-        complete(exchange_id, core::fail(cancelled_error()));
+        complete_error(exchange_id, cancelled_error());
         start_next();
     }
 
@@ -265,10 +708,30 @@ class Http1ClientSession final : public HttpClientSession,
     struct Pending {
         explicit Pending(boost::asio::any_io_executor executor) : timer(std::move(executor)) {}
 
+        bool is_tunnel = false;
+        bool is_streaming = false;
+        bool streaming_headers_delivered = false;
+        bool streaming_response_done = false;
+        bool streaming_response_read_pending = false;
+        bool streaming_request_chunked = false;
+        std::uint64_t streaming_request_written = 0;
+        std::size_t streaming_response_queued = 0;
+        std::size_t streaming_header_field_count = 0;
         HttpRequest request;
-        HttpMessage message;
+        HttpStreamingRequest streaming_request;
+        HttpTunnelRequest tunnel_request;
+        std::variant<HttpMessage, HttpTunnelMessage> message;
+        HttpStreamingMessage streaming_message;
+        std::unique_ptr<http::request_serializer<http::empty_body>> streaming_serializer;
         std::unique_ptr<HttpResponseParser> parser;
+        std::unique_ptr<HttpStreamingResponseParser> streaming_parser;
+        std::shared_ptr<detail::QueuedHttpBodyStream> streaming_response_body;
+        std::array<std::uint8_t, 16 * 1024> streaming_request_buffer{};
+        std::array<std::uint8_t, 1> streaming_request_probe{};
+        std::array<std::uint8_t, 16 * 1024> streaming_response_buffer{};
         Handler handler;
+        StreamingHandler streaming_handler;
+        TunnelHandler tunnel_handler;
         boost::asio::steady_timer timer;
     };
 
@@ -281,6 +744,25 @@ class Http1ClientSession final : public HttpClientSession,
     }
 
     void post_result(Handler handler, core::Result<HttpResponse> result) {
+        boost::asio::post(executor_,
+                          [handler = std::move(handler), result = std::move(result)]() mutable {
+                              if (handler) {
+                                  handler(std::move(result));
+                              }
+                          });
+    }
+
+    void post_tunnel_result(TunnelHandler handler, core::Result<HttpTunnelResponse> result) {
+        boost::asio::post(executor_,
+                          [handler = std::move(handler), result = std::move(result)]() mutable {
+                              if (handler) {
+                                  handler(std::move(result));
+                              }
+                          });
+    }
+
+    void post_streaming_result(StreamingHandler handler,
+                               core::Result<HttpStreamingResponse> result) {
         boost::asio::post(executor_,
                           [handler = std::move(handler), result = std::move(result)]() mutable {
                               if (handler) {
@@ -302,23 +784,572 @@ class Http1ClientSession final : public HttpClientSession,
             }
             active_id_ = exchange_id;
             auto pending = found->second;
+            if (pending->is_streaming) {
+                pending->streaming_request_chunked =
+                    pending->streaming_request.body != nullptr &&
+                    !pending->streaming_request.content_length.has_value();
+                pending->streaming_serializer =
+                    std::make_unique<http::request_serializer<http::empty_body>>(
+                        pending->streaming_message);
+                const auto self = shared_from_this();
+                http::async_write_header(
+                    *stream_, *pending->streaming_serializer,
+                    [self, exchange_id, pending](const boost::system::error_code &error,
+                                                 std::size_t) {
+                        if (self->stopped_ || self->retired_ || self->active_id_ != exchange_id) {
+                            return;
+                        }
+                        if (error) {
+                            self->fail_active(exchange_id, error,
+                                              "failed to write HTTP/1.1 streaming request header");
+                            return;
+                        }
+                        pending->streaming_serializer.reset();
+                        if (pending->streaming_request.body) {
+                            self->read_streaming_request_body(exchange_id, pending);
+                        } else if (!pending->streaming_request.request.body.empty()) {
+                            const auto body =
+                                boost::asio::buffer(pending->streaming_request.request.body);
+                            boost::asio::async_write(
+                                *self->stream_, body,
+                                [self, exchange_id, pending](
+                                    const boost::system::error_code &body_error, std::size_t) {
+                                    if (self->stopped_ || self->retired_ ||
+                                        self->active_id_ != exchange_id) {
+                                        return;
+                                    }
+                                    if (body_error) {
+                                        self->fail_active(
+                                            exchange_id, body_error,
+                                            "failed to write HTTP/1.1 buffered streaming body");
+                                        return;
+                                    }
+                                    self->read_streaming_response_header(exchange_id, pending);
+                                });
+                        } else {
+                            self->read_streaming_response_header(exchange_id, pending);
+                        }
+                    });
+                return;
+            }
             pending->parser = std::make_unique<HttpResponseParser>();
-            pending->parser->body_limit(pending->request.response_body_limit);
+            pending->parser->body_limit(pending->is_tunnel
+                                            ? pending->tunnel_request.rejection_body_limit
+                                            : pending->request.response_body_limit);
             const auto self = shared_from_this();
-            http::async_write(
-                *stream_, pending->message,
-                [self, exchange_id, pending](const boost::system::error_code &error, std::size_t) {
-                    if (self->stopped_ || self->retired_ || self->active_id_ != exchange_id) {
+            std::visit(
+                [this, self, exchange_id, pending](const auto &message) {
+                    http::async_write(*stream_, message,
+                                      [self, exchange_id, pending](
+                                          const boost::system::error_code &error, std::size_t) {
+                                          if (self->stopped_ || self->retired_ ||
+                                              self->active_id_ != exchange_id) {
+                                              return;
+                                          }
+                                          if (error) {
+                                              self->fail_active(exchange_id, error,
+                                                                "failed to write HTTP/1.1 request");
+                                              return;
+                                          }
+                                          if (pending->is_tunnel) {
+                                              self->read_tunnel_response_header(exchange_id,
+                                                                                pending);
+                                          } else {
+                                              self->read_response(exchange_id, pending);
+                                          }
+                                      });
+                },
+                pending->message);
+            return;
+        }
+    }
+
+    void read_streaming_request_body(ExchangeId exchange_id,
+                                     const std::shared_ptr<Pending> &pending) {
+        if (stopped_ || retired_ || active_id_ != exchange_id || !pending->streaming_request.body) {
+            return;
+        }
+        if (pending->streaming_request.content_length &&
+            pending->streaming_request_written == *pending->streaming_request.content_length) {
+            probe_streaming_request_eof(exchange_id, pending);
+            return;
+        }
+
+        auto buffer = boost::asio::buffer(pending->streaming_request_buffer);
+        if (pending->streaming_request.content_length) {
+            const auto remaining =
+                *pending->streaming_request.content_length - pending->streaming_request_written;
+            buffer =
+                boost::asio::buffer(pending->streaming_request_buffer.data(),
+                                    std::min<std::size_t>(pending->streaming_request_buffer.size(),
+                                                          static_cast<std::size_t>(remaining)));
+        }
+        const auto self = shared_from_this();
+        pending->streaming_request.body->async_read_some(
+            buffer,
+            [self, exchange_id, pending](const boost::system::error_code &error, std::size_t size) {
+                boost::asio::dispatch(self->executor_, [self, exchange_id, pending, error, size] {
+                    self->handle_streaming_request_body(exchange_id, pending, error, size);
+                });
+            });
+    }
+
+    void probe_streaming_request_eof(ExchangeId exchange_id,
+                                     const std::shared_ptr<Pending> &pending) {
+        const auto self = shared_from_this();
+        pending->streaming_request.body->async_read_some(
+            boost::asio::buffer(pending->streaming_request_probe),
+            [self, exchange_id, pending](const boost::system::error_code &error, std::size_t size) {
+                boost::asio::dispatch(self->executor_, [self, exchange_id, pending, error, size] {
+                    if (self->active_id_ != exchange_id || self->retired_ || self->stopped_) {
+                        return;
+                    }
+                    if (error != boost::asio::error::eof || size != 0) {
+                        self->fail_streaming_request(
+                            exchange_id, pending,
+                            protocol_error("HTTP/1.1 request body exceeded its content length"));
+                        return;
+                    }
+                    if (!pending->streaming_request.body->trailers().empty()) {
+                        self->fail_streaming_request(
+                            exchange_id, pending,
+                            protocol_error("HTTP/1.1 content-length request cannot have trailers"));
+                        return;
+                    }
+                    self->read_streaming_response_header(exchange_id, pending);
+                });
+            });
+    }
+
+    void handle_streaming_request_body(ExchangeId exchange_id,
+                                       const std::shared_ptr<Pending> &pending,
+                                       const boost::system::error_code &error, std::size_t size) {
+        if (active_id_ != exchange_id || retired_ || stopped_) {
+            return;
+        }
+        if (error && error != boost::asio::error::eof) {
+            fail_streaming_request(exchange_id, pending,
+                                   io_error("failed to read HTTP/1.1 request body", error));
+            return;
+        }
+        if (size == 0) {
+            if (error == boost::asio::error::eof) {
+                if (pending->streaming_request.content_length &&
+                    pending->streaming_request_written !=
+                        *pending->streaming_request.content_length) {
+                    fail_streaming_request(
+                        exchange_id, pending,
+                        protocol_error("HTTP/1.1 request body ended before its content length"));
+                    return;
+                }
+                finish_streaming_request_body(exchange_id, pending);
+                return;
+            }
+            fail_streaming_request(exchange_id, pending,
+                                   protocol_error("HTTP/1.1 request body source made no progress"));
+            return;
+        }
+
+        if (pending->streaming_request.content_length &&
+            size >
+                *pending->streaming_request.content_length - pending->streaming_request_written) {
+            fail_streaming_request(
+                exchange_id, pending,
+                protocol_error("HTTP/1.1 request body exceeded its content length"));
+            return;
+        }
+        pending->streaming_request_written += size;
+        auto wire = std::make_shared<std::vector<std::uint8_t>>();
+        const auto *data = pending->streaming_request_buffer.data();
+        if (pending->streaming_request_chunked) {
+            std::array<char, 2 * sizeof(std::size_t)> hex{};
+            const auto converted = std::to_chars(hex.data(), hex.data() + hex.size(), size, 16);
+            if (converted.ec != std::errc{}) {
+                fail_streaming_request(exchange_id, pending,
+                                       protocol_error("failed to encode HTTP chunk size"));
+                return;
+            }
+            wire->insert(wire->end(), hex.data(), converted.ptr);
+            wire->insert(wire->end(), {'\r', '\n'});
+        }
+        wire->insert(wire->end(), data, data + size);
+        if (pending->streaming_request_chunked) {
+            wire->insert(wire->end(), {'\r', '\n'});
+        }
+
+        const bool reached_eof = error == boost::asio::error::eof;
+        auto self = shared_from_this();
+        boost::asio::async_write(
+            *stream_, boost::asio::buffer(*wire),
+            [self, exchange_id, pending, wire,
+             reached_eof](const boost::system::error_code &write_error, std::size_t) {
+                if (self->active_id_ != exchange_id || self->retired_ || self->stopped_) {
+                    return;
+                }
+                if (write_error) {
+                    self->fail_streaming_request(
+                        exchange_id, pending,
+                        io_error("failed to write HTTP/1.1 request body", write_error));
+                    return;
+                }
+                if (reached_eof) {
+                    if (pending->streaming_request.content_length &&
+                        pending->streaming_request_written !=
+                            *pending->streaming_request.content_length) {
+                        self->fail_streaming_request(
+                            exchange_id, pending,
+                            protocol_error(
+                                "HTTP/1.1 request body ended before its content length"));
+                    } else {
+                        self->finish_streaming_request_body(exchange_id, pending);
+                    }
+                    return;
+                }
+                self->read_streaming_request_body(exchange_id, pending);
+            });
+    }
+
+    core::Result<std::vector<std::uint8_t>>
+    make_last_chunk(const std::vector<HttpHeader> &trailers) const {
+        auto wire = std::make_shared<std::vector<std::uint8_t>>();
+        const std::string_view end = "0\r\n";
+        wire->insert(wire->end(), end.begin(), end.end());
+        for (const auto &header : trailers) {
+            if (!is_token(header.name) || has_http_control(header.value) ||
+                is_header_name(header.name, "content-length") ||
+                is_forbidden_trailer_name(header.name)) {
+                return core::fail(protocol_error("HTTP/1.1 request trailer is invalid"));
+            }
+            const std::string line = header.name + ": " + header.value + "\r\n";
+            wire->insert(wire->end(), line.begin(), line.end());
+        }
+        wire->insert(wire->end(), {'\r', '\n'});
+        return std::move(*wire);
+    }
+
+    void finish_streaming_request_body(ExchangeId exchange_id,
+                                       const std::shared_ptr<Pending> &pending) {
+        if (pending->streaming_request_chunked) {
+            auto last_chunk = make_last_chunk(pending->streaming_request.body->trailers());
+            if (!last_chunk) {
+                fail_streaming_request(exchange_id, pending, last_chunk.error());
+                return;
+            }
+            auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(last_chunk.value()));
+            const auto self = shared_from_this();
+            boost::asio::async_write(
+                *stream_, boost::asio::buffer(*wire),
+                [self, exchange_id, pending, wire](const boost::system::error_code &error,
+                                                   std::size_t) {
+                    if (self->active_id_ != exchange_id || self->retired_ || self->stopped_) {
                         return;
                     }
                     if (error) {
-                        self->fail_active(exchange_id, error, "failed to write HTTP/1.1 request");
+                        self->fail_streaming_request(
+                            exchange_id, pending,
+                            io_error("failed to finish HTTP/1.1 chunked request body", error));
                         return;
                     }
-                    self->read_response(exchange_id, pending);
+                    self->read_streaming_response_header(exchange_id, pending);
                 });
             return;
         }
+        if (pending->streaming_request.content_length &&
+            pending->streaming_request_written != *pending->streaming_request.content_length) {
+            fail_streaming_request(
+                exchange_id, pending,
+                protocol_error("HTTP/1.1 request body ended before its content length"));
+            return;
+        }
+        read_streaming_response_header(exchange_id, pending);
+    }
+
+    void fail_streaming_request(ExchangeId exchange_id, const std::shared_ptr<Pending> &pending,
+                                core::Error error) {
+        if (active_id_ != exchange_id) {
+            return;
+        }
+        if (pending->streaming_request.body) {
+            pending->streaming_request.body->cancel();
+        }
+        retire_all(exchange_id, std::move(error),
+                   core::Error{core::ErrorCode::transport_io,
+                               "HTTP/1.1 connection was retired after a streaming request error"});
+    }
+
+    void read_streaming_response_header(ExchangeId exchange_id,
+                                        const std::shared_ptr<Pending> &pending) {
+        pending->streaming_parser = std::make_unique<HttpStreamingResponseParser>();
+        pending->streaming_parser->body_limit(std::numeric_limits<std::uint64_t>::max());
+        pending->streaming_parser->merge_all_trailers(true);
+        if (pending->streaming_request.request.method == "HEAD") {
+            pending->streaming_parser->skip(true);
+        }
+        const auto self = shared_from_this();
+        http::async_read_header(
+            *stream_, read_buffer_, *pending->streaming_parser,
+            [self, exchange_id, pending](const boost::system::error_code &error, std::size_t) {
+                if (self->stopped_ || self->retired_ || self->active_id_ != exchange_id) {
+                    return;
+                }
+                if (error) {
+                    self->fail_active(exchange_id, error,
+                                      "failed to read HTTP/1.1 streaming response headers");
+                    return;
+                }
+                const auto status = pending->streaming_parser->get().result_int();
+                if (status >= 100 && status < 200 && status != 101) {
+                    self->read_streaming_response_header(exchange_id, pending);
+                    return;
+                }
+
+                auto &message = pending->streaming_parser->get();
+                HttpStreamingResponse response;
+                response.response.version = message.version();
+                response.response.status = message.result_int();
+                response.response.keep_alive = message.keep_alive();
+                pending->streaming_header_field_count = static_cast<std::size_t>(
+                    std::distance(message.base().begin(), message.base().end()));
+                for (const auto &field : message.base()) {
+                    response.response.headers.push_back(
+                        {std::string(field.name_string()), std::string(field.value())});
+                }
+
+                const auto weak = self->weak_from_this();
+                pending->streaming_response_body = std::make_shared<detail::QueuedHttpBodyStream>(
+                    self->executor_, 256 * 1024,
+                    [weak, exchange_id](std::size_t size) {
+                        if (const auto owner = weak.lock()) {
+                            owner->streaming_response_consumed(exchange_id, size);
+                        }
+                    },
+                    [weak, exchange_id] {
+                        if (const auto owner = weak.lock()) {
+                            owner->cancel(exchange_id);
+                        }
+                    },
+                    [weak, exchange_id] {
+                        if (const auto owner = weak.lock()) {
+                            owner->streaming_response_drained(exchange_id);
+                        }
+                    });
+                response.body = pending->streaming_response_body;
+                pending->streaming_headers_delivered = true;
+                const bool already_done = pending->streaming_parser->is_done();
+                pending->streaming_response_done = already_done;
+                auto handler = std::move(pending->streaming_handler);
+                if (handler) {
+                    handler(std::move(response));
+                }
+                if (already_done) {
+                    pending->streaming_response_body->finish({});
+                } else {
+                    self->pump_streaming_response(exchange_id, pending);
+                }
+            });
+    }
+
+    void pump_streaming_response(ExchangeId exchange_id, const std::shared_ptr<Pending> &pending) {
+        if (stopped_ || retired_ || active_id_ != exchange_id || pending->streaming_response_done ||
+            pending->streaming_response_read_pending || !pending->streaming_response_body) {
+            return;
+        }
+        constexpr std::size_t kReceiveCapacity = 256 * 1024;
+        if (pending->streaming_response_queued >= kReceiveCapacity) {
+            return;
+        }
+        const auto capacity = std::min(pending->streaming_response_buffer.size(),
+                                       kReceiveCapacity - pending->streaming_response_queued);
+        auto &body = pending->streaming_parser->get().body();
+        body.data = pending->streaming_response_buffer.data();
+        body.size = capacity;
+        pending->streaming_response_read_pending = true;
+        const auto self = shared_from_this();
+        http::async_read_some(
+            *stream_, read_buffer_, *pending->streaming_parser,
+            [self, exchange_id, pending, capacity](const boost::system::error_code &error,
+                                                   std::size_t) {
+                if (self->stopped_ || self->retired_ || self->active_id_ != exchange_id) {
+                    return;
+                }
+                pending->streaming_response_read_pending = false;
+                auto &body = pending->streaming_parser->get().body();
+                const auto produced = capacity - body.size;
+                const bool need_buffer = error == http::error::need_buffer;
+                if (error && !need_buffer) {
+                    self->fail_streaming_response(exchange_id, pending, error);
+                    return;
+                }
+                if (produced != 0) {
+                    pending->streaming_response_queued += produced;
+                    if (!pending->streaming_response_body->receive(
+                            pending->streaming_response_buffer.data(), produced)) {
+                        self->fail_streaming_response(exchange_id, pending,
+                                                      boost::asio::error::no_buffer_space);
+                        return;
+                    }
+                }
+                if (pending->streaming_parser->is_done()) {
+                    pending->streaming_response_done = true;
+                    std::vector<HttpHeader> trailers;
+                    std::size_t index = 0;
+                    for (const auto &field : pending->streaming_parser->get().base()) {
+                        if (index++ >= pending->streaming_header_field_count) {
+                            trailers.push_back(
+                                {std::string(field.name_string()), std::string(field.value())});
+                        }
+                    }
+                    pending->streaming_response_body->finish(std::move(trailers));
+                    return;
+                }
+                if (!need_buffer && produced == 0) {
+                    self->pump_streaming_response(exchange_id, pending);
+                    return;
+                }
+                self->pump_streaming_response(exchange_id, pending);
+            });
+    }
+
+    void streaming_response_consumed(ExchangeId exchange_id, std::size_t size) {
+        const auto found = pending_.find(exchange_id);
+        if (found == pending_.end()) {
+            return;
+        }
+        auto &pending = *found->second;
+        pending.streaming_response_queued -= std::min(pending.streaming_response_queued, size);
+        if (!pending.streaming_response_done) {
+            pump_streaming_response(exchange_id, found->second);
+        }
+    }
+
+    void streaming_response_drained(ExchangeId exchange_id) {
+        const auto found = pending_.find(exchange_id);
+        if (found == pending_.end() || !found->second->streaming_response_done) {
+            return;
+        }
+        const auto pending = found->second;
+        const bool request_keep_alive = pending->streaming_request.request.keep_alive;
+        const bool response_keep_alive = pending->streaming_parser->get().keep_alive();
+        const bool reusable = request_keep_alive && response_keep_alive;
+        pending_.erase(found);
+        (void)pending->timer.cancel();
+        active_id_.reset();
+        if (!reusable) {
+            retired_ = true;
+            close_stream();
+            retire_queued("HTTP/1.1 connection is not reusable: request keep-alive=" +
+                          std::string(request_keep_alive ? "true" : "false") +
+                          ", response keep-alive=" + (response_keep_alive ? "true" : "false"));
+            return;
+        }
+        start_next();
+    }
+
+    void fail_streaming_response(ExchangeId exchange_id, const std::shared_ptr<Pending> &pending,
+                                 const boost::system::error_code &error) {
+        if (active_id_ != exchange_id) {
+            return;
+        }
+        if (pending->streaming_response_body) {
+            pending->streaming_response_body->fail(error);
+        }
+        retired_ = true;
+        close_stream();
+        active_id_.reset();
+        pending_.erase(exchange_id);
+        (void)pending->timer.cancel();
+        retire_queued("HTTP/1.1 connection closed before queued exchange after streaming response "
+                      "read failure (" +
+                      std::to_string(error.value()) + ": " + error.message() + ")");
+    }
+
+    void read_tunnel_response_header(ExchangeId exchange_id,
+                                     const std::shared_ptr<Pending> &pending) {
+        const auto self = shared_from_this();
+        http::async_read_header(
+            *stream_, read_buffer_, *pending->parser,
+            [self, exchange_id, pending](const boost::system::error_code &error, std::size_t) {
+                if (self->stopped_ || self->retired_ || self->active_id_ != exchange_id) {
+                    return;
+                }
+                if (error) {
+                    self->fail_active(exchange_id, error,
+                                      "failed to read HTTP/1.1 tunnel response headers");
+                    return;
+                }
+                const auto status = pending->parser->get().result_int();
+                if (status >= 100 && status < 200 && status != 101) {
+                    pending->parser = std::make_unique<HttpResponseParser>();
+                    pending->parser->body_limit(pending->tunnel_request.rejection_body_limit);
+                    self->read_tunnel_response_header(exchange_id, pending);
+                    return;
+                }
+                auto response = make_response(pending->parser->get());
+                if (tunnel_accepted(pending->tunnel_request, response)) {
+                    self->finish_tunnel(exchange_id, pending, std::move(response));
+                    return;
+                }
+                self->read_tunnel_rejection(exchange_id, pending);
+            });
+    }
+
+    void read_tunnel_rejection(ExchangeId exchange_id, const std::shared_ptr<Pending> &pending) {
+        const auto self = shared_from_this();
+        http::async_read(
+            *stream_, read_buffer_, *pending->parser,
+            [self, exchange_id, pending](const boost::system::error_code &error, std::size_t) {
+                if (self->stopped_ || self->retired_ || self->active_id_ != exchange_id) {
+                    return;
+                }
+                if (error) {
+                    self->fail_active(exchange_id, error,
+                                      "failed to read HTTP/1.1 tunnel rejection body");
+                    return;
+                }
+                auto response = make_response(pending->parser->release());
+                const bool reusable = response.keep_alive;
+                self->active_id_.reset();
+                if (!reusable) {
+                    self->retired_ = true;
+                    self->close_stream();
+                }
+                self->complete_tunnel(exchange_id, HttpTunnelResponse{std::move(response), {}});
+                if (reusable) {
+                    self->start_next();
+                } else {
+                    self->retire_queued();
+                }
+            });
+    }
+
+    void finish_tunnel(ExchangeId exchange_id, const std::shared_ptr<Pending> &pending,
+                       HttpResponse response) {
+        retired_ = true;
+        active_id_.reset();
+        std::vector<std::uint8_t> buffered(read_buffer_.size());
+        if (!buffered.empty()) {
+            const auto copied =
+                boost::asio::buffer_copy(boost::asio::buffer(buffered), read_buffer_.data());
+            buffered.resize(copied);
+            read_buffer_.consume(copied);
+        }
+        std::shared_ptr<core::StreamHandle> raw_stream;
+        if (stream_) {
+            raw_stream = stream_->take_handle();
+            stream_.reset();
+        }
+        if (!raw_stream) {
+            complete_tunnel(exchange_id,
+                            core::fail(core::Error{core::ErrorCode::transport_io,
+                                                   "HTTP/1.1 tunnel lost its underlying stream"}));
+            retire_queued();
+            return;
+        }
+        auto state = std::make_shared<Http1TunnelState>(std::move(raw_stream), std::move(buffered));
+        auto tunnel = std::make_unique<Http1TunnelStream>(std::move(state));
+        complete_tunnel(exchange_id, HttpTunnelResponse{std::move(response), std::move(tunnel)});
+        retire_queued();
+        (void)pending;
     }
 
     void read_response(ExchangeId exchange_id, const std::shared_ptr<Pending> &pending) {
@@ -355,42 +1386,42 @@ class Http1ClientSession final : public HttpClientSession,
             return;
         }
         if (active_id_ == exchange_id) {
-            retire_all(exchange_id, core::fail(timeout_error()),
-                       core::fail(core::Error{core::ErrorCode::transport_io,
-                                              "HTTP/1.1 connection was retired after a timeout"}));
+            retire_all(exchange_id, timeout_error(),
+                       core::Error{core::ErrorCode::transport_io,
+                                   "HTTP/1.1 connection was retired after a timeout"});
             return;
         }
-        complete(exchange_id, core::fail(timeout_error()));
+        complete_error(exchange_id, timeout_error());
     }
 
     void fail_active(ExchangeId exchange_id, const boost::system::error_code &error,
                      std::string context) {
         auto failure = is_http_framing_error(error)
-                           ? core::fail(protocol_error("HTTP/1.1 response framing failed"))
-                           : core::fail(io_error(std::move(context), error));
+                           ? protocol_error("HTTP/1.1 response framing failed")
+                           : io_error(std::move(context), error);
         retire_all(exchange_id, std::move(failure),
-                   core::fail(core::Error{core::ErrorCode::transport_io,
-                                          "HTTP/1.1 connection was retired after an I/O error"}));
+                   core::Error{core::ErrorCode::transport_io,
+                               "HTTP/1.1 connection was retired after an I/O error"});
     }
 
-    void retire_all(ExchangeId active_id, core::Result<HttpResponse> active_result,
-                    const core::Result<HttpResponse> &queued_result) {
+    void retire_all(ExchangeId active_id, core::Error active_error,
+                    const core::Error &queued_error) {
         retired_ = true;
         close_stream();
         active_id_.reset();
-        complete(active_id, std::move(active_result));
+        complete_error(active_id, std::move(active_error));
         std::vector<ExchangeId> remaining;
         remaining.reserve(pending_.size());
         for (const auto &[exchange_id, pending] : pending_) {
             remaining.push_back(exchange_id);
         }
         for (const auto exchange_id : remaining) {
-            complete(exchange_id, core::fail(queued_result.error()));
+            complete_error(exchange_id, queued_error);
         }
         queue_.clear();
     }
 
-    void retire_queued() {
+    void retire_queued(std::string reason = "HTTP/1.1 connection closed before queued exchange") {
         retired_ = true;
         close_stream();
         std::vector<ExchangeId> remaining;
@@ -399,9 +1430,7 @@ class Http1ClientSession final : public HttpClientSession,
             remaining.push_back(exchange_id);
         }
         for (const auto exchange_id : remaining) {
-            complete(exchange_id,
-                     core::fail(core::Error{core::ErrorCode::transport_io,
-                                            "HTTP/1.1 connection closed before queued exchange"}));
+            complete_error(exchange_id, core::Error{core::ErrorCode::transport_io, reason});
         }
         queue_.clear();
     }
@@ -420,6 +1449,50 @@ class Http1ClientSession final : public HttpClientSession,
         }
     }
 
+    void complete_tunnel(ExchangeId exchange_id, core::Result<HttpTunnelResponse> result) {
+        const auto found = pending_.find(exchange_id);
+        if (found == pending_.end()) {
+            return;
+        }
+        auto pending = std::move(found->second);
+        pending_.erase(found);
+        (void)pending->timer.cancel();
+        auto handler = std::move(pending->tunnel_handler);
+        if (handler) {
+            handler(std::move(result));
+        }
+    }
+
+    void complete_error(ExchangeId exchange_id, core::Error error) {
+        const auto found = pending_.find(exchange_id);
+        if (found == pending_.end()) {
+            return;
+        }
+        if (found->second->is_streaming) {
+            auto pending = std::move(found->second);
+            pending_.erase(found);
+            (void)pending->timer.cancel();
+            if (pending->streaming_headers_delivered && pending->streaming_response_body) {
+                boost::system::error_code body_error = boost::asio::error::connection_reset;
+                if (error.code == core::ErrorCode::timeout) {
+                    body_error = boost::asio::error::timed_out;
+                } else if (error.code == core::ErrorCode::cancelled) {
+                    body_error = boost::asio::error::operation_aborted;
+                }
+                pending->streaming_response_body->fail(body_error);
+            } else {
+                post_streaming_result(std::move(pending->streaming_handler),
+                                      core::fail(std::move(error)));
+            }
+            return;
+        }
+        if (found->second->is_tunnel) {
+            complete_tunnel(exchange_id, core::fail(std::move(error)));
+        } else {
+            complete(exchange_id, core::fail(std::move(error)));
+        }
+    }
+
     void complete_all(const core::Result<HttpResponse> &result) {
         std::vector<ExchangeId> exchanges;
         exchanges.reserve(pending_.size());
@@ -427,7 +1500,7 @@ class Http1ClientSession final : public HttpClientSession,
             exchanges.push_back(exchange_id);
         }
         for (const auto exchange_id : exchanges) {
-            complete(exchange_id, core::fail(result.error()));
+            complete_error(exchange_id, result.error());
         }
         queue_.clear();
     }

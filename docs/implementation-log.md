@@ -1,12 +1,39 @@
 # Implementation Log
 
+### 2026-09-18 — Record local proxy listener security scope
+
+- Documented that local HTTP and SOCKS5 listeners currently use plaintext connections without inbound authentication, and distinguished destination TLS through HTTP `CONNECT` from TLS to the proxy itself.
+
+### 2026-09-18 — Record HTTP/3 proxy integration limits
+
+- Documented that the shared HTTP/3 client transport and DoH/3 support are not equivalent to HTTP/3 proxy ingress or an HTTP/3 upstream proxy outbound.
+
+### 2026-09-18 — Scope the protocol reference
+
+- Limited `protocol-reference.md` to proxy and tunnel protocols, carriers, security layers, protocol options, inbound listeners, and pinned Mihomo sources; removed routing-group, share-link, controller, and native-project status material.
+- Corrected SSR wrapper order and clarified gRPC TLS options, WebSocket bootstrap, and SMUX stream semantics.
+
+### 2026-09-18 — Add streaming HTTP tunnels
+
+- Added a shared asynchronous full-duplex tunnel API while keeping buffered HTTP exchanges for DoH. HTTP/1.1 supports CONNECT and Upgrade; HTTP/2 and HTTP/3 support CONNECT and Extended CONNECT.
+- Added bounded receive buffering, backpressure, half-close, cancellation, and error propagation across tunnel streams. Kept HTTP/2 provider data alive through socket write completion and deferred stream destruction until outstanding asynchronous I/O callbacks finish.
+- Added independent Go interoperability coverage for HTTP/1.1 CONNECT and WebSocket Upgrade, HTTP/2 CONNECT and Extended CONNECT, and HTTP/3 CONNECT and Extended CONNECT.
+- Validated Windows x64 Release with clang-cl/MSVC and vcpkg: CTest 123/123, the uncached full Go interoperability suite, `go vet ./...`, formatting checks, and the six-case tunnel matrix repeated five times.
+
+### 2026-09-18 — Add streaming HTTP exchanges and forwarding
+
+- Added asynchronous request and response body streams with trailers for HTTP/1.1, HTTP/2, and HTTP/3 sessions, including bounded response buffering, cancellation, and backpressure. Corrected HTTP/3 QUIC receive-credit accounting for DATA payloads in both streaming and buffered responses.
+- Added an HTTP/1.1 forward-proxy path for absolute-form requests and an HTTP upstream proxy outbound with TLS CONNECT and Basic authentication. The forwarder strips hop-by-hop and proxy-authentication headers, handles `Expect: 100-continue`, and streams bodies and trailers.
+- Added independent Go interoperability coverage for 2 MiB concurrent request/response streams and trailers across HTTP/1.1, HTTP/2, and HTTP/3, raw HTTP/3 request-trailer framing, normal HTTP forwarding, and plain/TLS HTTP proxy outbounds.
+- Validated Windows x64 Release using clang-cl with the MSVC backend and vcpkg: CTest 123/123 and the full Go interoperability suite passed.
+
 ### 2026-09-18 — Extract shared HTTP/1.1 and HTTP/2 client sessions
 
 - Added a common HTTP request/response exchange API over injected streams. HTTP/1.1 now owns Beast framing, body limits, cancellation, deadlines, and ordered keep-alive exchanges; HTTP/2 owns nghttp2 framing, concurrent streams, bounded response bodies, cancellation/reset, and GOAWAY retirement.
 - Migrated DoH/1 and DoH/2 so DNS keeps `application/dns-message` construction and validation while transport owns HTTP serialization, parsing, and multiplexing. Added a loopback test proving queued HTTP/1.1 exchanges reuse one keep-alive connection.
 - Fixed a DoH/3 setup race by creating nghttp3 state as soon as the QUIC handshake completes, before processing any HTTP/3 streams from the same datagram.
 - Validated Windows x64 Release with standalone clang-cl/MSVC and vcpkg: CTest 119/119; full Go interop against independent DNSProxy and Mihomo processes; `go vet ./...`; DoH/3 DNSProxy interop repeated 10 times; and independent DoQ/DoH3 concurrent-stream tests.
-- The current HTTP API supports bounded buffered exchanges. Streaming bodies, full-duplex CONNECT/upgrade tunnels, and a reusable cross-protocol session pool remain unimplemented extraction work.
+- The HTTP API now supports full-duplex CONNECT/upgrade tunnels and streaming request/response bodies; a reusable cross-protocol session pool remains unimplemented extraction work.
 
 ### 2026-09-18 — Extract shared injected-stream TLS client
 

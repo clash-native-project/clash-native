@@ -1,5 +1,6 @@
 #include <clash_native/dns/dns_policy_router.hpp>
 #include <clash_native/dns/dns_server.hpp>
+#include <clash_native/outbound/http_proxy_outbound.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
 #include <clash_native/outbound/shadowsocks_outbound.hpp>
 #include <clash_native/outbound/trojan_outbound.hpp>
@@ -123,6 +124,32 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
             clash_native::outbound::TrojanOutboundConfig{
                 "test-proxy", server.host, server.port, password, server_name.value_or(server.host),
                 std::move(ca_pem), true},
+            std::move(resolver));
+        if (const auto result = outbound->validate(); !result) {
+            throw std::runtime_error(result.error().context);
+        }
+        if (const auto result = registry->add_outbound("test-proxy", std::move(outbound));
+            !result) {
+            throw std::runtime_error(result.error().context);
+        }
+    } else if (kind == "http") {
+        std::string ca_pem;
+        if (const auto ca_path = environment_value("CLASH_NATIVE_TEST_OUTBOUND_CA_FILE"); ca_path) {
+            std::ifstream file(*ca_path, std::ios::binary);
+            if (!file) {
+                throw std::runtime_error("failed to read HTTP proxy test CA file");
+            }
+            ca_pem.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+        }
+        const auto server_name = environment_value("CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME");
+        const auto username = environment_value("CLASH_NATIVE_TEST_OUTBOUND_USERNAME");
+        const auto tls = environment_value("CLASH_NATIVE_TEST_OUTBOUND_TLS");
+        auto outbound = std::make_shared<clash_native::outbound::HttpProxyOutbound>(
+            runtime,
+            clash_native::outbound::HttpProxyOutboundConfig{
+                "test-proxy", server.host, server.port, tls && *tls == "1",
+                server_name.value_or(server.host), std::move(ca_pem), true,
+                username.value_or(std::string{}), password},
             std::move(resolver));
         if (const auto result = outbound->validate(); !result) {
             throw std::runtime_error(result.error().context);
@@ -424,12 +451,13 @@ int main(int argc, char **) {
         if (outbound_kind) {
             const auto outbound_server = environment_value("CLASH_NATIVE_TEST_OUTBOUND_SERVER");
             const auto outbound_password = environment_value("CLASH_NATIVE_TEST_OUTBOUND_PASSWORD");
-            if (!outbound_server || !outbound_password) {
+            if (!outbound_server || (!outbound_password && *outbound_kind != "http")) {
                 throw std::runtime_error(
                     "CLASH_NATIVE_TEST_OUTBOUND_SERVER and _PASSWORD are required");
             }
-            proxy.set_outbound_registry(test_outbound_registry(
-                runtime, resolver, *outbound_kind, *outbound_server, *outbound_password));
+            proxy.set_outbound_registry(
+                test_outbound_registry(runtime, resolver, *outbound_kind, *outbound_server,
+                                       outbound_password.value_or(std::string{})));
             proxy.set_default_action(clash_native::router::RouteAction::named("test-proxy"));
         }
         if (run_stage2_composition) {

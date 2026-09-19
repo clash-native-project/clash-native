@@ -137,6 +137,7 @@ add_library(clash-native-core STATIC
     src/outbound/shadowsocks_crypto.cpp
     src/outbound/shadowsocks_outbound.cpp
     src/outbound/trojan_outbound.cpp
+    src/outbound/http_proxy_outbound.cpp
     src/outbound/builtin_outbound.cpp
     src/outbound/outbound_registry.cpp
     src/observability/connection_registry.cpp
@@ -218,6 +219,17 @@ if(BUILD_TESTING)
     target_compile_features(clash-native-test-host PRIVATE cxx_std_20)
 
     target_link_libraries(clash-native-test-host
+        PRIVATE
+            clash-native-core
+    )
+
+    add_executable(clash-native-http-tunnel-client
+        tests/host/http_tunnel_client.cpp
+    )
+
+    target_compile_features(clash-native-http-tunnel-client PRIVATE cxx_std_20)
+
+    target_link_libraries(clash-native-http-tunnel-client
         PRIVATE
             clash-native-core
     )

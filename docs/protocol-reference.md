@@ -1,12 +1,13 @@
 # Proxy Protocol Reference
 
-## Scope and status
+## Scope
 
-This document is a detailed reference for the proxy protocol surface exposed by
-the current local Mihomo source snapshot and for the protocol layers relevant
-when implementing <code>clash-native</code>.
+This document describes proxy and tunnel protocols exposed by Mihomo, their
+carriers and framing, and protocol-specific security or wrapper layers. The
+Mihomo configuration names and option lists refer to the source revision linked
+below.
 
-It records three different things separately:
+It distinguishes three different layers:
 
 1. A Mihomo configuration type, such as <code>vmess</code> or
    <code>hysteria2</code>.
@@ -15,10 +16,8 @@ It records three different things separately:
 3. An optional security, camouflage, or multiplexing layer, such as TLS,
    Reality, ShadowTLS, or SMUX.
 
-The lists below are based on the local Mihomo checkout at commit
-<code>ab405bad5bee</code>. They describe the current parser and source surface
-in that checkout; they are not a claim that every item is implemented by
-<code>clash-native</code>.
+The referenced Mihomo revision is
+<code>ab405bad5beeeac8b003bb01f60f134f6df54471</code>.
 
 ## 1. Layer model
 
@@ -48,20 +47,22 @@ OpenVPN data channel over UDP
 
 The terms are not interchangeable:
 
-- <code>HTTP</code> can mean an HTTP proxy protocol, an HTTP/1.1 carrier, or
-  an HTTP control API.
+- <code>HTTP</code> can mean an HTTP proxy protocol or HTTP carrier framing.
 - <code>QUIC</code> is a transport, not itself a Mihomo
   <code>proxies[].type</code>.
 - <code>HTTP/3</code> is HTTP semantics over QUIC and is not TCP-based.
 - <code>TLS</code> protects a carrier; it is not normally the proxy protocol.
-- WebSocket, gRPC, HTTP/2, and HTTP/3 are carriers or application framings.
+- WebSocket is a framed bidirectional protocol established through HTTP.
+- gRPC is an RPC framing and mapping over HTTP/2; Mihomo exposes it as a
+  selectable transport option.
+- HTTP/2 and HTTP/3 are HTTP versions; HTTP/3 runs over QUIC.
 - SMUX, UoT, XUDP, and packet-address modes alter multiplexing or delivery
   semantics. They are not standalone top-level proxy types.
 
-## 2. Complete outbound type list
+## 2. Proxy and tunnel protocol types
 
-The following values are accepted by Mihomo's outbound parser as
-<code>proxies[].type</code> values in the referenced source snapshot.
+The following protocol and tunnel values are accepted by Mihomo's outbound
+parser as <code>proxies[].type</code> values in the referenced source snapshot.
 
 | Config type | Alias or family | Role | Primary carrier | Version or important variants |
 | --- | --- | --- | --- | --- |
@@ -79,10 +80,6 @@ The following values are accepted by Mihomo's outbound parser as
 | <code>tuic</code> | TUIC | QUIC proxy | QUIC over UDP | TUIC v4 and v5; native or QUIC UDP relay |
 | <code>shadowquic</code> | ShadowQUIC | QUIC proxy | QUIC over UDP | QUIC v1 or v2; optional UDP-over-stream |
 | <code>gost-relay</code> | GOST Relay | Relay proxy | TCP and optional UDP | GOST relay features, TLS, and optional multiplexing |
-| <code>direct</code> | DIRECT | Built-in direct action | Direct TCP or UDP | No proxy protocol; direct target connection |
-| <code>dns</code> | DNS outbound | Built-in DNS action | DNS-specific transport | Configured DNS behavior |
-| <code>reject</code> | REJECT | Built-in reject action | None | Intentionally fails the connection or packet |
-| <code>rematch</code> | Re-match | Internal routing behavior | Inherited from the rematched rule | Not a wire protocol |
 | <code>ssh</code> | SSH | SSH-based proxy | TCP | Password or private-key authentication |
 | <code>mieru</code> | Mieru | Encrypted proxy | TCP or UDP | Mieru transport selection; optional UDP-over-stream |
 | <code>anytls</code> | AnyTLS | TLS-based proxy | TCP/TLS stream | AnyTLS framing and padding; optional wrappers |
@@ -93,10 +90,6 @@ The following values are accepted by Mihomo's outbound parser as
 | <code>tailscale</code> | Tailscale | Overlay network | Tailscale overlay | Not a generic HTTP or SOCKS wire protocol |
 | <code>zerotier</code> | ZeroTier | Overlay network | ZeroTier overlay | Not a generic HTTP or SOCKS wire protocol |
 | <code>easytier</code> | EasyTier | Overlay network | EasyTier overlay | Not a generic HTTP or SOCKS wire protocol |
-
-There are 28 parser values. <code>direct</code>, <code>dns</code>,
-<code>reject</code>, and <code>rematch</code> are built-in or internal
-behaviors rather than encrypted remote proxy protocols.
 
 ## 3. Per-protocol stack reference
 
@@ -155,7 +148,8 @@ and <code>2022-blake3-chacha20-poly1305</code>.
 ### 3.4 ShadowsocksR
 
 ~~~text
-SSR obfuscation -> SSR protocol authentication -> cipher -> TCP or UDP
+SSR payload -> protocol plugin -> cipher -> obfuscation -> TCP
+SSR UDP payload -> protocol plugin -> cipher -> UDP
 ~~~
 
 Obfuscation values:
@@ -195,7 +189,7 @@ Carrier choices:
 | <code>ws</code> | VMess -> WebSocket -> TCP; optionally TLS/WSS |
 | <code>http</code> | VMess -> HTTP/1.1 -> TCP |
 | <code>h2</code> | VMess -> HTTP/2 -> TLS/TCP |
-| <code>grpc</code> | VMess -> gRPC -> HTTP/2 -> TLS/TCP |
+| <code>grpc</code> | VMess -> gRPC -> HTTP/2 -> optional TLS -> TCP |
 | <code>mekya</code> | VMess -> Mekya carrier |
 | <code>mkcp</code> or <code>kcp</code> | VMess -> mKCP/KCP -> UDP |
 
@@ -203,6 +197,7 @@ The VMess cipher or <code>auto</code> selection is separate from the carrier.
 Masquerade headers can be selected for KCP/mKCP, including
 <code>none</code>, <code>srtp</code>, <code>utp</code>,
 <code>wechat-video</code>, <code>dtls</code>, and <code>wireguard</code>.
+For VMess gRPC, TLS is controlled separately and may be disabled.
 
 ### 3.6 VLESS
 
@@ -220,11 +215,12 @@ Carrier choices:
 | <code>ws</code> | VLESS -> WebSocket -> TCP; optionally TLS/WSS |
 | <code>http</code> | VLESS -> HTTP/1.1 -> TCP |
 | <code>h2</code> | VLESS -> HTTP/2 -> TLS/TCP |
-| <code>grpc</code> | VLESS -> gRPC -> HTTP/2 -> TLS/TCP |
+| <code>grpc</code> | VLESS -> gRPC -> HTTP/2 -> optional TLS -> TCP |
 | <code>xhttp</code> | VLESS -> XHTTP -> HTTP carrier |
 
 TLS, ECH, Reality, ShadowTLS, ResTLS, JLS, and TLS fingerprint options are
 separate layers, not VLESS versions.
+For VLESS gRPC, TLS is controlled separately and may be disabled.
 
 ### 3.7 Snell and Trojan
 
@@ -260,9 +256,8 @@ Hysteria v1 -> QUIC -> UDP
 
 <code>protocol</code> values are <code>udp</code>,
 <code>wechat-video</code>, and <code>faketcp</code>. XPlus obfuscation is
-enabled through <code>obfs</code>. The current source requires TLS 1.3 or
-newer for the normal QUIC handshake. The fake-TCP implementation is
-platform-sensitive and reports unsupported on non-Linux builds.
+enabled through <code>obfs</code>. Hysteria v1 uses TLS 1.3 for its QUIC
+handshake.
 
 Hysteria2:
 
@@ -291,7 +286,7 @@ ShadowQUIC:
 ShadowQUIC -> QUIC v1 or v2 -> UDP
 ~~~
 
-The current reference exposes QUIC versions <code>v1</code> and
+The ShadowQUIC adapter exposes QUIC versions <code>v1</code> and
 <code>v2</code>, plus optional UDP-over-stream.
 
 ### 3.10 Other stream and tunnel types
@@ -317,163 +312,10 @@ For Sudoku, HTTPMask modes are <code>legacy</code>, <code>stream</code>,
 <code>none</code>. Multiplexing is <code>off</code>, <code>auto</code>, or
 <code>on</code>. The <code>none</code> method provides no AEAD protection.
 
-OpenVPN transport values are <code>udp</code> and <code>tcp</code>. The current
-reference comments document AES-128/192/256-GCM, AES-128/192/256-CBC, and
+OpenVPN transport values are <code>udp</code> and <code>tcp</code>. The Mihomo
+configuration reference lists AES-128/192/256-GCM, AES-128/192/256-CBC, and
 <code>CHACHA20-POLY1305</code>, with MD5, SHA1, SHA256, SHA384, and SHA512
 authentication digest choices.
-
-The built-in actions <code>direct</code>, <code>dns</code>,
-<code>reject</code>, and <code>rematch</code> are not remote proxy protocols.
-
-## 8. Proxy groups and built-in runtime entries
-
-Proxy groups are selection logic around outbounds, not wire protocols. The
-current group parser accepts these usable group types:
-
-- <code>select</code>: manual selection
-- <code>url-test</code>: choose according to URL test results
-- <code>fallback</code>: use a fallback order
-- <code>load-balance</code>: distribute or select according to the configured
-  strategy
-
-The parser still recognizes <code>relay</code> to provide a migration error,
-but the current source says that the relay group was removed and recommends
-using a <code>dialer-proxy</code> relationship instead. It should not be
-documented as a usable current group type.
-
-Mihomo creates these built-in runtime entries in the current configuration
-path:
-
-- <code>DIRECT</code>
-- <code>REJECT</code>
-- <code>REJECT-DROP</code>
-- <code>COMPATIBLE</code>
-- <code>PASS</code>
-- <code>PASS-RULE</code>
-
-<code>GLOBAL</code> can be created as a group in the relevant global
-configuration path. These names are runtime actions or selectors, not
-additional transport protocols.
-
-## 9. Share-link schemes and aliases
-
-The current share-link converter recognizes these top-level schemes:
-
-| Share-link scheme | Normalized config type | Notes |
-| --- | --- | --- |
-| <code>hysteria</code> | <code>hysteria</code> | Hysteria v1 |
-| <code>hysteria2</code> | <code>hysteria2</code> | Hysteria2 |
-| <code>hy2</code> | <code>hysteria2</code> | Alias for Hysteria2 |
-| <code>hysteria2+realm</code> | <code>hysteria2</code> | Hysteria2 with Realm options |
-| <code>hy2+realm</code> | <code>hysteria2</code> | Alias for the Realm form |
-| <code>tuic</code> | <code>tuic</code> | TUIC |
-| <code>trojan</code> | <code>trojan</code> | Trojan |
-| <code>vless</code> | <code>vless</code> | VLESS |
-| <code>vmess</code> | <code>vmess</code> | VMess |
-| <code>ss</code> | <code>ss</code> | Shadowsocks |
-| <code>ssr</code> | <code>ssr</code> | ShadowsocksR |
-| <code>socks</code> | <code>socks5</code> | Normalized to SOCKS5 outbound |
-| <code>socks5</code> | <code>socks5</code> | SOCKS5 |
-| <code>socks5h</code> | <code>socks5</code> | SOCKS5 hostname-resolution convention |
-| <code>http</code> | <code>http</code> | Plain HTTP proxy |
-| <code>https</code> | <code>http</code> | HTTP proxy with TLS enabled |
-| <code>anytls</code> | <code>anytls</code> | AnyTLS |
-| <code>mierus</code> | <code>mieru</code> | Share-link spelling normalized to Mieru |
-
-There are 18 entries in this converter switch. A carrier option such as
-<code>httpupgrade</code> is not a separate top-level share-link scheme.
-
-### 9.1 Mihomo control API
-
-Mihomo's external controller is not a proxy data-plane protocol. It is an
-administrative API used to inspect and change runtime state.
-
-The current server setup includes:
-
-- HTTP over TCP for <code>external-controller</code>
-- TLS over TCP for <code>external-controller-tls</code>
-- ALPN values including <code>h2</code> and <code>http/1.1</code> for the TLS
-  controller
-- Unix-domain sockets on supported systems
-- Windows named pipes on Windows
-
-Typical API areas include logs, traffic, memory, version, configuration,
-proxies, groups, rules, connections, providers, cache, DNS, storage, restart,
-and upgrade operations. Authentication uses the configured secret, commonly
-as a Bearer token; WebSocket control connections can also use a query token.
-
-This API must not be counted as an additional proxy protocol supported by the
-data plane.
-
-## 10. Current <code>clash-native</code> status
-
-The current C++ project does not implement the complete Mihomo protocol surface
-above.
-
-Based on the current source:
-
-- The proxy server accepts SOCKS5 and HTTP CONNECT traffic.
-- The HTTP path accepts HTTP/1.0 and HTTP/1.1 request versions for its current
-  proxy behavior.
-- The currently registered built-in outbounds are <code>direct</code> and
-  <code>reject</code>.
-- DNS transport adapters include experimental DoH/1.1, DoH/2, DoQ, and DoH/3
-  paths. This does not mean that QUIC-based proxy protocols such as Hysteria,
-  Hysteria2, TUIC, ShadowQUIC, or MASQUE are implemented or interoperable.
-- The architecture document describes future work and is not implementation
-  evidence.
-
-The current native stack can therefore be summarized as:
-
-~~~text
-SOCKS5 inbound -> direct or reject outbound
-HTTP CONNECT inbound -> direct or reject outbound
-~~~
-
-No additional protocol should be marked implemented until it has a native
-adapter, a runtime integration path, and relevant tests.
-
-## 11. Source map
-
-The following files were used as the primary source map for this reference.
-The Mihomo checkout is read-only reference material for this project.
-
-### Mihomo parser and configuration sources
-
-- [Outbound parser](D:/Project/golang/mihomo/adapter/parser.go)
-- [Inbound listener parser](D:/Project/golang/mihomo/listener/parse.go)
-- [Proxy group parser](D:/Project/golang/mihomo/adapter/outboundgroup/parser.go)
-- [Share-link converter](D:/Project/golang/mihomo/common/convert/converter.go)
-- [Mihomo configuration reference](D:/Project/golang/mihomo/docs/config.yaml)
-
-### Mihomo protocol adapters and transports
-
-- [Shadowsocks outbound](D:/Project/golang/mihomo/adapter/outbound/shadowsocks.go)
-- [Shadowsocks cipher registry](D:/Project/golang/mihomo/transport/shadowsocks/core/cipher.go)
-- [ShadowsocksR outbound](D:/Project/golang/mihomo/adapter/outbound/shadowsocksr.go)
-- [VMess outbound](D:/Project/golang/mihomo/adapter/outbound/vmess.go)
-- [VLESS outbound](D:/Project/golang/mihomo/adapter/outbound/vless.go)
-- [Trojan outbound](D:/Project/golang/mihomo/adapter/outbound/trojan.go)
-- [Snell outbound](D:/Project/golang/mihomo/adapter/outbound/snell.go)
-- [Hysteria v1 outbound](D:/Project/golang/mihomo/adapter/outbound/hysteria.go)
-- [Hysteria2 outbound](D:/Project/golang/mihomo/adapter/outbound/hysteria2.go)
-- [TUIC outbound](D:/Project/golang/mihomo/adapter/outbound/tuic.go)
-- [ShadowQUIC outbound](D:/Project/golang/mihomo/adapter/outbound/shadowquic.go)
-- [MASQUE outbound](D:/Project/golang/mihomo/adapter/outbound/masque.go)
-- [TrustTunnel outbound](D:/Project/golang/mihomo/adapter/outbound/trusttunnel.go)
-- [Mieru outbound](D:/Project/golang/mihomo/adapter/outbound/mieru.go)
-- [Sudoku outbound](D:/Project/golang/mihomo/adapter/outbound/sudoku.go)
-
-### Current native implementation
-
-- [Current proxy server](D:/Project/cpp/clash-native/src/proxy/proxy_server.cpp)
-- [Built-in outbound implementations](D:/Project/cpp/clash-native/src/outbound/builtin_outbound.cpp)
-- [Proxy server interface](D:/Project/cpp/clash-native/include/clash_native/proxy/proxy_server.hpp)
-
-When a future implementation adds a protocol, update this document with the
-actual native status and tests. Do not promote a planned architecture item to
-an implemented protocol merely because a dependency or an empty adapter has
-been added.
 
 ## 4. Carrier, framing, and multiplexing reference
 
@@ -490,7 +332,7 @@ The following values are commonly nested under an outbound protocol.
 | HTTP/3 | <code>h3</code> | QUIC/UDP | HTTP semantics over QUIC |
 | WebSocket | <code>ws</code> | TCP or TLS/TCP | WebSocket stream; TLS gives WSS behavior |
 | HTTP Upgrade | <code>httpupgrade</code> | HTTP/1.1 over TCP or TLS/TCP | Upgrades an HTTP/1.1 request into a long-lived stream |
-| gRPC | <code>grpc</code> | HTTP/2 over TLS/TCP | gRPC stream framing and service-name routing |
+| gRPC | <code>grpc</code> | HTTP/2 over TCP; TLS depends on the adapter | gRPC stream framing and service-name routing |
 | XHTTP | <code>xhttp</code> | HTTP carrier | XHTTP request, padding, and method modes used by VLESS |
 | KCP | <code>kcp</code> | UDP | Packet-oriented reliable transport family |
 | mKCP | <code>mkcp</code> | UDP | V2Ray-compatible KCP framing and masquerade headers |
@@ -516,30 +358,33 @@ different version number. HTTP/3 is not a TCP protocol.
 
 ### 4.2 WebSocket and HTTP Upgrade
 
-WebSocket starts with an HTTP/1.1 handshake and then carries a WebSocket
-message stream. <code>ws</code> and WSS describe the same WebSocket family with
-and without TLS.
+In the Mihomo <code>ws</code> transports described here, WebSocket starts with
+an HTTP/1.1 Upgrade handshake and then carries WebSocket frames. WSS is the
+same transport protected by TLS. HTTP/2 has a separate WebSocket bootstrap
+mechanism, Extended CONNECT [RFC 8441](https://www.rfc-editor.org/rfc/rfc8441.html);
+it is not the HTTP/1.1 <code>ws</code> path described above.
 
 HTTP Upgrade also starts with HTTP/1.1 but changes the connection into another
 stream after the upgrade. <code>httpupgrade</code> is normally a transport
-option inside a V2Ray-style configuration, not a top-level outbound type or
-share-link scheme.
+option inside a V2Ray-style configuration, not a top-level proxy protocol.
 
 ### 4.3 gRPC
 
-The stack is:
+The protocol stack is:
 
 ~~~text
-gRPC -> HTTP/2 -> TLS -> TCP
+gRPC -> HTTP/2 -> (optional TLS) -> TCP
 ~~~
 
-The <code>grpc-service-name</code> identifies the service path. gRPC is an
-HTTP/2 carrier and not an independent IP transport.
+The <code>grpc-service-name</code> identifies the service path. gRPC is RPC
+framing carried over HTTP/2, not an independent IP transport. In this Mihomo
+revision, VMess and VLESS allow TLS to be disabled for gRPC; Trojan's gRPC
+transport uses TLS.
 
 ### 4.4 KCP and mKCP
 
-KCP and mKCP are UDP-based packet transports. Current examples expose optional
-masquerade headers:
+KCP and mKCP are UDP-based packet transports. The VMess mKCP configuration
+supports these optional masquerade headers:
 
 - <code>none</code>
 - <code>srtp</code>
@@ -553,10 +398,11 @@ the named protocol.
 
 ### 4.5 Multiplexing
 
-The current generic SMUX names are <code>smux</code>, <code>yamux</code>, and
-<code>h2mux</code>. Multiplexing allows several logical proxy streams to share
-one carrier connection. It is independent of whether the underlying
-connection is TCP, TLS/TCP, or QUIC/UDP, subject to adapter constraints.
+The configuration names in this Mihomo revision include <code>smux</code>,
+<code>yamux</code>, and <code>h2mux</code>. A selected adapter can use SMUX to
+multiplex logical byte streams over an ordered stream carrier. This does not
+make SMUX a native UDP datagram protocol; QUIC streams and any additional SMUX
+layer are adapter-specific choices.
 
 ## 5. Security, authentication, and camouflage layers
 
@@ -585,8 +431,7 @@ These layers are separate from the proxy type and carrier.
 
 ### 5.1 TLS version notes
 
-- Hysteria v1, Hysteria2, and TUIC use TLS 1.3-era QUIC handshakes.
-  Hysteria v1 explicitly requires TLS 1.3 or newer in the current source.
+- Hysteria v1, Hysteria2, and TUIC use TLS 1.3-based QUIC handshakes.
 - A generic <code>tls: true</code> option on a stream adapter does not
   automatically mean that the adapter is TLS 1.3-only. The actual minimum and
   maximum versions depend on the adapter and TLS implementation.
@@ -609,7 +454,7 @@ combination.
 
 ### 6.1 Shadowsocks plugin options
 
-The current Shadowsocks outbound adapter has these plugin families or wrappers:
+Mihomo's Shadowsocks outbound supports these plugin families or wrappers:
 
 - <code>obfs</code>: mode <code>http</code> or <code>tls</code>
 - <code>v2ray-plugin</code>: mode <code>websocket</code>, optionally TLS
@@ -680,7 +525,7 @@ methods are <code>chacha20-poly1305</code>, <code>aes-128-gcm</code>, and
 <code>on</code>. The <code>none</code> method provides no AEAD protection.
 
 OpenVPN transport selection is <code>proto: udp</code> or
-<code>proto: tcp</code>. The current reference comments document
+<code>proto: tcp</code>. The Mihomo configuration reference lists
 AES-128/192/256-GCM, AES-128/192/256-CBC, and
 <code>CHACHA20-POLY1305</code>, with MD5, SHA1, SHA256, SHA384, and SHA512
 authentication digest choices.
@@ -699,11 +544,7 @@ Mihomo's listener parser accepts these <code>listeners[].type</code> values:
 | --- | --- | --- |
 | <code>socks</code> | SOCKS listener | SOCKS4 and SOCKS5 on the same listener |
 | <code>http</code> | HTTP proxy listener | HTTP/1.0 and HTTP/1.1 proxy requests |
-| <code>tproxy</code> | Transparent proxy | Platform transparent-proxy interception |
-| <code>redir</code> | Redirect proxy | Platform redirect interception |
 | <code>mixed</code> | Combined listener | HTTP plus SOCKS4/SOCKS5 |
-| <code>tunnel</code> | Tunnel listener | Protocol-specific tunnel entry |
-| <code>tun</code> | TUN interface | Layer-3 packet interception |
 | <code>shadowsocks</code> | Shadowsocks inbound | Shadowsocks TCP/UDP; cipher-dependent |
 | <code>snell</code> | Snell inbound | Snell transport |
 | <code>vmess</code> | VMess inbound | VMess with TCP/WS/H2/gRPC/Mekya/mKCP options |
@@ -718,21 +559,37 @@ Mihomo's listener parser accepts these <code>listeners[].type</code> values:
 | <code>sudoku</code> | Sudoku inbound | Sudoku and optional HTTPMask |
 | <code>trusttunnel</code> | TrustTunnel inbound | TrustTunnel TCP/TLS or optional QUIC |
 
-Important inbound distinctions:
+Important listener distinctions:
 
 - <code>socks</code> is not SOCKS5-only. The listener checks the version byte
   and can handle SOCKS4 or SOCKS5.
 - <code>mixed</code> combines HTTP proxy handling with SOCKS4/SOCKS5 handling.
-- <code>tproxy</code>, <code>redir</code>, <code>tun</code>, and
-  <code>tunnel</code> are interception or packet-entry mechanisms, not ordinary
-  application-layer proxy protocols.
-- The listener parser does not provide generic inbound types for every
-  outbound type. For example, <code>ssh</code>, <code>wireguard</code>,
-  <code>openvpn</code>, <code>tailscale</code>, <code>zerotier</code>, and
-  <code>easytier</code> are not generic entries in this listener list.
-- The parser has <code>hysteria2</code> but not a separate
-  <code>hysteria</code> v1 listener type in this snapshot.
 
-Mihomo also has legacy/global listener creation paths for HTTP, SOCKS,
-redirect, Shadowsocks, VMess, TUIC, TProxy, mixed, and TUN listeners. Those
-runtime paths do not change the listener type list above.
+## 8. Mihomo source references
+
+The links below are pinned to Mihomo revision
+<code>ab405bad5beeeac8b003bb01f60f134f6df54471</code>.
+
+### Parser and configuration
+
+- [Outbound parser](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/adapter/parser.go)
+- [Inbound listener parser](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/listener/parse.go)
+- [Mihomo configuration reference](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/docs/config.yaml)
+
+### Protocol adapters and transports
+
+- [Shadowsocks outbound](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/adapter/outbound/shadowsocks.go)
+- [Shadowsocks cipher registry](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/transport/shadowsocks/core/cipher.go)
+- [ShadowsocksR outbound](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/adapter/outbound/shadowsocksr.go)
+- [VMess outbound](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/adapter/outbound/vmess.go)
+- [VLESS outbound](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/adapter/outbound/vless.go)
+- [Trojan outbound](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/adapter/outbound/trojan.go)
+- [Snell outbound](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/adapter/outbound/snell.go)
+- [Hysteria v1 outbound](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/adapter/outbound/hysteria.go)
+- [Hysteria2 outbound](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/adapter/outbound/hysteria2.go)
+- [TUIC outbound](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/adapter/outbound/tuic.go)
+- [ShadowQUIC outbound](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/adapter/outbound/shadowquic.go)
+- [MASQUE outbound](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/adapter/outbound/masque.go)
+- [TrustTunnel outbound](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/adapter/outbound/trusttunnel.go)
+- [Mieru outbound](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/adapter/outbound/mieru.go)
+- [Sudoku outbound](https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/adapter/outbound/sudoku.go)
