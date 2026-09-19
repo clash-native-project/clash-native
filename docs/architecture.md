@@ -1771,13 +1771,15 @@ the corresponding behavior has independent tests.
 
 #### KCP and mKCP
 
-This subsection likewise reserves the future KCP/mKCP boundary rather than
-adding KCP to the current extraction implementation scope.
+The reusable raw KCP carrier is implemented at this boundary. It consumes an
+injected `DatagramHandle`, owns ARQ sequence state, retransmission, congestion
+behavior, timers, windowing, and MTU limits, and produces a reliable ordered
+stream capability. It does not pass through the HTTP or QUIC interfaces.
 
-KCP consumes an injected `DatagramHandle`, owns ARQ sequence state,
-retransmission, congestion behavior, timers, windowing, and MTU limits, and
-produces a reliable ordered stream capability. It does not pass through the
-HTTP or QUIC interfaces.
+The current implementation is a client-side raw KCP carrier. Its Windows x64
+validation includes a 256 KiB bidirectional exchange with an independent
+`kcp-go` server. This validates the carrier and wire interoperability, but does
+not mark mKCP or any KCP-based proxy protocol complete.
 
 mKCP is a protocol-specific layer over the KCP engine. Its conversation IDs,
 masquerade headers, seeding, and configuration validation remain separate from
@@ -1863,11 +1865,12 @@ non-DNS generalization gate. Phase 6 is deferred beyond the current extraction.
    session and QUIC connection boundaries. Any missing feature is added as a
    capability with its own tests, not by exposing DNS internals or downcasting
    the connection.
-6. **Deferred carrier implementations.** After the current extraction is
-   closed, implement WebSocket/WSS with the first selected WS-based proxy and
-   KCP/mKCP with the first selected KCP-based proxy. These are design inputs,
-   not work items in the current extraction. Do not build unused carrier
-   directories or claim support from a dependency-only test.
+6. **Deferred carrier extensions.** After the current extraction is closed,
+   implement WebSocket/WSS with the first selected WS-based proxy and mKCP with
+   the first selected KCP-based proxy. The raw KCP carrier already exists as a
+   reusable stream component; these remaining layers are design inputs until a
+   protocol consumer requires them. Do not claim proxy support from a carrier
+   interoperability test alone.
 
 Temporary adapters may coexist during a phase, but there is one owner for each
 live protocol state machine. New proxy implementations must not add another
@@ -1908,11 +1911,13 @@ from DNS-owned stacks to shared carriers, but the overall generalization remains
 open until Stage 4 proxy-side use demonstrates that the interfaces are not
 still shaped around DNS exchanges.
 
-WebSocket/WSS and KCP/mKCP have separate future support gates and do not block
-completion of the current HTTP/QUIC extraction. Before either carrier is
-marked supported, WebSocket tests cover fragmentation, control frames, close,
-backpressure, and TLS failure; KCP tests cover loss, reordering, duplication,
-retransmit timing, MTU, cancellation, and shutdown.
+WebSocket/WSS and mKCP have separate future support gates and do not block
+completion of the current HTTP/QUIC extraction. Before WebSocket is marked
+supported, tests cover fragmentation, control frames, close, backpressure, and
+TLS failure. Before a KCP-based proxy is marked supported, tests cover KCP loss,
+reordering, duplication, retransmit timing, MTU, cancellation, and shutdown;
+the current raw KCP carrier has only its setup, payload, and independent wire
+interoperability coverage.
 
 Library construction tests prove only that dependencies link. A carrier is
 supported only after its native adapter, runtime composition, failure paths,
@@ -2199,10 +2204,11 @@ The initial ownership move from DNS to the shared QUIC and HTTP/3 layer is a
 Stage 2 prerequisite. Stage 4 may add capabilities demanded by proxy protocols,
 but it must not introduce a second protocol-local QUIC or HTTP/3 stack.
 
-WebSocket/WSS and KCP/mKCP appear in Section 15 as design constraints only.
-They are not implementation work or Stage 4 completion claims. Their
+WebSocket/WSS and mKCP remain design constraints rather than Stage 4
+completion claims. The raw KCP carrier is implemented and independently
+validated, but no KCP-based proxy protocol is claimed. Their remaining
 implementation phases are scheduled with the first selected proxy protocol
-that needs each carrier and use their separate Section 15 support gates.
+that needs each layer and use their separate Section 15 support gates.
 
 ### Portable core exit gate
 

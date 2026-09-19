@@ -14,6 +14,7 @@ find_package(boost_asio CONFIG REQUIRED)
 find_package(boost_beast CONFIG REQUIRED)
 find_package(c-ares CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
+find_package(kcp CONFIG REQUIRED)
 find_package(OpenSSL CONFIG REQUIRED)
 find_package(nghttp3 CONFIG REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
@@ -134,6 +135,7 @@ add_library(clash-native-core STATIC
     src/transport/http2_client.cpp
     src/transport/http3_client.cpp
     src/transport/grpc_client.cpp
+    src/transport/kcp_client.cpp
     src/transport/endpoint_dialer.cpp
     src/transport/quic_client.cpp
     src/transport/tls_client.cpp
@@ -172,6 +174,7 @@ target_link_libraries(clash-native-core
         c-ares::cares
         clash-native-boringssl
         clash-native-nghttp2
+        kcp::kcp
         ngtcp2_static
         ngtcp2_crypto_boringssl_static
         $<IF:$<TARGET_EXISTS:nghttp3::nghttp3>,nghttp3::nghttp3,nghttp3::nghttp3_static>
@@ -249,6 +252,17 @@ if(BUILD_TESTING)
             clash-native-core
     )
 
+    add_executable(clash-native-kcp-client
+        tests/host/kcp_client.cpp
+    )
+
+    target_compile_features(clash-native-kcp-client PRIVATE cxx_std_20)
+
+    target_link_libraries(clash-native-kcp-client
+        PRIVATE
+            clash-native-core
+    )
+
     add_executable(clash-native-tests
         tests/core/base64_test.cpp
         tests/core/channel_test.cpp
@@ -272,6 +286,7 @@ if(BUILD_TESTING)
         tests/runtime/runtime_snapshot_test.cpp
         tests/runtime/runtime_set_test.cpp
         tests/transport/endpoint_dialer_test.cpp
+        tests/transport/kcp_client_test.cpp
         tests/transport/udp_stream_test.cpp
     )
 
@@ -312,6 +327,21 @@ if(BUILD_TESTING)
     )
 
     gtest_discover_tests(clash-native-http-quic-smoke-tests)
+
+    add_executable(clash-native-protobuf-kcp-smoke-tests
+        tests/core/protobuf_kcp_dependencies_test.cpp
+    )
+
+    target_compile_features(clash-native-protobuf-kcp-smoke-tests PRIVATE cxx_std_20)
+
+    target_link_libraries(clash-native-protobuf-kcp-smoke-tests
+        PRIVATE
+            clash-native-core
+            GTest::gtest_main
+            kcp::kcp
+    )
+
+    gtest_discover_tests(clash-native-protobuf-kcp-smoke-tests)
 
     add_test(
         NAME clash-native.version

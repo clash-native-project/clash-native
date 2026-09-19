@@ -1,5 +1,16 @@
 # Implementation Log
 
+### 2026-09-19 — Add a reusable raw KCP stream carrier
+
+- Added a client-side KCP carrier over an injected `DatagramHandle`, with
+  Asio-driven update timers, ordered stream reads and writes, queued UDP packet
+  output, option validation, and support for payloads larger than the KCP
+  receive-window fragment limit.
+- Added C++ setup coverage and a Go `kcp-go` interoperability test that starts
+  an independent server and exchanges a validated 256 KiB payload in both
+  directions. Raw KCP is covered; mKCP framing, KCP plugins, and proxy protocol
+  composition remain separate work.
+
 ### 2026-09-19 — Centralize Base64 through BoringSSL
 
 - Added a shared core Base64 wrapper backed by BoringSSL's standard padded
@@ -11,18 +22,23 @@
 ### 2026-09-19 — Replace the gRPC C++ runtime with a Protobuf/HTTP2 client
 
 - Removed the upstream gRPC C++ runtime, its zlib-only direct dependency, and
-  the local gRPC vcpkg overlay.
+  the local gRPC vcpkg overlay. Kept KCP as a separate vcpkg dependency.
 - Added an asynchronous gRPC client wire layer over the existing HTTP/2
   session. It serializes `google::protobuf::MessageLite` values into the
   standard five-byte gRPC message envelope, supports metadata, deadlines,
   trailers, trailers-only status responses, incremental message reads,
   bidirectional half-close, cancellation, and identity message framing;
   compressed message encodings are rejected explicitly.
-- Added an independent grpc-go TLS interoperability
+- Added a Protobuf/KCP smoke test and an independent grpc-go TLS interoperability
   fixture covering unary metadata and trailers, a trailers-only non-OK status,
   binary metadata, and bidirectional streaming. The client remains a wire
   implementation rather than a generated service API; message compression and
   service-specific generated bindings are not included.
+
+### 2026-09-18 — Add gRPC and KCP dependencies
+
+- Added the upstream gRPC C++ library and KCP C library through the pinned vcpkg manifest baseline (Apache-2.0 and MIT). The gRPC overlay reuses the existing BoringSSL package for its OpenSSL-compatible API and prefers config-package discovery for correct Debug and Release library selection, avoiding a conflicting second TLS provider. Added zlib as a direct static-link dependency for gRPC's compression objects.
+- Linked both libraries to the core target and added API smoke tests for channel construction and KCP control-block lifecycle. This adds dependencies only; no gRPC or KCP proxy transport is implemented yet.
 
 ### 2026-09-18 — Record local proxy listener security scope
 

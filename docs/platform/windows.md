@@ -23,10 +23,11 @@ pixi run python scripts/build.py --build-type Release --llvm-root "C:\Program Fi
 
 The CMake build script resolves CMake and Ninja from the Pixi environment and
 uses standalone LLVM `clang-cl` with the MSVC toolchain. ngtcp2 is acquired by
-CMake FetchContent; HTTP, TLS, QUIC, and Protobuf dependencies are
+CMake FetchContent; HTTP, TLS, QUIC, Protobuf, and KCP dependencies are
 otherwise resolved by the vcpkg manifest. The gRPC client wire protocol is
 implemented over the existing HTTP/2 session and uses Protobuf serialization;
-the upstream gRPC C++ runtime is not linked.
+the upstream gRPC C++ runtime is not linked. KCP uses the upstream
+`skywind3000/kcp` C library under MIT.
 The manifest constrains package versions against the pinned vcpkg baseline.
 This Windows profile does not use MSYS2 or auxiliary build systems.
 Static CRT linkage does not remove Windows operating-system DLL dependencies;
@@ -56,3 +57,11 @@ route-management behavior.
 Do not use this document as evidence for another platform. Add or update the
 corresponding platform document when that platform is actually configured or
 tested.
+
+The current KCP interop check is Windows x64 only: build the
+`clash-native-kcp-client` host with the command above, set
+`CLASH_NATIVE_KCP_CLIENT` to that executable, and run
+`go test -count=1 -run '^TestKCPClientInteroperability$' -v .` from
+`tests/interop`. The test uses an independent `kcp-go` server and validates a
+256 KiB bidirectional exchange. It does not cover mKCP or a KCP-based proxy
+protocol.
