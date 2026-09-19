@@ -1,5 +1,27 @@
 # Implementation Log
 
+### 2026-09-19 — Add an HTTP/1.1 WebSocket client carrier
+
+- Added an asynchronous WebSocket client over an injected `StreamHandle`. The
+  carrier always uses HTTP/1.1 Upgrade, maps each write to one binary message,
+  exposes incoming binary message payloads as a byte stream, and delegates
+  masking, fragmentation, ping/pong, close handling, and handshake framing to
+  Boost.Beast. A TLS-wrapped stream can be supplied for WSS composition;
+  HTTP/2 and HTTP/3 Extended CONNECT are intentionally outside this API.
+- Added a Beast-specific Asio stream adapter that keeps asynchronous buffer
+  storage alive for framing operations. Added option/error coverage and a Go
+  Gorilla interoperability test with an independent HTTP/1.1 server,
+  ping control frame, custom handshake header, and a validated 256 KiB binary
+  echo. Binary message validation and deferred Beast stream destruction cover
+  the byte-stream adapter's protocol and cancellation boundaries. The Go
+  fixture keeps the connection open until the client consumes the echo so the
+  Windows TCP close path cannot race unread response data.
+- Enforced the configured WebSocket message size limit for both incoming and
+  outgoing binary messages.
+- Validated the Windows x64 Release clang-cl/MSVC build, CTest 133/133, the
+  full Go interoperability suite, `go vet ./...`, and repeated the WebSocket
+  interoperability case ten times.
+
 ### 2026-09-19 — Add a reusable raw KCP stream carrier
 
 - Added a client-side KCP carrier over an injected `DatagramHandle`, with

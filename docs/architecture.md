@@ -1633,9 +1633,11 @@ validate, extend, and harden the same shared layer; it does not perform the
 initial move out of DNS.
 
 WebSocket/WSS and KCP/mKCP are included in the design so the shared boundaries
-do not block them later, but they are not implementation deliverables of this
-Stage 2/Stage 4 extraction. Their implementation starts with the first selected
-proxy protocol that needs each carrier.
+do not block them later. The reusable HTTP/1.1 WebSocket carrier is now
+implemented; its first proxy consumer remains a separate protocol task. KCP is
+also available as a raw carrier, while mKCP and protocol-specific composition
+remain separate. HTTP/2 and HTTP/3 Extended CONNECT are not part of the current
+WebSocket carrier.
 
 HTTP proxy semantics and an HTTP carrier are different consumers of shared
 HTTP machinery. Likewise, DoH3 and a future MASQUE protocol both use HTTP/3,
@@ -1755,19 +1757,18 @@ extensions are part of compatibility and pool identity.
 
 #### WebSocket and WSS
 
-This subsection defines a future compatibility boundary; WebSocket/WSS is not
-part of the current TLS/HTTP/QUIC extraction implementation scope.
+WebSocket is a message and control-frame protocol over an HTTP handshake. The
+reusable client carrier accepts an injected `StreamHandle` and always performs
+an HTTP/1.1 Upgrade. It maps each outgoing write to one binary WebSocket
+message and exposes incoming binary message payloads through the project byte
+stream contract, including partial reads. Boost.Beast owns masking,
+fragmentation, ping/pong, close frames, and handshake framing.
 
-WebSocket is a message and control-frame protocol over an HTTP handshake. A
-`WebSocketChannel` preserves message boundaries, fragmentation, ping/pong,
-close, backpressure, and cancellation. A protocol may use an explicit
-byte-stream adapter only when its WebSocket mapping defines how messages are
-coalesced or split.
-
-The initial client handshake uses the shared HTTP/1.1 and TLS capabilities.
-WSS is TLS plus WebSocket, not a separate socket interface. Extended CONNECT
-over HTTP/2 or HTTP/3 is added only when a selected protocol requires it and
-the corresponding behavior has independent tests.
+WSS is TLS plus WebSocket, not a separate socket interface. A TLS-wrapped
+`StreamHandle` can be passed to the same client carrier. The current carrier
+does not implement HTTP/2 or HTTP/3 Extended CONNECT, and a complete
+WS-based proxy protocol still needs its own handshake, backpressure, close,
+and independent interoperability coverage.
 
 #### KCP and mKCP
 
@@ -1866,11 +1867,11 @@ non-DNS generalization gate. Phase 6 is deferred beyond the current extraction.
    capability with its own tests, not by exposing DNS internals or downcasting
    the connection.
 6. **Deferred carrier extensions.** After the current extraction is closed,
-   implement WebSocket/WSS with the first selected WS-based proxy and mKCP with
-   the first selected KCP-based proxy. The raw KCP carrier already exists as a
-   reusable stream component; these remaining layers are design inputs until a
-   protocol consumer requires them. Do not claim proxy support from a carrier
-   interoperability test alone.
+   implement mKCP with the first selected KCP-based proxy and compose the
+   existing WebSocket carrier with the first selected WS-based proxy. The raw
+   KCP carrier already exists as a reusable stream component, and the
+   HTTP/1.1 WebSocket carrier has independent wire coverage; neither carrier
+   test alone claims proxy protocol support.
 
 Temporary adapters may coexist during a phase, but there is one owner for each
 live protocol state machine. New proxy implementations must not add another
@@ -1911,11 +1912,12 @@ from DNS-owned stacks to shared carriers, but the overall generalization remains
 open until Stage 4 proxy-side use demonstrates that the interfaces are not
 still shaped around DNS exchanges.
 
-WebSocket/WSS and mKCP have separate future support gates and do not block
-completion of the current HTTP/QUIC extraction. Before WebSocket is marked
-supported, tests cover fragmentation, control frames, close, backpressure, and
-TLS failure. Before a KCP-based proxy is marked supported, tests cover KCP loss,
-reordering, duplication, retransmit timing, MTU, cancellation, and shutdown;
+WebSocket-based proxy composition and mKCP have separate support gates and do
+not block completion of the current HTTP/QUIC extraction. Before a
+WebSocket-based proxy is marked supported, tests cover fragmentation, control
+frames, close, backpressure, and TLS failure. Before a KCP-based proxy is
+marked supported, tests cover KCP loss, reordering, duplication, retransmit
+timing, MTU, cancellation, and shutdown;
 the current raw KCP carrier has only its setup, payload, and independent wire
 interoperability coverage.
 
@@ -2204,11 +2206,11 @@ The initial ownership move from DNS to the shared QUIC and HTTP/3 layer is a
 Stage 2 prerequisite. Stage 4 may add capabilities demanded by proxy protocols,
 but it must not introduce a second protocol-local QUIC or HTTP/3 stack.
 
-WebSocket/WSS and mKCP remain design constraints rather than Stage 4
-completion claims. The raw KCP carrier is implemented and independently
+The HTTP/1.1 WebSocket carrier is implemented and independently validated, but
+HTTP/2 and HTTP/3 Extended CONNECT plus WS-based proxy composition remain
+outside this milestone. The raw KCP carrier is implemented and independently
 validated, but no KCP-based proxy protocol is claimed. Their remaining
-implementation phases are scheduled with the first selected proxy protocol
-that needs each layer and use their separate Section 15 support gates.
+implementation phases use the separate Section 15 support gates.
 
 ### Portable core exit gate
 

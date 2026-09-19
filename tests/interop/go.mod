@@ -3,6 +3,7 @@ module clash-native/interop
 go 1.23.0
 
 require (
+	github.com/gorilla/websocket v1.5.3
 	github.com/miekg/dns v1.1.68
 	github.com/quic-go/qpack v0.5.1
 	github.com/quic-go/quic-go v0.54.0

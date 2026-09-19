@@ -65,3 +65,12 @@ The current KCP interop check is Windows x64 only: build the
 `tests/interop`. The test uses an independent `kcp-go` server and validates a
 256 KiB bidirectional exchange. It does not cover mKCP or a KCP-based proxy
 protocol.
+
+The WebSocket interop check is also Windows x64 only. The standard build script
+sets `CLASH_NATIVE_WEBSOCKET_CLIENT` to the built host and runs
+`go test -count=1 -run '^TestWebSocketClientInteroperability$' -v .` from
+`tests/interop` when the Go suite is enabled. The test starts an independent
+Gorilla WebSocket server, validates the HTTP/1.1 Upgrade path and a custom
+header, sends a ping control frame, and checks a 256 KiB binary echo. The
+carrier is limited to HTTP/1.1 Upgrade; HTTP/2 and HTTP/3 Extended CONNECT are
+not covered.

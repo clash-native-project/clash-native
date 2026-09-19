@@ -136,6 +136,7 @@ add_library(clash-native-core STATIC
     src/transport/http3_client.cpp
     src/transport/grpc_client.cpp
     src/transport/kcp_client.cpp
+    src/transport/websocket_client.cpp
     src/transport/endpoint_dialer.cpp
     src/transport/quic_client.cpp
     src/transport/tls_client.cpp
@@ -263,6 +264,17 @@ if(BUILD_TESTING)
             clash-native-core
     )
 
+    add_executable(clash-native-websocket-client
+        tests/host/websocket_client.cpp
+    )
+
+    target_compile_features(clash-native-websocket-client PRIVATE cxx_std_20)
+
+    target_link_libraries(clash-native-websocket-client
+        PRIVATE
+            clash-native-core
+    )
+
     add_executable(clash-native-tests
         tests/core/base64_test.cpp
         tests/core/channel_test.cpp
@@ -287,6 +299,7 @@ if(BUILD_TESTING)
         tests/runtime/runtime_set_test.cpp
         tests/transport/endpoint_dialer_test.cpp
         tests/transport/kcp_client_test.cpp
+        tests/transport/websocket_client_test.cpp
         tests/transport/udp_stream_test.cpp
     )
 

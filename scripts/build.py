@@ -306,6 +306,9 @@ def main() -> int:
             environment["CLASH_NATIVE_GRPC_CLIENT"] = str(
                 build_dir / "clash-native-grpc-client.exe"
             )
+            environment["CLASH_NATIVE_WEBSOCKET_CLIENT"] = str(
+                build_dir / "clash-native-websocket-client.exe"
+            )
             # Go's HTTP/2 server disables Extended CONNECT by default.
             godebug = [
                 setting
