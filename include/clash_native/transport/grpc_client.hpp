@@ -1,7 +1,7 @@
 #pragma once
 
 #include <clash_native/core/result.hpp>
-#include <clash_native/transport/http_client.hpp>
+#include <clash_native/transport/exchange_session.hpp>
 
 #include <google/protobuf/message_lite.h>
 
@@ -64,11 +64,10 @@ class GrpcClientCall final : public std::enable_shared_from_this<GrpcClientCall>
     friend class GrpcClient;
     class RequestBody;
 
-    GrpcClientCall(boost::asio::any_io_executor executor,
-                   std::shared_ptr<HttpClientSession> session, GrpcCallOptions options,
-                   OpenHandler open_handler);
+    GrpcClientCall(boost::asio::any_io_executor executor, std::shared_ptr<ExchangeSession> session,
+                   GrpcCallOptions options, OpenHandler open_handler);
     void start();
-    void on_response(core::Result<HttpStreamingResponse> result);
+    void on_response(core::Result<StreamingExchangeResponse> result);
     void read_response();
     void on_response_read(const boost::system::error_code &error, std::size_t size);
     void deliver_or_read();
@@ -77,12 +76,12 @@ class GrpcClientCall final : public std::enable_shared_from_this<GrpcClientCall>
     void post_read(ReadMessageHandler handler, core::Result<std::optional<std::string>> result);
 
     boost::asio::any_io_executor executor_;
-    std::shared_ptr<HttpClientSession> session_;
+    std::shared_ptr<ExchangeSession> session_;
     GrpcCallOptions options_;
     OpenHandler open_handler_;
     std::shared_ptr<RequestBody> request_body_;
-    std::shared_ptr<HttpBodyStream> response_body_;
-    HttpClientSession::ExchangeId exchange_id_ = 0;
+    std::shared_ptr<ExchangeBodyStream> response_body_;
+    ExchangeSession::ExchangeId exchange_id_ = 0;
     std::vector<GrpcMetadata> initial_metadata_;
     std::optional<GrpcStatus> status_;
     std::vector<std::uint8_t> response_bytes_;
@@ -99,14 +98,14 @@ class GrpcClientCall final : public std::enable_shared_from_this<GrpcClientCall>
 
 class GrpcClient final {
   public:
-    GrpcClient(boost::asio::any_io_executor executor, std::shared_ptr<HttpClientSession> session);
+    GrpcClient(boost::asio::any_io_executor executor, std::shared_ptr<ExchangeSession> session);
 
     std::shared_ptr<GrpcClientCall> start_call(GrpcCallOptions options,
                                                GrpcClientCall::OpenHandler handler);
 
   private:
     boost::asio::any_io_executor executor_;
-    std::shared_ptr<HttpClientSession> session_;
+    std::shared_ptr<ExchangeSession> session_;
 };
 
 } // namespace clash_native::transport

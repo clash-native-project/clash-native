@@ -1,6 +1,6 @@
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
-#include <clash_native/transport/http_client.hpp>
+#include <clash_native/transport/exchange_session.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include <boost/asio/post.hpp>
@@ -62,10 +62,11 @@ bool matches_question(const DnsPacket &response, const DnsPacket &query) {
                       });
 }
 
-const std::string *find_header(const transport::HttpResponse &response, std::string_view name) {
-    const auto found = std::find_if(
-        response.headers.begin(), response.headers.end(),
-        [name](const transport::HttpHeader &header) { return lower_trimmed(header.name) == name; });
+const std::string *find_header(const transport::ExchangeResponse &response, std::string_view name) {
+    const auto found = std::find_if(response.headers.begin(), response.headers.end(),
+                                    [name](const transport::ExchangeField &header) {
+                                        return lower_trimmed(header.name) == name;
+                                    });
     return found == response.headers.end() ? nullptr : &found->value;
 }
 
@@ -223,14 +224,14 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     }
 
     void start_http(std::unique_ptr<core::StreamHandle> stream) {
-        http_session_ = transport::make_http1_client_session(std::move(stream));
+        http_session_ = transport::make_http1_exchange_session(std::move(stream));
         if (!http_session_) {
             finish(core::fail(
                 {core::ErrorCode::configuration, "failed to create an HTTP/1.1 client session"}));
             return;
         }
 
-        transport::HttpRequest request;
+        transport::ExchangeRequest request;
         request.method = "POST";
         request.scheme = "https";
         request.authority = authority_;
@@ -242,19 +243,19 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
         request.keep_alive = false;
 
         const auto self = shared_from_this();
-        http_exchange_id_ =
-            http_session_->exchange(std::move(request), request_.deadline,
-                                    [self](core::Result<transport::HttpResponse> response) mutable {
-                                        self->http_exchange_started_ = false;
-                                        if (self->completed_) {
-                                            return;
-                                        }
-                                        self->http_response(std::move(response));
-                                    });
+        http_exchange_id_ = http_session_->exchange(
+            std::move(request), request_.deadline,
+            [self](core::Result<transport::ExchangeResponse> response) mutable {
+                self->http_exchange_started_ = false;
+                if (self->completed_) {
+                    return;
+                }
+                self->http_response(std::move(response));
+            });
         http_exchange_started_ = true;
     }
 
-    void http_response(core::Result<transport::HttpResponse> result) {
+    void http_response(core::Result<transport::ExchangeResponse> result) {
         if (!result) {
             finish(core::fail(result.error()));
             return;
@@ -318,8 +319,8 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     Handler handler_;
     boost::asio::steady_timer timer_;
     std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
-    std::shared_ptr<transport::HttpClientSession> http_session_;
-    transport::HttpClientSession::ExchangeId http_exchange_id_ = 0;
+    std::shared_ptr<transport::ExchangeSession> http_session_;
+    transport::ExchangeSession::ExchangeId http_exchange_id_ = 0;
     std::string authority_;
     bool http_exchange_started_ = false;
     bool completed_ = false;

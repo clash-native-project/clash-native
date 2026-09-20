@@ -1,6 +1,6 @@
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
-#include <clash_native/transport/http_client.hpp>
+#include <clash_native/transport/exchange_session.hpp>
 #include <clash_native/transport/quic_client.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
@@ -35,10 +35,10 @@ namespace {
 
 using namespace std::chrono_literals;
 using clash_native::core::StreamHandle;
-using clash_native::transport::HttpClientSession;
-using clash_native::transport::HttpHeader;
-using clash_native::transport::HttpStreamingRequest;
-using clash_native::transport::HttpStreamingResponse;
+using clash_native::transport::ExchangeField;
+using clash_native::transport::ExchangeSession;
+using clash_native::transport::StreamingExchangeRequest;
+using clash_native::transport::StreamingExchangeResponse;
 
 constexpr std::size_t kStreamingBodySize = 2 * 1024 * 1024;
 constexpr std::size_t kStreamingReadSize = 32 * 1024;
@@ -53,7 +53,7 @@ std::vector<std::uint8_t> make_streaming_payload(std::string_view marker, unsign
     return payload;
 }
 
-class TestBodyStream final : public clash_native::transport::HttpBodyStream,
+class TestBodyStream final : public clash_native::transport::ExchangeBodyStream,
                              public std::enable_shared_from_this<TestBodyStream> {
   public:
     TestBodyStream(boost::asio::any_io_executor executor, std::vector<std::uint8_t> payload,
@@ -84,14 +84,14 @@ class TestBodyStream final : public clash_native::transport::HttpBodyStream,
         });
     }
 
-    std::vector<HttpHeader> trailers() const override { return trailers_; }
+    std::vector<ExchangeField> trailers() const override { return trailers_; }
 
     void cancel() noexcept override { cancelled_.store(true); }
 
   private:
     boost::asio::any_io_executor executor_;
     std::vector<std::uint8_t> payload_;
-    std::vector<HttpHeader> trailers_;
+    std::vector<ExchangeField> trailers_;
     std::size_t offset_ = 0;
     std::atomic_bool cancelled_ = false;
 };
@@ -132,7 +132,7 @@ class TunnelProbe final : public std::enable_shared_from_this<TunnelProbe> {
     TunnelProbe(boost::asio::io_context &context, std::string mode)
         : context_(context), mode_(std::move(mode)), timer_(context) {}
 
-    void start(std::shared_ptr<HttpClientSession> session, unsigned int expected_status) {
+    void start(std::shared_ptr<ExchangeSession> session, unsigned int expected_status) {
         session_ = std::move(session);
         expected_status_ = expected_status;
         timer_.expires_after(12s);
@@ -142,10 +142,10 @@ class TunnelProbe final : public std::enable_shared_from_this<TunnelProbe> {
                 self->finish("HTTP tunnel probe timed out");
             }
         });
-        clash_native::transport::HttpTunnelRequest request;
+        clash_native::transport::StreamUpgradeRequest request;
         request.authority = "tunnel.test:443";
         if (mode_ == "upgrade") {
-            request.mode = clash_native::transport::HttpTunnelMode::upgrade;
+            request.mode = clash_native::transport::StreamUpgradeMode::upgrade;
             request.scheme = "http";
             request.target = "/ws";
             request.protocol = "websocket";
@@ -156,7 +156,8 @@ class TunnelProbe final : public std::enable_shared_from_this<TunnelProbe> {
         const auto deadline = std::chrono::steady_clock::now() + 10s;
         session_->open_tunnel(
             std::move(request), deadline,
-            [self](clash_native::core::Result<clash_native::transport::HttpTunnelResponse> result) {
+            [self](
+                clash_native::core::Result<clash_native::transport::StreamUpgradeResponse> result) {
                 if (!result) {
                     self->finish("open_tunnel failed: " + result.error().context);
                     return;
@@ -255,7 +256,7 @@ class TunnelProbe final : public std::enable_shared_from_this<TunnelProbe> {
     std::string mode_;
     unsigned int expected_status_ = 200;
     boost::asio::steady_timer timer_;
-    std::shared_ptr<HttpClientSession> session_;
+    std::shared_ptr<ExchangeSession> session_;
     std::unique_ptr<StreamHandle> stream_;
     const std::string payload_ = "clash-native-http-full-duplex-tunnel";
     std::array<std::uint8_t, 1024> read_buffer_{};
@@ -271,7 +272,7 @@ class StreamingProbe final : public std::enable_shared_from_this<StreamingProbe>
         : context_(context), delay_timer_(context),
           declare_request_trailers_(declare_request_trailers) {}
 
-    void start(std::shared_ptr<HttpClientSession> session) {
+    void start(std::shared_ptr<ExchangeSession> session) {
         session_ = std::move(session);
         timeout_timer_.emplace(context_);
         timeout_timer_->expires_after(45s);
@@ -286,7 +287,8 @@ class StreamingProbe final : public std::enable_shared_from_this<StreamingProbe>
             auto request = make_request(index);
             session_->exchange_streaming(
                 std::move(request), std::chrono::steady_clock::now() + 40s,
-                [self, index](clash_native::core::Result<HttpStreamingResponse> result) mutable {
+                [self,
+                 index](clash_native::core::Result<StreamingExchangeResponse> result) mutable {
                     self->on_response(index, std::move(result));
                 });
         }
@@ -299,8 +301,8 @@ class StreamingProbe final : public std::enable_shared_from_this<StreamingProbe>
   private:
     struct Exchange {
         std::string id;
-        std::shared_ptr<clash_native::transport::HttpBodyStream> request_body;
-        std::shared_ptr<clash_native::transport::HttpBodyStream> response_body;
+        std::shared_ptr<clash_native::transport::ExchangeBodyStream> request_body;
+        std::shared_ptr<clash_native::transport::ExchangeBodyStream> response_body;
         std::vector<std::uint8_t> received;
         std::array<std::uint8_t, kStreamingReadSize> read_buffer{};
         bool response_ready = false;
@@ -308,12 +310,12 @@ class StreamingProbe final : public std::enable_shared_from_this<StreamingProbe>
         bool complete = false;
     };
 
-    HttpStreamingRequest make_request(std::size_t index) {
+    StreamingExchangeRequest make_request(std::size_t index) {
         auto &exchange = exchanges_[index];
         exchange.id = index == 0 ? "A" : "B";
         exchange.received.reserve(kStreamingBodySize);
 
-        HttpStreamingRequest request;
+        StreamingExchangeRequest request;
         request.request.method = "POST";
         request.request.scheme = "http";
         request.request.authority = "localhost";
@@ -329,7 +331,7 @@ class StreamingProbe final : public std::enable_shared_from_this<StreamingProbe>
         return request;
     }
 
-    static std::string find_header(const std::vector<HttpHeader> &headers,
+    static std::string find_header(const std::vector<ExchangeField> &headers,
                                    std::string_view expected_name) {
         for (const auto &header : headers) {
             if (header.name.size() == expected_name.size() &&
@@ -349,7 +351,8 @@ class StreamingProbe final : public std::enable_shared_from_this<StreamingProbe>
         return {};
     }
 
-    void on_response(std::size_t index, clash_native::core::Result<HttpStreamingResponse> result) {
+    void on_response(std::size_t index,
+                     clash_native::core::Result<StreamingExchangeResponse> result) {
         if (finished_) {
             return;
         }
@@ -475,12 +478,188 @@ class StreamingProbe final : public std::enable_shared_from_this<StreamingProbe>
     boost::asio::steady_timer delay_timer_;
     std::optional<boost::asio::steady_timer> timeout_timer_;
     std::array<Exchange, 2> exchanges_;
-    std::shared_ptr<HttpClientSession> session_;
+    std::shared_ptr<ExchangeSession> session_;
     bool declare_request_trailers_ = false;
     bool delay_armed_ = false;
     bool finished_ = false;
     std::size_t completed_ = 0;
     std::string error_;
+};
+
+class RawQuicProbe final : public std::enable_shared_from_this<RawQuicProbe> {
+  public:
+    explicit RawQuicProbe(boost::asio::io_context &context)
+        : context_(context), timeout_timer_(context) {}
+
+    void start(std::shared_ptr<clash_native::transport::QuicClientConnection> connection) {
+        connection_ = std::move(connection);
+        timeout_timer_.expires_after(15s);
+        const auto self = shared_from_this();
+        timeout_timer_.async_wait([self](const boost::system::error_code &error) {
+            if (!error) {
+                self->finish("raw QUIC carrier probe timed out");
+            }
+        });
+
+        clash_native::transport::QuicClientEvents events;
+        events.ready = [self](std::string) { self->open_carrier_capabilities(); };
+        events.failed = [self](clash_native::core::Error error) {
+            self->finish("raw QUIC carrier failed: " + error.context);
+        };
+        connection_->set_events(std::move(events));
+    }
+
+    bool succeeded() const noexcept { return finished_ && error_.empty(); }
+    const std::string &error() const noexcept { return error_; }
+
+  private:
+    static constexpr std::size_t kStreamCount = 4;
+
+    void open_carrier_capabilities() {
+        if (finished_ || opened_) {
+            return;
+        }
+        opened_ = true;
+        const auto maximum = connection_->max_concurrent_streams();
+        if (!maximum || *maximum < kStreamCount) {
+            finish("QUIC peer did not advertise enough bidirectional stream capacity");
+            return;
+        }
+        datagram_ = connection_->open_datagram();
+        if (!datagram_ || datagram_->max_datagram_size() == 0) {
+            finish("QUIC DATAGRAM capability is unavailable after handshake");
+            return;
+        }
+
+        datagram_buffer_.fill(0);
+        const auto self = shared_from_this();
+        datagram_->async_receive_from(
+            boost::asio::buffer(datagram_buffer_),
+            [self](const boost::system::error_code &error, std::size_t size,
+                   boost::asio::ip::udp::endpoint) {
+                if (error || std::string(reinterpret_cast<const char *>(self->datagram_buffer_.data()),
+                                         size) != self->datagram_payload_) {
+                    self->finish("QUIC DATAGRAM echo failed");
+                    return;
+                }
+                self->datagram_done_ = true;
+                self->maybe_finish();
+            });
+        const auto payload = std::vector<std::uint8_t>(datagram_payload_.begin(),
+                                                        datagram_payload_.end());
+        datagram_->async_send_to(
+            boost::asio::buffer(payload), connection_->remote_endpoint(),
+            [self](const boost::system::error_code &error, std::size_t size) {
+                if (error || size != self->datagram_payload_.size()) {
+                    self->finish("QUIC DATAGRAM send failed");
+                }
+            });
+
+        stream_handles_.resize(kStreamCount);
+        stream_payloads_.resize(kStreamCount);
+        for (std::size_t index = 0; index < kStreamCount; ++index) {
+            stream_payloads_[index] = "quic-stream-" + std::to_string(index);
+            clash_native::transport::MultiplexedStreamRequest request;
+            connection_->open_stream(
+                request, std::chrono::steady_clock::now() + 10s,
+                [self, index](clash_native::core::Result<std::unique_ptr<StreamHandle>> result) {
+                    if (!result) {
+                        self->finish("QUIC multiplexed stream open failed: " +
+                                     result.error().context);
+                        return;
+                    }
+                    self->stream_handles_[index] = std::move(result.value());
+                    ++self->streams_opened_;
+                    if (self->streams_opened_ == kStreamCount &&
+                        self->connection_->active_streams() < kStreamCount) {
+                        self->finish("QUIC multiplexed session lost an active stream");
+                        return;
+                    }
+                    self->write_stream(index);
+                });
+        }
+    }
+
+    void write_stream(std::size_t index) {
+        const auto self = shared_from_this();
+        auto &stream = stream_handles_[index];
+        stream->async_write(
+            boost::asio::buffer(stream_payloads_[index]),
+            [self, index](const boost::system::error_code &error, std::size_t size) {
+                if (error || size != self->stream_payloads_[index].size()) {
+                    self->finish("QUIC multiplexed stream write failed");
+                    return;
+                }
+                auto buffer = std::make_shared<std::array<std::uint8_t, 128>>();
+                self->stream_buffers_[index] = buffer;
+                self->stream_handles_[index]->async_read_some(
+                    boost::asio::buffer(*buffer),
+                    [self, index, buffer](const boost::system::error_code &read_error,
+                                          std::size_t read_size) {
+                        if (read_error) {
+                            self->finish("QUIC multiplexed stream echo read failed: " +
+                                         read_error.message());
+                            return;
+                        }
+                        if (std::string(reinterpret_cast<const char *>(buffer->data()), read_size) !=
+                            self->stream_payloads_[index]) {
+                            self->finish("QUIC multiplexed stream echo mismatch");
+                            return;
+                        }
+                        self->stream_handles_[index]->close();
+                        self->stream_handles_[index].reset();
+                        ++self->streams_done_;
+                        self->maybe_finish();
+                    });
+            });
+    }
+
+    void maybe_finish() {
+        if (streams_done_ == kStreamCount && datagram_done_) {
+            finish({});
+        }
+    }
+
+    void finish(std::string error) {
+        if (finished_) {
+            return;
+        }
+        finished_ = true;
+        error_ = std::move(error);
+        (void)timeout_timer_.cancel();
+        for (auto &stream : stream_handles_) {
+            if (stream) {
+                stream->close();
+                stream.reset();
+            }
+        }
+        if (datagram_) {
+            datagram_->close();
+            datagram_.reset();
+        }
+        if (connection_) {
+            connection_->close();
+            connection_.reset();
+        }
+        context_.stop();
+    }
+
+    boost::asio::io_context &context_;
+    boost::asio::steady_timer timeout_timer_;
+    std::shared_ptr<clash_native::transport::QuicClientConnection> connection_;
+    std::unique_ptr<clash_native::core::DatagramHandle> datagram_;
+    std::vector<std::unique_ptr<StreamHandle>> stream_handles_;
+    std::vector<std::string> stream_payloads_;
+    std::vector<std::shared_ptr<std::array<std::uint8_t, 128>>> stream_buffers_ =
+        std::vector<std::shared_ptr<std::array<std::uint8_t, 128>>>(kStreamCount);
+    std::array<std::uint8_t, 128> datagram_buffer_{};
+    const std::string datagram_payload_ = "quic-datagram";
+    std::string error_;
+    std::size_t streams_opened_ = 0;
+    std::size_t streams_done_ = 0;
+    bool datagram_done_ = false;
+    bool opened_ = false;
+    bool finished_ = false;
 };
 
 std::unique_ptr<StreamHandle> connect_tcp(boost::asio::io_context &context,
@@ -492,7 +671,8 @@ std::unique_ptr<StreamHandle> connect_tcp(boost::asio::io_context &context,
 
 int run_http1(const ServerAddress &server, const std::string &mode) {
     boost::asio::io_context context;
-    auto session = clash_native::transport::make_http1_client_session(connect_tcp(context, server));
+    auto session =
+        clash_native::transport::make_http1_exchange_session(connect_tcp(context, server));
     if (mode == "streaming") {
         auto probe = std::make_shared<StreamingProbe>(context, true);
         boost::asio::post(context, [probe, session = std::move(session)]() mutable {
@@ -550,7 +730,7 @@ int run_http2(const ServerAddress &server, const std::string &mode) {
                 return;
             }
             auto session =
-                clash_native::transport::make_http2_client_session(std::move(result->stream));
+                clash_native::transport::make_http2_exchange_session(std::move(result->stream));
             if (!session) {
                 fail_probe("failed to create HTTP/2 client session");
                 return;
@@ -598,7 +778,7 @@ int run_http3(const ServerAddress &server, const std::string &mode) {
         std::cerr << "failed to create QUIC client connection\n";
         return 1;
     }
-    const auto session = clash_native::transport::make_http3_client_session(
+    const auto session = clash_native::transport::make_http3_exchange_session(
         connection, [tunnel_weak = std::weak_ptr<TunnelProbe>(tunnel_probe),
                      streaming_weak = std::weak_ptr<StreamingProbe>(streaming_probe)](
                         clash_native::core::Error error) {
@@ -624,11 +804,44 @@ int run_http3(const ServerAddress &server, const std::string &mode) {
     return 0;
 }
 
+int run_raw_quic(const ServerAddress &server) {
+    boost::asio::io_context context;
+    auto datagram = std::make_unique<clash_native::net::UdpStream>(context.get_executor());
+    boost::system::error_code error;
+    datagram->open(boost::asio::ip::udp::v4(), error);
+    if (!error) {
+        datagram->bind({boost::asio::ip::address_v4::loopback(), 0}, error);
+    }
+    if (error) {
+        throw std::system_error(error, "failed to open QUIC UDP socket");
+    }
+    clash_native::transport::QuicClientOptions options;
+    options.server_name = "localhost";
+    options.verify_peer = false;
+    options.alpn_protocols = {"raw-quic"};
+    options.handshake_timeout = 10s;
+    const auto connection = clash_native::transport::make_quic_client_connection(
+        context.get_executor(), std::move(datagram), {server.address, server.port},
+        std::move(options), {});
+    if (!connection) {
+        std::cerr << "failed to create QUIC client connection\n";
+        return 1;
+    }
+    const auto probe = std::make_shared<RawQuicProbe>(context);
+    probe->start(connection);
+    context.run();
+    if (!probe->succeeded()) {
+        std::cerr << probe->error() << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
     if (argc < 3 || argc > 4) {
-        std::cerr << "usage: clash-native-http-tunnel-client <http1|http2|http3> "
+        std::cerr << "usage: clash-native-http-tunnel-client <http1|http2|http3|quic> "
                      "<IPv4:port> [connect|upgrade|streaming]\n";
         return 2;
     }
@@ -647,6 +860,9 @@ int main(int argc, char **argv) {
         if (protocol == "http3" &&
             (mode == "connect" || mode == "upgrade" || mode == "streaming")) {
             return run_http3(server, mode);
+        }
+        if (protocol == "quic" && argc == 3) {
+            return run_raw_quic(server);
         }
         std::cerr << "unsupported protocol/mode combination\n";
         return 2;

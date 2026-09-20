@@ -2,7 +2,7 @@
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
 #include <clash_native/proxy/tcp_relay.hpp>
-#include <clash_native/transport/http_client.hpp>
+#include <clash_native/transport/exchange_session.hpp>
 
 #include "outbound/outbound_utils.hpp"
 #include "outbound/proxy_address.hpp"
@@ -346,7 +346,7 @@ std::optional<ParsedHttpTarget> parse_http_absolute_target(std::string_view targ
                             std::move(origin_target), target_end == std::string_view::npos};
 }
 
-class ProxyRequestBodyStream final : public transport::HttpBodyStream,
+class ProxyRequestBodyStream final : public transport::ExchangeBodyStream,
                                      public std::enable_shared_from_this<ProxyRequestBodyStream> {
   public:
     using Parser = http::request_parser<http::buffer_body>;
@@ -416,8 +416,8 @@ class ProxyRequestBodyStream final : public transport::HttpBodyStream,
         });
     }
 
-    std::vector<transport::HttpHeader> trailers() const override {
-        std::vector<transport::HttpHeader> result;
+    std::vector<transport::ExchangeField> trailers() const override {
+        std::vector<transport::ExchangeField> result;
         if (!parser_->is_done()) {
             return result;
         }
@@ -1246,7 +1246,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     }
 
     void start_http_forward_exchange() {
-        http_session_ = transport::make_http1_client_session(std::move(remote_));
+        http_session_ = transport::make_http1_exchange_session(std::move(remote_));
         if (!http_session_) {
             send_http_forward_response(502, "Bad Gateway");
             return;
@@ -1255,12 +1255,12 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         auto self = shared_from_this();
         http_exchange_id_ = http_session_->exchange_streaming(
             std::move(http_forward_request_), deadline,
-            [self](core::Result<transport::HttpStreamingResponse> result) mutable {
+            [self](core::Result<transport::StreamingExchangeResponse> result) mutable {
                 self->handle_http_forward_response(std::move(result));
             });
     }
 
-    void handle_http_forward_response(core::Result<transport::HttpStreamingResponse> result) {
+    void handle_http_forward_response(core::Result<transport::StreamingExchangeResponse> result) {
         if (closed_.load(std::memory_order_acquire)) {
             return;
         }
@@ -1306,7 +1306,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         return http_forward_request_method_ == method;
     }
 
-    std::string build_http_forward_response_headers(const transport::HttpResponse &response,
+    std::string build_http_forward_response_headers(const transport::ExchangeResponse &response,
                                                     bool has_body) {
         std::unordered_set<std::string> connection_options;
         for (const auto &header : response.headers) {
@@ -1610,11 +1610,11 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     boost::beast::flat_buffer http_buffer_;
     std::shared_ptr<ProxyRequestBodyStream::Parser> http_request_parser_;
     std::shared_ptr<ProxyRequestBodyStream> http_request_body_;
-    transport::HttpStreamingRequest http_forward_request_;
+    transport::StreamingExchangeRequest http_forward_request_;
     std::string http_forward_request_method_;
-    std::shared_ptr<transport::HttpClientSession> http_session_;
-    transport::HttpClientSession::ExchangeId http_exchange_id_ = 0;
-    transport::HttpStreamingResponse http_forward_response_;
+    std::shared_ptr<transport::ExchangeSession> http_session_;
+    transport::ExchangeSession::ExchangeId http_exchange_id_ = 0;
+    transport::StreamingExchangeResponse http_forward_response_;
     std::array<std::uint8_t, 16 * 1024> http_forward_response_buffer_{};
     std::uint64_t http_forward_request_bytes_ = 0;
     std::uint64_t http_forward_response_bytes_ = 0;

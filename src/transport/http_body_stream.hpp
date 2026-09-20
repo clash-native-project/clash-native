@@ -1,6 +1,6 @@
 #pragma once
 
-#include <clash_native/transport/http_client.hpp>
+#include <clash_native/transport/exchange_session.hpp>
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/error.hpp>
@@ -19,15 +19,16 @@ namespace clash_native::transport::detail {
 // Buffers response DATA only until the consumer reads it. HTTP/2 and HTTP/3
 // wire flow-control credit is returned by on_consume, so a slow consumer also
 // applies backpressure to the peer.
-class QueuedHttpBodyStream final : public HttpBodyStream,
-                                   public std::enable_shared_from_this<QueuedHttpBodyStream> {
+class QueuedExchangeBodyStream final
+    : public ExchangeBodyStream,
+      public std::enable_shared_from_this<QueuedExchangeBodyStream> {
   public:
     using Executor = boost::asio::any_io_executor;
     using Action = std::function<void()>;
     using ConsumeHandler = std::function<void(std::size_t)>;
 
-    QueuedHttpBodyStream(Executor executor, std::size_t capacity, ConsumeHandler on_consume,
-                         Action on_cancel, Action on_drained)
+    QueuedExchangeBodyStream(Executor executor, std::size_t capacity, ConsumeHandler on_consume,
+                             Action on_cancel, Action on_drained)
         : executor_(std::move(executor)), capacity_(capacity), on_consume_(std::move(on_consume)),
           on_cancel_(std::move(on_cancel)), on_drained_(std::move(on_drained)) {}
 
@@ -58,7 +59,7 @@ class QueuedHttpBodyStream final : public HttpBodyStream,
         });
     }
 
-    std::vector<HttpHeader> trailers() const override {
+    std::vector<ExchangeField> trailers() const override {
         std::lock_guard lock(trailers_mutex_);
         return trailers_;
     }
@@ -105,7 +106,7 @@ class QueuedHttpBodyStream final : public HttpBodyStream,
         return true;
     }
 
-    void finish(std::vector<HttpHeader> trailers) {
+    void finish(std::vector<ExchangeField> trailers) {
         if (terminal_) {
             return;
         }
@@ -205,7 +206,7 @@ class QueuedHttpBodyStream final : public HttpBodyStream,
     bool drained_signalled_ = false;
     bool cancelled_ = false;
     mutable std::mutex trailers_mutex_;
-    std::vector<HttpHeader> trailers_;
+    std::vector<ExchangeField> trailers_;
 };
 
 } // namespace clash_native::transport::detail

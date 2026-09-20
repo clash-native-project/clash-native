@@ -271,6 +271,8 @@ Asio sockets:
 | `DatagramOpenResult` | Established datagram handle, selected chain, and association semantics |
 | `StreamHandle` | Asynchronous read, write, half-close, cancellation, endpoints, and transport ownership |
 | `DatagramHandle` | Addressed send/receive, cancellation, association semantics, MTU information, and transport ownership |
+| `MultiplexedSession` | Logical stream allocation, cancellation, capacity, retirement, and session ownership for a multiplexed carrier |
+| `ExchangeSession` | Request/response heads, streaming bodies, cancellation, and stream-upgrade results over an HTTP-like exchange carrier |
 | `ConnectionTrace` | Selected outbound/group chain and diagnostic annotations outside the I/O interface |
 
 An asynchronous buffer view must remain valid until its operation completes.
@@ -1650,8 +1652,9 @@ tests. The intended module split does not justify adding empty `transport`,
 
 ### 15.3 Capability interfaces
 
-The exact C++ names and callback or sender forms are not frozen, but the
-responsibilities are.
+The public capability interfaces have explicit ownership and cancellation
+boundaries. Their callback forms are asynchronous and must complete exactly
+once unless the surrounding API documents a stronger guarantee.
 
 #### Endpoint dialing
 
@@ -1699,6 +1702,53 @@ Likewise, the datagram boundary must retain the destination and association
 semantics required by the caller instead of assuming that every carrier is a
 raw connected UDP socket.
 
+#### Stream and datagram handles
+
+`StreamHandle` and `DatagramHandle` are the established I/O boundaries used by
+the endpoint dialer and outbound relay. They preserve byte-stream or datagram
+semantics respectively; a protocol adapter may wrap either handle without
+exposing the underlying Asio socket.
+
+The carrier-to-capability flow is:
+
+```mermaid
+flowchart TD
+    TCP[TCP] --> SH[StreamHandle]
+    UDP[UDP] --> DH[DatagramHandle]
+    QUIC[QUIC] --> MS[MultiplexedSession]
+    MS --> QSH[StreamHandle]
+    QUIC --> QD[QUIC DATAGRAM]
+    QD --> QDH[DatagramHandle]
+    H1[HTTP/1.1] --> ES1[ExchangeSession]
+    ES1 --> C1[CONNECT / Upgrade]
+    C1 --> H1S[StreamHandle]
+    H2[HTTP/2] --> ES2[ExchangeSession]
+    H2 --> MS2[MultiplexedSession]
+    ES2 --> C2[CONNECT / Extended CONNECT]
+    C2 --> H2S[StreamHandle]
+    H3[HTTP/3] --> ES3[ExchangeSession]
+    H3 --> MS3[MultiplexedSession]
+    ES3 --> C3[CONNECT / Extended CONNECT]
+    C3 --> H3S[StreamHandle]
+    H3 --> H3D[QUIC DATAGRAM]
+    H3D --> H3DH[DatagramHandle]
+```
+
+#### Multiplexed sessions
+
+`MultiplexedSession` is the capability for an already-established
+carrier that can allocate independent logical bidirectional streams. It owns
+logical stream operation IDs, asynchronous stream opening, cancellation,
+active-stream accounting, advertised capacity, retirement, and shutdown. The
+returned `StreamHandle` is the only byte I/O surface exposed to the caller.
+Unidirectional control streams remain private to a carrier because they do not
+match the read/write contract of `StreamHandle`.
+
+HTTP/2 and HTTP/3 request streams are not forced through this raw-stream
+interface: their headers and flow-control state are part of `ExchangeSession`.
+Their tunnel operations may still return a `StreamHandle`. This keeps a raw
+QUIC stream allocator from being mistaken for a generic HTTP request API.
+
 #### TLS
 
 A TLS client connector decorates an injected `StreamHandle` and returns another
@@ -1714,10 +1764,13 @@ cancellation, and error classification behavior.
 
 #### HTTP
 
-HTTP uses an exchange/session interface rather than pretending every version
-is one byte stream. The common semantic types cover request and response heads,
-streaming bodies, body limits, cancellation, and an optional tunnel result.
-Version-specific implementations own their wire state:
+HTTP uses `ExchangeSession` rather than pretending every version is one byte
+stream. The common semantic types cover request and response heads, streaming
+bodies, body limits, cancellation, and stream-upgrade results.
+`MultiplexedSession` is a separate capability for carriers that expose raw
+logical stream allocation and session capacity; an HTTP implementation may
+provide exchange operations without exposing raw streams. Version-specific
+implementations own their wire state:
 
 - HTTP/1.1 owns serialization, parsing, keep-alive, upgrade, CONNECT, and a
   non-multiplexed connection pool;
@@ -1736,8 +1789,8 @@ own Beast, nghttp2, or nghttp3 sessions.
 
 The QUIC connection engine owns one ngtcp2 connection, BoringSSL QUIC TLS
 state, Asio datagram I/O, loss/expiry timers, connection-level flow control,
-stream allocation, optional QUIC datagrams, and connection retirement. It
-exposes QUIC streams and datagram capability, not DNS exchanges.
+stream allocation, QUIC DATAGRAM frames, and connection retirement. It exposes
+QUIC streams and datagram capability, not DNS exchanges.
 
 ```text
 Asio datagram receive -> ngtcp2 packet input -> QUIC connection events

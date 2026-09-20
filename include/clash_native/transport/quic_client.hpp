@@ -2,6 +2,7 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
+#include <clash_native/transport/multiplexed_session.hpp>
 
 #include <boost/asio/any_io_executor.hpp>
 
@@ -44,8 +45,25 @@ struct QuicOpenStreamResult {
     std::optional<core::Error> error;
 };
 
-class QuicClientConnection final {
+struct QuicStreamObserver {
+    std::function<void(const std::uint8_t *, std::size_t, bool)> data;
+    std::function<void(std::size_t, bool)> write_consumed;
+    std::function<void()> writable;
+    std::function<void(std::uint64_t)> closed;
+    std::function<void(std::uint64_t)> reset;
+};
+
+struct QuicDatagramObserver {
+    std::function<void(const std::uint8_t *, std::size_t)> data;
+    std::function<void()> closed;
+};
+
+class QuicClientConnection final : public MultiplexedSession,
+                                   public std::enable_shared_from_this<QuicClientConnection> {
   public:
+    using ObserverId = std::uint64_t;
+    using DatagramWriteHandler = core::DatagramHandle::WriteHandler;
+
     QuicClientConnection(const QuicClientConnection &) = delete;
     QuicClientConnection &operator=(const QuicClientConnection &) = delete;
     ~QuicClientConnection();
@@ -56,8 +74,25 @@ class QuicClientConnection final {
     void write_stream_data(std::int64_t stream_id, std::vector<std::uint8_t> data, bool fin);
     void shutdown_stream(std::int64_t stream_id, std::uint64_t application_error) noexcept;
     core::Status extend_receive_credit(std::int64_t stream_id, std::size_t consumed);
+
+    StreamId open_stream(MultiplexedStreamRequest request,
+                         std::chrono::steady_clock::time_point deadline,
+                         StreamHandler handler) override;
+    void cancel(StreamId stream_id) noexcept override;
+    std::size_t active_streams() const noexcept override;
+    std::optional<std::size_t> max_concurrent_streams() const noexcept override;
+    void stop() noexcept override { close(); }
+
+    ObserverId observe_stream(std::int64_t stream_id, QuicStreamObserver observer);
+    void remove_stream_observer(std::int64_t stream_id, ObserverId observer_id) noexcept;
+    ObserverId observe_datagrams(QuicDatagramObserver observer);
+    void remove_datagram_observer(ObserverId observer_id) noexcept;
+    void async_send_datagram(std::vector<std::uint8_t> data, DatagramWriteHandler handler);
+    std::unique_ptr<core::DatagramHandle> open_datagram();
+    std::size_t max_datagram_size() const noexcept;
+    boost::asio::ip::udp::endpoint remote_endpoint() const noexcept;
     bool ready() const noexcept;
-    bool retired() const noexcept;
+    bool retired() const noexcept override;
     boost::asio::any_io_executor executor() const noexcept;
     void set_events(QuicClientEvents events);
     void close() noexcept;

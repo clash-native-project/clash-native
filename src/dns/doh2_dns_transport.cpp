@@ -1,6 +1,6 @@
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
-#include <clash_native/transport/http_client.hpp>
+#include <clash_native/transport/exchange_session.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include <boost/asio/post.hpp>
@@ -51,10 +51,10 @@ std::string_view trim_ascii(std::string_view value) {
     return value;
 }
 
-const std::string *find_header(const transport::HttpResponse &response, std::string_view name) {
+const std::string *find_header(const transport::ExchangeResponse &response, std::string_view name) {
     const auto found = std::find_if(
         response.headers.begin(), response.headers.end(),
-        [name](const transport::HttpHeader &header) { return lower_copy(header.name) == name; });
+        [name](const transport::ExchangeField &header) { return lower_copy(header.name) == name; });
     return found == response.headers.end() ? nullptr : &found->value;
 }
 
@@ -129,7 +129,7 @@ class Doh2DnsTransport final : public DnsTransport {
 // selected h2, all HTTP/2 framing and stream multiplexing belongs to transport.
 class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Session> {
   public:
-    using Handler = transport::HttpClientSession::Handler;
+    using Handler = transport::ExchangeSession::Handler;
 
     Session(runtime::AsioRuntime &runtime, boost::asio::ip::tcp::endpoint endpoint,
             std::string server_name, std::string authority, std::string path, bool verify_peer,
@@ -140,7 +140,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
 
     ~Session() { stop(); }
 
-    void exchange(std::uint16_t query_id, transport::HttpRequest request,
+    void exchange(std::uint16_t query_id, transport::ExchangeRequest request,
                   std::chrono::steady_clock::time_point deadline, Handler handler) {
         if (stopped_ || retired_) {
             complete_immediately(std::move(handler), cancelled_error());
@@ -204,10 +204,10 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     struct Pending {
         explicit Pending(boost::asio::io_context &context) : timer(context) {}
 
-        transport::HttpRequest request;
+        transport::ExchangeRequest request;
         Handler handler;
         boost::asio::steady_timer timer;
-        transport::HttpClientSession::ExchangeId http_exchange_id = 0;
+        transport::ExchangeSession::ExchangeId http_exchange_id = 0;
         bool http_exchange_started = false;
     };
 
@@ -269,7 +269,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
                         }
                         self->connecting_ = false;
                         self->http_session_ =
-                            transport::make_http2_client_session(std::move(tls->stream));
+                            transport::make_http2_exchange_session(std::move(tls->stream));
                         if (!self->http_session_) {
                             self->connection_failed(
                                 protocol_error("failed to create an HTTP/2 client session"));
@@ -304,7 +304,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         pending->http_exchange_started = true;
         pending->http_exchange_id = http_session_->exchange(
             std::move(pending->request), pending->timer.expiry(),
-            [self, query_id](core::Result<transport::HttpResponse> result) mutable {
+            [self, query_id](core::Result<transport::ExchangeResponse> result) mutable {
                 self->finish_pending(query_id, std::move(result));
             });
     }
@@ -327,7 +327,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         abandon_connect_if_idle();
     }
 
-    void finish_pending(std::uint16_t query_id, core::Result<transport::HttpResponse> result) {
+    void finish_pending(std::uint16_t query_id, core::Result<transport::ExchangeResponse> result) {
         const auto found = pending_.find(query_id);
         if (found == pending_.end()) {
             return;
@@ -399,7 +399,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     bool verify_peer_;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
     std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
-    std::shared_ptr<transport::HttpClientSession> http_session_;
+    std::shared_ptr<transport::ExchangeSession> http_session_;
     std::unordered_map<std::uint16_t, std::shared_ptr<Pending>> pending_;
     std::uint64_t connection_generation_ = 0;
     bool connecting_ = false;
@@ -454,7 +454,7 @@ class Doh2DnsTransport::Operation final
         const auto endpoint = owner_.config_.tcp_endpoint.value_or(boost::asio::ip::tcp::endpoint(
             owner_.config_.endpoint.address(),
             owner_.config_.endpoint.port() == 53 ? 443 : owner_.config_.endpoint.port()));
-        transport::HttpRequest request;
+        transport::ExchangeRequest request;
         request.method = "POST";
         request.scheme = "https";
         request.authority = authority_for(owner_.config_, endpoint);
@@ -465,7 +465,7 @@ class Doh2DnsTransport::Operation final
         request.response_body_limit = 0xffff;
         const auto self = shared_from_this();
         session_->exchange(query_id_, std::move(request), request_.deadline,
-                           [self](core::Result<transport::HttpResponse> result) mutable {
+                           [self](core::Result<transport::ExchangeResponse> result) mutable {
                                self->session_finished(std::move(result));
                            });
         exchange_started_ = true;
@@ -484,7 +484,7 @@ class Doh2DnsTransport::Operation final
     std::uint16_t query_id() const noexcept { return query_id_; }
 
   private:
-    void session_finished(core::Result<transport::HttpResponse> result) {
+    void session_finished(core::Result<transport::ExchangeResponse> result) {
         exchange_started_ = false;
         if (completed_) {
             return;

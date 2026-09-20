@@ -74,3 +74,11 @@ Gorilla WebSocket server, validates the HTTP/1.1 Upgrade path and a custom
 header, sends a ping control frame, and checks a 256 KiB binary echo. The
 carrier is limited to HTTP/1.1 Upgrade; HTTP/2 and HTTP/3 Extended CONNECT are
 not covered.
+
+The raw QUIC carrier interop check is Windows x64 only. The standard build
+script sets `CLASH_NATIVE_HTTP_TUNNEL_CLIENT` and runs
+`TestQUICCarrierExposesStreamsAndDatagrams` from `tests/interop`. The test uses
+an independent `quic-go` server, opens four concurrent bidirectional streams
+on one QUIC connection, and echoes a QUIC DATAGRAM through the common
+`StreamHandle` and `DatagramHandle` adapters. It does not prove DoQ, DoH/3, or
+HTTP/3 proxy semantics.

@@ -33,7 +33,7 @@ void QuicDnsTransport::Operation::start_doh3_session() {
         if (const auto self = weak.lock())
             self->fail_session(std::move(error));
     };
-    auto session = transport::make_http3_client_session(quic_, failure);
+    auto session = transport::make_http3_exchange_session(quic_, failure);
     if (retired_) {
         if (session)
             session->stop();
@@ -66,7 +66,7 @@ void QuicDnsTransport::Operation::submit_http3_exchange(const std::shared_ptr<Ex
     if (!http3_ || retired_ || exchange->result || exchange->http_exchange_id) {
         return;
     }
-    transport::HttpRequest request;
+    transport::ExchangeRequest request;
     request.method = "POST";
     request.scheme = "https";
     request.authority = authority_;
@@ -80,15 +80,15 @@ void QuicDnsTransport::Operation::submit_http3_exchange(const std::shared_ptr<Ex
     const auto weak = weak_from_this();
     exchange->http_exchange_id =
         http3_->exchange(std::move(request), exchange->request.deadline,
-                         [weak, id](core::Result<transport::HttpResponse> result) mutable {
+                         [weak, id](core::Result<transport::ExchangeResponse> result) mutable {
                              if (const auto self = weak.lock()) {
                                  self->on_http3_result(id, std::move(result));
                              }
                          });
 }
 
-void QuicDnsTransport::Operation::on_http3_result(ExchangeId id,
-                                                  core::Result<transport::HttpResponse> result) {
+void QuicDnsTransport::Operation::on_http3_result(
+    ExchangeId id, core::Result<transport::ExchangeResponse> result) {
     const auto found = exchanges_.find(id);
     if (found == exchanges_.end() || found->second->result) {
         return;
@@ -106,7 +106,7 @@ void QuicDnsTransport::Operation::on_http3_result(ExchangeId id,
         return;
     }
     const auto content_type = std::find_if(result->headers.begin(), result->headers.end(),
-                                           [](const transport::HttpHeader &header) {
+                                           [](const transport::ExchangeField &header) {
                                                return lower_copy(header.name) == "content-type";
                                            });
     if (content_type == result->headers.end() ||

@@ -4,6 +4,7 @@
 
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/dispatch.hpp>
+#include <boost/asio/error.hpp>
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -35,6 +37,8 @@ namespace clash_native::transport {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+constexpr std::size_t kQuicDatagramPayloadLimit = 1200;
 
 std::uint64_t timestamp_now() noexcept {
     return static_cast<std::uint64_t>(
@@ -194,6 +198,110 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         }
     }
 
+    QuicClientConnection::ObserverId observe_stream(std::int64_t stream_id,
+                                                    QuicStreamObserver observer) {
+        const auto observer_id = next_observer_id_++;
+        stream_observers_[stream_id].emplace(observer_id, std::move(observer));
+        return observer_id;
+    }
+
+    void remove_stream_observer(std::int64_t stream_id,
+                                QuicClientConnection::ObserverId observer_id) noexcept {
+        const auto found = stream_observers_.find(stream_id);
+        if (found == stream_observers_.end()) {
+            return;
+        }
+        found->second.erase(observer_id);
+        if (found->second.empty()) {
+            stream_observers_.erase(found);
+        }
+    }
+
+    QuicClientConnection::ObserverId observe_datagrams(QuicDatagramObserver observer) {
+        const auto observer_id = next_observer_id_++;
+        datagram_observers_.emplace(observer_id, std::move(observer));
+        return observer_id;
+    }
+
+    void remove_datagram_observer(QuicClientConnection::ObserverId observer_id) noexcept {
+        datagram_observers_.erase(observer_id);
+    }
+
+    void async_send_datagram(std::vector<std::uint8_t> data,
+                             QuicClientConnection::DatagramWriteHandler handler) {
+        auto fail_async = [executor = executor_, handler = std::move(handler)](
+                              const boost::system::error_code &error) mutable {
+            boost::asio::post(executor, [handler = std::move(handler), error]() mutable {
+                if (handler) {
+                    handler(error, 0);
+                }
+            });
+        };
+        if (retired_) {
+            fail_async(boost::asio::error::operation_aborted);
+            return;
+        }
+        const auto maximum = max_datagram_size();
+        if (!ready_ || maximum == 0) {
+            fail_async(boost::asio::error::operation_not_supported);
+            return;
+        }
+        if (data.size() > maximum) {
+            fail_async(boost::asio::error::message_size);
+            return;
+        }
+        datagram_writes_.push_back(
+            PendingDatagram{std::move(data), std::move(handler), next_datagram_id_++});
+        request_write();
+    }
+
+    std::size_t max_datagram_size() const noexcept {
+        if (connection_ == nullptr) {
+            return 0;
+        }
+        const auto *parameters = ngtcp2_conn_get_remote_transport_params2(connection_);
+        if (parameters == nullptr || parameters->max_datagram_frame_size == 0) {
+            return 0;
+        }
+        return std::min<std::size_t>(static_cast<std::size_t>(parameters->max_datagram_frame_size),
+                                     kQuicDatagramPayloadLimit);
+    }
+
+    boost::asio::ip::udp::endpoint remote_endpoint() const noexcept { return remote_endpoint_; }
+
+    QuicClientConnection::StreamId track_multiplexed_stream(std::int64_t stream_id) {
+        const auto operation_id = next_operation_id_++;
+        multiplexed_streams_.emplace(operation_id, stream_id);
+        active_streams_.insert(stream_id);
+        return operation_id;
+    }
+
+    QuicClientConnection::StreamId next_operation_id() noexcept { return next_operation_id_++; }
+
+    void cancel_multiplexed_stream(QuicClientConnection::StreamId operation_id) noexcept {
+        const auto found = multiplexed_streams_.find(operation_id);
+        if (found == multiplexed_streams_.end()) {
+            return;
+        }
+        const auto stream_id = found->second;
+        multiplexed_streams_.erase(found);
+        active_streams_.erase(stream_id);
+        shutdown_stream(stream_id, 0);
+    }
+
+    std::size_t active_streams() const noexcept { return active_streams_.size(); }
+
+    std::optional<std::size_t> max_concurrent_streams() const noexcept {
+        if (connection_ == nullptr) {
+            return std::nullopt;
+        }
+        const auto *parameters = ngtcp2_conn_get_remote_transport_params2(connection_);
+        if (parameters == nullptr || parameters->initial_max_streams_bidi == 0) {
+            return std::nullopt;
+        }
+        return static_cast<std::size_t>(parameters->initial_max_streams_bidi);
+    }
+
   private:
     struct PendingWrite {
         std::vector<std::uint8_t> bytes;
@@ -205,6 +313,12 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         std::array<std::uint8_t, 65536> bytes{};
     };
 
+    struct PendingDatagram {
+        std::vector<std::uint8_t> bytes;
+        QuicClientConnection::DatagramWriteHandler handler;
+        std::uint64_t id = 0;
+    };
+
     static ngtcp2_conn *get_connection(ngtcp2_crypto_conn_ref *ref) noexcept {
         return static_cast<Impl *>(ref->user_data)->connection_;
     }
@@ -213,6 +327,163 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
                              const ngtcp2_rand_ctx *) noexcept {
         if (RAND_bytes(data, static_cast<int>(length)) != 1) {
             std::abort();
+        }
+    }
+
+    void dispatch_stream_data(std::int64_t stream_id, const std::uint8_t *data, std::size_t length,
+                              bool fin) {
+        if (events_.stream_data) {
+            events_.stream_data(stream_id, data, length, fin);
+        }
+        const auto found = stream_observers_.find(stream_id);
+        if (found == stream_observers_.end()) {
+            return;
+        }
+        std::vector<QuicStreamObserver> observers;
+        observers.reserve(found->second.size());
+        for (const auto &[observer_id, observer] : found->second) {
+            (void)observer_id;
+            observers.push_back(observer);
+        }
+        for (const auto &observer : observers) {
+            if (observer.data) {
+                observer.data(data, length, fin);
+            }
+        }
+    }
+
+    void dispatch_stream_write_consumed(std::int64_t stream_id, std::size_t length, bool complete) {
+        if (events_.stream_write_consumed) {
+            events_.stream_write_consumed(stream_id, length, complete);
+        }
+        const auto found = stream_observers_.find(stream_id);
+        if (found == stream_observers_.end()) {
+            return;
+        }
+        std::vector<QuicStreamObserver> observers;
+        observers.reserve(found->second.size());
+        for (const auto &[observer_id, observer] : found->second) {
+            (void)observer_id;
+            observers.push_back(observer);
+        }
+        for (const auto &observer : observers) {
+            if (observer.write_consumed) {
+                observer.write_consumed(length, complete);
+            }
+        }
+    }
+
+    void dispatch_stream_writable(std::int64_t stream_id) {
+        if (events_.stream_writable) {
+            events_.stream_writable(stream_id);
+        }
+        const auto found = stream_observers_.find(stream_id);
+        if (found == stream_observers_.end()) {
+            return;
+        }
+        std::vector<QuicStreamObserver> observers;
+        observers.reserve(found->second.size());
+        for (const auto &[observer_id, observer] : found->second) {
+            (void)observer_id;
+            observers.push_back(observer);
+        }
+        for (const auto &observer : observers) {
+            if (observer.writable) {
+                observer.writable();
+            }
+        }
+    }
+
+    void dispatch_stream_closed(std::int64_t stream_id, std::uint64_t application_error) {
+        if (events_.stream_closed) {
+            events_.stream_closed(stream_id, application_error);
+        }
+        active_streams_.erase(stream_id);
+        for (auto iterator = multiplexed_streams_.begin();
+             iterator != multiplexed_streams_.end();) {
+            if (iterator->second == stream_id) {
+                iterator = multiplexed_streams_.erase(iterator);
+            } else {
+                ++iterator;
+            }
+        }
+        const auto found = stream_observers_.find(stream_id);
+        if (found == stream_observers_.end()) {
+            return;
+        }
+        std::vector<QuicStreamObserver> observers;
+        observers.reserve(found->second.size());
+        for (const auto &[observer_id, observer] : found->second) {
+            (void)observer_id;
+            observers.push_back(observer);
+        }
+        for (const auto &observer : observers) {
+            if (observer.closed) {
+                observer.closed(application_error);
+            }
+        }
+    }
+
+    void dispatch_stream_reset(std::int64_t stream_id, std::uint64_t application_error) {
+        if (events_.stream_reset) {
+            events_.stream_reset(stream_id, application_error);
+        }
+        active_streams_.erase(stream_id);
+        for (auto iterator = multiplexed_streams_.begin();
+             iterator != multiplexed_streams_.end();) {
+            if (iterator->second == stream_id) {
+                iterator = multiplexed_streams_.erase(iterator);
+            } else {
+                ++iterator;
+            }
+        }
+        const auto found = stream_observers_.find(stream_id);
+        if (found == stream_observers_.end()) {
+            return;
+        }
+        std::vector<QuicStreamObserver> observers;
+        observers.reserve(found->second.size());
+        for (const auto &[observer_id, observer] : found->second) {
+            (void)observer_id;
+            observers.push_back(observer);
+        }
+        for (const auto &observer : observers) {
+            if (observer.reset) {
+                observer.reset(application_error);
+            }
+        }
+    }
+
+    void dispatch_datagram(const std::uint8_t *data, std::size_t length) {
+        const auto observers = datagram_observers_;
+        for (const auto &[observer_id, observer] : observers) {
+            (void)observer_id;
+            if (observer.data) {
+                observer.data(data, length);
+            }
+        }
+    }
+
+    void dispatch_datagram_closed() {
+        const auto observers = datagram_observers_;
+        for (const auto &[observer_id, observer] : observers) {
+            (void)observer_id;
+            if (observer.closed) {
+                observer.closed();
+            }
+        }
+    }
+
+    void dispatch_stream_observers_reset() {
+        const auto observers = stream_observers_;
+        for (const auto &[stream_id, stream_observer_map] : observers) {
+            (void)stream_id;
+            for (const auto &[observer_id, observer] : stream_observer_map) {
+                (void)observer_id;
+                if (observer.reset) {
+                    observer.reset(0);
+                }
+            }
         }
     }
 
@@ -246,10 +517,8 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
                               std::uint64_t, const std::uint8_t *data, std::size_t length,
                               void *user_data, void *) {
         auto *self = static_cast<Impl *>(user_data);
-        if (self->events_.stream_data) {
-            self->events_.stream_data(stream_id, data, length,
-                                      (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0);
-        }
+        self->dispatch_stream_data(stream_id, data, length,
+                                   (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0);
         return 0;
     }
 
@@ -267,9 +536,7 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         auto *self = static_cast<Impl *>(user_data);
         self->blocked_streams_.erase(stream_id);
         self->queue_stream(stream_id);
-        if (self->events_.stream_writable) {
-            self->events_.stream_writable(stream_id);
-        }
+        self->dispatch_stream_writable(stream_id);
         return 0;
     }
 
@@ -293,9 +560,7 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         self->blocked_streams_.erase(stream_id);
         self->scheduled_streams_.erase(stream_id);
         std::erase(self->ready_streams_, stream_id);
-        if (self->events_.stream_closed) {
-            self->events_.stream_closed(stream_id, application_error);
-        }
+        self->dispatch_stream_closed(stream_id, application_error);
         return 0;
     }
 
@@ -320,9 +585,14 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
     static int on_receive_reset(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t,
                                 std::uint64_t application_error, void *user_data, void *) {
         auto *self = static_cast<Impl *>(user_data);
-        if (self->events_.stream_reset) {
-            self->events_.stream_reset(stream_id, application_error);
-        }
+        self->dispatch_stream_reset(stream_id, application_error);
+        return 0;
+    }
+
+    static int on_recv_datagram(ngtcp2_conn *, std::uint32_t, const std::uint8_t *data,
+                                std::size_t length, void *user_data) {
+        auto *self = static_cast<Impl *>(user_data);
+        self->dispatch_datagram(data, length);
         return 0;
     }
 
@@ -394,6 +664,7 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         callbacks.extend_max_local_streams_uni = &on_extend_max_local_streams_uni;
         callbacks.stream_close = &on_stream_closed;
         callbacks.stream_reset = &on_receive_reset;
+        callbacks.recv_datagram = &on_recv_datagram;
 
         ngtcp2_cid destination_id{};
         destination_id.datalen = NGTCP2_MIN_INITIAL_DCIDLEN;
@@ -435,6 +706,7 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         parameters.initial_max_stream_data_uni = 256 * 1024;
         parameters.initial_max_streams_bidi = 16;
         parameters.initial_max_streams_uni = 3;
+        parameters.max_datagram_frame_size = kQuicDatagramPayloadLimit;
         const int created = ngtcp2_conn_client_new(&connection_, &destination_id, &source_id, &path,
                                                    NGTCP2_PROTO_VER_V1, &callbacks, &settings,
                                                    &parameters, nullptr, this);
@@ -635,15 +907,13 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
             } else {
                 queue_stream(stream_id);
             }
-            if (events_.stream_write_consumed) {
-                if (advanced != 0) {
-                    events_.stream_write_consumed(stream_id, advanced, false);
-                }
-                events_.stream_write_consumed(stream_id, 0, true);
+            if (advanced != 0) {
+                dispatch_stream_write_consumed(stream_id, advanced, false);
             }
+            dispatch_stream_write_consumed(stream_id, 0, true);
         } else {
-            if (advanced != 0 && events_.stream_write_consumed) {
-                events_.stream_write_consumed(stream_id, advanced, false);
+            if (advanced != 0) {
+                dispatch_stream_write_consumed(stream_id, advanced, false);
             }
             queue_stream(stream_id);
         }
@@ -673,6 +943,39 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
                 const auto now = timestamp_now();
                 bool packet_ready = false;
                 for (std::size_t frame_count = 0; frame_count < 128; ++frame_count) {
+                    if (!datagram_writes_.empty()) {
+                        auto &datagram = datagram_writes_.front();
+                        int accepted = 0;
+                        const auto written = ngtcp2_conn_write_datagram(
+                            connection_, &path_storage.path, &packet_info, packet.data(),
+                            packet.size(), &accepted, NGTCP2_WRITE_DATAGRAM_FLAG_NONE, datagram.id,
+                            datagram.bytes.data(), datagram.bytes.size(), now);
+                        if (written < 0) {
+                            auto handler = std::move(datagram.handler);
+                            datagram_writes_.pop_front();
+                            post_datagram_result(std::move(handler),
+                                                 boost::asio::error::message_size, 0);
+                            if (written == NGTCP2_ERR_INVALID_STATE ||
+                                written == NGTCP2_ERR_INVALID_ARGUMENT) {
+                                continue;
+                            }
+                            fail(protocol_error(
+                                std::string("ngtcp2 failed to write a QUIC DATAGRAM: ") +
+                                ngtcp2_strerror(static_cast<int>(written))));
+                            break;
+                        }
+                        if (accepted == 0 || written == 0) {
+                            break;
+                        }
+                        auto handler = std::move(datagram.handler);
+                        const auto size = datagram.bytes.size();
+                        datagram_writes_.pop_front();
+                        post_datagram_result(std::move(handler), {}, size);
+                        ngtcp2_conn_update_pkt_tx_time(connection_, now);
+                        outgoing_.emplace_back(packet.begin(), packet.begin() + written);
+                        packet_ready = true;
+                        break;
+                    }
                     std::int64_t stream_id = -1;
                     std::array<ngtcp2_vec, 1> vectors{};
                     std::size_t vector_count = 0;
@@ -745,6 +1048,15 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         schedule_expiry();
     }
 
+    void post_datagram_result(QuicClientConnection::DatagramWriteHandler handler,
+                              const boost::system::error_code &error, std::size_t size) {
+        boost::asio::post(executor_, [handler = std::move(handler), error, size]() mutable {
+            if (handler) {
+                handler(error, size);
+            }
+        });
+    }
+
     void send_next_packet() {
         if (retired_ || sending_ || outgoing_.empty() || !datagram_) {
             return;
@@ -812,6 +1124,16 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         retired_ = true;
         ready_ = false;
         expiry_timer_.cancel();
+        for (auto &datagram : datagram_writes_) {
+            post_datagram_result(std::move(datagram.handler),
+                                 boost::asio::error::operation_aborted, 0);
+        }
+        datagram_writes_.clear();
+        dispatch_datagram_closed();
+        dispatch_stream_observers_reset();
+        stream_observers_.clear();
+        multiplexed_streams_.clear();
+        active_streams_.clear();
         if (datagram_) {
             datagram_->cancel();
             datagram_->close();
@@ -830,6 +1152,16 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         retired_ = true;
         ready_ = false;
         expiry_timer_.cancel();
+        for (auto &datagram : datagram_writes_) {
+            post_datagram_result(std::move(datagram.handler),
+                                 boost::asio::error::operation_aborted, 0);
+        }
+        datagram_writes_.clear();
+        dispatch_datagram_closed();
+        dispatch_stream_observers_reset();
+        stream_observers_.clear();
+        multiplexed_streams_.clear();
+        active_streams_.clear();
         if (datagram_) {
             datagram_->cancel();
             datagram_->close();
@@ -868,12 +1200,22 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
     SSL *ssl_ = nullptr;
     ngtcp2_conn *connection_ = nullptr;
     std::unordered_map<std::int64_t, std::deque<PendingWrite>> stream_writes_;
+    std::unordered_map<std::int64_t,
+                       std::unordered_map<QuicClientConnection::ObserverId, QuicStreamObserver>>
+        stream_observers_;
+    std::unordered_map<QuicClientConnection::ObserverId, QuicDatagramObserver> datagram_observers_;
+    std::unordered_map<QuicClientConnection::StreamId, std::int64_t> multiplexed_streams_;
+    std::set<std::int64_t> active_streams_;
     std::set<std::int64_t> finished_streams_;
     std::set<std::int64_t> blocked_streams_;
     std::set<std::int64_t> scheduled_streams_;
     std::deque<std::int64_t> ready_streams_;
     std::deque<std::vector<std::uint8_t>> outgoing_;
+    std::deque<PendingDatagram> datagram_writes_;
     std::optional<core::Error> error_;
+    QuicClientConnection::ObserverId next_observer_id_ = 1;
+    QuicClientConnection::StreamId next_operation_id_ = 1;
+    std::uint64_t next_datagram_id_ = 1;
     bool ready_ = false;
     bool retired_ = false;
     bool receiving_ = false;
@@ -883,6 +1225,410 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
     bool write_again_ = false;
     bool stream_capacity_pending_ = false;
 };
+
+namespace {
+
+class QuicStreamHandle final : public core::StreamHandle {
+  public:
+    QuicStreamHandle(std::shared_ptr<QuicClientConnection> connection,
+                     MultiplexedSession::StreamId operation_id, std::int64_t stream_id)
+        : connection_(std::move(connection)), operation_id_(operation_id), stream_id_(stream_id),
+          executor_(connection_->executor()) {
+        observer_id_ = connection_->observe_stream(
+            stream_id_, QuicStreamObserver{
+                            [this](const std::uint8_t *data, std::size_t size, bool fin) {
+                                on_data(data, size, fin);
+                            },
+                            [this](std::size_t, bool complete) {
+                                if (complete) {
+                                    on_write_complete();
+                                }
+                            },
+                            [this] { pump_write(); },
+                            [this](std::uint64_t) { on_stream_closed(); },
+                            [this](std::uint64_t) { on_stream_reset(); },
+                        });
+    }
+
+    ~QuicStreamHandle() override { close(); }
+
+    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+        if (read_pending_) {
+            post_read(boost::asio::error::operation_aborted, 0, std::move(handler));
+            return;
+        }
+        if (closed_) {
+            post_read(boost::asio::error::operation_aborted, 0, std::move(handler));
+            return;
+        }
+        read_pending_ = true;
+        read_data_ = static_cast<std::uint8_t *>(buffer.data());
+        read_size_ = buffer.size();
+        read_handler_ = std::move(handler);
+        fulfill_read();
+    }
+
+    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
+        if (closed_ || send_shutdown_) {
+            post_write(boost::asio::error::operation_aborted, 0, std::move(handler));
+            return;
+        }
+        const auto size = buffer.size();
+        if (size == 0) {
+            post_write({}, 0, std::move(handler));
+            return;
+        }
+        PendingWrite pending;
+        pending.bytes.resize(size);
+        std::memcpy(pending.bytes.data(), buffer.data(), size);
+        pending.handler = std::move(handler);
+        writes_.push_back(std::move(pending));
+        pump_write();
+    }
+
+    boost::asio::any_io_executor executor() noexcept override { return executor_; }
+
+    boost::asio::ip::tcp::endpoint
+    local_endpoint(boost::system::error_code &error) const noexcept override {
+        error = boost::asio::error::operation_not_supported;
+        return {};
+    }
+
+    void shutdown_send(boost::system::error_code &error) noexcept override {
+        if (closed_ || send_shutdown_) {
+            error = closed_ ? boost::asio::error::operation_aborted : boost::system::error_code{};
+            return;
+        }
+        send_shutdown_ = true;
+        connection_->write_stream_data(stream_id_, {}, true);
+        error.clear();
+    }
+
+    void close() noexcept override {
+        if (closed_) {
+            return;
+        }
+        closed_ = true;
+        connection_->remove_stream_observer(stream_id_, observer_id_);
+        connection_->cancel(operation_id_);
+        fail_pending(boost::asio::error::operation_aborted);
+    }
+
+  private:
+    struct ReadChunk {
+        std::vector<std::uint8_t> bytes;
+        std::size_t offset = 0;
+        bool fin = false;
+    };
+
+    struct PendingWrite {
+        std::vector<std::uint8_t> bytes;
+        WriteHandler handler;
+    };
+
+    void on_data(const std::uint8_t *data, std::size_t size, bool fin) {
+        if (closed_) {
+            return;
+        }
+        if (size != 0) {
+            ReadChunk chunk;
+            chunk.bytes.assign(data, data + size);
+            chunk.fin = fin;
+            read_queue_.push_back(std::move(chunk));
+        } else if (fin) {
+            eof_ = true;
+        }
+        if (fin && !read_queue_.empty()) {
+            read_queue_.back().fin = true;
+        }
+        fulfill_read();
+    }
+
+    void on_stream_closed() {
+        if (closed_) {
+            return;
+        }
+        eof_ = true;
+        fulfill_read();
+    }
+
+    void on_stream_reset() {
+        if (closed_) {
+            return;
+        }
+        terminal_error_ = boost::asio::error::connection_reset;
+        fail_pending(*terminal_error_);
+        connection_->remove_stream_observer(stream_id_, observer_id_);
+        closed_ = true;
+    }
+
+    void fulfill_read() {
+        if (!read_pending_ || closed_) {
+            return;
+        }
+        if (terminal_error_) {
+            auto handler = std::move(read_handler_);
+            read_pending_ = false;
+            post_read(*terminal_error_, 0, std::move(handler));
+            return;
+        }
+        if (read_queue_.empty()) {
+            if (eof_) {
+                auto handler = std::move(read_handler_);
+                read_pending_ = false;
+                post_read(boost::asio::error::eof, 0, std::move(handler));
+            }
+            return;
+        }
+
+        auto &chunk = read_queue_.front();
+        const auto available = chunk.bytes.size() - chunk.offset;
+        const auto copied = std::min(read_size_, available);
+        std::memcpy(read_data_, chunk.bytes.data() + chunk.offset, copied);
+        chunk.offset += copied;
+        if (chunk.offset == chunk.bytes.size()) {
+            const bool fin = chunk.fin;
+            read_queue_.pop_front();
+            if (fin) {
+                eof_ = true;
+            }
+        }
+        const auto consumed = copied;
+        const auto handler = std::move(read_handler_);
+        read_pending_ = false;
+        read_data_ = nullptr;
+        read_size_ = 0;
+        if (consumed != 0) {
+            (void)connection_->extend_receive_credit(stream_id_, consumed);
+        }
+        post_read({}, consumed, handler);
+    }
+
+    void pump_write() {
+        if (closed_ || write_in_flight_ || writes_.empty()) {
+            return;
+        }
+        write_in_flight_ = true;
+        connection_->write_stream_data(stream_id_, writes_.front().bytes, false);
+    }
+
+    void on_write_complete() {
+        if (closed_ || !write_in_flight_ || writes_.empty()) {
+            return;
+        }
+        auto handler = std::move(writes_.front().handler);
+        const auto size = writes_.front().bytes.size();
+        writes_.pop_front();
+        write_in_flight_ = false;
+        post_write({}, size, std::move(handler));
+        pump_write();
+    }
+
+    void fail_pending(const boost::system::error_code &error) {
+        if (read_pending_) {
+            auto handler = std::move(read_handler_);
+            read_pending_ = false;
+            post_read(error, 0, std::move(handler));
+        }
+        if (write_in_flight_ && !writes_.empty()) {
+            auto handler = std::move(writes_.front().handler);
+            writes_.pop_front();
+            write_in_flight_ = false;
+            post_write(error, 0, std::move(handler));
+        }
+        while (!writes_.empty()) {
+            auto handler = std::move(writes_.front().handler);
+            writes_.pop_front();
+            post_write(error, 0, std::move(handler));
+        }
+    }
+
+    void post_read(const boost::system::error_code &error, std::size_t size, ReadHandler handler) {
+        boost::asio::post(executor_, [handler = std::move(handler), error, size]() mutable {
+            if (handler) {
+                handler(error, size);
+            }
+        });
+    }
+
+    void post_write(const boost::system::error_code &error, std::size_t size,
+                    WriteHandler handler) {
+        boost::asio::post(executor_, [handler = std::move(handler), error, size]() mutable {
+            if (handler) {
+                handler(error, size);
+            }
+        });
+    }
+
+    std::shared_ptr<QuicClientConnection> connection_;
+    MultiplexedSession::StreamId operation_id_;
+    std::int64_t stream_id_;
+    boost::asio::any_io_executor executor_;
+    QuicClientConnection::ObserverId observer_id_ = 0;
+    std::deque<ReadChunk> read_queue_;
+    std::deque<PendingWrite> writes_;
+    std::uint8_t *read_data_ = nullptr;
+    std::size_t read_size_ = 0;
+    ReadHandler read_handler_;
+    std::optional<boost::system::error_code> terminal_error_;
+    bool read_pending_ = false;
+    bool write_in_flight_ = false;
+    bool eof_ = false;
+    bool send_shutdown_ = false;
+    bool closed_ = false;
+};
+
+class QuicDatagramHandle final : public core::DatagramHandle {
+  public:
+    explicit QuicDatagramHandle(std::shared_ptr<QuicClientConnection> connection)
+        : connection_(std::move(connection)), executor_(connection_->executor()) {
+        observer_id_ = connection_->observe_datagrams(QuicDatagramObserver{
+            [this](const std::uint8_t *data, std::size_t size) { on_data(data, size); },
+            [this] { on_connection_closed(); }});
+    }
+
+    ~QuicDatagramHandle() override { close(); }
+
+    void async_send_to(boost::asio::const_buffer buffer, boost::asio::ip::udp::endpoint destination,
+                       WriteHandler handler) override {
+        if (closed_) {
+            post_write(boost::asio::error::operation_aborted, 0, std::move(handler));
+            return;
+        }
+        if (destination != connection_->remote_endpoint()) {
+            post_write(boost::asio::error::host_unreachable, 0, std::move(handler));
+            return;
+        }
+        if (buffer.size() > max_datagram_size()) {
+            post_write(boost::asio::error::message_size, 0, std::move(handler));
+            return;
+        }
+        std::vector<std::uint8_t> bytes(buffer.size());
+        if (!bytes.empty()) {
+            std::memcpy(bytes.data(), buffer.data(), bytes.size());
+        }
+        connection_->async_send_datagram(std::move(bytes), std::move(handler));
+    }
+
+    void async_receive_from(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+        if (read_pending_) {
+            post_read(boost::asio::error::operation_aborted, 0, {}, std::move(handler));
+            return;
+        }
+        if (closed_) {
+            post_read(boost::asio::error::operation_aborted, 0, {}, std::move(handler));
+            return;
+        }
+        read_pending_ = true;
+        read_data_ = static_cast<std::uint8_t *>(buffer.data());
+        read_size_ = buffer.size();
+        read_handler_ = std::move(handler);
+        fulfill_read();
+    }
+
+    boost::asio::any_io_executor executor() noexcept override { return executor_; }
+
+    std::size_t max_datagram_size() const noexcept override {
+        return connection_->max_datagram_size();
+    }
+
+    void cancel() noexcept override {
+        if (closed_) {
+            return;
+        }
+        fail_read(boost::asio::error::operation_aborted);
+    }
+
+    void close() noexcept override {
+        if (closed_) {
+            return;
+        }
+        closed_ = true;
+        connection_->remove_datagram_observer(observer_id_);
+        fail_read(boost::asio::error::operation_aborted);
+    }
+
+  private:
+    struct Datagram {
+        std::vector<std::uint8_t> bytes;
+    };
+
+    void on_data(const std::uint8_t *data, std::size_t size) {
+        if (closed_) {
+            return;
+        }
+        Datagram datagram;
+        datagram.bytes.assign(data, data + size);
+        queue_.push_back(std::move(datagram));
+        fulfill_read();
+    }
+
+    void fulfill_read() {
+        if (!read_pending_ || closed_ || queue_.empty()) {
+            return;
+        }
+        auto datagram = std::move(queue_.front());
+        queue_.pop_front();
+        if (datagram.bytes.size() > read_size_) {
+            read_pending_ = false;
+            post_read(boost::asio::error::message_size, 0, connection_->remote_endpoint(),
+                      std::move(read_handler_));
+            return;
+        }
+        if (!datagram.bytes.empty()) {
+            std::memcpy(read_data_, datagram.bytes.data(), datagram.bytes.size());
+        }
+        read_pending_ = false;
+        post_read({}, datagram.bytes.size(), connection_->remote_endpoint(),
+                  std::move(read_handler_));
+    }
+
+    void fail_read(const boost::system::error_code &error) {
+        if (!read_pending_) {
+            return;
+        }
+        read_pending_ = false;
+        post_read(error, 0, {}, std::move(read_handler_));
+    }
+
+    void on_connection_closed() {
+        if (closed_) {
+            return;
+        }
+        closed_ = true;
+        fail_read(boost::asio::error::operation_aborted);
+    }
+
+    void post_read(const boost::system::error_code &error, std::size_t size,
+                   boost::asio::ip::udp::endpoint sender, ReadHandler handler) {
+        boost::asio::post(executor_, [handler = std::move(handler), error, size, sender]() mutable {
+            if (handler) {
+                handler(error, size, sender);
+            }
+        });
+    }
+
+    void post_write(const boost::system::error_code &error, std::size_t size,
+                    WriteHandler handler) {
+        boost::asio::post(executor_, [handler = std::move(handler), error, size]() mutable {
+            if (handler) {
+                handler(error, size);
+            }
+        });
+    }
+
+    std::shared_ptr<QuicClientConnection> connection_;
+    boost::asio::any_io_executor executor_;
+    QuicClientConnection::ObserverId observer_id_ = 0;
+    std::deque<Datagram> queue_;
+    std::uint8_t *read_data_ = nullptr;
+    std::size_t read_size_ = 0;
+    ReadHandler read_handler_;
+    bool read_pending_ = false;
+    bool closed_ = false;
+};
+
+} // namespace
 
 QuicClientConnection::QuicClientConnection(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
@@ -894,6 +1640,95 @@ QuicOpenStreamResult QuicClientConnection::open_bidirectional_stream() {
 
 QuicOpenStreamResult QuicClientConnection::open_unidirectional_stream() {
     return impl_->open_stream(true);
+}
+
+MultiplexedSession::StreamId
+QuicClientConnection::open_stream(MultiplexedStreamRequest request,
+                                  std::chrono::steady_clock::time_point deadline,
+                                  StreamHandler handler) {
+    const auto operation_id = impl_->next_operation_id();
+    const auto completion = std::make_shared<StreamHandler>(std::move(handler));
+    auto post_failure = [executor = impl_->executor(), completion](core::Error error) mutable {
+        boost::asio::post(executor, [completion, error = std::move(error)]() mutable {
+            if (*completion) {
+                (*completion)(core::fail(std::move(error)));
+            }
+        });
+    };
+    if (!request.bidirectional) {
+        post_failure(core::Error{core::ErrorCode::unsupported,
+                                 "QUIC unidirectional streams are not StreamHandle-compatible",
+                                 {}});
+        return operation_id;
+    }
+    if (deadline <= Clock::now()) {
+        post_failure(core::Error{core::ErrorCode::timeout, "QUIC stream open timed out", {}});
+        return operation_id;
+    }
+    const auto opened = impl_->open_stream(false);
+    if (opened.state != QuicOpenStreamResult::State::opened || opened.stream_id < 0) {
+        post_failure(opened.error.value_or(
+            core::Error{core::ErrorCode::transport_io, "QUIC stream could not be opened", {}}));
+        return operation_id;
+    }
+    const auto tracked_id = impl_->track_multiplexed_stream(opened.stream_id);
+    const auto connection = shared_from_this();
+    auto stream = std::make_unique<QuicStreamHandle>(connection, tracked_id, opened.stream_id);
+    boost::asio::post(impl_->executor(),
+                      [handler = std::move(*completion), stream = std::move(stream)]() mutable {
+                          if (handler) {
+                              handler(std::move(stream));
+                          }
+                      });
+    return tracked_id;
+}
+
+void QuicClientConnection::cancel(StreamId stream_id) noexcept {
+    impl_->cancel_multiplexed_stream(stream_id);
+}
+
+std::size_t QuicClientConnection::active_streams() const noexcept {
+    return impl_->active_streams();
+}
+
+std::optional<std::size_t> QuicClientConnection::max_concurrent_streams() const noexcept {
+    return impl_->max_concurrent_streams();
+}
+
+QuicClientConnection::ObserverId QuicClientConnection::observe_stream(std::int64_t stream_id,
+                                                                      QuicStreamObserver observer) {
+    return impl_->observe_stream(stream_id, std::move(observer));
+}
+
+void QuicClientConnection::remove_stream_observer(std::int64_t stream_id,
+                                                  ObserverId observer_id) noexcept {
+    impl_->remove_stream_observer(stream_id, observer_id);
+}
+
+QuicClientConnection::ObserverId
+QuicClientConnection::observe_datagrams(QuicDatagramObserver observer) {
+    return impl_->observe_datagrams(std::move(observer));
+}
+
+void QuicClientConnection::remove_datagram_observer(ObserverId observer_id) noexcept {
+    impl_->remove_datagram_observer(observer_id);
+}
+
+void QuicClientConnection::async_send_datagram(std::vector<std::uint8_t> data,
+                                               DatagramWriteHandler handler) {
+    impl_->async_send_datagram(std::move(data), std::move(handler));
+}
+
+std::unique_ptr<core::DatagramHandle> QuicClientConnection::open_datagram() {
+    return std::make_unique<QuicDatagramHandle>(shared_from_this());
+}
+
+std::size_t QuicClientConnection::max_datagram_size() const noexcept {
+    return impl_->max_datagram_size();
+}
+
+boost::asio::ip::udp::endpoint QuicClientConnection::remote_endpoint() const noexcept {
+    return impl_->remote_endpoint();
 }
 
 void QuicClientConnection::write_stream_data(std::int64_t stream_id, std::vector<std::uint8_t> data,

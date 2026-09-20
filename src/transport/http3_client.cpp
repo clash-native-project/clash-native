@@ -1,6 +1,6 @@
 #include "http_body_stream.hpp"
 #include "http_tunnel_stream.hpp"
-#include <clash_native/transport/http_client.hpp>
+#include <clash_native/transport/exchange_session.hpp>
 #include <clash_native/transport/quic_client.hpp>
 
 #include <boost/asio/error.hpp>
@@ -101,7 +101,8 @@ std::string lower_copy(std::string_view value) {
     return result;
 }
 
-class Http3ClientSession final : public HttpClientSession,
+class Http3ClientSession final : public ExchangeSession,
+                                 public MultiplexedSession,
                                  public std::enable_shared_from_this<Http3ClientSession> {
   public:
     Http3ClientSession(std::shared_ptr<QuicClientConnection> connection,
@@ -169,7 +170,7 @@ class Http3ClientSession final : public HttpClientSession,
         connection_->set_events(std::move(events));
     }
 
-    ExchangeId exchange(HttpRequest request, std::chrono::steady_clock::time_point deadline,
+    ExchangeId exchange(ExchangeRequest request, std::chrono::steady_clock::time_point deadline,
                         Handler handler) override {
         const auto exchange_id = next_exchange_id();
         if (stopped_ || retired_) {
@@ -205,7 +206,7 @@ class Http3ClientSession final : public HttpClientSession,
         return exchange_id;
     }
 
-    ExchangeId exchange_streaming(HttpStreamingRequest request,
+    ExchangeId exchange_streaming(StreamingExchangeRequest request,
                                   std::chrono::steady_clock::time_point deadline,
                                   StreamingHandler handler) override {
         const auto exchange_id = next_exchange_id();
@@ -246,7 +247,7 @@ class Http3ClientSession final : public HttpClientSession,
         return exchange_id;
     }
 
-    ExchangeId open_tunnel(HttpTunnelRequest request,
+    ExchangeId open_tunnel(StreamUpgradeRequest request,
                            std::chrono::steady_clock::time_point deadline,
                            TunnelHandler handler) override {
         const auto exchange_id = next_exchange_id();
@@ -259,7 +260,7 @@ class Http3ClientSession final : public HttpClientSession,
             return exchange_id;
         }
         if (request.authority.empty() || contains_uri_whitespace(request.authority) ||
-            (request.mode == HttpTunnelMode::upgrade &&
+            (request.mode == StreamUpgradeMode::upgrade &&
              (!is_token(request.protocol) || !is_token(request.scheme) ||
               (request.scheme != "http" && request.scheme != "https") || request.target.empty() ||
               contains_uri_whitespace(request.target) ||
@@ -313,6 +314,32 @@ class Http3ClientSession final : public HttpClientSession,
         return exchange_id;
     }
 
+    MultiplexedSession *multiplexed_session() noexcept override { return this; }
+
+    StreamId open_stream(MultiplexedStreamRequest, std::chrono::steady_clock::time_point,
+                         StreamHandler handler) override {
+        const auto stream_id = static_cast<StreamId>(next_exchange_id());
+        boost::asio::post(executor_, [handler = std::move(handler)]() mutable {
+            if (handler) {
+                handler(core::fail(
+                    core::Error{core::ErrorCode::unsupported,
+                                "HTTP/3 exposes logical streams through ExchangeSession requests",
+                                {}}));
+            }
+        });
+        return stream_id;
+    }
+
+    std::size_t active_streams() const noexcept override { return pending_.size(); }
+
+    std::optional<std::size_t> max_concurrent_streams() const noexcept override {
+        return connection_->max_concurrent_streams();
+    }
+
+    std::unique_ptr<core::DatagramHandle> open_datagram() override {
+        return connection_->open_datagram();
+    }
+
     void cancel(ExchangeId exchange_id) noexcept override {
         fail_pending(exchange_id, cancelled_error());
     }
@@ -334,14 +361,14 @@ class Http3ClientSession final : public HttpClientSession,
     struct Pending {
         explicit Pending(boost::asio::any_io_executor executor) : timer(std::move(executor)) {}
 
-        HttpRequest request;
-        HttpTunnelRequest tunnel_request;
-        HttpResponse response;
-        std::shared_ptr<HttpBodyStream> request_body_source;
+        ExchangeRequest request;
+        StreamUpgradeRequest tunnel_request;
+        ExchangeResponse response;
+        std::shared_ptr<ExchangeBodyStream> request_body_source;
         std::optional<std::uint64_t> request_content_length;
         std::vector<std::uint8_t> request_body_buffer;
-        std::vector<HttpHeader> request_body_trailers;
-        std::vector<HttpHeader> response_trailers;
+        std::vector<ExchangeField> request_body_trailers;
+        std::vector<ExchangeField> response_trailers;
         Handler handler;
         StreamingHandler streaming_handler;
         TunnelHandler tunnel_handler;
@@ -362,7 +389,7 @@ class Http3ClientSession final : public HttpClientSession,
         std::size_t pending_payload_credit = 0;
         std::size_t deferred_receive_credit = 0;
         std::shared_ptr<detail::HttpTunnelStreamState> tunnel_state;
-        std::shared_ptr<detail::QueuedHttpBodyStream> streaming_response_body;
+        std::shared_ptr<detail::QueuedExchangeBodyStream> streaming_response_body;
         bool is_tunnel = false;
         bool is_streaming = false;
         bool streaming_response_delivered = false;
@@ -385,7 +412,7 @@ class Http3ClientSession final : public HttpClientSession,
 
     using PendingPtr = std::shared_ptr<Pending>;
 
-    static std::optional<core::Error> validate_request(const HttpRequest &request) {
+    static std::optional<core::Error> validate_request(const ExchangeRequest &request) {
         if (!is_token(request.method) || !is_token(request.scheme) || request.authority.empty() ||
             request.target.empty() || contains_uri_whitespace(request.authority) ||
             contains_uri_whitespace(request.target)) {
@@ -419,7 +446,7 @@ class Http3ClientSession final : public HttpClientSession,
     }
 
     static std::optional<core::Error>
-    validate_streaming_request(const HttpStreamingRequest &request,
+    validate_streaming_request(const StreamingExchangeRequest &request,
                                std::optional<std::uint64_t> &content_length) {
         if (const auto error = validate_request(request.request)) {
             return error;
@@ -482,7 +509,7 @@ class Http3ClientSession final : public HttpClientSession,
     }
 
     static std::optional<core::Error>
-    validate_request_trailers(const std::vector<HttpHeader> &trailers) {
+    validate_request_trailers(const std::vector<ExchangeField> &trailers) {
         for (const auto &header : trailers) {
             if (!is_token(header.name) || contains_control(header.value)) {
                 return core::Error{core::ErrorCode::configuration,
@@ -508,7 +535,7 @@ class Http3ClientSession final : public HttpClientSession,
         return result;
     }
 
-    void post_result(Handler handler, core::Result<HttpResponse> result) {
+    void post_result(Handler handler, core::Result<ExchangeResponse> result) {
         boost::asio::post(executor_,
                           [handler = std::move(handler), result = std::move(result)]() mutable {
                               if (handler) {
@@ -518,7 +545,7 @@ class Http3ClientSession final : public HttpClientSession,
     }
 
     void post_streaming_result(StreamingHandler handler,
-                               core::Result<HttpStreamingResponse> result) {
+                               core::Result<StreamingExchangeResponse> result) {
         boost::asio::post(executor_,
                           [handler = std::move(handler), result = std::move(result)]() mutable {
                               if (handler) {
@@ -527,7 +554,7 @@ class Http3ClientSession final : public HttpClientSession,
                           });
     }
 
-    void post_tunnel_result(TunnelHandler handler, core::Result<HttpTunnelResponse> result) {
+    void post_tunnel_result(TunnelHandler handler, core::Result<StreamUpgradeResponse> result) {
         boost::asio::post(executor_,
                           [handler = std::move(handler), result = std::move(result)]() mutable {
                               if (handler) {
@@ -871,7 +898,7 @@ class Http3ClientSession final : public HttpClientSession,
         }
         pending->streaming_response_delivered = true;
         const auto weak = weak_from_this();
-        pending->streaming_response_body = std::make_shared<detail::QueuedHttpBodyStream>(
+        pending->streaming_response_body = std::make_shared<detail::QueuedExchangeBodyStream>(
             executor_, kHttp3ResponseBodyQueueLimit,
             [weak, exchange_id](std::size_t size) {
                 if (const auto self = weak.lock()) {
@@ -889,8 +916,8 @@ class Http3ClientSession final : public HttpClientSession,
                 }
             });
         auto handler = std::move(pending->streaming_handler);
-        HttpStreamingResponse response{std::move(pending->response),
-                                       pending->streaming_response_body};
+        StreamingExchangeResponse response{std::move(pending->response),
+                                           pending->streaming_response_body};
         post_streaming_result(std::move(handler), std::move(response));
     }
 
@@ -1095,7 +1122,7 @@ class Http3ClientSession final : public HttpClientSession,
                 continue;
             }
             const auto &pending = found->second;
-            if (pending->is_tunnel && pending->tunnel_request.mode == HttpTunnelMode::upgrade) {
+            if (pending->is_tunnel && pending->tunnel_request.mode == StreamUpgradeMode::upgrade) {
                 if (!remote_settings_received_) {
                     continue;
                 }
@@ -1180,7 +1207,7 @@ class Http3ClientSession final : public HttpClientSession,
     void submit_tunnel(ExchangeId exchange_id, const PendingPtr &pending, std::int64_t stream_id) {
         std::vector<std::string> names{":method"};
         std::vector<std::string> values{"CONNECT"};
-        if (pending->tunnel_request.mode == HttpTunnelMode::connect) {
+        if (pending->tunnel_request.mode == StreamUpgradeMode::connect) {
             names.emplace_back(":authority");
             values.push_back(pending->tunnel_request.authority);
         } else {
@@ -1290,9 +1317,10 @@ class Http3ClientSession final : public HttpClientSession,
             });
         auto handler = std::move(pending->tunnel_handler);
         auto response = std::move(pending->response);
-        post_tunnel_result(std::move(handler),
-                           HttpTunnelResponse{std::move(response), detail::make_http_tunnel_stream(
-                                                                       pending->tunnel_state)});
+        post_tunnel_result(
+            std::move(handler),
+            StreamUpgradeResponse{std::move(response),
+                                  detail::make_http_tunnel_stream(pending->tunnel_state)});
     }
 
     void pump_output() {
@@ -1572,7 +1600,7 @@ class Http3ClientSession final : public HttpClientSession,
             }
         } else if (pending->is_tunnel) {
             post_tunnel_result(std::move(pending->tunnel_handler),
-                               HttpTunnelResponse{std::move(pending->response), {}});
+                               StreamUpgradeResponse{std::move(pending->response), {}});
         } else {
             post_result(std::move(pending->handler), std::move(pending->response));
         }
@@ -1717,9 +1745,9 @@ class Http3ClientSession final : public HttpClientSession,
 
 } // namespace
 
-std::shared_ptr<HttpClientSession>
-make_http3_client_session(std::shared_ptr<QuicClientConnection> connection,
-                          std::function<void(core::Error)> failure_handler) {
+std::shared_ptr<ExchangeSession>
+make_http3_exchange_session(std::shared_ptr<QuicClientConnection> connection,
+                            std::function<void(core::Error)> failure_handler) {
     if (!connection) {
         return {};
     }

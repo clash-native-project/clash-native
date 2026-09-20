@@ -6,7 +6,7 @@
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
-#include <clash_native/transport/http_client.hpp>
+#include <clash_native/transport/exchange_session.hpp>
 
 #include <gtest/gtest.h>
 
@@ -1860,7 +1860,7 @@ TEST(DnsQueryServiceTest, EvictsLeastRecentlyUsedEntriesAtTheConfiguredCapacity)
     runtime.stop();
 }
 
-TEST(HttpClientSessionTest, ReusesHttp11ConnectionForQueuedExchanges) {
+TEST(ExchangeSessionTest, ReusesHttp11ConnectionForQueuedExchanges) {
     namespace asio = boost::asio;
     namespace http = boost::beast::http;
     using tcp = asio::ip::tcp;
@@ -1902,12 +1902,13 @@ TEST(HttpClientSessionTest, ReusesHttp11ConnectionForQueuedExchanges) {
         }
     });
 
-    auto session = clash_native::transport::make_http1_client_session(
+    auto session = clash_native::transport::make_http1_exchange_session(
         std::make_unique<clash_native::net::TcpStream>(std::move(client)));
-    std::array<std::optional<clash_native::core::Result<clash_native::transport::HttpResponse>>, 2>
+    std::array<std::optional<clash_native::core::Result<clash_native::transport::ExchangeResponse>>,
+               2>
         results;
     for (std::size_t index = 0; index < results.size(); ++index) {
-        clash_native::transport::HttpRequest request;
+        clash_native::transport::ExchangeRequest request;
         request.method = "POST";
         request.scheme = "http";
         request.authority = "localhost";

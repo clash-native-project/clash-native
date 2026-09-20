@@ -1,7 +1,7 @@
 #pragma once
 
 #include <clash_native/dns/dns_transport.hpp>
-#include <clash_native/transport/http_client.hpp>
+#include <clash_native/transport/exchange_session.hpp>
 #include <clash_native/transport/quic_client.hpp>
 
 #include <boost/asio/ip/udp.hpp>
@@ -80,7 +80,7 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
         DnsExchangeRequest request;
         boost::asio::steady_timer deadline_timer;
         std::int64_t stream_id = -1;
-        std::optional<transport::HttpClientSession::ExchangeId> http_exchange_id;
+        std::optional<transport::ExchangeSession::ExchangeId> http_exchange_id;
         std::vector<std::uint8_t> doq_response;
         std::optional<core::Result<DnsPacket>> result;
     };
@@ -114,7 +114,7 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
 
     void open_pending_http3_exchanges();
     void submit_http3_exchange(const std::shared_ptr<Exchange> &exchange);
-    void on_http3_result(ExchangeId id, core::Result<transport::HttpResponse> result);
+    void on_http3_result(ExchangeId id, core::Result<transport::ExchangeResponse> result);
 
     void decode_dns_response(Exchange &exchange, std::span<const std::uint8_t> wire);
     void set_exchange_error(Exchange &exchange, core::Error error);
@@ -135,7 +135,7 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
     std::string authority_;
     std::string path_;
     std::shared_ptr<transport::QuicClientConnection> quic_;
-    std::shared_ptr<transport::HttpClientSession> http3_;
+    std::shared_ptr<transport::ExchangeSession> http3_;
     std::unordered_map<ExchangeId, std::shared_ptr<Exchange>> exchanges_;
     std::unordered_map<std::int64_t, std::shared_ptr<Exchange>> stream_exchanges_;
     std::deque<ExchangeId> pending_exchanges_;

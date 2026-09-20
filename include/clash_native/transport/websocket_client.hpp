@@ -2,7 +2,7 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
-#include <clash_native/transport/http_client.hpp>
+#include <clash_native/transport/exchange_session.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -21,7 +21,7 @@ struct WebSocketClientOptions {
     std::string target;
     // Additional handshake headers. Connection, Upgrade, Host, and
     // Sec-WebSocket-* framing headers are managed by the client.
-    std::vector<HttpHeader> headers;
+    std::vector<ExchangeField> headers;
     std::size_t max_message_size = 16 * 1024 * 1024;
     std::optional<std::chrono::steady_clock::time_point> deadline;
 };

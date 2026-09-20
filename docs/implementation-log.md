@@ -1,5 +1,42 @@
 # Implementation Log
 
+### 2026-09-19 — Complete QUIC handle completion paths
+
+- Routed ngtcp2 stream-consumption notifications to both legacy QUIC events and
+  `StreamHandle` observers, so asynchronous writes complete on the common
+  handle interface.
+- Completed pending stream and DATAGRAM operations when a QUIC connection is
+  reset or retired, including receive cancellation and observer cleanup.
+
+### 2026-09-19 — Connect QUIC carriers to the common capability interfaces
+
+- Added the native QUIC `MultiplexedSession` implementation. Each opened
+  bidirectional QUIC stream is returned as a `StreamHandle`, with shared
+  connection capacity, cancellation, stream close/reset propagation, and
+  asynchronous write completion.
+- Added the QUIC DATAGRAM adapter as a `DatagramHandle`, including negotiated
+  payload-size validation, asynchronous send/receive, peer association, and
+  connection-retirement completion for pending operations.
+- HTTP/2 and HTTP/3 exchange sessions now expose their multiplexed carrier
+  capability and active-stream capacity; CONNECT and Extended CONNECT continue
+  to produce `StreamHandle` values through `ExchangeSession`. HTTP/3 also
+  exposes its QUIC DATAGRAM carrier handle.
+- Added a Windows x64 clang-cl/MSVC interoperation test using a Go quic-go
+  server. It opens four concurrent QUIC streams on one connection and echoes a
+  QUIC DATAGRAM through the common handles.
+
+### 2026-09-19 — Generalize HTTP exchange and carrier session interfaces
+
+- Renamed the public HTTP-facing message and session vocabulary to
+  `ExchangeField`, `ExchangeRequest`, `ExchangeResponse`, `ExchangeBodyStream`,
+  `StreamUpgrade*`, and `ExchangeSession`. HTTP/1.1, HTTP/2, and HTTP/3
+  implementations, DoH adapters, gRPC, the HTTP proxy outbound, and host tests
+  now use the generic exchange interface.
+- Added the public `MultiplexedSession` capability contract for logical stream
+  allocation, cancellation, capacity, and retirement. HTTP exchange semantics
+  remain separate from raw logical stream allocation. The old HTTP header and
+  factory names remain as compatibility aliases only.
+
 ### 2026-09-19 — Add an HTTP/1.1 WebSocket client carrier
 
 - Added an asynchronous WebSocket client over an injected `StreamHandle`. The

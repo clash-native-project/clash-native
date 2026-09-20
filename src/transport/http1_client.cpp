@@ -1,6 +1,6 @@
 #include "http_body_stream.hpp"
 #include "http_tunnel_stream.hpp"
-#include <clash_native/transport/http_client.hpp>
+#include <clash_native/transport/exchange_session.hpp>
 
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/async_result.hpp>
@@ -32,8 +32,8 @@ namespace http = boost::beast::http;
 using HttpMessage = http::request<http::vector_body<std::uint8_t>>;
 using HttpTunnelMessage = http::request<http::empty_body>;
 using HttpStreamingMessage = http::request<http::empty_body>;
-using HttpResponseParser = http::response_parser<http::vector_body<std::uint8_t>>;
-using HttpStreamingResponseParser = http::response_parser<http::buffer_body>;
+using ExchangeResponseParser = http::response_parser<http::vector_body<std::uint8_t>>;
+using StreamingExchangeResponseParser = http::response_parser<http::buffer_body>;
 
 // Beast's composed HTTP operations copy their stream and accept buffer
 // sequences, while StreamHandle exposes a unique owner and single buffers.
@@ -344,7 +344,7 @@ bool valid_trailer_declaration(std::string_view value) {
     }
 }
 
-core::Result<HttpMessage> make_message(const HttpRequest &request) {
+core::Result<HttpMessage> make_message(const ExchangeRequest &request) {
     if (!is_token(request.method) || request.target.empty() || has_uri_whitespace(request.target) ||
         has_uri_whitespace(request.authority)) {
         return core::fail(core::Error{core::ErrorCode::configuration,
@@ -373,7 +373,7 @@ core::Result<HttpMessage> make_message(const HttpRequest &request) {
     return message;
 }
 
-core::Result<HttpStreamingMessage> make_streaming_message(const HttpStreamingRequest &request) {
+core::Result<HttpStreamingMessage> make_streaming_message(const StreamingExchangeRequest &request) {
     if (!is_token(request.request.method) || request.request.target.empty() ||
         has_uri_whitespace(request.request.target) ||
         has_uri_whitespace(request.request.authority)) {
@@ -436,12 +436,12 @@ core::Result<HttpStreamingMessage> make_streaming_message(const HttpStreamingReq
     return message;
 }
 
-core::Result<HttpTunnelMessage> make_tunnel_message(const HttpTunnelRequest &request) {
+core::Result<HttpTunnelMessage> make_tunnel_message(const StreamUpgradeRequest &request) {
     if (request.authority.empty() || has_uri_whitespace(request.authority)) {
         return core::fail(
             core::Error{core::ErrorCode::configuration, "HTTP/1.1 tunnel authority is invalid"});
     }
-    if (request.mode == HttpTunnelMode::upgrade &&
+    if (request.mode == StreamUpgradeMode::upgrade &&
         (request.target.empty() || has_uri_whitespace(request.target) ||
          !is_token(request.protocol))) {
         return core::fail(core::Error{core::ErrorCode::configuration,
@@ -449,8 +449,9 @@ core::Result<HttpTunnelMessage> make_tunnel_message(const HttpTunnelRequest &req
     }
 
     HttpTunnelMessage message;
-    message.method(request.mode == HttpTunnelMode::connect ? http::verb::connect : http::verb::get);
-    message.target(request.mode == HttpTunnelMode::connect ? request.authority : request.target);
+    message.method(request.mode == StreamUpgradeMode::connect ? http::verb::connect
+                                                              : http::verb::get);
+    message.target(request.mode == StreamUpgradeMode::connect ? request.authority : request.target);
     message.version(11);
 
     bool has_host = false;
@@ -484,14 +485,14 @@ core::Result<HttpTunnelMessage> make_tunnel_message(const HttpTunnelRequest &req
     if (!has_host) {
         message.set(http::field::host, request.authority);
     }
-    if (request.mode == HttpTunnelMode::upgrade) {
+    if (request.mode == StreamUpgradeMode::upgrade) {
         message.set(http::field::connection, "Upgrade");
         message.set(http::field::upgrade, request.protocol);
     }
     return message;
 }
 
-const std::string *find_header(const HttpResponse &response, std::string_view name) {
+const std::string *find_header(const ExchangeResponse &response, std::string_view name) {
     for (const auto &header : response.headers) {
         if (header.name.size() == name.size() &&
             std::equal(header.name.begin(), header.name.end(), name.begin(),
@@ -528,8 +529,8 @@ bool contains_header_token(std::string_view value, std::string_view token) {
     return false;
 }
 
-bool tunnel_accepted(const HttpTunnelRequest &request, const HttpResponse &response) {
-    if (request.mode == HttpTunnelMode::connect) {
+bool tunnel_accepted(const StreamUpgradeRequest &request, const ExchangeResponse &response) {
+    if (request.mode == StreamUpgradeMode::connect) {
         return response.status >= 200 && response.status < 300;
     }
     const auto *upgrade = find_header(response, "upgrade");
@@ -539,8 +540,8 @@ bool tunnel_accepted(const HttpTunnelRequest &request, const HttpResponse &respo
            contains_header_token(*connection, "upgrade");
 }
 
-HttpResponse make_response(http::response<http::vector_body<std::uint8_t>> message) {
-    HttpResponse response;
+ExchangeResponse make_response(http::response<http::vector_body<std::uint8_t>> message) {
+    ExchangeResponse response;
     response.version = message.version();
     response.status = message.result_int();
     response.keep_alive = message.keep_alive();
@@ -557,14 +558,14 @@ bool is_http_framing_error(const boost::system::error_code &error) {
            error == http::error::bad_version;
 }
 
-class Http1ClientSession final : public HttpClientSession,
+class Http1ClientSession final : public ExchangeSession,
                                  public std::enable_shared_from_this<Http1ClientSession> {
   public:
     explicit Http1ClientSession(std::unique_ptr<core::StreamHandle> stream)
         : executor_(stream->executor()),
           stream_(std::make_unique<Http1StreamAdapter>(std::move(stream))) {}
 
-    ExchangeId exchange(HttpRequest request, std::chrono::steady_clock::time_point deadline,
+    ExchangeId exchange(ExchangeRequest request, std::chrono::steady_clock::time_point deadline,
                         Handler handler) override {
         const auto exchange_id = next_exchange_id();
         if (stopped_ || retired_) {
@@ -600,7 +601,7 @@ class Http1ClientSession final : public HttpClientSession,
         return exchange_id;
     }
 
-    ExchangeId exchange_streaming(HttpStreamingRequest request,
+    ExchangeId exchange_streaming(StreamingExchangeRequest request,
                                   std::chrono::steady_clock::time_point deadline,
                                   StreamingHandler handler) override {
         const auto exchange_id = next_exchange_id();
@@ -639,7 +640,7 @@ class Http1ClientSession final : public HttpClientSession,
         return exchange_id;
     }
 
-    ExchangeId open_tunnel(HttpTunnelRequest request,
+    ExchangeId open_tunnel(StreamUpgradeRequest request,
                            std::chrono::steady_clock::time_point deadline,
                            TunnelHandler handler) override {
         const auto exchange_id = next_exchange_id();
@@ -717,15 +718,15 @@ class Http1ClientSession final : public HttpClientSession,
         std::uint64_t streaming_request_written = 0;
         std::size_t streaming_response_queued = 0;
         std::size_t streaming_header_field_count = 0;
-        HttpRequest request;
-        HttpStreamingRequest streaming_request;
-        HttpTunnelRequest tunnel_request;
+        ExchangeRequest request;
+        StreamingExchangeRequest streaming_request;
+        StreamUpgradeRequest tunnel_request;
         std::variant<HttpMessage, HttpTunnelMessage> message;
         HttpStreamingMessage streaming_message;
         std::unique_ptr<http::request_serializer<http::empty_body>> streaming_serializer;
-        std::unique_ptr<HttpResponseParser> parser;
-        std::unique_ptr<HttpStreamingResponseParser> streaming_parser;
-        std::shared_ptr<detail::QueuedHttpBodyStream> streaming_response_body;
+        std::unique_ptr<ExchangeResponseParser> parser;
+        std::unique_ptr<StreamingExchangeResponseParser> streaming_parser;
+        std::shared_ptr<detail::QueuedExchangeBodyStream> streaming_response_body;
         std::array<std::uint8_t, 16 * 1024> streaming_request_buffer{};
         std::array<std::uint8_t, 1> streaming_request_probe{};
         std::array<std::uint8_t, 16 * 1024> streaming_response_buffer{};
@@ -743,7 +744,7 @@ class Http1ClientSession final : public HttpClientSession,
         return result;
     }
 
-    void post_result(Handler handler, core::Result<HttpResponse> result) {
+    void post_result(Handler handler, core::Result<ExchangeResponse> result) {
         boost::asio::post(executor_,
                           [handler = std::move(handler), result = std::move(result)]() mutable {
                               if (handler) {
@@ -752,7 +753,7 @@ class Http1ClientSession final : public HttpClientSession,
                           });
     }
 
-    void post_tunnel_result(TunnelHandler handler, core::Result<HttpTunnelResponse> result) {
+    void post_tunnel_result(TunnelHandler handler, core::Result<StreamUpgradeResponse> result) {
         boost::asio::post(executor_,
                           [handler = std::move(handler), result = std::move(result)]() mutable {
                               if (handler) {
@@ -762,7 +763,7 @@ class Http1ClientSession final : public HttpClientSession,
     }
 
     void post_streaming_result(StreamingHandler handler,
-                               core::Result<HttpStreamingResponse> result) {
+                               core::Result<StreamingExchangeResponse> result) {
         boost::asio::post(executor_,
                           [handler = std::move(handler), result = std::move(result)]() mutable {
                               if (handler) {
@@ -832,7 +833,7 @@ class Http1ClientSession final : public HttpClientSession,
                     });
                 return;
             }
-            pending->parser = std::make_unique<HttpResponseParser>();
+            pending->parser = std::make_unique<ExchangeResponseParser>();
             pending->parser->body_limit(pending->is_tunnel
                                             ? pending->tunnel_request.rejection_body_limit
                                             : pending->request.response_body_limit);
@@ -1010,7 +1011,7 @@ class Http1ClientSession final : public HttpClientSession,
     }
 
     core::Result<std::vector<std::uint8_t>>
-    make_last_chunk(const std::vector<HttpHeader> &trailers) const {
+    make_last_chunk(const std::vector<ExchangeField> &trailers) const {
         auto wire = std::make_shared<std::vector<std::uint8_t>>();
         const std::string_view end = "0\r\n";
         wire->insert(wire->end(), end.begin(), end.end());
@@ -1079,7 +1080,7 @@ class Http1ClientSession final : public HttpClientSession,
 
     void read_streaming_response_header(ExchangeId exchange_id,
                                         const std::shared_ptr<Pending> &pending) {
-        pending->streaming_parser = std::make_unique<HttpStreamingResponseParser>();
+        pending->streaming_parser = std::make_unique<StreamingExchangeResponseParser>();
         pending->streaming_parser->body_limit(std::numeric_limits<std::uint64_t>::max());
         pending->streaming_parser->merge_all_trailers(true);
         if (pending->streaming_request.request.method == "HEAD") {
@@ -1104,7 +1105,7 @@ class Http1ClientSession final : public HttpClientSession,
                 }
 
                 auto &message = pending->streaming_parser->get();
-                HttpStreamingResponse response;
+                StreamingExchangeResponse response;
                 response.response.version = message.version();
                 response.response.status = message.result_int();
                 response.response.keep_alive = message.keep_alive();
@@ -1116,23 +1117,24 @@ class Http1ClientSession final : public HttpClientSession,
                 }
 
                 const auto weak = self->weak_from_this();
-                pending->streaming_response_body = std::make_shared<detail::QueuedHttpBodyStream>(
-                    self->executor_, 256 * 1024,
-                    [weak, exchange_id](std::size_t size) {
-                        if (const auto owner = weak.lock()) {
-                            owner->streaming_response_consumed(exchange_id, size);
-                        }
-                    },
-                    [weak, exchange_id] {
-                        if (const auto owner = weak.lock()) {
-                            owner->cancel(exchange_id);
-                        }
-                    },
-                    [weak, exchange_id] {
-                        if (const auto owner = weak.lock()) {
-                            owner->streaming_response_drained(exchange_id);
-                        }
-                    });
+                pending->streaming_response_body =
+                    std::make_shared<detail::QueuedExchangeBodyStream>(
+                        self->executor_, 256 * 1024,
+                        [weak, exchange_id](std::size_t size) {
+                            if (const auto owner = weak.lock()) {
+                                owner->streaming_response_consumed(exchange_id, size);
+                            }
+                        },
+                        [weak, exchange_id] {
+                            if (const auto owner = weak.lock()) {
+                                owner->cancel(exchange_id);
+                            }
+                        },
+                        [weak, exchange_id] {
+                            if (const auto owner = weak.lock()) {
+                                owner->streaming_response_drained(exchange_id);
+                            }
+                        });
                 response.body = pending->streaming_response_body;
                 pending->streaming_headers_delivered = true;
                 const bool already_done = pending->streaming_parser->is_done();
@@ -1191,7 +1193,7 @@ class Http1ClientSession final : public HttpClientSession,
                 }
                 if (pending->streaming_parser->is_done()) {
                     pending->streaming_response_done = true;
-                    std::vector<HttpHeader> trailers;
+                    std::vector<ExchangeField> trailers;
                     std::size_t index = 0;
                     for (const auto &field : pending->streaming_parser->get().base()) {
                         if (index++ >= pending->streaming_header_field_count) {
@@ -1279,7 +1281,7 @@ class Http1ClientSession final : public HttpClientSession,
                 }
                 const auto status = pending->parser->get().result_int();
                 if (status >= 100 && status < 200 && status != 101) {
-                    pending->parser = std::make_unique<HttpResponseParser>();
+                    pending->parser = std::make_unique<ExchangeResponseParser>();
                     pending->parser->body_limit(pending->tunnel_request.rejection_body_limit);
                     self->read_tunnel_response_header(exchange_id, pending);
                     return;
@@ -1313,7 +1315,7 @@ class Http1ClientSession final : public HttpClientSession,
                     self->retired_ = true;
                     self->close_stream();
                 }
-                self->complete_tunnel(exchange_id, HttpTunnelResponse{std::move(response), {}});
+                self->complete_tunnel(exchange_id, StreamUpgradeResponse{std::move(response), {}});
                 if (reusable) {
                     self->start_next();
                 } else {
@@ -1323,7 +1325,7 @@ class Http1ClientSession final : public HttpClientSession,
     }
 
     void finish_tunnel(ExchangeId exchange_id, const std::shared_ptr<Pending> &pending,
-                       HttpResponse response) {
+                       ExchangeResponse response) {
         retired_ = true;
         active_id_.reset();
         std::vector<std::uint8_t> buffered(read_buffer_.size());
@@ -1347,7 +1349,7 @@ class Http1ClientSession final : public HttpClientSession,
         }
         auto state = std::make_shared<Http1TunnelState>(std::move(raw_stream), std::move(buffered));
         auto tunnel = std::make_unique<Http1TunnelStream>(std::move(state));
-        complete_tunnel(exchange_id, HttpTunnelResponse{std::move(response), std::move(tunnel)});
+        complete_tunnel(exchange_id, StreamUpgradeResponse{std::move(response), std::move(tunnel)});
         retire_queued();
         (void)pending;
     }
@@ -1435,7 +1437,7 @@ class Http1ClientSession final : public HttpClientSession,
         queue_.clear();
     }
 
-    void complete(ExchangeId exchange_id, core::Result<HttpResponse> result) {
+    void complete(ExchangeId exchange_id, core::Result<ExchangeResponse> result) {
         const auto found = pending_.find(exchange_id);
         if (found == pending_.end()) {
             return;
@@ -1449,7 +1451,7 @@ class Http1ClientSession final : public HttpClientSession,
         }
     }
 
-    void complete_tunnel(ExchangeId exchange_id, core::Result<HttpTunnelResponse> result) {
+    void complete_tunnel(ExchangeId exchange_id, core::Result<StreamUpgradeResponse> result) {
         const auto found = pending_.find(exchange_id);
         if (found == pending_.end()) {
             return;
@@ -1493,7 +1495,7 @@ class Http1ClientSession final : public HttpClientSession,
         }
     }
 
-    void complete_all(const core::Result<HttpResponse> &result) {
+    void complete_all(const core::Result<ExchangeResponse> &result) {
         std::vector<ExchangeId> exchanges;
         exchanges.reserve(pending_.size());
         for (const auto &[exchange_id, pending] : pending_) {
@@ -1525,8 +1527,8 @@ class Http1ClientSession final : public HttpClientSession,
 
 } // namespace
 
-std::shared_ptr<HttpClientSession>
-make_http1_client_session(std::unique_ptr<core::StreamHandle> stream) {
+std::shared_ptr<ExchangeSession>
+make_http1_exchange_session(std::unique_ptr<core::StreamHandle> stream) {
     if (!stream) {
         return {};
     }

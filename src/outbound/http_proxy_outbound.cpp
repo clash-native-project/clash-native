@@ -1,7 +1,7 @@
 #include <clash_native/core/base64.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/http_proxy_outbound.hpp>
-#include <clash_native/transport/http_client.hpp>
+#include <clash_native/transport/exchange_session.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include "outbound_utils.hpp"
@@ -47,7 +47,7 @@ std::string destination_authority(const core::Destination &destination) {
 class HttpProxyTunnelStream final : public core::StreamHandle {
   public:
     HttpProxyTunnelStream(std::unique_ptr<core::StreamHandle> stream,
-                          std::shared_ptr<transport::HttpClientSession> session)
+                          std::shared_ptr<transport::ExchangeSession> session)
         : stream_(std::move(stream)), session_(std::move(session)) {}
 
     void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
@@ -84,7 +84,7 @@ class HttpProxyTunnelStream final : public core::StreamHandle {
 
   private:
     std::unique_ptr<core::StreamHandle> stream_;
-    std::shared_ptr<transport::HttpClientSession> session_;
+    std::shared_ptr<transport::ExchangeSession> session_;
 };
 
 class HttpProxyConnectOperation final
@@ -236,9 +236,9 @@ class HttpProxyConnectOperation final
             return;
         }
         if (alpn == "h2") {
-            session_ = transport::make_http2_client_session(std::move(stream));
+            session_ = transport::make_http2_exchange_session(std::move(stream));
         } else {
-            session_ = transport::make_http1_client_session(std::move(stream));
+            session_ = transport::make_http1_exchange_session(std::move(stream));
         }
         if (!session_) {
             finish(core::StreamOpenResult::failed(
@@ -246,7 +246,7 @@ class HttpProxyConnectOperation final
             return;
         }
 
-        transport::HttpTunnelRequest tunnel;
+        transport::StreamUpgradeRequest tunnel;
         tunnel.authority = destination_authority(request_.destination);
         if (!config_.username.empty()) {
             tunnel.headers.push_back(
@@ -256,7 +256,7 @@ class HttpProxyConnectOperation final
         auto self = shared_from_this();
         session_->open_tunnel(
             std::move(tunnel), deadline_,
-            [self](core::Result<transport::HttpTunnelResponse> result) mutable {
+            [self](core::Result<transport::StreamUpgradeResponse> result) mutable {
                 if (self->completed_) {
                     if (result && result->stream) {
                         result->stream->close();
@@ -317,7 +317,7 @@ class HttpProxyConnectOperation final
     core::StreamRequest request_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
     std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
-    std::shared_ptr<transport::HttpClientSession> session_;
+    std::shared_ptr<transport::ExchangeSession> session_;
     boost::asio::steady_timer timer_;
     core::StreamOpenHandler handler_;
     std::chrono::steady_clock::time_point deadline_{};

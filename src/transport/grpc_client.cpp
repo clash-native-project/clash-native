@@ -82,7 +82,7 @@ std::optional<std::string> percent_decode(std::string_view input) {
     return result;
 }
 
-std::optional<std::string_view> find_header(const std::vector<HttpHeader> &headers,
+std::optional<std::string_view> find_header(const std::vector<ExchangeField> &headers,
                                             std::string_view name) {
     for (const auto &header : headers) {
         if (lower_copy(header.name) == name) {
@@ -92,7 +92,7 @@ std::optional<std::string_view> find_header(const std::vector<HttpHeader> &heade
     return std::nullopt;
 }
 
-std::vector<GrpcMetadata> application_metadata(const std::vector<HttpHeader> &headers) {
+std::vector<GrpcMetadata> application_metadata(const std::vector<ExchangeField> &headers) {
     std::vector<GrpcMetadata> result;
     for (const auto &header : headers) {
         const auto name = lower_copy(header.name);
@@ -114,7 +114,7 @@ std::vector<GrpcMetadata> application_metadata(const std::vector<HttpHeader> &he
     return result;
 }
 
-core::Result<GrpcStatus> parse_status(const std::vector<HttpHeader> &headers) {
+core::Result<GrpcStatus> parse_status(const std::vector<ExchangeField> &headers) {
     const auto status_value = find_header(headers, "grpc-status");
     if (!status_value) {
         return core::fail(
@@ -205,7 +205,7 @@ core::Status validate_options(const GrpcCallOptions &options) {
 
 } // namespace
 
-class GrpcClientCall::RequestBody final : public HttpBodyStream,
+class GrpcClientCall::RequestBody final : public ExchangeBodyStream,
                                           public std::enable_shared_from_this<RequestBody> {
   public:
     RequestBody(boost::asio::any_io_executor executor, std::size_t max_message_size)
@@ -249,7 +249,7 @@ class GrpcClientCall::RequestBody final : public HttpBodyStream,
         });
     }
 
-    std::vector<HttpHeader> trailers() const override { return {}; }
+    std::vector<ExchangeField> trailers() const override { return {}; }
 
     void cancel() noexcept override {
         const auto self = shared_from_this();
@@ -383,7 +383,7 @@ class GrpcClientCall::RequestBody final : public HttpBodyStream,
 };
 
 GrpcClientCall::GrpcClientCall(boost::asio::any_io_executor executor,
-                               std::shared_ptr<HttpClientSession> session, GrpcCallOptions options,
+                               std::shared_ptr<ExchangeSession> session, GrpcCallOptions options,
                                OpenHandler open_handler)
     : executor_(std::move(executor)), session_(std::move(session)), options_(std::move(options)),
       open_handler_(std::move(open_handler)),
@@ -422,7 +422,7 @@ void GrpcClientCall::start() {
         return;
     }
 
-    HttpStreamingRequest request;
+    StreamingExchangeRequest request;
     request.request.method = "POST";
     request.request.scheme = options_.scheme;
     request.request.authority = options_.authority;
@@ -443,12 +443,13 @@ void GrpcClientCall::start() {
     const auto deadline = options_.deadline.value_or(std::chrono::steady_clock::time_point::max());
     const auto self = shared_from_this();
     exchange_id_ = session_->exchange_streaming(
-        std::move(request), deadline, [self](core::Result<HttpStreamingResponse> result) mutable {
+        std::move(request), deadline,
+        [self](core::Result<StreamingExchangeResponse> result) mutable {
             self->on_response(std::move(result));
         });
 }
 
-void GrpcClientCall::on_response(core::Result<HttpStreamingResponse> result) {
+void GrpcClientCall::on_response(core::Result<StreamingExchangeResponse> result) {
     if (cancelled_) {
         return;
     }
@@ -756,7 +757,7 @@ core::Status GrpcClientCall::finish_response() {
                                      "gRPC response ended with a truncated message frame"));
     }
     const auto trailer_headers =
-        response_body_ ? response_body_->trailers() : std::vector<HttpHeader>{};
+        response_body_ ? response_body_->trailers() : std::vector<ExchangeField>{};
     if (find_header(trailer_headers, "grpc-status")) {
         auto trailer_status = parse_status(trailer_headers);
         if (!trailer_status) {
@@ -801,7 +802,7 @@ void GrpcClientCall::post_read(ReadMessageHandler handler,
 }
 
 GrpcClient::GrpcClient(boost::asio::any_io_executor executor,
-                       std::shared_ptr<HttpClientSession> session)
+                       std::shared_ptr<ExchangeSession> session)
     : executor_(std::move(executor)), session_(std::move(session)) {}
 
 std::shared_ptr<GrpcClientCall> GrpcClient::start_call(GrpcCallOptions options,

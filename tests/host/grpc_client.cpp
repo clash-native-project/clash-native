@@ -1,6 +1,6 @@
 #include <clash_native/net/tcp_stream.hpp>
+#include <clash_native/transport/exchange_session.hpp>
 #include <clash_native/transport/grpc_client.hpp>
-#include <clash_native/transport/http_client.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include <google/protobuf/wrappers.pb.h>
@@ -28,11 +28,11 @@
 namespace {
 
 using namespace std::chrono_literals;
+using clash_native::transport::ExchangeSession;
 using clash_native::transport::GrpcCallOptions;
 using clash_native::transport::GrpcClient;
 using clash_native::transport::GrpcClientCall;
 using clash_native::transport::GrpcMetadata;
-using clash_native::transport::HttpClientSession;
 
 struct ServerAddress {
     boost::asio::ip::address address;
@@ -106,7 +106,7 @@ class GrpcProbe final : public std::enable_shared_from_this<GrpcProbe> {
     GrpcProbe(boost::asio::io_context &context, std::string mode)
         : context_(context), mode_(std::move(mode)), timer_(context) {}
 
-    void start(std::shared_ptr<HttpClientSession> session) {
+    void start(std::shared_ptr<ExchangeSession> session) {
         session_ = std::move(session);
         timer_.expires_after(20s);
         const auto self = shared_from_this();
@@ -290,7 +290,7 @@ class GrpcProbe final : public std::enable_shared_from_this<GrpcProbe> {
     boost::asio::io_context &context_;
     std::string mode_;
     boost::asio::steady_timer timer_;
-    std::shared_ptr<HttpClientSession> session_;
+    std::shared_ptr<ExchangeSession> session_;
     std::shared_ptr<GrpcClientCall> call_;
     google::protobuf::StringValue response_;
     std::size_t send_index_ = 0;
@@ -328,7 +328,7 @@ int run_probe(const ServerAddress &server, const std::string &mode) {
                 return probe->fail("gRPC TLS server did not negotiate HTTP/2");
             }
             auto session =
-                clash_native::transport::make_http2_client_session(std::move(result->stream));
+                clash_native::transport::make_http2_exchange_session(std::move(result->stream));
             probe->start(std::move(session));
         });
     context.run();
