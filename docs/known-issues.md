@@ -2,6 +2,34 @@
 
 This document records observed issues that are deferred for later investigation. It distinguishes measured behavior from suspected causes.
 
+## Four plain-UDP DNS timeout tests on Windows
+
+- **Status:** Deferred; reproducible baseline issue on the Windows x64 test
+  profile.
+- **Scope:** Plain DNS over UDP on the IPv4 loopback, using the local fake DNS
+  servers in the test suite. This does not cover DoT, DoH, DoQ, or DoH/3.
+
+The following tests time out instead of completing their expected UDP exchange:
+
+- `ResolverServiceTest.SeparatesCacheEntriesByEdnsSemanticsButIgnoresTransactionId`
+- `ResolverServiceTest.IgnoresResponsesFromUnexpectedUdpSender`
+- `ResolverServiceTest.IgnoresResponsesWithAnUnexpectedQuestion`
+- `ResolverServiceTransportTest.UsesNamedOutboundForPlainUdpEgress`
+
+The first test times out the first EDNS query before the fake server observes a
+usable response, so the second semantic variant does not create its separate
+cache entry. The next two tests intentionally reject a response from the wrong
+sender or with the wrong question and should then complete through the fallback
+server; instead the fallback exchange remains pending until the resolver
+deadline. The named-outbound test opens `DirectOutbound` and reports a
+successful UDP send, but its loopback fake server does not complete the reply,
+so the DNS operation reaches its 500 ms deadline.
+
+The failures were reproduced with the current build and with the pre-KCP
+`stage2-clang-cl-x64` test binary. They therefore predate the kcptun/KCP
+change and are not evidence of a KCP or encrypted-DNS regression. The exact
+Windows UDP scheduling or loopback interaction remains to be isolated.
+
 ## Mihomo SMUX peer closes the full stream after FIN
 
 - **Status:** Deferred; interoperability limitation in the tested Mihomo

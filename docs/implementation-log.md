@@ -1250,3 +1250,9 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 
 - Made closed UoT datagram handles reject new reads immediately and complete an
   in-flight read with `operation_aborted` when the underlying stream is closed.
+### 2026-09-20 — Record the plain-UDP DNS timeout baseline
+
+- Documented the four reproducible Windows x64 DNS tests that time out on the
+  local plain-UDP loopback path.
+- Recorded that the same failures occur in the pre-KCP test binary, so they are
+  an existing baseline issue rather than a kcptun/KCP regression.
