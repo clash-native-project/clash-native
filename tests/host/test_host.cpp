@@ -127,6 +127,12 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
                     throw std::runtime_error("invalid CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_VERSION");
                 }
             }
+            config.plugin_version_hint =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_VERSION_HINT")
+                    .value_or(config.plugin_version_hint);
+            config.plugin_restls_script =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_RESTLS_SCRIPT")
+                    .value_or("");
             if (const auto alpn =
                     environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_ALPN");
                 alpn && !alpn->empty()) {

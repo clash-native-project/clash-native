@@ -141,6 +141,25 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
 `, shadowTlsPassword)
 		}
 	}
+	const restlsPassword = "clash-native-restls-password"
+	restlsAddress := reserveMihomoShadowsocksAddressOnHost(t, udpHost)
+	_, restlsPort, err := net.SplitHostPort(restlsAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(&listenerConfig, `
+  - name: test-shadowsocks-restls-tls12
+    type: shadowsocks
+    listen: %s
+    port: %s
+    password: '%s'
+    cipher: chacha20-ietf-poly1305
+    res-tls:
+      enable: true
+      dest: www.google.com:443
+      password: '%s'
+      restls-script: "1000?100<1,500~100,350~100,600~100,400~200"
+`, udpHost, restlsPort, mihomoTestPassword, restlsPassword)
 	trojanAddress := reserveMihomoTCPAddress(t)
 	_, trojanPort, err := net.SplitHostPort(trojanAddress)
 	if err != nil {
@@ -189,6 +208,7 @@ listeners:%s
 	for _, address := range shadowTlsAddresses {
 		listenerAddresses = append(listenerAddresses, address)
 	}
+	listenerAddresses = append(listenerAddresses, restlsAddress)
 	mihomo := startMihomo(t, mihomoExecutable, home, configPath, listenerAddresses)
 	defer stopInteropProcess(t, mihomo)
 
@@ -330,6 +350,38 @@ listeners:%s
 			}
 		})
 	}
+
+	t.Run("Shadowsocks/restls-tls12", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":                         "shadowsocks",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":                  restlsAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":                mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_METHOD":                  "chacha20-ietf-poly1305",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN":                  "restls",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_HOST":             "www.google.com",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_PASSWORD":         restlsPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_VERSION_HINT":     "tls12",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_RESTLS_SCRIPT":    "1000?100<1,500~100,350~100,600~100,400~200",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_SKIP_CERT_VERIFY": "1",
+			"CLASH_NATIVE_TEST_PROXY_HOST":                       udpHost,
+		})
+		defer stopProxy()
+
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-restls-tls12-", 2048))
+		writeBytes(t, client, payload)
+		if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("half-close C++ to Mihomo ResTLS stream: %v", err)
+			}
+		}
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo ResTLS returned different bytes")
+		}
+	})
 
 	t.Run("Trojan/TLS", func(t *testing.T) {
 		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{

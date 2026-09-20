@@ -94,6 +94,12 @@ address encoding for each packet frame. `DatagramHandle` preserves either an IP
 address or a domain name returned by the protocol. Native UDP socket adapters
 still require an IP address when sending to the operating system.
 
+`TestMihomoActualServerInteroperability/Shadowsocks/restls-tls12` validates
+the Shadowsocks ResTLS outbound path against a real Mihomo listener. It uses a
+separately built Go test executable, the TLS 1.2 version hint, the configured
+Mihomo ResTLS script, and a TCP echo exchange. The native client rejects the
+TLS 1.3 hint until Botan's ResTLS session-ID and record hooks are implemented.
+
 `TestMihomoActualServerShadowsocksKcpTun` validates the Shadowsocks `kcptun`
 carrier against a real Mihomo listener. It covers TCP relay and UDP-over-TCP
 relay through KCP, SMUX, packet encryption, FEC framing, and the Snappy stream
@@ -158,6 +164,9 @@ $env:CLASH_NATIVE_TEST_HOST = 'D:\Project\cpp\clash-native\build\windows-clang-c
 
 # Run Shadowsocks UDP-over-TCP versions 1 and 2.
 & $interop '-test.count=1' '-test.run=^TestMihomoActualServerShadowsocksUoT$' '-test.v=true'
+
+# Run the Shadowsocks ResTLS TLS 1.2 case.
+& $interop '-test.count=1' '-test.run=^TestMihomoActualServerInteroperability$/Shadowsocks/restls-tls12$' '-test.v=true'
 
 # Run the Shadowsocks kcptun full KCP/SMUX profile.
 & $interop '-test.count=1' '-test.run=^TestMihomoActualServerShadowsocksKcpTun$' '-test.v=true'

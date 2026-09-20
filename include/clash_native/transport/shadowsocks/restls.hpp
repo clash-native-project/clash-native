@@ -61,7 +61,8 @@ struct RestlsDecodedRecord {
 class RestlsApplicationCodec final {
   public:
     RestlsApplicationCodec(std::array<std::uint8_t, 32> secret,
-                           std::vector<std::uint8_t> server_random, bool to_client) noexcept;
+                           std::vector<std::uint8_t> server_random, bool to_client,
+                           bool tls12_gcm = false) noexcept;
 
     core::Result<std::vector<std::uint8_t>> encode(std::span<const std::uint8_t> data,
                                                    std::size_t data_length,
@@ -76,6 +77,7 @@ class RestlsApplicationCodec final {
     std::array<std::uint8_t, 32> secret_{};
     std::vector<std::uint8_t> server_random_;
     bool to_client_ = false;
+    bool tls12_gcm_ = false;
     std::uint64_t counter_ = 0;
 };
 

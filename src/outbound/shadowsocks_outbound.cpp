@@ -7,6 +7,7 @@
 #include <clash_native/transport/shadowsocks/legacy_stream.hpp>
 #include <clash_native/transport/shadowsocks/simple_obfs.hpp>
 #include <clash_native/transport/shadowsocks/shadow_tls.hpp>
+#include <clash_native/transport/shadowsocks/restls_client.hpp>
 #include <clash_native/transport/shadowsocks/ss2022_packet.hpp>
 #include <clash_native/transport/shadowsocks/ss2022_stream.hpp>
 #include <clash_native/transport/shadowsocks/stream_carrier.hpp>
@@ -534,7 +535,8 @@ class ShadowsocksConnectOperation final
         }
         if (!config_.plugin.empty() && config_.plugin != "obfs" &&
             config_.plugin != "v2ray-plugin" && config_.plugin != "gost-plugin" &&
-            config_.plugin != "kcptun" && config_.plugin != "shadow-tls") {
+            config_.plugin != "kcptun" && config_.plugin != "shadow-tls" &&
+            config_.plugin != "restls") {
             return core::fail({core::ErrorCode::unsupported, "unsupported Shadowsocks plugin", {}});
         }
         if (config_.plugin == "obfs" && config_.plugin_mode != "http" &&
@@ -575,6 +577,23 @@ class ShadowsocksConnectOperation final
                                    "Shadowsocks Shadow-TLS host is required", {}});
             }
         }
+        if (config_.plugin == "restls") {
+            if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() || config_.plugin_tls ||
+                config_.plugin_version_hint.empty()) {
+                return core::fail({core::ErrorCode::configuration,
+                                   "Shadowsocks ResTLS does not use WebSocket plugin options",
+                                   {}});
+            }
+            if (config_.plugin_version_hint != "tls12" &&
+                config_.plugin_version_hint != "tls13") {
+                return core::fail({core::ErrorCode::configuration,
+                                   "Shadowsocks ResTLS version hint must be tls12 or tls13", {}});
+            }
+            if (config_.plugin_password.empty() || config_.plugin_host.empty()) {
+                return core::fail({core::ErrorCode::configuration,
+                                   "Shadowsocks ResTLS host and password are required", {}});
+            }
+        }
         if (config_.udp_over_tcp_version != 1 && config_.udp_over_tcp_version != 2) {
             return core::fail({core::ErrorCode::configuration,
                                "Shadowsocks UDP-over-TCP version must be 1 or 2",
@@ -609,6 +628,8 @@ class ShadowsocksConnectOperation final
     bool kcptun_plugin() const noexcept { return config_.plugin == "kcptun"; }
 
     bool shadow_tls_plugin() const noexcept { return config_.plugin == "shadow-tls"; }
+
+    bool restls_plugin() const noexcept { return config_.plugin == "restls"; }
 
     ss::WebSocketPluginOptions websocket_options() const {
         return {config_.plugin_host.empty() ? "bing.com" : config_.plugin_host,
@@ -677,6 +698,10 @@ class ShadowsocksConnectOperation final
                     self->open_shadow_tls();
                     return;
                 }
+                if (self->restls_plugin()) {
+                    self->open_restls();
+                    return;
+                }
                 self->send_initial_request();
             });
     }
@@ -693,6 +718,27 @@ class ShadowsocksConnectOperation final
             options.alpn_protocols = config_.plugin_alpn;
         }
         ss::async_open_shadow_tls(
+            std::move(stream), std::move(options),
+            [self](core::Result<std::unique_ptr<core::StreamHandle>> result) mutable {
+                if (!result) {
+                    self->finish(core::StreamOpenResult::failed(result.error()));
+                    return;
+                }
+                self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
+                self->send_initial_request();
+            });
+    }
+
+    void open_restls() {
+        auto self = shared_from_this();
+        auto stream = std::make_unique<net::TcpStream>(std::move(*socket_));
+        ss::RestlsClientOptions options;
+        options.server_name = config_.plugin_host;
+        options.password = config_.plugin_password;
+        options.version_hint = config_.plugin_version_hint;
+        options.restls_script = config_.plugin_restls_script;
+        options.skip_cert_verify = config_.plugin_skip_cert_verify;
+        ss::async_open_restls(
             std::move(stream), std::move(options),
             [self](core::Result<std::unique_ptr<core::StreamHandle>> result) mutable {
                 if (!result) {
@@ -1287,7 +1333,7 @@ core::Status ShadowsocksOutbound::validate() const {
     }
     if (!config_.plugin.empty() && config_.plugin != "obfs" && config_.plugin != "v2ray-plugin" &&
         config_.plugin != "gost-plugin" && config_.plugin != "kcptun" &&
-        config_.plugin != "shadow-tls") {
+        config_.plugin != "shadow-tls" && config_.plugin != "restls") {
         return core::fail({core::ErrorCode::unsupported, "unsupported Shadowsocks plugin", {}});
     }
     if (config_.plugin == "obfs" && config_.plugin_mode != "http" && config_.plugin_mode != "tls") {
@@ -1324,6 +1370,22 @@ core::Status ShadowsocksOutbound::validate() const {
         if (config_.plugin_host.empty()) {
             return core::fail({core::ErrorCode::configuration,
                                "Shadowsocks Shadow-TLS host is required", {}});
+        }
+    }
+    if (config_.plugin == "restls") {
+        if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() || config_.plugin_tls ||
+            config_.plugin_version_hint.empty()) {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks ResTLS does not use WebSocket plugin options", {}});
+        }
+        if (config_.plugin_version_hint != "tls12" &&
+            config_.plugin_version_hint != "tls13") {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks ResTLS version hint must be tls12 or tls13", {}});
+        }
+        if (config_.plugin_password.empty() || config_.plugin_host.empty()) {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks ResTLS host and password are required", {}});
         }
     }
     if (config_.plugin == "kcptun") {

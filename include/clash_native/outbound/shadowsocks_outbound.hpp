@@ -39,6 +39,8 @@ struct ShadowsocksOutboundConfig {
     std::string plugin_password;
     int plugin_version = 2;
     std::vector<std::string> plugin_alpn;
+    std::string plugin_version_hint = "tls12";
+    std::string plugin_restls_script;
 };
 
 class ShadowsocksOutbound final : public core::Outbound {

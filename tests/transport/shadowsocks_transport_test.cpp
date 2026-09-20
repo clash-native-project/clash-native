@@ -373,6 +373,18 @@ TEST(ShadowsocksTransportTest, RoundTripsResTlsApplicationRecord) {
     clash_native::transport::shadowsocks::RestlsApplicationCodec rejector(secret, server_random,
                                                                           false);
     EXPECT_FALSE(rejector.decode(tampered));
+
+    clash_native::transport::shadowsocks::RestlsApplicationCodec gcm_encoder(
+        secret, server_random, false, true);
+    const auto gcm_wire = gcm_encoder.encode(data, data.size(), 17, command);
+    ASSERT_TRUE(gcm_wire);
+    ASSERT_EQ(gcm_wire.value().size(), wire.value().size() + 8U);
+    clash_native::transport::shadowsocks::RestlsApplicationCodec gcm_decoder(
+        secret, server_random, false, true);
+    const auto gcm_decoded = gcm_decoder.decode(gcm_wire.value());
+    ASSERT_TRUE(gcm_decoded);
+    EXPECT_EQ(gcm_decoded.value().data, data);
+    EXPECT_EQ(gcm_decoded.value().command.response, 1U);
 }
 
 TEST(ShadowsocksTransportTest, DerivesResTlsSessionAuthenticationIds) {

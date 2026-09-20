@@ -1279,3 +1279,17 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   whole stream after receiving FIN.
 - Shadow-TLS v3 remains explicitly unsupported: the current BoringSSL client
   wrapper has no safe client-hello SessionID generation hook for the v3 HMAC.
+
+### 2026-09-21 — Add the Shadowsocks ResTLS TLS 1.2 outbound carrier
+
+- Added a native Botan TLS 1.2 client and ResTLS application-record adapter,
+  including the TLS 1.2 GCM explicit counters, authenticated length and command
+  fields, script target ranges, and response-record flow control.
+- Connected the carrier to the Shadowsocks TCP outbound path and kept the
+  plugin configuration separate from the Shadowsocks cipher framing.
+- Added codec coverage for plain and TLS 1.2 GCM ResTLS records and a real
+  Windows x64 Mihomo interoperability test using a separately built Go test
+  executable and a clean Mihomo server binary.
+- The native client currently accepts only the `tls12` version hint; `tls13`
+  remains an explicit unsupported result until Botan's TLS 1.3 session-ID
+  derivation and ResTLS record hooks are wired.
