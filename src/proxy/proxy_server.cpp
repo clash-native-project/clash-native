@@ -1028,14 +1028,15 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         udp_relay_socket_->async_receive_from(
             boost::asio::buffer(udp_receive_buffer_),
             [self](const boost::system::error_code &error, std::size_t size,
-                   boost::asio::ip::udp::endpoint sender) {
+                   core::DatagramAddress sender) {
                 if (error) {
                     if (error != boost::asio::error::operation_aborted) {
                         self->close();
                     }
                     return;
                 }
-                if (!self->accept_udp_sender(sender)) {
+                if (!sender.is_address() || !self->accept_udp_sender(boost::asio::ip::udp::endpoint(
+                                                sender.address(), sender.port()))) {
                     self->read_socks_udp_packet();
                     return;
                 }
@@ -1124,7 +1125,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
                                  auto payloads = std::move(packets->second);
                                  self->pending_udp_packets_.erase(packets);
                                  if (!result.succeeded()) {
-                                    return;
+                                     return;
                                  }
                                  auto path = std::make_shared<UdpPath>();
                                  path->key = key;
@@ -1145,7 +1146,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         auto self = shared_from_this();
         const auto payload_buffer = boost::asio::buffer(*payload);
         path->handle->async_send_to(
-            payload_buffer, path->target,
+            payload_buffer, core::DatagramAddress::from_endpoint(path->target),
             [self, path, payload](const boost::system::error_code &error, std::size_t) {
                 if (error && error != boost::asio::error::operation_aborted &&
                     !self->closed_.load(std::memory_order_acquire)) {
@@ -1171,7 +1172,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         path->handle->async_receive_from(
             boost::asio::buffer(path->receive_buffer),
             [self, path](const boost::system::error_code &error, std::size_t size,
-                         boost::asio::ip::udp::endpoint source) {
+                         core::DatagramAddress source) {
                 if (error) {
                     if (error != boost::asio::error::operation_aborted &&
                         !self->closed_.load(std::memory_order_acquire)) {
@@ -1188,13 +1189,12 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
             });
     }
 
-    void send_socks_udp_response(boost::asio::ip::udp::endpoint source,
+    void send_socks_udp_response(core::DatagramAddress source,
                                  std::span<const std::uint8_t> payload) {
         if (closed_.load(std::memory_order_acquire) || !udp_client_endpoint_) {
             return;
         }
-        auto address = outbound::detail::encode_proxy_address(
-            core::Destination::address(source.address(), source.port()));
+        auto address = outbound::detail::encode_proxy_address(source.to_destination());
         if (!address) {
             return;
         }
@@ -1205,7 +1205,8 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         packet->insert(packet->end(), payload.begin(), payload.end());
         auto self = shared_from_this();
         udp_relay_socket_->async_send_to(
-            boost::asio::buffer(*packet), *udp_client_endpoint_,
+            boost::asio::buffer(*packet),
+            core::DatagramAddress::from_endpoint(*udp_client_endpoint_),
             [self, packet](const boost::system::error_code &, std::size_t) {});
     }
 

@@ -111,7 +111,7 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
     UdpOverTcpState(std::unique_ptr<core::StreamHandle> stream, UdpOverTcpOptions options)
         : stream_(std::move(stream)), options_(std::move(options)) {}
 
-    void send(boost::asio::const_buffer buffer, boost::asio::ip::udp::endpoint destination,
+    void send(boost::asio::const_buffer buffer, core::DatagramAddress destination,
               core::DatagramHandle::WriteHandler handler) {
         if (closed_) {
             post_write_result(std::move(handler), boost::asio::error::operation_aborted, 0);
@@ -122,8 +122,7 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
             return;
         }
 
-        auto address = encode_destination(
-            core::Destination::address(destination.address(), destination.port()));
+        auto address = encode_destination(destination.to_destination());
         if (!address) {
             post_write_result(std::move(handler), protocol_error(), 0);
             return;
@@ -282,7 +281,7 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
 
     void post_read_result(core::DatagramHandle::ReadHandler handler,
                           const boost::system::error_code &error, std::size_t size,
-                          boost::asio::ip::udp::endpoint source) {
+                          core::DatagramAddress source) {
         boost::asio::post(stream_->executor(),
                           [handler = std::move(handler), error, size, source]() mutable {
                               handler(error, size, source);
@@ -348,10 +347,42 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
                 self->finish_receive(error, 0, {});
                 return;
             }
-            // DatagramHandle exposes an IP endpoint. A domain in a response
-            // cannot be represented without a resolver, so reject it clearly.
-            self->finish_receive(protocol_error(), 0, {});
+            const auto size = static_cast<std::size_t>((*length)[0]);
+            if (size == 0) {
+                self->finish_receive(protocol_error(), 0, {});
+                return;
+            }
+            self->read_domain_name(size);
         });
+    }
+
+    void read_domain_name(std::size_t size) {
+        auto domain = std::make_shared<std::vector<std::uint8_t>>(size);
+        auto self = shared_from_this();
+        read_exact(domain, 0, [self, domain](const boost::system::error_code &error) {
+            if (error) {
+                self->finish_receive(error, 0, {});
+                return;
+            }
+            self->read_domain_port(std::string(domain->begin(), domain->end()));
+        });
+    }
+
+    void read_domain_port(std::string domain) {
+        auto port = std::make_shared<std::vector<std::uint8_t>>(2);
+        auto self = shared_from_this();
+        read_exact(port, 0,
+                   [self, domain = std::move(domain),
+                    port](const boost::system::error_code &error) mutable {
+                       if (error) {
+                           self->finish_receive(error, 0, {});
+                           return;
+                       }
+                       const auto port_value =
+                           static_cast<std::uint16_t>((*port)[0] << 8 | (*port)[1]);
+                       self->read_payload_length(
+                           core::DatagramAddress::domain(std::move(domain), port_value));
+                   });
     }
 
     void read_numeric_address(std::uint8_t family, std::size_t address_size) {
@@ -385,7 +416,7 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
                 parsed_address = boost::asio::ip::address_v6(bytes);
             }
             const auto port_value = static_cast<std::uint16_t>((*port)[0] << 8 | (*port)[1]);
-            self->read_payload_length({parsed_address, port_value});
+            self->read_payload_length(core::DatagramAddress::address(parsed_address, port_value));
         });
     }
 
@@ -402,7 +433,7 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
         });
     }
 
-    void read_payload_length(boost::asio::ip::udp::endpoint source) {
+    void read_payload_length(core::DatagramAddress source) {
         auto length = std::make_shared<std::vector<std::uint8_t>>(2);
         auto self = shared_from_this();
         read_exact(length, 0, [self, length, source](const boost::system::error_code &error) {
@@ -415,7 +446,7 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
         });
     }
 
-    void read_payload_bytes(boost::asio::ip::udp::endpoint source, std::size_t size) {
+    void read_payload_bytes(core::DatagramAddress source, std::size_t size) {
         auto payload = std::make_shared<std::vector<std::uint8_t>>(size);
         auto self = shared_from_this();
         read_exact(payload, 0, [self, payload, source](const boost::system::error_code &error) {
@@ -435,7 +466,7 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
     }
 
     void finish_receive(const boost::system::error_code &error, std::size_t size,
-                        boost::asio::ip::udp::endpoint source) {
+                        core::DatagramAddress source) {
         read_in_progress_ = false;
         auto handler = std::move(receive_handler_);
         if (handler) {
@@ -460,7 +491,7 @@ class UdpOverTcpHandle final : public core::DatagramHandle {
   public:
     explicit UdpOverTcpHandle(std::shared_ptr<UdpOverTcpState> state) : state_(std::move(state)) {}
 
-    void async_send_to(boost::asio::const_buffer buffer, boost::asio::ip::udp::endpoint destination,
+    void async_send_to(boost::asio::const_buffer buffer, core::DatagramAddress destination,
                        WriteHandler handler) override {
         state_->send(buffer, std::move(destination), std::move(handler));
     }

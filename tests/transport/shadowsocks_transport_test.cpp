@@ -1,26 +1,95 @@
+#include <clash_native/core/base64.hpp>
 #include <clash_native/transport/shadowsocks/crypto.hpp>
 #include <clash_native/transport/shadowsocks/legacy_packet.hpp>
 #include <clash_native/transport/shadowsocks/ss2022_packet.hpp>
-#include <clash_native/core/base64.hpp>
+#include <clash_native/transport/shadowsocks/udp_over_tcp.hpp>
 
 #include <gtest/gtest.h>
 
+#include <boost/asio/error.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/post.hpp>
+
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <future>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
 
 using clash_native::transport::shadowsocks::LegacyStreamCipher;
 
+class BufferedStream final : public clash_native::core::StreamHandle {
+  public:
+    BufferedStream(boost::asio::any_io_executor executor, std::vector<std::uint8_t> input)
+        : executor_(std::move(executor)), input_(std::move(input)) {}
+
+    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+        if (input_.empty()) {
+            boost::asio::post(executor_, [handler = std::move(handler)]() mutable {
+                handler(boost::asio::error::eof, 0);
+            });
+            return;
+        }
+        const auto size = std::min(buffer.size(), input_.size());
+        std::memcpy(buffer.data(), input_.data(), size);
+        input_.erase(input_.begin(), input_.begin() + static_cast<std::ptrdiff_t>(size));
+        boost::asio::post(executor_,
+                          [handler = std::move(handler), size]() mutable { handler({}, size); });
+    }
+
+    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
+        written_.insert(written_.end(), static_cast<const std::uint8_t *>(buffer.data()),
+                        static_cast<const std::uint8_t *>(buffer.data()) + buffer.size());
+        boost::asio::post(executor_, [handler = std::move(handler),
+                                      size = buffer.size()]() mutable { handler({}, size); });
+    }
+
+    boost::asio::any_io_executor executor() noexcept override { return executor_; }
+
+    boost::asio::ip::tcp::endpoint
+    local_endpoint(boost::system::error_code &error) const noexcept override {
+        error.clear();
+        return {};
+    }
+
+    void shutdown_send(boost::system::error_code &error) noexcept override { error.clear(); }
+    void close() noexcept override { closed_ = true; }
+
+  private:
+    boost::asio::any_io_executor executor_;
+    std::vector<std::uint8_t> input_;
+    std::vector<std::uint8_t> written_;
+    bool closed_ = false;
+};
+
 TEST(ShadowsocksTransportTest, RecognizesClassicCipherFamilies) {
-    constexpr std::array methods{
-        "aes-128-ctr", "aes-192-ctr", "aes-256-ctr", "aes-128-cfb", "aes-192-cfb",
-        "aes-256-cfb", "rc4-md5",     "chacha20-ietf", "aes-128-gcm", "aes-192-gcm",
-        "aes-256-gcm", "chacha20-ietf-poly1305", "xchacha20-ietf-poly1305", "chacha20",
-        "xchacha20", "chacha8-ietf-poly1305", "xchacha8-ietf-poly1305", "aes-128-ccm",
-        "aes-192-ccm", "aes-256-ccm"};
+    constexpr std::array methods{"aes-128-ctr",
+                                 "aes-192-ctr",
+                                 "aes-256-ctr",
+                                 "aes-128-cfb",
+                                 "aes-192-cfb",
+                                 "aes-256-cfb",
+                                 "rc4-md5",
+                                 "chacha20-ietf",
+                                 "aes-128-gcm",
+                                 "aes-192-gcm",
+                                 "aes-256-gcm",
+                                 "chacha20-ietf-poly1305",
+                                 "xchacha20-ietf-poly1305",
+                                 "chacha20",
+                                 "xchacha20",
+                                 "chacha8-ietf-poly1305",
+                                 "xchacha8-ietf-poly1305",
+                                 "aes-128-ccm",
+                                 "aes-192-ccm",
+                                 "aes-256-ccm"};
     for (const auto method : methods) {
         EXPECT_TRUE(clash_native::transport::shadowsocks::cipher_method(method)) << method;
     }
@@ -37,8 +106,8 @@ TEST(ShadowsocksTransportTest, RecognizesAndRoundTripsShadowsocks2022) {
         const auto password = clash_native::core::base64_encode(
             std::string(reinterpret_cast<const char *>(psk.data()), psk.size()));
         std::vector<std::uint8_t> salt(spec.value().salt_size, 0x52);
-        const auto key = clash_native::transport::shadowsocks::
-            derive_shadowsocks_2022_session_key(method, password, salt);
+        const auto key = clash_native::transport::shadowsocks::derive_shadowsocks_2022_session_key(
+            method, password, salt);
         ASSERT_TRUE(key) << method;
         std::vector<std::uint8_t> nonce(spec.value().nonce_size, 0x17);
         const auto ciphertext = clash_native::transport::shadowsocks::aead_encrypt(
@@ -52,18 +121,25 @@ TEST(ShadowsocksTransportTest, RecognizesAndRoundTripsShadowsocks2022) {
 }
 
 TEST(ShadowsocksTransportTest, EncryptsAndDecryptsAeadPayloads) {
-    constexpr std::array methods{"aes-128-gcm", "aes-192-gcm", "aes-256-gcm",
-                                 "chacha20-ietf-poly1305", "xchacha20-ietf-poly1305",
-                                 "chacha8-ietf-poly1305", "xchacha8-ietf-poly1305", "aes-128-ccm",
-                                 "aes-192-ccm", "aes-256-ccm"};
-    const std::vector<std::uint8_t> plaintext{'s', 'h', 'a', 'd', 'o', 'w', 's', 'o', 'c', 'k', 's'};
+    constexpr std::array methods{"aes-128-gcm",
+                                 "aes-192-gcm",
+                                 "aes-256-gcm",
+                                 "chacha20-ietf-poly1305",
+                                 "xchacha20-ietf-poly1305",
+                                 "chacha8-ietf-poly1305",
+                                 "xchacha8-ietf-poly1305",
+                                 "aes-128-ccm",
+                                 "aes-192-ccm",
+                                 "aes-256-ccm"};
+    const std::vector<std::uint8_t> plaintext{'s', 'h', 'a', 'd', 'o', 'w',
+                                              's', 'o', 'c', 'k', 's'};
     for (const auto method : methods) {
         const auto spec = clash_native::transport::shadowsocks::cipher_method(method);
         ASSERT_TRUE(spec) << method;
         std::vector<std::uint8_t> salt(spec.value().salt_size, 0x23);
         std::vector<std::uint8_t> nonce(spec.value().nonce_size, 0x42);
-        const auto key = clash_native::transport::shadowsocks::derive_aead_subkey(
-            method, "test-password", salt);
+        const auto key =
+            clash_native::transport::shadowsocks::derive_aead_subkey(method, "test-password", salt);
         ASSERT_TRUE(key) << method;
         const auto ciphertext = clash_native::transport::shadowsocks::aead_encrypt(
             method, key.value(), nonce, plaintext);
@@ -117,8 +193,8 @@ TEST(ShadowsocksTransportTest, RoundTripsXchacha20Poly1305PacketPrimitive) {
         nonce[index] = static_cast<std::uint8_t>(index * 13U + 5U);
     }
     const std::vector<std::uint8_t> plaintext{'x', 'c', 'h', 'a', 'c', 'h', 'a'};
-    const auto ciphertext = clash_native::transport::shadowsocks::xchacha20_poly1305_encrypt(
-        key, nonce, plaintext);
+    const auto ciphertext =
+        clash_native::transport::shadowsocks::xchacha20_poly1305_encrypt(key, nonce, plaintext);
     ASSERT_TRUE(ciphertext);
     const auto recovered = clash_native::transport::shadowsocks::xchacha20_poly1305_decrypt(
         key, nonce, ciphertext.value());
@@ -140,8 +216,8 @@ TEST(ShadowsocksTransportTest, MatchesMihomoXchacha8Construction) {
         const auto xchacha8 = clash_native::transport::shadowsocks::aead_encrypt(
             "xchacha8-ietf-poly1305", key, nonce, plaintext);
         ASSERT_TRUE(xchacha8) << "size=" << size;
-        const auto xchacha20 = clash_native::transport::shadowsocks::xchacha20_poly1305_encrypt(
-            key, nonce, plaintext);
+        const auto xchacha20 =
+            clash_native::transport::shadowsocks::xchacha20_poly1305_encrypt(key, nonce, plaintext);
         ASSERT_TRUE(xchacha20) << "size=" << size;
         EXPECT_NE(xchacha8.value(), xchacha20.value()) << "size=" << size;
         const auto recovered = clash_native::transport::shadowsocks::aead_decrypt(
@@ -160,30 +236,29 @@ TEST(ShadowsocksTransportTest, MatchesMihomoXchacha8Construction) {
     }();
     const auto vector_ciphertext = clash_native::transport::shadowsocks::aead_encrypt(
         "xchacha8-ietf-poly1305", key,
-        std::vector<std::uint8_t>{5, 18, 31, 44, 57, 70, 83, 96, 109, 122, 135, 148, 161, 174,
-                                  187, 200, 213, 226, 239, 252, 9, 22, 35, 48},
+        std::vector<std::uint8_t>{5,   18,  31,  44,  57,  70,  83,  96,  109, 122, 135, 148,
+                                  161, 174, 187, 200, 213, 226, 239, 252, 9,   22,  35,  48},
         vector_plaintext);
     ASSERT_TRUE(vector_ciphertext);
     const std::vector<std::uint8_t> expected{
-        0xc7, 0x99, 0x06, 0x5f, 0x78, 0x17, 0x60, 0x1d, 0xc5, 0x41, 0x4d,
-        0x1e, 0x27, 0x63, 0xad, 0x4b, 0x6c, 0xd5, 0x2a, 0xde, 0x92, 0x7d,
-        0x10, 0xc6, 0xb4, 0x40, 0xd5, 0xc7, 0x1e, 0x77, 0x2a, 0x76, 0x33,
-        0xff, 0xf3, 0x9c, 0xbb, 0xa0, 0x8c, 0xd0, 0xb2, 0xcd, 0xad, 0x62,
-        0x75, 0xa7, 0xf1};
+        0xc7, 0x99, 0x06, 0x5f, 0x78, 0x17, 0x60, 0x1d, 0xc5, 0x41, 0x4d, 0x1e,
+        0x27, 0x63, 0xad, 0x4b, 0x6c, 0xd5, 0x2a, 0xde, 0x92, 0x7d, 0x10, 0xc6,
+        0xb4, 0x40, 0xd5, 0xc7, 0x1e, 0x77, 0x2a, 0x76, 0x33, 0xff, 0xf3, 0x9c,
+        0xbb, 0xa0, 0x8c, 0xd0, 0xb2, 0xcd, 0xad, 0x62, 0x75, 0xa7, 0xf1};
     EXPECT_EQ(vector_ciphertext.value(), expected);
 }
 
 TEST(ShadowsocksTransportTest, EncryptsAndDecryptsLegacyStreams) {
-    constexpr std::array methods{"aes-128-ctr", "aes-192-ctr", "aes-256-ctr", "aes-128-cfb",
-                                 "aes-192-cfb", "aes-256-cfb", "rc4-md5", "chacha20",
+    constexpr std::array methods{"aes-128-ctr",   "aes-192-ctr", "aes-256-ctr", "aes-128-cfb",
+                                 "aes-192-cfb",   "aes-256-cfb", "rc4-md5",     "chacha20",
                                  "chacha20-ietf", "xchacha20"};
     const std::vector<std::uint8_t> source(257, 0x7a);
     for (const auto method : methods) {
         const auto spec = clash_native::transport::shadowsocks::cipher_method(method);
         ASSERT_TRUE(spec) << method;
         std::vector<std::uint8_t> iv(spec.value().iv_size, 0x19);
-        const auto key = clash_native::transport::shadowsocks::derive_legacy_key(
-            method, "test-password", iv);
+        const auto key =
+            clash_native::transport::shadowsocks::derive_legacy_key(method, "test-password", iv);
         ASSERT_TRUE(key) << method;
         auto encrypted = source;
         auto encryptor = LegacyStreamCipher::create(method, key.value(), iv, true);
@@ -197,8 +272,8 @@ TEST(ShadowsocksTransportTest, EncryptsAndDecryptsLegacyStreams) {
 }
 
 TEST(ShadowsocksTransportTest, EncryptsAndDecryptsLegacyDatagrams) {
-    constexpr std::array methods{"aes-128-ctr", "aes-192-ctr", "aes-256-ctr", "aes-128-cfb",
-                                 "aes-192-cfb", "aes-256-cfb", "rc4-md5", "chacha20",
+    constexpr std::array methods{"aes-128-ctr",   "aes-192-ctr", "aes-256-ctr", "aes-128-cfb",
+                                 "aes-192-cfb",   "aes-256-cfb", "rc4-md5",     "chacha20",
                                  "chacha20-ietf", "xchacha20"};
     const std::vector<std::uint8_t> source{'d', 'a', 't', 'a', 'g', 'r', 'a', 'm'};
     for (const auto method : methods) {
@@ -210,6 +285,43 @@ TEST(ShadowsocksTransportTest, EncryptsAndDecryptsLegacyDatagrams) {
         ASSERT_TRUE(recovered) << method;
         EXPECT_EQ(recovered.value(), source) << method;
     }
+}
+
+TEST(ShadowsocksTransportTest, PreservesDomainAddressInUdpOverTcpResponse) {
+    boost::asio::io_context context;
+    const std::string domain = "example.test";
+    std::vector<std::uint8_t> frame{0x02, static_cast<std::uint8_t>(domain.size())};
+    frame.insert(frame.end(), domain.begin(), domain.end());
+    frame.insert(frame.end(), {0x01, 0xbb, 0x00, 0x02, 'o', 'k'});
+    auto stream = std::make_unique<BufferedStream>(context.get_executor(), frame);
+    auto datagram = clash_native::transport::shadowsocks::make_udp_over_tcp_datagram_handle(
+        std::move(stream), {});
+    ASSERT_TRUE(datagram);
+
+    std::array<std::uint8_t, 8> payload{};
+    std::promise<void> completed;
+    auto future = completed.get_future();
+    boost::system::error_code receive_error;
+    std::size_t received_size = 0;
+    clash_native::core::DatagramAddress source;
+    datagram.value()->async_receive_from(
+        boost::asio::buffer(payload), [&completed, &receive_error, &received_size, &source](
+                                          const boost::system::error_code &error, std::size_t size,
+                                          clash_native::core::DatagramAddress sender) {
+            receive_error = error;
+            received_size = size;
+            source = std::move(sender);
+            completed.set_value();
+        });
+    context.run();
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    EXPECT_FALSE(receive_error);
+    EXPECT_EQ(received_size, 2U);
+    EXPECT_EQ(std::string(reinterpret_cast<const char *>(payload.data()), received_size), "ok");
+    ASSERT_TRUE(source.is_domain());
+    EXPECT_EQ(source.domain(), domain);
+    EXPECT_EQ(source.port(), 443);
 }
 
 } // namespace

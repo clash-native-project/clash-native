@@ -26,7 +26,7 @@ class UdpStream final : public core::DatagramHandle {
         socket_->set_option(option, error);
     }
 
-    void async_send_to(boost::asio::const_buffer buffer, boost::asio::ip::udp::endpoint destination,
+    void async_send_to(boost::asio::const_buffer buffer, core::DatagramAddress destination,
                        WriteHandler handler) override;
     void async_receive_from(boost::asio::mutable_buffer buffer, ReadHandler handler) override;
     boost::asio::any_io_executor executor() noexcept override;

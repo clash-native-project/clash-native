@@ -1,5 +1,17 @@
 # Implementation Log
 
+### 2026-09-20 — Preserve domain addresses in datagram handles
+
+- Replaced the endpoint-only `DatagramHandle` address contract with the
+  variant-backed `core::DatagramAddress`, which preserves either an IP address
+  or a domain name and its port.
+- Migrated UDP stream, DNS, QUIC, KCP, proxy relay, Shadowsocks, and test
+  call sites to the new address type. Native UDP sockets convert only IP
+  addresses to OS endpoints, while protocol transports can return domain
+  metadata without resolving it away.
+- Added contract coverage for IP/domain datagram addresses and a UoT frame
+  test that verifies a domain source address survives asynchronous parsing.
+
 ### 2026-09-20 — Add Shadowsocks WebSocket plugin carriers
 
 - Added a reusable Shadowsocks byte carrier that can wrap a raw TCP socket or

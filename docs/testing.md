@@ -90,9 +90,9 @@ version 1 and version 2 against a real Mihomo Shadowsocks listener. The test
 uses a separately built Go test executable, a UDP echo service, and a
 non-loopback IPv4 bind when required by the Windows UDP environment. Version 2
 uses the standard SOCKS address encoding for its request header and the UoT
-address encoding for each packet frame. The current `DatagramHandle` source
-endpoint is IP-only, so a domain-addressed response frame is rejected instead
-of being returned without its original domain metadata.
+address encoding for each packet frame. `DatagramHandle` preserves either an IP
+address or a domain name returned by the protocol. Native UDP socket adapters
+still require an IP address when sending to the operating system.
 
 Build Mihomo from its source checkout, then run the opt-in integration test
 from `tests/interop` with both executable paths set:

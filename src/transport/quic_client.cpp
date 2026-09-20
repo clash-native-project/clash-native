@@ -799,7 +799,7 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         datagram_->async_receive_from(
             boost::asio::buffer(buffer->bytes),
             [self, buffer](const boost::system::error_code &error, std::size_t length,
-                           boost::asio::ip::udp::endpoint sender) {
+                           core::DatagramAddress sender) {
                 boost::asio::dispatch(self->executor_, [self, buffer, error, length,
                                                         sender = std::move(sender)] {
                     self->receiving_ = false;
@@ -812,8 +812,12 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
                         }
                         return;
                     }
-                    if (sender == self->remote_endpoint_ && length != 0) {
-                        self->process_datagram(buffer->bytes.data(), length, sender);
+                    if (sender.is_address() &&
+                        sender.address() == self->remote_endpoint_.address() &&
+                        sender.port() == self->remote_endpoint_.port() && length != 0) {
+                        self->process_datagram(
+                            buffer->bytes.data(), length,
+                            boost::asio::ip::udp::endpoint(sender.address(), sender.port()));
                     }
                     if (!self->retired_) {
                         self->receive_next();
@@ -1066,7 +1070,7 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         outgoing_.pop_front();
         const auto self = shared_from_this();
         datagram_->async_send_to(
-            boost::asio::buffer(*packet), remote_endpoint_,
+            boost::asio::buffer(*packet), core::DatagramAddress::from_endpoint(remote_endpoint_),
             [self, packet](const boost::system::error_code &error, std::size_t length) {
                 boost::asio::dispatch(self->executor_, [self, packet, error, length] {
                     self->sending_ = false;
@@ -1125,8 +1129,8 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         ready_ = false;
         expiry_timer_.cancel();
         for (auto &datagram : datagram_writes_) {
-            post_datagram_result(std::move(datagram.handler),
-                                 boost::asio::error::operation_aborted, 0);
+            post_datagram_result(std::move(datagram.handler), boost::asio::error::operation_aborted,
+                                 0);
         }
         datagram_writes_.clear();
         dispatch_datagram_closed();
@@ -1153,8 +1157,8 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         ready_ = false;
         expiry_timer_.cancel();
         for (auto &datagram : datagram_writes_) {
-            post_datagram_result(std::move(datagram.handler),
-                                 boost::asio::error::operation_aborted, 0);
+            post_datagram_result(std::move(datagram.handler), boost::asio::error::operation_aborted,
+                                 0);
         }
         datagram_writes_.clear();
         dispatch_datagram_closed();
@@ -1489,13 +1493,15 @@ class QuicDatagramHandle final : public core::DatagramHandle {
 
     ~QuicDatagramHandle() override { close(); }
 
-    void async_send_to(boost::asio::const_buffer buffer, boost::asio::ip::udp::endpoint destination,
+    void async_send_to(boost::asio::const_buffer buffer, core::DatagramAddress destination,
                        WriteHandler handler) override {
         if (closed_) {
             post_write(boost::asio::error::operation_aborted, 0, std::move(handler));
             return;
         }
-        if (destination != connection_->remote_endpoint()) {
+        if (!destination.is_address() ||
+            destination.address() != connection_->remote_endpoint().address() ||
+            destination.port() != connection_->remote_endpoint().port()) {
             post_write(boost::asio::error::host_unreachable, 0, std::move(handler));
             return;
         }
@@ -1571,7 +1577,8 @@ class QuicDatagramHandle final : public core::DatagramHandle {
         queue_.pop_front();
         if (datagram.bytes.size() > read_size_) {
             read_pending_ = false;
-            post_read(boost::asio::error::message_size, 0, connection_->remote_endpoint(),
+            post_read(boost::asio::error::message_size, 0,
+                      core::DatagramAddress::from_endpoint(connection_->remote_endpoint()),
                       std::move(read_handler_));
             return;
         }
@@ -1579,7 +1586,8 @@ class QuicDatagramHandle final : public core::DatagramHandle {
             std::memcpy(read_data_, datagram.bytes.data(), datagram.bytes.size());
         }
         read_pending_ = false;
-        post_read({}, datagram.bytes.size(), connection_->remote_endpoint(),
+        post_read({}, datagram.bytes.size(),
+                  core::DatagramAddress::from_endpoint(connection_->remote_endpoint()),
                   std::move(read_handler_));
     }
 
@@ -1600,7 +1608,7 @@ class QuicDatagramHandle final : public core::DatagramHandle {
     }
 
     void post_read(const boost::system::error_code &error, std::size_t size,
-                   boost::asio::ip::udp::endpoint sender, ReadHandler handler) {
+                   core::DatagramAddress sender, ReadHandler handler) {
         boost::asio::post(executor_, [handler = std::move(handler), error, size, sender]() mutable {
             if (handler) {
                 handler(error, size, sender);

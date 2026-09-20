@@ -536,19 +536,21 @@ class RawQuicProbe final : public std::enable_shared_from_this<RawQuicProbe> {
         datagram_->async_receive_from(
             boost::asio::buffer(datagram_buffer_),
             [self](const boost::system::error_code &error, std::size_t size,
-                   boost::asio::ip::udp::endpoint) {
-                if (error || std::string(reinterpret_cast<const char *>(self->datagram_buffer_.data()),
-                                         size) != self->datagram_payload_) {
+                   clash_native::core::DatagramAddress) {
+                if (error ||
+                    std::string(reinterpret_cast<const char *>(self->datagram_buffer_.data()),
+                                size) != self->datagram_payload_) {
                     self->finish("QUIC DATAGRAM echo failed");
                     return;
                 }
                 self->datagram_done_ = true;
                 self->maybe_finish();
             });
-        const auto payload = std::vector<std::uint8_t>(datagram_payload_.begin(),
-                                                        datagram_payload_.end());
+        const auto payload =
+            std::vector<std::uint8_t>(datagram_payload_.begin(), datagram_payload_.end());
         datagram_->async_send_to(
-            boost::asio::buffer(payload), connection_->remote_endpoint(),
+            boost::asio::buffer(payload),
+            clash_native::core::DatagramAddress::from_endpoint(connection_->remote_endpoint()),
             [self](const boost::system::error_code &error, std::size_t size) {
                 if (error || size != self->datagram_payload_.size()) {
                     self->finish("QUIC DATAGRAM send failed");
@@ -601,8 +603,8 @@ class RawQuicProbe final : public std::enable_shared_from_this<RawQuicProbe> {
                                          read_error.message());
                             return;
                         }
-                        if (std::string(reinterpret_cast<const char *>(buffer->data()), read_size) !=
-                            self->stream_payloads_[index]) {
+                        if (std::string(reinterpret_cast<const char *>(buffer->data()),
+                                        read_size) != self->stream_payloads_[index]) {
                             self->finish("QUIC multiplexed stream echo mismatch");
                             return;
                         }

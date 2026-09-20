@@ -67,6 +67,50 @@ class Destination {
     std::uint16_t port_;
 };
 
+// Address carried by a datagram protocol. Unlike udp::endpoint, this type
+// preserves a domain name when the protocol supplies one on the wire.
+class DatagramAddress {
+  public:
+    DatagramAddress() = default;
+
+    static DatagramAddress domain(std::string value, std::uint16_t port) {
+        return DatagramAddress(std::move(value), port);
+    }
+
+    static DatagramAddress address(boost::asio::ip::address value, std::uint16_t port) {
+        return DatagramAddress(std::move(value), port);
+    }
+
+    static DatagramAddress from_endpoint(boost::asio::ip::udp::endpoint value) {
+        return address(value.address(), value.port());
+    }
+
+    bool is_domain() const noexcept { return std::holds_alternative<std::string>(value_); }
+    bool is_address() const noexcept {
+        return std::holds_alternative<boost::asio::ip::address>(value_);
+    }
+
+    const std::string &domain() const { return std::get<std::string>(value_); }
+    const boost::asio::ip::address &address() const {
+        return std::get<boost::asio::ip::address>(value_);
+    }
+    std::uint16_t port() const noexcept { return port_; }
+
+    Destination to_destination() const {
+        return is_domain() ? Destination::domain(domain(), port())
+                           : Destination::address(address(), port());
+    }
+
+  private:
+    DatagramAddress(std::string value, std::uint16_t port)
+        : value_(std::move(value)), port_(port) {}
+    DatagramAddress(boost::asio::ip::address value, std::uint16_t port)
+        : value_(std::move(value)), port_(port) {}
+
+    std::variant<boost::asio::ip::address, std::string> value_ = boost::asio::ip::address{};
+    std::uint16_t port_ = 0;
+};
+
 struct OutboundDescriptor {
     std::string id;
     std::string protocol;
@@ -112,12 +156,11 @@ class StreamHandle {
 
 class DatagramHandle {
   public:
-    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t,
-                                           boost::asio::ip::udp::endpoint)>;
+    using ReadHandler =
+        std::function<void(const boost::system::error_code &, std::size_t, DatagramAddress)>;
     using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
 
-    virtual void async_send_to(boost::asio::const_buffer buffer,
-                               boost::asio::ip::udp::endpoint destination,
+    virtual void async_send_to(boost::asio::const_buffer buffer, DatagramAddress destination,
                                WriteHandler handler) = 0;
     virtual void async_receive_from(boost::asio::mutable_buffer buffer, ReadHandler handler) = 0;
     virtual boost::asio::any_io_executor executor() noexcept = 0;

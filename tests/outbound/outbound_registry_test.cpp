@@ -157,7 +157,8 @@ TEST(DirectOutboundTest, OpensAnIpDatagramForDnsEgress) {
     runtime.start();
 
     const std::string payload = "dns-egress";
-    handle->async_send_to(boost::asio::buffer(payload), endpoint,
+    handle->async_send_to(boost::asio::buffer(payload),
+                          clash_native::core::DatagramAddress::from_endpoint(endpoint),
                           [](const boost::system::error_code &, std::size_t) {});
     ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_EQ(future.get(), payload.size());
@@ -184,11 +185,10 @@ TEST(ShadowsocksOutboundTest, RejectsEncryptedUdpDatagramsLargerThan1500Bytes) {
     const auto test_address = udp_test_address(runtime.context());
 
     for (const auto &method : methods) {
-        boost::asio::ip::udp::socket server(runtime.context(),
-                                            {test_address, 0});
+        boost::asio::ip::udp::socket server(runtime.context(), {test_address, 0});
         clash_native::outbound::ShadowsocksOutbound outbound(
-            runtime, {"test-shadowsocks", test_address.to_string(), server.local_endpoint().port(), method.name,
-                      "test-password"});
+            runtime, {"test-shadowsocks", test_address.to_string(), server.local_endpoint().port(),
+                      method.name, "test-password"});
 
         auto opened_promise =
             std::make_shared<std::promise<clash_native::core::DatagramOpenResult>>();
@@ -201,8 +201,7 @@ TEST(ShadowsocksOutboundTest, RejectsEncryptedUdpDatagramsLargerThan1500Bytes) {
         ASSERT_TRUE(opened.succeeded());
         auto handle = std::move(opened.handle);
 
-        const auto destination =
-            boost::asio::ip::udp::endpoint(test_address, 53);
+        const auto destination = boost::asio::ip::udp::endpoint(test_address, 53);
         const auto payload_at_limit =
             encrypted_limit - method.key_size - ipv4_proxy_address_size - aead_tag_size;
 
@@ -221,7 +220,8 @@ TEST(ShadowsocksOutboundTest, RejectsEncryptedUdpDatagramsLargerThan1500Bytes) {
             std::make_shared<std::promise<std::pair<boost::system::error_code, std::size_t>>>();
         auto send_future = send_promise->get_future();
         handle->async_send_to(
-            boost::asio::buffer(payload), destination,
+            boost::asio::buffer(payload),
+            clash_native::core::DatagramAddress::from_endpoint(destination),
             [send_promise](const boost::system::error_code &error, std::size_t size) {
                 send_promise->set_value({error, size});
             });
@@ -237,7 +237,8 @@ TEST(ShadowsocksOutboundTest, RejectsEncryptedUdpDatagramsLargerThan1500Bytes) {
             std::make_shared<std::promise<std::pair<boost::system::error_code, std::size_t>>>();
         auto oversized_future = oversized_promise->get_future();
         handle->async_send_to(
-            boost::asio::buffer(payload), destination,
+            boost::asio::buffer(payload),
+            clash_native::core::DatagramAddress::from_endpoint(destination),
             [oversized_promise](const boost::system::error_code &error, std::size_t size) {
                 oversized_promise->set_value({error, size});
             });

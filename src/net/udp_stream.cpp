@@ -1,5 +1,7 @@
 #include <clash_native/net/udp_stream.hpp>
 
+#include <boost/asio/post.hpp>
+
 #include <utility>
 
 namespace clash_native::net {
@@ -17,11 +19,18 @@ void UdpStream::bind(boost::asio::ip::udp::endpoint endpoint, boost::system::err
     socket_->bind(std::move(endpoint), error);
 }
 
-void UdpStream::async_send_to(boost::asio::const_buffer buffer,
-                              boost::asio::ip::udp::endpoint destination, WriteHandler handler) {
+void UdpStream::async_send_to(boost::asio::const_buffer buffer, core::DatagramAddress destination,
+                              WriteHandler handler) {
     const auto socket = socket_;
+    if (!destination.is_address()) {
+        boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+            handler(boost::asio::error::operation_not_supported, 0);
+        });
+        return;
+    }
+    const auto endpoint = boost::asio::ip::udp::endpoint(destination.address(), destination.port());
     socket->async_send_to(
-        buffer, destination,
+        buffer, endpoint,
         [socket, handler = std::move(handler)](const boost::system::error_code &error,
                                                std::size_t size) mutable { handler(error, size); });
 }
@@ -29,10 +38,12 @@ void UdpStream::async_send_to(boost::asio::const_buffer buffer,
 void UdpStream::async_receive_from(boost::asio::mutable_buffer buffer, ReadHandler handler) {
     const auto socket = socket_;
     const auto sender = std::make_shared<boost::asio::ip::udp::endpoint>();
-    socket->async_receive_from(buffer, *sender,
-                               [socket, sender, handler = std::move(handler)](
-                                   const boost::system::error_code &error,
-                                   std::size_t size) mutable { handler(error, size, *sender); });
+    socket->async_receive_from(
+        buffer, *sender,
+        [socket, sender, handler = std::move(handler)](const boost::system::error_code &error,
+                                                       std::size_t size) mutable {
+            handler(error, size, core::DatagramAddress::from_endpoint(*sender));
+        });
 }
 
 boost::asio::any_io_executor UdpStream::executor() noexcept { return socket_->get_executor(); }

@@ -905,11 +905,10 @@ class ShadowsocksConnectOperation final
 class ShadowsocksDatagramHandle final : public core::DatagramHandle {
   public:
     struct State : std::enable_shared_from_this<State> {
-        State(runtime::AsioRuntime &runtime, std::shared_ptr<dns::ResolverService> resolver,
-              std::shared_ptr<net::UdpStream> socket, boost::asio::ip::udp::endpoint server,
+        State(std::shared_ptr<net::UdpStream> socket, boost::asio::ip::udp::endpoint server,
               std::string method, std::string password)
-            : runtime(runtime), resolver(std::move(resolver)), socket(std::move(socket)),
-              server(std::move(server)), method(std::move(method)), password(std::move(password)) {
+            : socket(std::move(socket)), server(std::move(server)), method(std::move(method)),
+              password(std::move(password)) {
             const auto method_info = ss::cipher_method(this->method);
             if (method_info && method_info.value().shadowsocks_2022) {
                 ss2022_codec = std::make_unique<ss::Shadowsocks2022DatagramCodec>(this->method,
@@ -917,10 +916,9 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
             }
         }
 
-        void send(boost::asio::const_buffer buffer, boost::asio::ip::udp::endpoint destination,
+        void send(boost::asio::const_buffer buffer, core::DatagramAddress destination,
                   WriteHandler handler) {
-            const auto target =
-                core::Destination::address(destination.address(), destination.port());
+            const auto target = destination.to_destination();
             auto address = detail::encode_proxy_address(target);
             const auto method_info = ss::cipher_method(method);
             if (!address || !method_info) {
@@ -943,7 +941,7 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
                 auto packet = std::make_shared<std::vector<std::uint8_t>>(std::move(wire.value()));
                 auto self = shared_from_this();
                 socket->async_send_to(
-                    boost::asio::buffer(*packet), server,
+                    boost::asio::buffer(*packet), core::DatagramAddress::from_endpoint(server),
                     [self, packet, handler = std::move(handler),
                      payload_size](const boost::system::error_code &error, std::size_t) mutable {
                         handler(error, error ? 0 : payload_size);
@@ -961,7 +959,8 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
             }
             auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(encoded.value()));
             auto self = shared_from_this();
-            socket->async_send_to(boost::asio::buffer(*wire), server,
+            socket->async_send_to(boost::asio::buffer(*wire),
+                                  core::DatagramAddress::from_endpoint(server),
                                   [self, wire, handler = std::move(handler), payload_size](
                                       const boost::system::error_code &error, std::size_t) mutable {
                                       handler(error, error ? 0 : payload_size);
@@ -981,13 +980,14 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
             auto self = shared_from_this();
             socket->async_receive_from(boost::asio::buffer(receive_buffer),
                                        [self](const boost::system::error_code &error,
-                                              std::size_t size,
-                                              boost::asio::ip::udp::endpoint sender) {
+                                              std::size_t size, core::DatagramAddress sender) {
                                            if (error) {
                                                self->finish_receive(error, 0, {});
                                                return;
                                            }
-                                           if (sender != self->server) {
+                                           if (!sender.is_address() ||
+                                               sender.address() != self->server.address() ||
+                                               sender.port() != self->server.port()) {
                                                self->receive_next();
                                                return;
                                            }
@@ -999,13 +999,14 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
             auto self = shared_from_this();
             socket->async_receive_from(boost::asio::buffer(receive_buffer),
                                        [self](const boost::system::error_code &error,
-                                              std::size_t size,
-                                              boost::asio::ip::udp::endpoint sender) {
+                                              std::size_t size, core::DatagramAddress sender) {
                                            if (error) {
                                                self->finish_receive(error, 0, {});
                                                return;
                                            }
-                                           if (sender != self->server) {
+                                           if (!sender.is_address() ||
+                                               sender.address() != self->server.address() ||
+                                               sender.port() != self->server.port()) {
                                                self->receive_next();
                                                return;
                                            }
@@ -1042,30 +1043,19 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
             const auto payload_offset = address.value().size;
             const auto payload_size = plaintext.size() - payload_offset;
             if (address.value().destination.is_address()) {
-                const auto endpoint = boost::asio::ip::udp::endpoint(
-                    address.value().destination.address(), address.value().destination.port());
-                complete_payload(plaintext, payload_offset, payload_size, endpoint);
+                complete_payload(
+                    plaintext, payload_offset, payload_size,
+                    core::DatagramAddress::address(address.value().destination.address(),
+                                                   address.value().destination.port()));
                 return;
             }
-
-            const auto destination = address.value().destination;
-            auto self = shared_from_this();
-            detail::resolve_host(
-                runtime, resolver, destination.domain(),
-                [self, plaintext = std::move(plaintext), payload_offset, payload_size,
-                 port = destination.port()](core::Result<detail::AddressList> result) mutable {
-                    if (!result || result.value().empty()) {
-                        self->finish_receive(boost::asio::error::host_not_found, 0, {});
-                        return;
-                    }
-                    self->complete_payload(
-                        plaintext, payload_offset, payload_size,
-                        boost::asio::ip::udp::endpoint(result.value().front(), port));
-                });
+            complete_payload(plaintext, payload_offset, payload_size,
+                             core::DatagramAddress::domain(address.value().destination.domain(),
+                                                           address.value().destination.port()));
         }
 
         void complete_payload(const std::vector<std::uint8_t> &plaintext, std::size_t offset,
-                              std::size_t size, boost::asio::ip::udp::endpoint sender) {
+                              std::size_t size, core::DatagramAddress sender) {
             if (size > output_buffer.size()) {
                 finish_receive(boost::asio::error::message_size, 0, {});
                 return;
@@ -1077,7 +1067,7 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
         }
 
         void finish_receive(const boost::system::error_code &error, std::size_t size,
-                            boost::asio::ip::udp::endpoint sender) {
+                            core::DatagramAddress sender) {
             receive_in_progress = false;
             auto handler = std::move(receive_handler);
             if (handler) {
@@ -1104,8 +1094,6 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
                 kMaxUdpWireSize);
         }
 
-        runtime::AsioRuntime &runtime;
-        std::shared_ptr<dns::ResolverService> resolver;
         std::shared_ptr<net::UdpStream> socket;
         boost::asio::ip::udp::endpoint server;
         std::string method;
@@ -1120,7 +1108,7 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
   public:
     explicit ShadowsocksDatagramHandle(std::shared_ptr<State> state) : state_(std::move(state)) {}
 
-    void async_send_to(boost::asio::const_buffer buffer, boost::asio::ip::udp::endpoint destination,
+    void async_send_to(boost::asio::const_buffer buffer, core::DatagramAddress destination,
                        WriteHandler handler) override {
         state_->send(buffer, std::move(destination), std::move(handler));
     }
@@ -1225,33 +1213,29 @@ void ShadowsocksOutbound::open_datagram(core::DatagramRequest request,
         auto operation = std::make_shared<ShadowsocksConnectOperation>(
             runtime_, resolver_, config_, std::move(stream_request),
             [handler = std::move(handler), initial_destination = request.initial_destination,
-             version, context = &runtime_.context()](
-                core::StreamOpenResult result) mutable {
-                boost::asio::post(
-                    context->get_executor(),
-                    [handler = std::move(handler), initial_destination, version,
-                     result = std::move(result)]() mutable {
-                        if (!result.succeeded()) {
-                            handler(core::DatagramOpenResult::failed(
-                                result.error.value_or(core::Error{
-                                    core::ErrorCode::transport_io,
-                                    "failed to open Shadowsocks UoT stream"})));
-                            return;
-                        }
-                        const auto request_destination =
-                            version == 2 ? initial_destination : std::nullopt;
-                        auto datagram = ss::make_udp_over_tcp_datagram_handle(
-                            std::move(result.handle),
-                            {version == 2 ? ss::UdpOverTcpVersion::version2
-                                          : ss::UdpOverTcpVersion::legacy,
-                             request_destination});
-                        if (!datagram) {
-                            handler(core::DatagramOpenResult::failed(datagram.error()));
-                            return;
-                        }
-                        handler(core::DatagramOpenResult::opened(
-                            std::move(datagram.value()), core::DatagramSemantics::multi_destination));
-                    });
+             version, context = &runtime_.context()](core::StreamOpenResult result) mutable {
+                boost::asio::post(context->get_executor(), [handler = std::move(handler),
+                                                            initial_destination, version,
+                                                            result = std::move(result)]() mutable {
+                    if (!result.succeeded()) {
+                        handler(core::DatagramOpenResult::failed(result.error.value_or(
+                            core::Error{core::ErrorCode::transport_io,
+                                        "failed to open Shadowsocks UoT stream"})));
+                        return;
+                    }
+                    const auto request_destination =
+                        version == 2 ? initial_destination : std::nullopt;
+                    auto datagram = ss::make_udp_over_tcp_datagram_handle(
+                        std::move(result.handle), {version == 2 ? ss::UdpOverTcpVersion::version2
+                                                                : ss::UdpOverTcpVersion::legacy,
+                                                   request_destination});
+                    if (!datagram) {
+                        handler(core::DatagramOpenResult::failed(datagram.error()));
+                        return;
+                    }
+                    handler(core::DatagramOpenResult::opened(
+                        std::move(datagram.value()), core::DatagramSemantics::multi_destination));
+                });
             });
         operation->start();
         return;
@@ -1293,8 +1277,7 @@ void ShadowsocksOutbound::open_datagram(core::DatagramRequest request,
             }
             if (method.value().kind == ss::CipherKind::stream) {
                 auto handle = detail::make_legacy_shadowsocks_datagram_handle(
-                    *runtime, std::move(resolver), std::move(socket), server, config.method,
-                    config.password);
+                    std::move(socket), server, config.method, config.password);
                 if (!handle) {
                     handler(core::DatagramOpenResult::failed(handle.error()));
                     return;
@@ -1304,8 +1287,7 @@ void ShadowsocksOutbound::open_datagram(core::DatagramRequest request,
                 return;
             }
             auto state = std::make_shared<ShadowsocksDatagramHandle::State>(
-                *runtime, std::move(resolver), std::move(socket), server, config.method,
-                config.password);
+                std::move(socket), server, config.method, config.password);
             handler(core::DatagramOpenResult::opened(
                 std::make_unique<ShadowsocksDatagramHandle>(std::move(state)),
                 core::DatagramSemantics::multi_destination));

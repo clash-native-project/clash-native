@@ -682,7 +682,7 @@ class AsioDnsTransport::Operation final
         }
         auto self = shared_from_this();
         datagram_->async_send_to(
-            boost::asio::buffer(query_), udp_endpoint_,
+            boost::asio::buffer(query_), core::DatagramAddress::from_endpoint(udp_endpoint_),
             [self, generation](const boost::system::error_code &send_error, std::size_t) {
                 if (generation != self->attempt_generation_ || self->completed_) {
                     return;
@@ -704,7 +704,7 @@ class AsioDnsTransport::Operation final
         datagram_->async_receive_from(
             boost::asio::buffer(response_buffer_),
             [self, generation](const boost::system::error_code &error, std::size_t size,
-                               boost::asio::ip::udp::endpoint sender) {
+                               core::DatagramAddress sender) {
                 if (generation != self->attempt_generation_ || self->completed_) {
                     return;
                 }
@@ -713,7 +713,8 @@ class AsioDnsTransport::Operation final
                         upstream_error("failed to receive DNS UDP response", error));
                     return;
                 }
-                if (sender != self->udp_endpoint_ || size < 2 ||
+                if (!sender.is_address() || sender.address() != self->udp_endpoint_.address() ||
+                    sender.port() != self->udp_endpoint_.port() || size < 2 ||
                     static_cast<std::uint16_t>(self->response_buffer_[0] << 8 |
                                                self->response_buffer_[1]) != self->query_id_) {
                     self->receive_udp(generation);

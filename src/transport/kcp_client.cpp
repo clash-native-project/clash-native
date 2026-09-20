@@ -159,7 +159,7 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
         datagram_->async_receive_from(
             boost::asio::buffer(receive_buffer_),
             [self](const boost::system::error_code &error, std::size_t size,
-                   boost::asio::ip::udp::endpoint sender) {
+                   core::DatagramAddress sender) {
                 if (self->closed_) {
                     return;
                 }
@@ -167,7 +167,8 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
                     self->fail(error);
                     return;
                 }
-                if (sender != self->remote_endpoint_) {
+                if (!sender.is_address() || sender.address() != self->remote_endpoint_.address() ||
+                    sender.port() != self->remote_endpoint_.port()) {
                     self->start_receive();
                     return;
                 }
@@ -221,7 +222,7 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
         auto packet = send_queue_.front();
         auto self = shared_from_this();
         datagram_->async_send_to(
-            boost::asio::buffer(*packet), remote_endpoint_,
+            boost::asio::buffer(*packet), core::DatagramAddress::from_endpoint(remote_endpoint_),
             [self, packet](const boost::system::error_code &error, std::size_t) {
                 self->send_in_progress_ = false;
                 if (self->closed_) {
