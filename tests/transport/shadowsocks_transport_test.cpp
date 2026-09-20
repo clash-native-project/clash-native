@@ -1,4 +1,5 @@
 #include <clash_native/core/base64.hpp>
+#include <clash_native/transport/shadowsocks/jls.hpp>
 #include <clash_native/transport/shadowsocks/crypto.hpp>
 #include <clash_native/transport/shadowsocks/legacy_packet.hpp>
 #include <clash_native/transport/shadowsocks/restls.hpp>
@@ -408,6 +409,85 @@ TEST(ShadowsocksTransportTest, DerivesResTlsSessionAuthenticationIds) {
         {std::vector<std::uint8_t>{'p', 's', 'k'}});
     ASSERT_TRUE(tls13);
     EXPECT_EQ(tls13.value().size(), 16U);
+}
+
+TEST(ShadowsocksTransportTest, MatchesJlsFakeRandomVector) {
+    const clash_native::transport::shadowsocks::JlsUser user{"jls-user", "jls-password"};
+    const std::array<std::uint8_t, 16> seed{0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                                            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f};
+    const std::array<std::uint8_t, 23> auth_data{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                                                 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+                                                 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16};
+    const std::vector<std::uint8_t> expected{0xa5, 0x19, 0xf2, 0xd0, 0xa2, 0xb3, 0x6b, 0x3a,
+                                             0x96, 0xfc, 0x5f, 0x43, 0x9c, 0x8e, 0xd9, 0x36,
+                                             0x82, 0xa3, 0xc7, 0x16, 0xd1, 0xf1, 0xe9, 0xbe,
+                                             0x6d, 0xa9, 0x4d, 0x98, 0x44, 0x43, 0x1d, 0xa6};
+
+    const auto fake = clash_native::transport::shadowsocks::build_jls_fake_random(
+        user, std::span<const std::uint8_t, 16>(seed), auth_data);
+    ASSERT_TRUE(fake);
+    EXPECT_EQ(fake.value(), expected);
+    EXPECT_TRUE(
+        clash_native::transport::shadowsocks::check_jls_fake_random(user, fake.value(), auth_data));
+
+    auto tampered = fake.value();
+    tampered.front() ^= 0x01;
+    EXPECT_FALSE(
+        clash_native::transport::shadowsocks::check_jls_fake_random(user, tampered, auth_data));
+    EXPECT_FALSE(clash_native::transport::shadowsocks::check_jls_fake_random(
+        {"wrong-user", user.password}, fake.value(), auth_data));
+}
+
+TEST(ShadowsocksTransportTest, ZeroesJlsHelloAuthenticationFields) {
+    auto append_u16 = [](std::vector<std::uint8_t> &wire, std::uint16_t value) {
+        wire.push_back(static_cast<std::uint8_t>(value >> 8));
+        wire.push_back(static_cast<std::uint8_t>(value));
+    };
+    std::vector<std::uint8_t> body{0x03, 0x03};
+    body.insert(body.end(), 32, 0xaa);
+    body.push_back(0);
+    append_u16(body, 2);
+    body.insert(body.end(), {0x13, 0x01});
+    body.insert(body.end(), {1, 0});
+
+    std::vector<std::uint8_t> extensions;
+    append_u16(extensions, 0x0000);
+    append_u16(extensions, 0);
+    std::vector<std::uint8_t> psk{0, 9, 0, 3, 'a', 'b', 'c', 0, 0, 0, 1, 0, 3, 2, 0x11, 0x22};
+    append_u16(extensions, 0x0029);
+    append_u16(extensions, static_cast<std::uint16_t>(psk.size()));
+    extensions.insert(extensions.end(), psk.begin(), psk.end());
+    append_u16(body, static_cast<std::uint16_t>(extensions.size()));
+    body.insert(body.end(), extensions.begin(), extensions.end());
+
+    std::vector<std::uint8_t> client_hello{1, 0, 0, 0};
+    client_hello.insert(client_hello.end(), body.begin(), body.end());
+    const auto body_length = client_hello.size() - 4;
+    client_hello[1] = static_cast<std::uint8_t>(body_length >> 16);
+    client_hello[2] = static_cast<std::uint8_t>(body_length >> 8);
+    client_hello[3] = static_cast<std::uint8_t>(body_length);
+
+    const auto client_auth =
+        clash_native::transport::shadowsocks::jls_client_hello_auth_data(client_hello);
+    ASSERT_TRUE(client_auth);
+    EXPECT_TRUE(std::all_of(client_auth.value().begin() + 6, client_auth.value().begin() + 6 + 32,
+                            [](std::uint8_t value) { return value == 0; }));
+    EXPECT_EQ(client_auth.value()[client_auth.value().size() - 2], 0);
+    EXPECT_EQ(client_auth.value().back(), 0);
+    EXPECT_EQ(client_auth.value()[client_auth.value().size() - 3], 2);
+
+    std::vector<std::uint8_t> server_hello{2, 0, 0, 0, 0x03, 0x03};
+    server_hello.insert(server_hello.end(), 32, 0xbb);
+    server_hello.insert(server_hello.end(), {0x13, 0x01, 0, 0, 0});
+    const auto server_length = server_hello.size() - 4;
+    server_hello[1] = static_cast<std::uint8_t>(server_length >> 16);
+    server_hello[2] = static_cast<std::uint8_t>(server_length >> 8);
+    server_hello[3] = static_cast<std::uint8_t>(server_length);
+    const auto server_auth =
+        clash_native::transport::shadowsocks::jls_server_hello_auth_data(server_hello);
+    ASSERT_TRUE(server_auth);
+    EXPECT_TRUE(std::all_of(server_auth.value().begin() + 6, server_auth.value().begin() + 6 + 32,
+                            [](std::uint8_t value) { return value == 0; }));
 }
 
 } // namespace

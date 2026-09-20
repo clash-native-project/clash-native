@@ -4,6 +4,7 @@
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/transport/shadowsocks/aead_packet.hpp>
 #include <clash_native/transport/shadowsocks/crypto.hpp>
+#include <clash_native/transport/shadowsocks/jls_client.hpp>
 #include <clash_native/transport/shadowsocks/legacy_stream.hpp>
 #include <clash_native/transport/shadowsocks/simple_obfs.hpp>
 #include <clash_native/transport/shadowsocks/shadow_tls.hpp>
@@ -536,7 +537,7 @@ class ShadowsocksConnectOperation final
         if (!config_.plugin.empty() && config_.plugin != "obfs" &&
             config_.plugin != "v2ray-plugin" && config_.plugin != "gost-plugin" &&
             config_.plugin != "kcptun" && config_.plugin != "shadow-tls" &&
-            config_.plugin != "restls") {
+            config_.plugin != "restls" && config_.plugin != "jls") {
             return core::fail({core::ErrorCode::unsupported, "unsupported Shadowsocks plugin", {}});
         }
         if (config_.plugin == "obfs" && config_.plugin_mode != "http" &&
@@ -594,6 +595,18 @@ class ShadowsocksConnectOperation final
                                    "Shadowsocks ResTLS host and password are required", {}});
             }
         }
+        if (config_.plugin == "jls") {
+            if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() || config_.plugin_tls) {
+                return core::fail({core::ErrorCode::configuration,
+                                   "Shadowsocks JLS requires the TLS 1.3 carrier without WebSocket options",
+                                   {}});
+            }
+            if (config_.plugin_username.empty() || config_.plugin_password.empty() ||
+                config_.plugin_host.empty()) {
+                return core::fail({core::ErrorCode::configuration,
+                                   "Shadowsocks JLS host, username, and password are required", {}});
+            }
+        }
         if (config_.udp_over_tcp_version != 1 && config_.udp_over_tcp_version != 2) {
             return core::fail({core::ErrorCode::configuration,
                                "Shadowsocks UDP-over-TCP version must be 1 or 2",
@@ -630,6 +643,8 @@ class ShadowsocksConnectOperation final
     bool shadow_tls_plugin() const noexcept { return config_.plugin == "shadow-tls"; }
 
     bool restls_plugin() const noexcept { return config_.plugin == "restls"; }
+
+    bool jls_plugin() const noexcept { return config_.plugin == "jls"; }
 
     ss::WebSocketPluginOptions websocket_options() const {
         return {config_.plugin_host.empty() ? "bing.com" : config_.plugin_host,
@@ -702,6 +717,10 @@ class ShadowsocksConnectOperation final
                     self->open_restls();
                     return;
                 }
+                if (self->jls_plugin()) {
+                    self->open_jls();
+                    return;
+                }
                 self->send_initial_request();
             });
     }
@@ -739,6 +758,27 @@ class ShadowsocksConnectOperation final
         options.restls_script = config_.plugin_restls_script;
         options.skip_cert_verify = config_.plugin_skip_cert_verify;
         ss::async_open_restls(
+            std::move(stream), std::move(options),
+            [self](core::Result<std::unique_ptr<core::StreamHandle>> result) mutable {
+                if (!result) {
+                    self->finish(core::StreamOpenResult::failed(result.error()));
+                    return;
+                }
+                self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
+                self->send_initial_request();
+            });
+    }
+
+    void open_jls() {
+        auto self = shared_from_this();
+        auto stream = std::make_unique<net::TcpStream>(std::move(*socket_));
+        ss::JlsClientOptions options;
+        options.server_name = config_.plugin_host;
+        options.username = config_.plugin_username;
+        options.password = config_.plugin_password;
+        options.alpn = config_.plugin_alpn;
+        options.skip_cert_verify = config_.plugin_skip_cert_verify;
+        ss::async_open_jls(
             std::move(stream), std::move(options),
             [self](core::Result<std::unique_ptr<core::StreamHandle>> result) mutable {
                 if (!result) {
@@ -1333,7 +1373,8 @@ core::Status ShadowsocksOutbound::validate() const {
     }
     if (!config_.plugin.empty() && config_.plugin != "obfs" && config_.plugin != "v2ray-plugin" &&
         config_.plugin != "gost-plugin" && config_.plugin != "kcptun" &&
-        config_.plugin != "shadow-tls" && config_.plugin != "restls") {
+        config_.plugin != "shadow-tls" && config_.plugin != "restls" &&
+        config_.plugin != "jls") {
         return core::fail({core::ErrorCode::unsupported, "unsupported Shadowsocks plugin", {}});
     }
     if (config_.plugin == "obfs" && config_.plugin_mode != "http" && config_.plugin_mode != "tls") {
@@ -1386,6 +1427,18 @@ core::Status ShadowsocksOutbound::validate() const {
         if (config_.plugin_password.empty() || config_.plugin_host.empty()) {
             return core::fail({core::ErrorCode::configuration,
                                "Shadowsocks ResTLS host and password are required", {}});
+        }
+    }
+    if (config_.plugin == "jls") {
+        if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() || config_.plugin_tls) {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks JLS requires the TLS 1.3 carrier without WebSocket options",
+                               {}});
+        }
+        if (config_.plugin_username.empty() || config_.plugin_password.empty() ||
+            config_.plugin_host.empty()) {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks JLS host, username, and password are required", {}});
         }
     }
     if (config_.plugin == "kcptun") {

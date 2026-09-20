@@ -117,6 +117,8 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
                     .value_or("") == "1";
             config.plugin_password =
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_PASSWORD").value_or("");
+            config.plugin_username =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_USERNAME").value_or("");
             if (const auto version =
                     environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_VERSION");
                 version && !version->empty()) {

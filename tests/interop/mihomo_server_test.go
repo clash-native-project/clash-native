@@ -160,6 +160,30 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
       password: '%s'
       restls-script: "1000?100<1,500~100,350~100,600~100,400~200"
 `, udpHost, restlsPort, mihomoTestPassword, restlsPassword)
+	const jlsUsername = "clash-native-jls-user"
+	const jlsPassword = "clash-native-jls-password"
+	jlsAddress := reserveMihomoShadowsocksAddressOnHost(t, udpHost)
+	_, jlsPort, err := net.SplitHostPort(jlsAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(&listenerConfig, `
+  - name: test-shadowsocks-jls
+    type: shadowsocks
+    listen: %s
+    port: %s
+    password: '%s'
+    cipher: chacha20-ietf-poly1305
+    jls-config:
+      enable: true
+      users:
+        - username: '%s'
+          password: '%s'
+      sni: www.google.com
+      dest: www.google.com:443
+      alpn:
+        - http/1.1
+`, udpHost, jlsPort, mihomoTestPassword, jlsUsername, jlsPassword)
 	trojanAddress := reserveMihomoTCPAddress(t)
 	_, trojanPort, err := net.SplitHostPort(trojanAddress)
 	if err != nil {
@@ -209,6 +233,7 @@ listeners:%s
 		listenerAddresses = append(listenerAddresses, address)
 	}
 	listenerAddresses = append(listenerAddresses, restlsAddress)
+	listenerAddresses = append(listenerAddresses, jlsAddress)
 	mihomo := startMihomo(t, mihomoExecutable, home, configPath, listenerAddresses)
 	defer stopInteropProcess(t, mihomo)
 
@@ -380,6 +405,36 @@ listeners:%s
 		readBytes(t, client, echoed)
 		if string(echoed) != string(payload) {
 			t.Fatal("Mihomo ResTLS returned different bytes")
+		}
+	})
+
+	t.Run("Shadowsocks/jls", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":                         "shadowsocks",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":                  jlsAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":                mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_METHOD":                  "chacha20-ietf-poly1305",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN":                  "jls",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_HOST":             "www.google.com",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_USERNAME":         jlsUsername,
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_PASSWORD":         jlsPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_ALPN":             "http/1.1",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_SKIP_CERT_VERIFY": "1",
+			"CLASH_NATIVE_TEST_PROXY_HOST":                       udpHost,
+		})
+		defer stopProxy()
+
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-jls-", 2048))
+		writeBytes(t, client, payload)
+		// Mihomo's JLS server returns a tls.Conn to its generic relay. The relay
+		// falls back to Close when that TLS connection does not expose CloseWrite,
+		// so a peer FIN closes the whole tunnel before the echo can return.
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo JLS returned different bytes")
 		}
 	})
 

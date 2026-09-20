@@ -1,5 +1,18 @@
 # Implementation Log
 
+### 2026-09-21 — Add the Shadowsocks JLS TLS 1.3 carrier
+
+- Added the JLS username/password authentication primitives, ClientHello and
+  ServerHello authentication-data handling, and the asynchronous Botan TLS 1.3
+  stream adapter.
+- Added a reproducible Botan vcpkg overlay patch for the ClientHello random
+  callback and wired the JLS plugin into the Shadowsocks outbound.
+- Added deterministic JLS vector/parser tests and a real Mihomo TLS 1.3
+  interoperability case. The Mihomo JLS relay closes the complete tunnel when
+  its generic TLS connection receives a peer FIN, so the interop case keeps
+  the client write side open while validating the reverse echo. TLS 1.3
+  ResTLS remains outside the validated scope.
+
 ### 2026-09-21 — Add the ResTLS framing and authentication primitives
 
 - Added a native ResTLS transport module for the password-derived BLAKE3

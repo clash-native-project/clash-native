@@ -97,8 +97,18 @@ still require an IP address when sending to the operating system.
 `TestMihomoActualServerInteroperability/Shadowsocks/restls-tls12` validates
 the Shadowsocks ResTLS outbound path against a real Mihomo listener. It uses a
 separately built Go test executable, the TLS 1.2 version hint, the configured
-Mihomo ResTLS script, and a TCP echo exchange. The native client rejects the
-TLS 1.3 hint until Botan's ResTLS session-ID and record hooks are implemented.
+Mihomo ResTLS script, and a TCP echo exchange. TLS 1.3 ResTLS remains outside
+the validated scope until the native TLS client has matching session-ID and
+record hooks.
+
+`TestMihomoActualServerInteroperability/Shadowsocks/jls` validates the
+Shadowsocks JLS outbound path against a real Mihomo listener. It uses a
+TLS 1.3-only JLS handshake, configured username and password, an HTTP/1.1
+ALPN, and a TCP echo exchange through the authenticated Shadowsocks stream.
+The case does not send a peer FIN because the tested Mihomo generic relay
+closes its complete TLS tunnel when the JLS connection does not expose
+`CloseWrite`; this is a server-side half-close limitation, not a JLS
+handshake or data-path failure.
 
 `TestMihomoActualServerShadowsocksKcpTun` validates the Shadowsocks `kcptun`
 carrier against a real Mihomo listener. It covers TCP relay and UDP-over-TCP
@@ -167,6 +177,9 @@ $env:CLASH_NATIVE_TEST_HOST = 'D:\Project\cpp\clash-native\build\windows-clang-c
 
 # Run the Shadowsocks ResTLS TLS 1.2 case.
 & $interop '-test.count=1' '-test.run=^TestMihomoActualServerInteroperability$/Shadowsocks/restls-tls12$' '-test.v=true'
+
+# Run the Shadowsocks JLS TLS 1.3 case.
+& $interop '-test.count=1' '-test.run=^TestMihomoActualServerInteroperability$/Shadowsocks/jls$' '-test.v=true'
 
 # Run the Shadowsocks kcptun full KCP/SMUX profile.
 & $interop '-test.count=1' '-test.run=^TestMihomoActualServerShadowsocksKcpTun$' '-test.v=true'

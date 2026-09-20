@@ -49,6 +49,24 @@ same behavior, nor does it justify claiming full half-close interoperability.
 Revisit this issue with a peer that preserves the opposite direction after FIN,
 then add an end-to-end test before changing the transport contract.
 
+## Mihomo JLS relay closes the full TLS tunnel after FIN
+
+- **Status:** Deferred; interoperability limitation in the tested Mihomo
+  server path.
+- **Scope:** Shadowsocks JLS over a TLS 1.3 carrier on Windows x64.
+
+The C++ JLS client preserves the underlying stream half-close after queued TLS
+records have been written. The tested Mihomo JLS server returns a Go TLS
+connection to its generic relay. That connection does not expose `CloseWrite`,
+so the relay falls back to closing the complete connection when the peer sends
+FIN. The server therefore can terminate the reverse direction before the
+upstream echo is delivered.
+
+The JLS handshake, ServerHello authentication, and bidirectional data path
+interoperate when the client keeps the write side open. The current JLS
+interop case uses that mode and records this peer-specific limitation rather
+than treating it as a cryptographic or framing failure.
+
 ## Large UDP DNS bursts can lose datagrams on Windows
 
 - **Status:** Deferred; root cause is not isolated.

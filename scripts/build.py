@@ -163,6 +163,18 @@ def ensure_vcpkg(
     return root
 
 
+def prepare_vcpkg_ports() -> Path:
+    """Validate project-owned overlay ports before configuring vcpkg."""
+    botan_port = PROJECT_ROOT / "third_party" / "vcpkg" / "ports" / "botan"
+    required_files = ("portfile.cmake", "vcpkg.json", "configure", "jls-random.patch")
+    missing = [name for name in required_files if not (botan_port / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            "Project Botan overlay is incomplete; missing: " + ", ".join(missing)
+        )
+    return botan_port.parent
+
+
 def validate_build_cache(build_dir: Path, toolchain_file: Path, triplet: str) -> bool:
     cache_file = build_dir / "CMakeCache.txt"
     if not cache_file.is_file():
@@ -244,6 +256,7 @@ def main() -> int:
             arguments.update_vcpkg,
             environment,
         )
+        overlay_ports = prepare_vcpkg_ports()
 
         build_dir = (
             arguments.build_dir
@@ -274,6 +287,7 @@ def main() -> int:
             f"-DCMAKE_MAKE_PROGRAM={cmake_path(ninja)}",
             f"-DVCPKG_TARGET_TRIPLET={triplet}",
             f"-DVCPKG_OVERLAY_TRIPLETS={cmake_path(PROJECT_ROOT / 'triplets')}",
+            f"-DVCPKG_OVERLAY_PORTS={cmake_path(overlay_ports)}",
             "-DVCPKG_MANIFEST_MODE=ON",
             f"-DCMAKE_C_COMPILER={cmake_path(toolchain.clang_cl)}",
             f"-DCMAKE_CXX_COMPILER={cmake_path(toolchain.clang_cl)}",

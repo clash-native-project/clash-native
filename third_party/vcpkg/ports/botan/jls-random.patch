@@ -1,0 +1,81 @@
+--- a/src/lib/tls/tls_callbacks.h
++++ b/src/lib/tls/tls_callbacks.h
+@@ -42,10 +42,11 @@
+ }
+ 
+ namespace TLS {
+ 
+ class Handshake_Message;
++class Client_Hello;
+ class Policy;
+ class Extensions;
+ class Certificate_Status_Request;
+ class Session_Summary;
+ class Session;
+@@ -557,10 +558,20 @@
+        * @param message the handshake message
+        */
+       virtual void tls_inspect_handshake_msg(const Handshake_Message& message);
+ 
+       /**
++       * Optional callback: modify the random field of an outgoing TLS 1.3
++       * ClientHello after all extensions and PSK binders have been built.
++       *
++       * The callback runs before the message enters the handshake transcript.
++       * The default implementation leaves the random field unchanged.
++       */
++      virtual void tls_modify_client_hello_random(std::vector<uint8_t>& random,
++                                                  const Client_Hello& hello);
++
++      /**
+        * Optional callback for server: choose ALPN protocol
+        *
+        * ALPN (RFC 7301) works by the client sending a list of application
+        * protocols it is willing to negotiate. The server then selects which
+        * protocol to use. RFC 7301 requires that if the server does not support
+--- a/src/lib/tls/tls_callbacks.cpp
++++ b/src/lib/tls/tls_callbacks.cpp
+@@ -45,10 +45,15 @@
+ #endif
+ 
+ namespace Botan {
+ 
+ void TLS::Callbacks::tls_inspect_handshake_msg(const Handshake_Message& /*unused*/) {
++   // default is no op
++}
++
++void TLS::Callbacks::tls_modify_client_hello_random(std::vector<uint8_t>& /*unused*/,
++                                                    const Client_Hello& /*unused*/) {
+    // default is no op
+ }
+ 
+ std::string TLS::Callbacks::tls_server_choose_app_protocol(const std::vector<std::string>& /*unused*/) {
+    return "";
+--- a/src/lib/tls/tls13/msg_client_hello_13.cpp
++++ b/src/lib/tls/tls13/msg_client_hello_13.cpp
+@@ -279,10 +279,12 @@
+          throw TLS_Exception(Alert::InternalError,
+                              "Application modified extensions of Client Hello, PSK is not last anymore");
+       }
+       calculate_psk_binders({});
+    }
++
++   cb.tls_modify_client_hello_random(m_data->m_random, *this);
+ }
+ 
+ std::variant<Client_Hello_13, Client_Hello_12_Shim> Client_Hello_13::parse(const std::vector<uint8_t>& buf) {
+    auto data = std::make_unique<Client_Hello_Internal>(buf);
+    const auto version = data->version();
+@@ -359,10 +361,12 @@
+       // RFC 8446 4.2.11.2
+       //    If the server responds with a HelloRetryRequest and the client
+       //    then sends ClientHello2, its binder will be computed over: [...].
+       calculate_psk_binders(transcript_hash_state.clone());
+    }
++
++   cb.tls_modify_client_hello_random(m_data->m_random, *this);
+ }
+ 
+ void Client_Hello_13::validate_updates(const Client_Hello_13& new_ch) {
+    // RFC 8446 4.1.2
+    //    The client will also send a ClientHello when the server has responded

@@ -150,6 +150,8 @@ add_library(clash-native-core STATIC
     src/transport/shadowsocks/shadow_tls.cpp
     src/transport/shadowsocks/restls.cpp
     src/transport/shadowsocks/restls_client.cpp
+    src/transport/shadowsocks/jls.cpp
+    src/transport/shadowsocks/jls_client.cpp
     src/transport/shadowsocks/websocket_plugin.cpp
     src/transport/shadowsocks/udp_over_tcp.cpp
     src/transport/shadowsocks/kcptun.cpp

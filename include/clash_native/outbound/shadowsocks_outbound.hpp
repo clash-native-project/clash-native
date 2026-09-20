@@ -22,7 +22,8 @@ struct ShadowsocksOutboundConfig {
     std::string password;
     // Optional Shadowsocks TCP plugin. simple-obfs supports HTTP and TLS;
     // v2ray-plugin and gost-plugin support WebSocket with optional TLS;
-    // shadow-tls supports Shadow-TLS v1 and v2 carriers.
+    // shadow-tls supports Shadow-TLS v1 and v2 carriers; restls and jls add
+    // the password-authenticated TLS 1.2 and TLS 1.3 carriers respectively.
     // Native Shadowsocks UDP remains direct.
     std::string plugin;
     std::string plugin_mode;
@@ -37,6 +38,7 @@ struct ShadowsocksOutboundConfig {
     bool udp_over_tcp = false;
     std::uint8_t udp_over_tcp_version = 1;
     std::string plugin_password;
+    std::string plugin_username;
     int plugin_version = 2;
     std::vector<std::string> plugin_alpn;
     std::string plugin_version_hint = "tls12";
