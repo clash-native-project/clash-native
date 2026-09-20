@@ -1,6 +1,7 @@
 #include <clash_native/core/base64.hpp>
 #include <clash_native/transport/shadowsocks/crypto.hpp>
 #include <clash_native/transport/shadowsocks/legacy_packet.hpp>
+#include <clash_native/transport/shadowsocks/restls.hpp>
 #include <clash_native/transport/shadowsocks/ss2022_packet.hpp>
 #include <clash_native/transport/shadowsocks/udp_over_tcp.hpp>
 
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <future>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <utility>
 #include <vector>
@@ -322,6 +324,78 @@ TEST(ShadowsocksTransportTest, PreservesDomainAddressInUdpOverTcpResponse) {
     ASSERT_TRUE(source.is_domain());
     EXPECT_EQ(source.domain(), domain);
     EXPECT_EQ(source.port(), 443);
+}
+
+TEST(ShadowsocksTransportTest, ParsesResTlsRecordScript) {
+    const auto script = clash_native::transport::shadowsocks::parse_restls_script(
+        "250?100<1,350~100<1,600~100,300~200,300~100");
+    ASSERT_TRUE(script);
+    ASSERT_EQ(script.value().size(), 5U);
+    EXPECT_TRUE(script.value()[0].randomize_target);
+    EXPECT_EQ(script.value()[0].target_length, 250U);
+    EXPECT_EQ(script.value()[0].random_range, 100U);
+    EXPECT_TRUE(script.value()[0].command.needs_peer_response());
+    EXPECT_EQ(script.value()[0].command.response, 1U);
+    EXPECT_FALSE(script.value()[2].command.needs_peer_response());
+    EXPECT_FALSE(clash_native::transport::shadowsocks::parse_restls_script("250<256"));
+}
+
+TEST(ShadowsocksTransportTest, RoundTripsResTlsApplicationRecord) {
+    std::array<std::uint8_t, 32> secret{};
+    std::iota(secret.begin(), secret.end(), 1);
+    std::vector<std::uint8_t> server_random(32);
+    std::iota(server_random.begin(), server_random.end(), 0xa0);
+    const std::vector<std::uint8_t> data{'r', 'e', 's', 't', 'l', 's'};
+    const clash_native::transport::shadowsocks::RestlsCommand command{
+        clash_native::transport::shadowsocks::RestlsCommandKind::response, 1};
+
+    clash_native::transport::shadowsocks::RestlsApplicationCodec encoder(secret, server_random,
+                                                                         false);
+    const auto wire = encoder.encode(data, data.size(), 17, command);
+    ASSERT_TRUE(wire);
+    ASSERT_EQ(encoder.counter(), 1U);
+    EXPECT_EQ(wire.value()[0], 23U);
+    EXPECT_EQ(wire.value()[1], 3U);
+    EXPECT_EQ(wire.value()[2], 3U);
+
+    clash_native::transport::shadowsocks::RestlsApplicationCodec decoder(secret, server_random,
+                                                                         false);
+    const auto decoded = decoder.decode(wire.value());
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded.value().data, data);
+    EXPECT_EQ(decoded.value().command.kind,
+              clash_native::transport::shadowsocks::RestlsCommandKind::response);
+    EXPECT_EQ(decoded.value().command.response, 1U);
+    EXPECT_EQ(decoder.counter(), 1U);
+
+    auto tampered = wire.value();
+    tampered.back() ^= 0x01;
+    clash_native::transport::shadowsocks::RestlsApplicationCodec rejector(secret, server_random,
+                                                                          false);
+    EXPECT_FALSE(rejector.decode(tampered));
+}
+
+TEST(ShadowsocksTransportTest, DerivesResTlsSessionAuthenticationIds) {
+    const auto secret = clash_native::transport::shadowsocks::derive_restls_secret("password");
+    ASSERT_TRUE(secret);
+    std::vector<std::vector<std::uint8_t>> ecdhe{std::vector<std::uint8_t>(32, 0x11),
+                                                 std::vector<std::uint8_t>(65, 0x22),
+                                                 std::vector<std::uint8_t>(97, 0x33)};
+    const auto tls12 =
+        clash_native::transport::shadowsocks::derive_restls_tls12_session_id(secret.value(), ecdhe);
+    ASSERT_TRUE(tls12);
+    EXPECT_EQ(tls12.value().size(), 32U);
+    const std::vector<std::uint8_t> ticket(48, 0x44);
+    const auto tls12_ticket = clash_native::transport::shadowsocks::derive_restls_tls12_session_id(
+        secret.value(), ecdhe, ticket);
+    ASSERT_TRUE(tls12_ticket);
+    EXPECT_NE(tls12.value(), tls12_ticket.value());
+
+    const auto tls13 = clash_native::transport::shadowsocks::derive_restls_tls13_session_id(
+        secret.value(), {{0x001d, std::vector<std::uint8_t>(32, 0x55)}},
+        {std::vector<std::uint8_t>{'p', 's', 'k'}});
+    ASSERT_TRUE(tls13);
+    EXPECT_EQ(tls13.value().size(), 16U);
 }
 
 } // namespace

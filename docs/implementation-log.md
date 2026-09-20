@@ -1,5 +1,16 @@
 # Implementation Log
 
+### 2026-09-21 — Add the ResTLS framing and authentication primitives
+
+- Added a native ResTLS transport module for the password-derived BLAKE3
+  traffic key, TLS 1.2 and TLS 1.3 ClientHello authentication Session ID
+  derivation, record-script parsing, and post-handshake application record
+  encoding and decoding.
+- Added deterministic CTest coverage for script validation, authenticated
+  record round trips, tamper rejection, and both TLS version Session ID forms.
+  The Shadowsocks `restls` plugin remains rejected at configuration time until
+  the native TLS client can emit the matching custom ClientHello materials.
+
 ### 2026-09-20 — Record the kcptun half-close interoperability boundary
 
 - Added a known-issues entry documenting that the tested Mihomo SMUX listener
