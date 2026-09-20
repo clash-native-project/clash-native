@@ -33,8 +33,9 @@ class BootstrapDnsTransport final : public DnsTransport,
   public:
     BootstrapDnsTransport(runtime::AsioRuntime &runtime, DnsUpstreamConfig config)
         : runtime_(runtime), config_(std::move(config)),
-          bootstrap_(config_.bootstrap_resolver ? config_.bootstrap_resolver
-                                                : make_system_bootstrap_resolver(runtime_)) {}
+          bootstrap_(config_.bootstrap_resolver
+                         ? config_.bootstrap_resolver
+                         : make_bootstrap_resolver(runtime_, config_.bootstrap_dns_servers)) {}
 
     ExchangeId exchange(DnsExchangeRequest request, Handler handler) override {
         const auto exchange_id = next_exchange_id_++;

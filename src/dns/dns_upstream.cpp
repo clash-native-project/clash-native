@@ -220,6 +220,7 @@ DnsUpstreamGroup::DnsUpstreamGroup(runtime::AsioRuntime &runtime, DnsUpstreamGro
             fallback.doh_authority = member.doh_authority;
             fallback.dial_policy = member.dial_policy;
             fallback.dialer = member.dialer;
+            fallback.bootstrap_dns_servers = member.bootstrap_dns_servers;
             expanded_members.push_back(std::move(fallback));
         }
     }

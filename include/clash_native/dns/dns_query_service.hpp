@@ -7,6 +7,8 @@
 #include <clash_native/outbound/outbound_registry.hpp>
 #include <clash_native/router/traffic_router.hpp>
 
+#include <boost/asio/ip/udp.hpp>
+
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -18,6 +20,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace clash_native::dns {
 
@@ -32,13 +35,15 @@ struct DnsResolverConfig {
                       std::uint64_t cache_generation = 0,
                       std::shared_ptr<const ResolverDependencyGraph> dependency_graph = nullptr,
                       outbound::OutboundRegistry::Snapshot outbound_registry = nullptr,
-                      router::TrafficRouter::Snapshot traffic_router = nullptr)
+                      router::TrafficRouter::Snapshot traffic_router = nullptr,
+                      std::vector<boost::asio::ip::udp::endpoint> bootstrap_dns_servers = {})
         : default_upstream(std::move(default_upstream)),
           upstream_groups(std::move(upstream_groups)), policy_router(std::move(policy_router)),
           transport_factory(std::move(transport_factory)), group_configs(std::move(group_configs)),
           dependency_graph(std::move(dependency_graph)),
           outbound_registry(std::move(outbound_registry)),
-          traffic_router(std::move(traffic_router)) {
+          traffic_router(std::move(traffic_router)),
+          bootstrap_dns_servers(std::move(bootstrap_dns_servers)) {
         this->cache_capacity = cache_capacity;
         this->negative_cache_ttl = negative_cache_ttl;
         this->cache_generation = cache_generation;
@@ -55,6 +60,8 @@ struct DnsResolverConfig {
     std::shared_ptr<const ResolverDependencyGraph> dependency_graph;
     outbound::OutboundRegistry::Snapshot outbound_registry;
     router::TrafficRouter::Snapshot traffic_router;
+    // Literal DNS servers used before the built-in bootstrap fallback list.
+    std::vector<boost::asio::ip::udp::endpoint> bootstrap_dns_servers;
 };
 
 class DnsQueryService final {

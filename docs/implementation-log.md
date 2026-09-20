@@ -1,5 +1,16 @@
 # Implementation Log
 
+### 2026-09-20 — Add fixed-address bootstrap DNS fallback
+
+- Added an asynchronous bootstrap resolver chain for hostname-based DNS
+  upstreams. User-configured literal DNS servers are tried first, followed by
+  `223.5.5.5`, `223.6.6.6`, `1.1.1.1`, `1.0.0.1`, `8.8.8.8`, and `8.8.4.4`.
+- Bootstrap queries use Asio UDP with c-ares-backed DNS message parsing and
+  fall back to the Windows system resolver only after the literal candidates
+  are exhausted.
+- Added configuration and tests for the ordered built-in list and the system
+  resolver fallback.
+
 ### 2026-09-20 — Preserve domain addresses in datagram handles
 
 - Replaced the endpoint-only `DatagramHandle` address contract with the

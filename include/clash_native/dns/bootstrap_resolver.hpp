@@ -4,6 +4,7 @@
 #include <clash_native/runtime/asio_runtime.hpp>
 
 #include <boost/asio/ip/address.hpp>
+#include <boost/asio/ip/udp.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -27,5 +28,16 @@ class BootstrapResolver {
 };
 
 std::shared_ptr<BootstrapResolver> make_system_bootstrap_resolver(runtime::AsioRuntime &runtime);
+
+// Returns the built-in IPv4 DNS servers used to bootstrap hostname-based
+// encrypted DNS upstreams. The order is part of the fallback policy.
+std::vector<boost::asio::ip::udp::endpoint> default_bootstrap_dns_servers();
+
+// Creates a bootstrap resolver that tries configured literal DNS servers,
+// then the built-in servers, and finally the system resolver.
+std::shared_ptr<BootstrapResolver>
+make_bootstrap_resolver(runtime::AsioRuntime &runtime,
+                        std::vector<boost::asio::ip::udp::endpoint> configured_servers = {},
+                        std::shared_ptr<BootstrapResolver> system_resolver = nullptr);
 
 } // namespace clash_native::dns

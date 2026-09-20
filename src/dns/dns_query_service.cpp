@@ -183,6 +183,11 @@ DnsQueryService::DnsQueryService(runtime::AsioRuntime &runtime, DnsResolverConfi
     if (!config_.transport_factory) {
         config_.transport_factory = default_transport_factory();
     }
+    const auto install_bootstrap_servers = [this](DnsUpstreamConfig &upstream) {
+        if (upstream.bootstrap_dns_servers.empty()) {
+            upstream.bootstrap_dns_servers = config_.bootstrap_dns_servers;
+        }
+    };
     const auto install_egress_dialer = [this](DnsUpstreamConfig &upstream) {
         if (upstream.egress_hostname.empty()) {
             upstream.egress_hostname =
@@ -217,14 +222,17 @@ DnsQueryService::DnsQueryService(runtime::AsioRuntime &runtime, DnsResolverConfi
             }
         }
     };
+    install_bootstrap_servers(config_.default_upstream);
     install_egress_dialer(config_.default_upstream);
     for (auto &[name, upstream] : config_.upstream_groups) {
         (void)name;
+        install_bootstrap_servers(upstream);
         install_egress_dialer(upstream);
     }
     for (auto &[name, group] : config_.group_configs) {
         (void)name;
         for (auto &upstream : group.members) {
+            install_bootstrap_servers(upstream);
             install_egress_dialer(upstream);
         }
     }

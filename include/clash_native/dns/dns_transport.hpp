@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace clash_native::dns {
 
@@ -88,6 +89,8 @@ struct DnsUpstreamConfig {
     std::string egress_hostname;
     // When set, the endpoint address is resolved by the explicit bootstrap resolver.
     std::string hostname;
+    // Literal DNS servers tried before the built-in bootstrap servers.
+    std::vector<boost::asio::ip::udp::endpoint> bootstrap_dns_servers;
     std::shared_ptr<BootstrapResolver> bootstrap_resolver;
 };
 
