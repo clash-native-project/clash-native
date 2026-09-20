@@ -325,7 +325,11 @@ func testShadowsocksUDPAssociateWithPayload(t *testing.T, proxyAddress, targetAd
 func testShadowsocksUDPAssociateWithPayloadResult(t *testing.T, proxyAddress, targetAddress string,
 	expectedIP net.IP, want []byte, expectResponse bool) {
 	t.Helper()
-	clientUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	clientHost, _, err := net.SplitHostPort(proxyAddress)
+	if err != nil {
+		t.Fatalf("parse SOCKS5 proxy address: %v", err)
+	}
+	clientUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(clientHost)})
 	if err != nil {
 		t.Fatal(err)
 	}

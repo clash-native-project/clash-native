@@ -1,0 +1,20 @@
+#pragma once
+
+#include <clash_native/core/outbound.hpp>
+#include <clash_native/core/result.hpp>
+#include <clash_native/transport/shadowsocks/crypto.hpp>
+
+#include <boost/asio/ip/tcp.hpp>
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace clash_native::transport::shadowsocks {
+
+core::Result<std::unique_ptr<core::StreamHandle>> make_legacy_stream_handle(
+    std::shared_ptr<boost::asio::ip::tcp::socket> socket, std::string method,
+    std::string password, LegacyStreamCipher write_cipher);
+
+} // namespace clash_native::transport::shadowsocks

@@ -15,7 +15,30 @@ type UDPEcho struct {
 }
 
 func StartUDPEcho() (*UDPEcho, error) {
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	return StartUDPEchoAt(LocalIPv4Host())
+}
+
+// LocalIPv4Host returns the local IPv4 address selected for a non-loopback UDP
+// route. Windows test environments can disable UDP loopback while still
+// allowing local interface traffic, so UDP integration tests should use this
+// address when they need two independent processes to exchange datagrams.
+func LocalIPv4Host() string {
+	probe, err := net.DialUDP("udp4", nil, &net.UDPAddr{
+		IP:   net.IPv4(192, 0, 2, 1),
+		Port: 9,
+	})
+	if err == nil {
+		address := probe.LocalAddr().(*net.UDPAddr).IP
+		_ = probe.Close()
+		if address != nil && !address.IsUnspecified() && !address.IsLoopback() {
+			return address.String()
+		}
+	}
+	return "127.0.0.1"
+}
+
+func StartUDPEchoAt(host string) (*UDPEcho, error) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(host)})
 	if err != nil {
 		return nil, fmt.Errorf("listen for UDP echo endpoint: %w", err)
 	}

@@ -3,6 +3,7 @@
 #include <clash_native/outbound/http_proxy_outbound.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
 #include <clash_native/outbound/shadowsocks_outbound.hpp>
+#include <clash_native/transport/shadowsocks/ss2022_packet.hpp>
 #include <clash_native/outbound/trojan_outbound.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
@@ -13,6 +14,7 @@
 #include <boost/asio/signal_set.hpp>
 #include <boost/asio/streambuf.hpp>
 #include <boost/asio/write.hpp>
+#include <boost/system/errc.hpp>
 
 #include <charconv>
 #include <chrono>
@@ -31,6 +33,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
 
 namespace {
@@ -359,6 +362,78 @@ class Stage2ReloadControl final : public std::enable_shared_from_this<Stage2Relo
     boost::asio::ip::tcp::endpoint endpoint_;
 };
 
+int run_raw_shadowsocks2022_udp_test() {
+    const auto server_text = environment_value("CLASH_NATIVE_TEST_OUTBOUND_SERVER");
+    const auto method = environment_value("CLASH_NATIVE_TEST_OUTBOUND_METHOD");
+    const auto password = environment_value("CLASH_NATIVE_TEST_OUTBOUND_PASSWORD");
+    const auto target_text = environment_value("CLASH_NATIVE_TEST_RAW_SS2022_TARGET");
+    if (!server_text || !method || !password || !target_text) {
+        throw std::runtime_error("raw Shadowsocks 2022 UDP test variables are incomplete");
+    }
+    const auto server = parse_host_port(*server_text);
+    const auto target = parse_host_port(*target_text);
+    boost::system::error_code error;
+    const auto server_address = boost::asio::ip::make_address(server.host, error);
+    if (error || !server_address.is_v4()) {
+        throw std::runtime_error("raw Shadowsocks 2022 UDP test requires an IPv4 server");
+    }
+    const auto target_address = boost::asio::ip::make_address(target.host, error);
+    if (error || !target_address.is_v4()) {
+        throw std::runtime_error("raw Shadowsocks 2022 UDP test requires an IPv4 target");
+    }
+
+    clash_native::transport::shadowsocks::Shadowsocks2022DatagramCodec codec(*method, *password);
+    const auto target_bytes = target_address.to_v4().to_bytes();
+    std::vector<std::uint8_t> destination{1, target_bytes[0], target_bytes[1], target_bytes[2],
+                                          target_bytes[3], static_cast<std::uint8_t>(target.port >> 8),
+                                          static_cast<std::uint8_t>(target.port)};
+    const std::vector<std::uint8_t> payload{'c', 'l', 'a', 's', 'h', '-', 'n', 'a', 't', 'i', 'v',
+                                            'e', '-', 's', 's', '2', '0', '2', '2', '-', 'u', 'd', 'p'};
+    const auto wire = codec.encrypt(destination, payload);
+    if (!wire) {
+        throw std::runtime_error(wire.error().context);
+    }
+
+    boost::asio::io_context context;
+    boost::asio::ip::udp::socket socket(context, boost::asio::ip::udp::v4());
+    socket.bind({boost::asio::ip::udp::v4(), 0}, error);
+    if (error) {
+        throw std::system_error(error, "bind raw Shadowsocks 2022 UDP socket");
+    }
+    const boost::asio::ip::udp::endpoint server_endpoint(server_address, server.port);
+    std::cout << "clash-native-test-host raw-udp-ready" << std::endl;
+    socket.send_to(boost::asio::buffer(wire.value()), server_endpoint, 0, error);
+    if (error) {
+        throw std::system_error(error, "send raw Shadowsocks 2022 UDP packet");
+    }
+    socket.non_blocking(true, error);
+    if (error) {
+        throw std::system_error(error, "configure raw Shadowsocks 2022 UDP socket");
+    }
+    std::array<std::uint8_t, 65507> buffer{};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        boost::asio::ip::udp::endpoint sender;
+        const auto size = socket.receive_from(boost::asio::buffer(buffer), sender, 0, error);
+        if (!error) {
+            auto plaintext = codec.decrypt(std::span<const std::uint8_t>(buffer.data(), size));
+            if (!plaintext || plaintext.value().size() != destination.size() + payload.size() ||
+                !std::equal(destination.begin(), destination.end(), plaintext.value().begin()) ||
+                !std::equal(payload.begin(), payload.end(), plaintext.value().begin() +
+                                                               static_cast<std::ptrdiff_t>(destination.size()))) {
+                throw std::runtime_error("raw Shadowsocks 2022 UDP response payload mismatch");
+            }
+            std::cout << "clash-native-test-host raw-udp-pass" << std::endl;
+            return 0;
+        }
+        if (error != boost::asio::error::would_block && error != boost::asio::error::try_again) {
+            throw std::system_error(error, "receive raw Shadowsocks 2022 UDP response");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    throw std::runtime_error("timed out waiting for raw Shadowsocks 2022 UDP response");
+}
+
 } // namespace
 
 int main(int argc, char **) {
@@ -368,6 +443,10 @@ int main(int argc, char **) {
     }
 
     try {
+        if (const auto raw_udp = environment_value("CLASH_NATIVE_TEST_RAW_SS2022_UDP");
+            raw_udp && *raw_udp == "1") {
+            return run_raw_shadowsocks2022_udp_test();
+        }
         clash_native::runtime::AsioRuntime runtime;
         std::shared_ptr<clash_native::dns::ResolverService> resolver;
         std::shared_ptr<clash_native::dns::ResolverService> reload_resolver;
@@ -442,8 +521,17 @@ int main(int argc, char **) {
             };
         }
 
-        clash_native::proxy::ProxyServer proxy(runtime,
-                                               {boost::asio::ip::address_v4::loopback(), 0});
+        boost::system::error_code proxy_address_error;
+        auto proxy_address = boost::asio::ip::address_v4::loopback();
+        if (const auto proxy_host = environment_value("CLASH_NATIVE_TEST_PROXY_HOST");
+            proxy_host && !proxy_host->empty()) {
+            const auto parsed = boost::asio::ip::make_address(*proxy_host, proxy_address_error);
+            if (proxy_address_error || !parsed.is_v4()) {
+                throw std::runtime_error("CLASH_NATIVE_TEST_PROXY_HOST must be an IPv4 address");
+            }
+            proxy_address = parsed.to_v4();
+        }
+        clash_native::proxy::ProxyServer proxy(runtime, {proxy_address, 0});
         if (resolver) {
             proxy.set_resolver(resolver);
         }

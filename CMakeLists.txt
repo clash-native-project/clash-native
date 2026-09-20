@@ -16,6 +16,8 @@ find_package(c-ares CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 find_package(kcp CONFIG REQUIRED)
 find_package(OpenSSL CONFIG REQUIRED)
+find_package(blake3 CONFIG REQUIRED)
+find_package(botan CONFIG REQUIRED)
 find_package(nghttp3 CONFIG REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
@@ -137,10 +139,16 @@ add_library(clash-native-core STATIC
     src/transport/grpc_client.cpp
     src/transport/kcp_client.cpp
     src/transport/websocket_client.cpp
+    src/transport/shadowsocks/crypto.cpp
+    src/transport/shadowsocks/aead_packet.cpp
+    src/transport/shadowsocks/legacy_packet.cpp
+    src/transport/shadowsocks/legacy_stream.cpp
+    src/transport/shadowsocks/ss2022_packet.cpp
+    src/transport/shadowsocks/ss2022_stream.cpp
+    src/outbound/shadowsocks_legacy_datagram.cpp
     src/transport/endpoint_dialer.cpp
     src/transport/quic_client.cpp
     src/transport/tls_client.cpp
-    src/outbound/shadowsocks_crypto.cpp
     src/outbound/shadowsocks_outbound.cpp
     src/outbound/trojan_outbound.cpp
     src/outbound/http_proxy_outbound.cpp
@@ -174,6 +182,8 @@ target_link_libraries(clash-native-core
         Boost::beast
         c-ares::cares
         clash-native-boringssl
+        BLAKE3::blake3
+        Botan::Botan-static
         clash-native-nghttp2
         kcp::kcp
         ngtcp2_static
@@ -301,6 +311,7 @@ if(BUILD_TESTING)
         tests/transport/kcp_client_test.cpp
         tests/transport/websocket_client_test.cpp
         tests/transport/udp_stream_test.cpp
+        tests/transport/shadowsocks_transport_test.cpp
     )
 
     target_include_directories(clash-native-tests

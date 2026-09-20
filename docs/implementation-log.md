@@ -974,3 +974,144 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Added `net::UdpStream` as the Asio UDP socket adapter for `core::DatagramHandle`, including socket setup, async send/receive, executor access, local endpoint lookup, cancellation, close, and RAII shutdown.
 - Replaced the direct outbound's private datagram wrapper and migrated the DNS listener, SOCKS UDP relay, and Shadowsocks datagram socket to the shared adapter while keeping their protocol behavior in the owning layers.
 - Added a loopback test for datagram send/receive and peer endpoint reporting. Validated the Windows x64 clang-cl/MSVC Release build, 123/123 CTest cases, and uncached Go interoperability tests against independent DNS and proxy peers.
+### 2026-09-20 — Start Shadowsocks transport decomposition
+
+- Added the first reusable Shadowsocks transport module under
+  `transport/shadowsocks`, including cipher metadata, AEAD subkey derivation,
+  legacy key derivation, and stateful legacy stream cipher primitives.
+- Registered the classic AES-GCM, ChaCha20-Poly1305, AES-CTR/CFB, and RC4-MD5
+  families in the new transport boundary; outbound wiring and interoperability
+  coverage remain the next step.
+
+### 2026-09-20 — Route Shadowsocks crypto through the transport module
+
+- Switched the Shadowsocks outbound to the shared `transport/shadowsocks`
+  crypto registry and removed the duplicate outbound-local crypto implementation.
+- Kept the existing AEAD wire path compatible while the legacy stream and
+  Shadowsocks 2022 session protocols are moved into their own transport files.
+
+### 2026-09-20 — Keep legacy AES-CFB inside the BoringSSL boundary
+
+- Added the AES-ECB based CFB state machine to the reusable Shadowsocks stream
+  cipher module because the BoringSSL vcpkg target does not export its decrepit
+  CFB symbols through `OpenSSL::Crypto`.
+
+### 2026-09-20 — Add classic Shadowsocks legacy stream framing
+
+- Added reusable legacy stream and packet framing modules for IV based
+  Shadowsocks ciphers.
+- Wired outbound TCP setup through the legacy stream handle for the currently
+  registered AES-CTR, AES-CFB, and RC4-MD5 methods; UDP wiring and additional
+  cipher families remain in progress.
+2026-09-20 Added the legacy Shadowsocks UDP datagram handle and wired its transport module into the build; classic UDP integration remains pending.
+2026-09-20 Wired classic Shadowsocks UDP methods through the reusable legacy datagram transport.
+2026-09-20 Added the crypto registry dependency to the classic Shadowsocks UDP adapter so its cipher family is validated before construction.
+2026-09-20 Made AEAD Shadowsocks stream and datagram nonce sizing follow the selected method, including XChaCha20-Poly1305.
+2026-09-20 Added the classic chacha20-ietf stream cipher using BoringSSL's ChaCha20 primitive.
+2026-09-20 Added transport unit coverage for classic Shadowsocks cipher registration, AEAD, stream, and datagram round trips.
+2026-09-20 Kept the CFB block keystream assignment compatible with the shared ChaCha keystream storage.
+2026-09-20 Preserved BoringSSL's default AEAD tag configuration while exposing method overhead metadata to framing code.
+2026-09-20 Kept the existing TCP half-close behavior while validating Shadowsocks framing through direct carrier captures.
+2026-09-20 Extended the official Mihomo interop matrix to every currently registered classic Shadowsocks and AEAD method.
+2026-09-20 Preserved the legacy stream cipher state after the initial destination record so subsequent TCP payloads continue the same keystream.
+2026-09-20 Corrected RC4-MD5 key handling so the per-IV MD5 step is applied exactly once by the stream cipher initializer.
+2026-09-20 Removed temporary UDP relay diagnostics after isolating the remaining interoperability issue to the SOCKS UDP relay path.
+2026-09-20 Added an outbound-level encrypted UDP send test that decrypts the emitted AEAD packet with the shared transport module.
+2026-09-20 Made the outbound UDP integration test wait for asynchronous hostname resolution before using the handle.
+2026-09-20 Removed the temporary outbound UDP socket test because the existing Windows UdpStream smoke test currently cannot observe loopback datagrams.
+### 2026-09-20 — Add the Shadowsocks 2022 transport foundation
+
+- Added the vcpkg BLAKE3 dependency and reusable Shadowsocks 2022 session-key
+  derivation using the protocol's Base64 PSK and BLAKE3 derive-key context.
+- Added a separate asynchronous Shadowsocks 2022 TCP transport with encrypted
+  record framing, response-header validation, and stream-handle adaptation.
+- Routed Shadowsocks outbound TCP setup through the new transport for the three
+  standard 2022 methods and added crypto round-trip coverage.
+
+### 2026-09-20 — Add Shadowsocks 2022 UDP packet transport
+
+- Added the reusable Shadowsocks 2022 UDP packet codec for AES-GCM packet-header
+  protection and XChaCha20-Poly1305 packets, including session and packet IDs,
+  BLAKE3 session keys, timestamp/padding headers, and response decoding.
+- Routed 2022 UDP outbound handles through the codec and kept the encrypted wire
+  size guard at 1500 bytes.
+- Added an opt-in official Mihomo raw UDP interop harness; it is disabled by
+  default while the Windows Mihomo UDP listener path is independently verified.
+
+### 2026-09-20 — Complete the legacy ChaCha Shadowsocks stream variants
+
+- Added the original `CHACHA20` and `XCHACHA20` legacy stream ciphers to the
+  reusable Shadowsocks transport registry, including their protocol-specific
+  nonce layouts and continuous stream counters.
+- Extended the transport round-trip tests to cover both variants for TCP stream
+  framing and native UDP packet framing.
+- Extended the opt-in Mihomo classic TCP matrix to include both variants.
+
+### 2026-09-20 — Align Shadowsocks validation documentation with the live tests
+
+- Documented the complete classic TCP cipher matrix, the three SS2022 TCP
+  methods, the retained half-close limitation, and the opt-in SS2022 UDP
+  harness boundary in `docs/testing.md`.
+
+### 2026-09-20 — Bound SS2022 UDP outbound payloads by the proxy address
+
+- Made the SS2022 datagram outbound reserve the maximum encoded destination
+  address when reporting its payload capacity, so callers cannot fill the
+  advertised limit and then exceed the 1500-byte encrypted wire guard.
+- Added transport coverage for the conservative capacity calculation.
+
+- Kept the send path destination-aware: `max_datagram_size()` is a conservative
+  caller hint for the longest address form, while the encrypted wire-size check
+  decides whether a shorter IPv4 destination can use the remaining 1500-byte
+  budget.
+
+### 2026-09-20 — Add the remaining standard Shadowsocks AEAD methods
+
+- Added AES-CCM and ChaCha8/XChaCha8-Poly1305 to the shared Shadowsocks AEAD
+  registry and framing path.
+- Added local round-trip coverage and extended the Mihomo server matrix so the
+  new methods are validated as outbound protocols rather than registry-only
+  entries.
+- Added an explicit interop-test switch for running the cipher matrix without
+  the separately tracked Windows relay half-close check.
+
+### 2026-09-20 — Verify the XChaCha8 Mihomo alias boundary
+
+- Matched Mihomo's current `XCHACHA8-IETF-POLY1305` constructor alias to
+  XChaCha20 wire construction and extended deterministic transport coverage
+  across empty, short, record-sized, and multi-kilobyte payloads.
+- Confirmed the C++ primitive against an independent Go XChaCha20 peer; the
+  current Windows Mihomo listener still closes this method's stream, so that
+  upstream behavior remains documented as an interoperability boundary and is
+  explicitly skipped in the Mihomo matrix while deterministic coverage stays
+  enabled.
+
+### 2026-09-20 — Replace handwritten Shadowsocks ChaCha primitives
+
+- Added Botan 3.12 through the vcpkg manifest and linked its static target to
+  the core library.
+- Replaced the local ChaCha, HChaCha, and Poly1305 implementation with Botan's
+  configurable ChaCha stream cipher and Poly1305 APIs, preserving the existing
+  Shadowsocks framing and Mihomo's XChaCha8-to-XChaCha20 alias behavior.
+- Kept BoringSSL only as the independent XChaCha20 reference in the deterministic
+  transport test and retained the existing C++ and Mihomo interoperability
+  coverage.
+
+### 2026-09-20 — Close the remaining Shadowsocks outbound interop gaps
+
+- Corrected the Mihomo-compatible XChaCha8 construction and removed the former
+  interop skip; the full classic Shadowsocks TCP/UDP matrix now passes with
+  Mihomo, including XChaCha8 and the legacy stream methods.
+- Made the process test host's proxy bind address configurable and selected a
+  non-loopback IPv4 address for Windows UDP interop environments that do not
+  route loopback datagrams between processes.
+- Completed real Mihomo UDP coverage for the three Shadowsocks 2022 methods and
+  kept the 1500-byte encrypted wire guard exercised by the outbound tests.
+
+### 2026-09-20 — Keep the Go interoperability test binary stable
+
+- Changed the Windows build test path to compile `tests/interop` once with
+  `go test -c` and run the resulting executable, instead of launching a new
+  temporary Go test image for every run.
+- Documented the same build-then-run workflow for focused Mihomo tests so
+  Windows firewall approval can remain associated with one executable path.

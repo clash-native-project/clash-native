@@ -22,19 +22,36 @@ struct ReceivedDatagram {
     UdpEndpoint sender;
 };
 
+boost::asio::ip::address_v4 udp_test_address(boost::asio::io_context &context) {
+    boost::asio::ip::udp::socket probe(context);
+    boost::system::error_code error;
+    probe.open(boost::asio::ip::udp::v4(), error);
+    if (!error) {
+        probe.connect({boost::asio::ip::make_address_v4("192.0.2.1"), 9}, error);
+        if (!error) {
+            const auto local = probe.local_endpoint(error).address();
+            if (!error && local.is_v4() && !local.is_loopback() && !local.is_unspecified()) {
+                return local.to_v4();
+            }
+        }
+    }
+    return boost::asio::ip::address_v4::loopback();
+}
+
 } // namespace
 
 TEST(UdpStreamTest, SendsAndReceivesDatagramsWithPeerEndpoints) {
     clash_native::runtime::AsioRuntime runtime;
+    const auto test_address = udp_test_address(runtime.context());
     clash_native::net::UdpStream stream(runtime.context().get_executor());
     boost::system::error_code error;
     stream.open(boost::asio::ip::udp::v4(), error);
     ASSERT_FALSE(error);
-    stream.bind({boost::asio::ip::address_v4::loopback(), 0}, error);
+    stream.bind({test_address, 0}, error);
     ASSERT_FALSE(error);
 
     boost::asio::ip::udp::socket peer(runtime.context(),
-                                      {boost::asio::ip::address_v4::loopback(), 0});
+                                      {test_address, 0});
     const auto stream_endpoint = stream.local_endpoint(error);
     ASSERT_FALSE(error);
 

@@ -317,10 +317,20 @@ def main() -> int:
             ]
             godebug.append("http2xconnect=1")
             environment["GODEBUG"] = ",".join(godebug)
+            interop_dir = PROJECT_ROOT / "tests" / "interop"
+            interop_binary = build_dir / "clash-native-interop-tests.exe"
+            # Keep a stable test executable path so Windows firewall approval is
+            # attached to one binary instead of a new temporary go test image
+            # on every invocation.
             run(
-                [str(go), "test", "-count=1", "./..."],
+                [str(go), "test", "-c", "-o", str(interop_binary), "."],
                 environment,
-                cwd=PROJECT_ROOT / "tests" / "interop",
+                cwd=interop_dir,
+            )
+            run(
+                [str(interop_binary), "-test.count=1"],
+                environment,
+                cwd=interop_dir,
             )
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
         print(f"Build failed: {error}", file=sys.stderr)

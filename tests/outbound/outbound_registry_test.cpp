@@ -44,6 +44,22 @@ class StubOutbound final : public clash_native::core::Outbound {
     clash_native::core::OutboundDescriptor descriptor_;
 };
 
+boost::asio::ip::address_v4 udp_test_address(boost::asio::io_context &context) {
+    boost::asio::ip::udp::socket probe(context);
+    boost::system::error_code error;
+    probe.open(boost::asio::ip::udp::v4(), error);
+    if (!error) {
+        probe.connect({boost::asio::ip::make_address_v4("192.0.2.1"), 9}, error);
+        if (!error) {
+            const auto local = probe.local_endpoint(error).address();
+            if (!error && local.is_v4() && !local.is_loopback() && !local.is_unspecified()) {
+                return local.to_v4();
+            }
+        }
+    }
+    return boost::asio::ip::address_v4::loopback();
+}
+
 } // namespace
 
 TEST(OutboundRegistryTest, ValidatesGroupsAndSelectsMembers) {
@@ -165,12 +181,13 @@ TEST(ShadowsocksOutboundTest, RejectsEncryptedUdpDatagramsLargerThan1500Bytes) {
 
     clash_native::runtime::AsioRuntime runtime;
     runtime.start();
+    const auto test_address = udp_test_address(runtime.context());
 
     for (const auto &method : methods) {
         boost::asio::ip::udp::socket server(runtime.context(),
-                                            {boost::asio::ip::address_v4::loopback(), 0});
+                                            {test_address, 0});
         clash_native::outbound::ShadowsocksOutbound outbound(
-            runtime, {"test-shadowsocks", "127.0.0.1", server.local_endpoint().port(), method.name,
+            runtime, {"test-shadowsocks", test_address.to_string(), server.local_endpoint().port(), method.name,
                       "test-password"});
 
         auto opened_promise =
@@ -185,7 +202,7 @@ TEST(ShadowsocksOutboundTest, RejectsEncryptedUdpDatagramsLargerThan1500Bytes) {
         auto handle = std::move(opened.handle);
 
         const auto destination =
-            boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 53);
+            boost::asio::ip::udp::endpoint(test_address, 53);
         const auto payload_at_limit =
             encrypted_limit - method.key_size - ipv4_proxy_address_size - aead_tag_size;
 

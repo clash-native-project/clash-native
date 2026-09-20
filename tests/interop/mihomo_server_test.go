@@ -19,7 +19,7 @@ import (
 const mihomoTestPassword = "clash-native-mihomo-test-password"
 
 // Leave room for Shadowsocks framing within the outbound's 1500-byte encrypted datagram limit.
-const mihomoInteropUDPPayloadSize = 1200
+const mihomoInteropUDPPayloadSize = 1000
 
 func TestMihomoActualServerInteroperability(t *testing.T) {
 	mihomoExecutable := os.Getenv("MIHOMO_EXECUTABLE")
@@ -40,17 +40,24 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer udpEcho.Close()
+	udpHost := endpoints.LocalIPv4Host()
 
 	tlsMaterial, err := endpoints.NewTrojanTLSMaterial()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	methods := []string{"aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"}
+	methods := []string{
+		"aes-128-gcm", "aes-192-gcm", "aes-256-gcm", "chacha20-ietf-poly1305",
+		"xchacha20-ietf-poly1305", "chacha8-ietf-poly1305", "xchacha8-ietf-poly1305",
+		"aes-128-ccm", "aes-192-ccm", "aes-256-ccm", "aes-128-ctr", "aes-192-ctr", "aes-256-ctr",
+		"aes-128-cfb", "aes-192-cfb", "aes-256-cfb", "rc4-md5", "chacha20-ietf",
+		"chacha20", "xchacha20",
+	}
 	shadowsocksAddresses := make(map[string]string, len(methods))
 	var listenerConfig strings.Builder
 	for _, method := range methods {
-		address := reserveMihomoShadowsocksAddress(t)
+		address := reserveMihomoShadowsocksAddressOnHost(t, udpHost)
 		shadowsocksAddresses[method] = address
 		_, port, err := net.SplitHostPort(address)
 		if err != nil {
@@ -59,12 +66,12 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
 		fmt.Fprintf(&listenerConfig, `
   - name: test-%s
     type: shadowsocks
-    listen: 127.0.0.1
+    listen: %s
     port: %s
     udp: true
     password: '%s'
     cipher: %s
-`, method, port, mihomoTestPassword, method)
+`, method, udpHost, port, mihomoTestPassword, method)
 	}
 	trojanAddress := reserveMihomoTCPAddress(t)
 	_, trojanPort, err := net.SplitHostPort(trojanAddress)
@@ -126,6 +133,7 @@ listeners:%s
 				"CLASH_NATIVE_TEST_OUTBOUND_SERVER":   shadowsocksAddresses[method],
 				"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD": mihomoTestPassword,
 				"CLASH_NATIVE_TEST_OUTBOUND_METHOD":   method,
+				"CLASH_NATIVE_TEST_PROXY_HOST":        udpHost,
 			})
 			defer stopProxy()
 
@@ -133,8 +141,10 @@ listeners:%s
 			defer client.Close()
 			payload := []byte(strings.Repeat("cpp-to-mihomo-shadowsocks-tcp-", 2048))
 			writeBytes(t, client, payload)
-			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
-				t.Fatalf("half-close C++ to Mihomo Shadowsocks TCP stream: %v", err)
+			if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+				if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+					t.Fatalf("half-close C++ to Mihomo Shadowsocks TCP stream: %v", err)
+				}
 			}
 			echoed := make([]byte, len(payload))
 			readBytes(t, client, echoed)
@@ -147,8 +157,7 @@ listeners:%s
 				udpPayload[index] = byte(index % 251)
 			}
 			testShadowsocksUDPAssociateWithPayload(t, proxyAddress,
-				testHostnameAddress(t, "127.0.0.1", udpEcho.Addr().String()),
-				net.IPv4(127, 0, 0, 1), udpPayload)
+				udpEcho.Addr().String(), udpEcho.Addr().IP, udpPayload)
 		})
 	}
 
@@ -202,6 +211,192 @@ listeners:%s
 			t.Fatal("C++ Trojan outbound accepted Mihomo's untrusted certificate")
 		}
 	})
+}
+
+func TestMihomoActualServerShadowsocks2022TCP(t *testing.T) {
+	mihomoExecutable := os.Getenv("MIHOMO_EXECUTABLE")
+	if mihomoExecutable == "" {
+		t.Skip("MIHOMO_EXECUTABLE is not set")
+	}
+	if os.Getenv("CLASH_NATIVE_TEST_HOST") == "" {
+		t.Skip("CLASH_NATIVE_TEST_HOST is not set")
+	}
+
+	tcpEcho, err := endpoints.StartTCPEcho()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcpEcho.Close()
+	keys := []struct {
+		method   string
+		password string
+	}{
+		{"2022-blake3-aes-128-gcm", "AQIDBAUGBwgJCgsMDQ4PEA=="},
+		{"2022-blake3-aes-256-gcm", "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="},
+		{"2022-blake3-chacha20-poly1305", "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="},
+	}
+	addresses := make(map[string]string, len(keys))
+	var listenerConfig strings.Builder
+	for _, key := range keys {
+		address := reserveMihomoShadowsocksAddress(t)
+		addresses[key.method] = address
+		_, port, err := net.SplitHostPort(address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&listenerConfig, `
+  - name: test-%s
+    type: shadowsocks
+    listen: 127.0.0.1
+    port: %s
+    udp: true
+    password: '%s'
+    cipher: %s
+`, key.method, port, key.password, key.method)
+	}
+
+	home := t.TempDir()
+	configPath := filepath.Join(home, "config.yaml")
+	config := fmt.Sprintf(`allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: debug
+ipv6: false
+rules:
+  - MATCH,DIRECT
+listeners:%s
+`, listenerConfig.String())
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	addressesList := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		addressesList = append(addressesList, address)
+	}
+	mihomo := startMihomo(t, mihomoExecutable, home, configPath, addressesList)
+	defer stopInteropProcess(t, mihomo)
+
+	for _, key := range keys {
+		key := key
+		t.Run(key.method, func(t *testing.T) {
+			proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+				"CLASH_NATIVE_TEST_OUTBOUND":          "shadowsocks",
+				"CLASH_NATIVE_TEST_OUTBOUND_SERVER":   addresses[key.method],
+				"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD": key.password,
+				"CLASH_NATIVE_TEST_OUTBOUND_METHOD":   key.method,
+			})
+			defer stopProxy()
+			client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+			defer client.Close()
+			payload := []byte(strings.Repeat("cpp-to-mihomo-shadowsocks-2022-tcp-", 64))
+			writeBytes(t, client, payload)
+			echoed := make([]byte, len(payload))
+			readBytes(t, client, echoed)
+			if string(echoed) != string(payload) {
+				t.Fatal("Mihomo Shadowsocks 2022 TCP returned different bytes")
+			}
+		})
+	}
+}
+
+func TestMihomoActualServerShadowsocks2022UDP(t *testing.T) {
+	mihomoExecutable := os.Getenv("MIHOMO_EXECUTABLE")
+	if mihomoExecutable == "" {
+		t.Skip("MIHOMO_EXECUTABLE is not set")
+	}
+	testHostExecutable := os.Getenv("CLASH_NATIVE_TEST_HOST")
+	if testHostExecutable == "" {
+		t.Skip("CLASH_NATIVE_TEST_HOST is not set")
+	}
+	udpHost := endpoints.LocalIPv4Host()
+	udpEcho, err := endpoints.StartUDPEchoAt(udpHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpEcho.Close()
+
+	keys := []struct {
+		method   string
+		password string
+	}{
+		{"2022-blake3-aes-128-gcm", "AQIDBAUGBwgJCgsMDQ4PEA=="},
+		{"2022-blake3-aes-256-gcm", "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="},
+		{"2022-blake3-chacha20-poly1305", "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="},
+	}
+	addresses := make(map[string]string, len(keys))
+	var listenerConfig strings.Builder
+	for _, key := range keys {
+		address := reserveMihomoShadowsocksAddressOnHost(t, udpHost)
+		addresses[key.method] = address
+		_, port, err := net.SplitHostPort(address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&listenerConfig, `
+  - name: test-%s
+    type: shadowsocks
+    listen: %s
+    port: %s
+    udp: true
+    password: '%s'
+    cipher: %s
+`, key.method, udpHost, port, key.password, key.method)
+	}
+	home := t.TempDir()
+	configPath := filepath.Join(home, "config.yaml")
+	config := fmt.Sprintf(`allow-lan: false
+bind-address: 0.0.0.0
+mode: rule
+log-level: debug
+ipv6: false
+rules:
+  - MATCH,DIRECT
+listeners:%s
+`, listenerConfig.String())
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	listenerAddresses := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		listenerAddresses = append(listenerAddresses, address)
+	}
+	mihomo := startMihomo(t, mihomoExecutable, home, configPath, listenerAddresses)
+	defer stopInteropProcess(t, mihomo)
+
+	for _, key := range keys {
+		key := key
+		t.Run(key.method, func(t *testing.T) {
+			processContext, cancel := context.WithCancel(context.Background())
+			process, err := harness.StartWithEnv(processContext, testHostExecutable, map[string]string{
+				"CLASH_NATIVE_TEST_RAW_SS2022_UDP":    "1",
+				"CLASH_NATIVE_TEST_OUTBOUND_SERVER":   addresses[key.method],
+				"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD": key.password,
+				"CLASH_NATIVE_TEST_OUTBOUND_METHOD":   key.method,
+				"CLASH_NATIVE_TEST_RAW_SS2022_TARGET": udpEcho.Addr().String(),
+			})
+			if err != nil {
+				cancel()
+				t.Fatalf("start raw Shadowsocks 2022 UDP test host: %v", err)
+			}
+			defer cancel()
+			readyContext, readyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, err = harness.WaitForLine(readyContext, process, "clash-native-test-host raw-udp-ready")
+			readyCancel()
+			if err != nil {
+				stdout, stderr := process.Output()
+				t.Fatalf("wait for raw Shadowsocks 2022 UDP test host: %v; stdout=%q stderr=%q",
+					err, stdout, stderr)
+			}
+			waitContext, waitCancel := context.WithTimeout(context.Background(), 8*time.Second)
+			err = process.Wait(waitContext)
+			waitCancel()
+			if err != nil {
+				stdout, stderr := process.Output()
+				t.Fatalf("raw Shadowsocks 2022 UDP test failed: %v; stdout=%q stderr=%q",
+					err, stdout, stderr)
+			}
+		})
+	}
 }
 
 func startMihomo(t *testing.T, executable, home, config string, listeners []string) *harness.Process {
@@ -264,22 +459,26 @@ func stopInteropProcess(t *testing.T, process *harness.Process) {
 }
 
 func reserveMihomoShadowsocksAddress(t *testing.T) string {
+	return reserveMihomoShadowsocksAddressOnHost(t, "127.0.0.1")
+}
+
+func reserveMihomoShadowsocksAddressOnHost(t *testing.T, host string) string {
 	t.Helper()
 	var lastErr error
 	for range 64 {
-		udp, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		tcp, err := net.Listen("tcp4", net.JoinHostPort(host, "0"))
 		if err != nil {
 			t.Fatalf("reserve Mihomo Shadowsocks UDP port: %v", err)
 		}
-		port := udp.LocalAddr().(*net.UDPAddr).Port
-		tcp, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
-		_ = udp.Close()
+		port := tcp.Addr().(*net.TCPAddr).Port
+		udp, err := net.ListenPacket("udp4", net.JoinHostPort(host, strconv.Itoa(port)))
+		_ = tcp.Close()
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		_ = tcp.Close()
-		return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+		_ = udp.Close()
+		return net.JoinHostPort(host, strconv.Itoa(port))
 	}
 	t.Fatalf("reserve a shared TCP/UDP port for Mihomo Shadowsocks: %v", lastErr)
 	return ""
