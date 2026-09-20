@@ -6,6 +6,7 @@
 #include <clash_native/transport/shadowsocks/crypto.hpp>
 #include <clash_native/transport/shadowsocks/legacy_stream.hpp>
 #include <clash_native/transport/shadowsocks/simple_obfs.hpp>
+#include <clash_native/transport/shadowsocks/shadow_tls.hpp>
 #include <clash_native/transport/shadowsocks/ss2022_packet.hpp>
 #include <clash_native/transport/shadowsocks/ss2022_stream.hpp>
 #include <clash_native/transport/shadowsocks/stream_carrier.hpp>
@@ -24,8 +25,6 @@
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/system/errc.hpp>
-
-#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
@@ -371,10 +370,17 @@ class ShadowsocksStreamHandle final : public core::StreamHandle {
         }
 
         void read_exact_carrier(boost::asio::mutable_buffer buffer, ExactReadHandler handler) {
+            auto callback = std::make_shared<ExactReadHandler>(std::move(handler));
+            read_exact_carrier(buffer, std::move(callback));
+        }
+
+        void read_exact_carrier(boost::asio::mutable_buffer buffer,
+                                std::shared_ptr<ExactReadHandler> callback) {
             auto self = shared_from_this();
             carrier->async_read_some(
-                buffer, [self, buffer, handler = std::move(handler)](
+                buffer, [self, buffer, callback = std::move(callback)](
                             const boost::system::error_code &error, std::size_t size) mutable {
+                    auto &handler = *callback;
                     if (error) {
                         handler(error);
                         return;
@@ -389,7 +395,7 @@ class ShadowsocksStreamHandle final : public core::StreamHandle {
                     }
                     auto remaining = boost::asio::mutable_buffer(
                         static_cast<std::uint8_t *>(buffer.data()) + size, buffer.size() - size);
-                    self->read_exact_carrier(remaining, std::move(handler));
+                    self->read_exact_carrier(remaining, callback);
                 });
         }
 
@@ -528,7 +534,7 @@ class ShadowsocksConnectOperation final
         }
         if (!config_.plugin.empty() && config_.plugin != "obfs" &&
             config_.plugin != "v2ray-plugin" && config_.plugin != "gost-plugin" &&
-            config_.plugin != "kcptun") {
+            config_.plugin != "kcptun" && config_.plugin != "shadow-tls") {
             return core::fail({core::ErrorCode::unsupported, "unsupported Shadowsocks plugin", {}});
         }
         if (config_.plugin == "obfs" && config_.plugin_mode != "http" &&
@@ -548,6 +554,26 @@ class ShadowsocksConnectOperation final
             return core::fail({core::ErrorCode::configuration,
                                "Shadowsocks kcptun does not use WebSocket plugin options",
                                {}});
+        }
+        if (config_.plugin == "shadow-tls") {
+            if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() || config_.plugin_tls) {
+                return core::fail({core::ErrorCode::configuration,
+                                   "Shadowsocks Shadow-TLS does not use WebSocket plugin options",
+                                   {}});
+            }
+            if (config_.plugin_version < 1 || config_.plugin_version > 2) {
+                return core::fail({core::ErrorCode::configuration,
+                                   "Shadowsocks Shadow-TLS version must be 1 or 2", {}});
+            }
+            if (config_.plugin_version == 2 && config_.plugin_password.empty()) {
+                return core::fail({core::ErrorCode::configuration,
+                                   "Shadowsocks Shadow-TLS v2 requires a plugin password",
+                                   {}});
+            }
+            if (config_.plugin_host.empty()) {
+                return core::fail({core::ErrorCode::configuration,
+                                   "Shadowsocks Shadow-TLS host is required", {}});
+            }
         }
         if (config_.udp_over_tcp_version != 1 && config_.udp_over_tcp_version != 2) {
             return core::fail({core::ErrorCode::configuration,
@@ -581,6 +607,8 @@ class ShadowsocksConnectOperation final
     }
 
     bool kcptun_plugin() const noexcept { return config_.plugin == "kcptun"; }
+
+    bool shadow_tls_plugin() const noexcept { return config_.plugin == "shadow-tls"; }
 
     ss::WebSocketPluginOptions websocket_options() const {
         return {config_.plugin_host.empty() ? "bing.com" : config_.plugin_host,
@@ -645,6 +673,33 @@ class ShadowsocksConnectOperation final
                          "failed to connect to Shadowsocks server", detail::to_std_error(error)}));
                     return;
                 }
+                if (self->shadow_tls_plugin()) {
+                    self->open_shadow_tls();
+                    return;
+                }
+                self->send_initial_request();
+            });
+    }
+
+    void open_shadow_tls() {
+        auto self = shared_from_this();
+        auto stream = std::make_unique<net::TcpStream>(std::move(*socket_));
+        ss::ShadowTlsClientOptions options;
+        options.version = config_.plugin_version;
+        options.password = config_.plugin_password;
+        options.host = config_.plugin_host;
+        options.skip_cert_verify = config_.plugin_skip_cert_verify;
+        if (!config_.plugin_alpn.empty()) {
+            options.alpn_protocols = config_.plugin_alpn;
+        }
+        ss::async_open_shadow_tls(
+            std::move(stream), std::move(options),
+            [self](core::Result<std::unique_ptr<core::StreamHandle>> result) mutable {
+                if (!result) {
+                    self->finish(core::StreamOpenResult::failed(result.error()));
+                    return;
+                }
+                self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
                 self->send_initial_request();
             });
     }
@@ -1231,7 +1286,8 @@ core::Status ShadowsocksOutbound::validate() const {
         return core::Status(core::fail(method.error()));
     }
     if (!config_.plugin.empty() && config_.plugin != "obfs" && config_.plugin != "v2ray-plugin" &&
-        config_.plugin != "gost-plugin" && config_.plugin != "kcptun") {
+        config_.plugin != "gost-plugin" && config_.plugin != "kcptun" &&
+        config_.plugin != "shadow-tls") {
         return core::fail({core::ErrorCode::unsupported, "unsupported Shadowsocks plugin", {}});
     }
     if (config_.plugin == "obfs" && config_.plugin_mode != "http" && config_.plugin_mode != "tls") {
@@ -1250,6 +1306,25 @@ core::Status ShadowsocksOutbound::validate() const {
         return core::fail({core::ErrorCode::configuration,
                            "Shadowsocks kcptun does not use WebSocket plugin options",
                            {}});
+    }
+    if (config_.plugin == "shadow-tls") {
+        if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() || config_.plugin_tls) {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks Shadow-TLS does not use WebSocket plugin options",
+                               {}});
+        }
+        if (config_.plugin_version < 1 || config_.plugin_version > 2) {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks Shadow-TLS version must be 1 or 2", {}});
+        }
+        if (config_.plugin_version == 2 && config_.plugin_password.empty()) {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks Shadow-TLS v2 requires a plugin password", {}});
+        }
+        if (config_.plugin_host.empty()) {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks Shadow-TLS host is required", {}});
+        }
     }
     if (config_.plugin == "kcptun") {
         if (const auto validation = transport::shadowsocks::validate_kcptun_client_options(

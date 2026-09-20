@@ -115,6 +115,37 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
             config.plugin_skip_cert_verify =
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_SKIP_CERT_VERIFY")
                     .value_or("") == "1";
+            config.plugin_password =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_PASSWORD").value_or("");
+            if (const auto version =
+                    environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_VERSION");
+                version && !version->empty()) {
+                const auto parsed = std::from_chars(version->data(),
+                                                    version->data() + version->size(),
+                                                    config.plugin_version);
+                if (parsed.ec != std::errc{} || parsed.ptr != version->data() + version->size()) {
+                    throw std::runtime_error("invalid CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_VERSION");
+                }
+            }
+            if (const auto alpn =
+                    environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_ALPN");
+                alpn && !alpn->empty()) {
+                std::size_t offset = 0;
+                while (offset <= alpn->size()) {
+                    const auto separator = alpn->find(',', offset);
+                    const auto length = separator == std::string::npos
+                                            ? alpn->size() - offset
+                                            : separator - offset;
+                    if (length == 0) {
+                        throw std::runtime_error("invalid CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_ALPN");
+                    }
+                    config.plugin_alpn.emplace_back(alpn->substr(offset, length));
+                    if (separator == std::string::npos) {
+                        break;
+                    }
+                    offset = separator + 1;
+                }
+            }
             if (config.plugin == "kcptun") {
                 auto options = clash_native::transport::shadowsocks::KcptunClientOptions{};
                 options.key = environment_value("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_KEY")

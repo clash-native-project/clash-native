@@ -61,8 +61,9 @@ std::uint16_t read_u16(std::span<const std::uint8_t> input) {
     return static_cast<std::uint16_t>((static_cast<std::uint16_t>(input[0]) << 8) | input[1]);
 }
 
-std::vector<std::uint8_t> make_tls_client_hello(std::span<const std::uint8_t> payload,
-                                                std::string_view server_name) {
+std::vector<std::uint8_t> make_tls_client_hello_impl(
+    std::span<const std::uint8_t> payload, std::string_view server_name,
+    std::span<const std::uint8_t> requested_session_id) {
     if (server_name.empty() || server_name.size() > 0xff ||
         payload.size() > std::numeric_limits<std::uint16_t>::max() ||
         server_name.size() + payload.size() > 0xff00) {
@@ -70,8 +71,13 @@ std::vector<std::uint8_t> make_tls_client_hello(std::span<const std::uint8_t> pa
     }
     std::array<std::uint8_t, 28> random_bytes_buffer{};
     std::array<std::uint8_t, 32> session_id{};
-    if (!random_bytes(random_bytes_buffer) || !random_bytes(session_id)) {
+    if (!random_bytes(random_bytes_buffer) ||
+        (requested_session_id.empty() ? !random_bytes(session_id)
+                                      : requested_session_id.size() != session_id.size())) {
         return {};
+    }
+    if (!requested_session_id.empty()) {
+        std::copy(requested_session_id.begin(), requested_session_id.end(), session_id.begin());
     }
 
     const auto body_length = 212 + payload.size() + server_name.size();
@@ -410,6 +416,12 @@ class HttpObfsResponse final : public std::enable_shared_from_this<HttpObfsRespo
 };
 
 } // namespace
+
+std::vector<std::uint8_t> make_tls_client_hello(std::span<const std::uint8_t> payload,
+                                                std::string_view server_name,
+                                                std::span<const std::uint8_t> session_id) {
+    return make_tls_client_hello_impl(payload, server_name, session_id);
+}
 
 void async_write_http_obfs_request(std::shared_ptr<boost::asio::ip::tcp::socket> socket,
                                    std::vector<std::uint8_t> initial_payload,

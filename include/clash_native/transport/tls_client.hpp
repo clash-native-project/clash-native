@@ -17,6 +17,8 @@ struct TlsClientOptions {
     bool verify_peer = true;
     std::string trusted_ca_pem;
     std::vector<std::string> alpn_protocols;
+    bool handoff_raw_transport = false;
+    std::optional<int> maximum_tls_version;
     std::optional<std::chrono::steady_clock::time_point> deadline;
 };
 

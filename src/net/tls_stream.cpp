@@ -32,4 +32,13 @@ void TlsStream::shutdown_send(boost::system::error_code &error) noexcept {
 
 void TlsStream::close() noexcept { stream_->lowest_layer().close(); }
 
+std::unique_ptr<core::StreamHandle> TlsStream::take_transport() noexcept {
+    if (!stream_) {
+        return {};
+    }
+    auto transport = stream_->next_layer().release();
+    stream_.reset();
+    return transport;
+}
+
 } // namespace clash_native::net

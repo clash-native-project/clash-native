@@ -107,6 +107,40 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
       enable: true
       mode: tls
 `, udpHost, tlsObfsPort, mihomoTestPassword)
+	const shadowTlsPassword = "clash-native-shadow-tls-password"
+	shadowTlsAddresses := make(map[int]string, 2)
+	for _, version := range []int{1, 2} {
+		address := reserveMihomoShadowsocksAddressOnHost(t, udpHost)
+		shadowTlsAddresses[version] = address
+		_, port, err := net.SplitHostPort(address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&listenerConfig, `
+  - name: test-shadowsocks-shadow-tls-v%d
+    type: shadowsocks
+    listen: %s
+    port: %s
+    password: '%s'
+    cipher: chacha20-ietf-poly1305
+`, version, udpHost, port, mihomoTestPassword)
+		if version == 1 {
+			listenerConfig.WriteString(`    shadow-tls:
+      enable: true
+      version: 1
+      handshake:
+        dest: itunes.apple.com:443
+`)
+		} else if version == 2 {
+			fmt.Fprintf(&listenerConfig, `    shadow-tls:
+      enable: true
+      version: 2
+      password: '%s'
+      handshake:
+        dest: itunes.apple.com:443
+`, shadowTlsPassword)
+		}
+	}
 	trojanAddress := reserveMihomoTCPAddress(t)
 	_, trojanPort, err := net.SplitHostPort(trojanAddress)
 	if err != nil {
@@ -150,8 +184,12 @@ listeners:%s
 		t.Fatal(err)
 	}
 
-	mihomo := startMihomo(t, mihomoExecutable, home, configPath,
-		append([]string{trojanAddress, obfsAddress, tlsObfsAddress}, mapValues(shadowsocksAddresses)...))
+	listenerAddresses := []string{trojanAddress, obfsAddress, tlsObfsAddress}
+	listenerAddresses = append(listenerAddresses, mapValues(shadowsocksAddresses)...)
+	for _, address := range shadowTlsAddresses {
+		listenerAddresses = append(listenerAddresses, address)
+	}
+	mihomo := startMihomo(t, mihomoExecutable, home, configPath, listenerAddresses)
 	defer stopInteropProcess(t, mihomo)
 
 	for _, method := range methods {
@@ -252,6 +290,46 @@ listeners:%s
 			t.Fatal("Mihomo Shadowsocks TLS obfs returned different bytes")
 		}
 	})
+
+	for _, version := range []int{1, 2} {
+		version := version
+		t.Run(fmt.Sprintf("Shadowsocks/shadow-tls-v%d", version), func(t *testing.T) {
+			environment := map[string]string{
+				"CLASH_NATIVE_TEST_OUTBOUND":                         "shadowsocks",
+				"CLASH_NATIVE_TEST_OUTBOUND_SERVER":                  shadowTlsAddresses[version],
+				"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":                mihomoTestPassword,
+				"CLASH_NATIVE_TEST_OUTBOUND_METHOD":                  "chacha20-ietf-poly1305",
+				"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN":                  "shadow-tls",
+				"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_HOST":             "itunes.apple.com",
+				"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_VERSION":          strconv.Itoa(version),
+				"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_SKIP_CERT_VERIFY": "1",
+				"CLASH_NATIVE_TEST_PROXY_HOST":                       udpHost,
+			}
+			if version >= 2 {
+				environment["CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_PASSWORD"] = shadowTlsPassword
+			}
+			if version == 2 {
+				environment["CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_ALPN"] = "http/1.1"
+			}
+			proxyAddress, stopProxy := startOutboundTestHost(t, environment)
+			defer stopProxy()
+
+			client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+			defer client.Close()
+			payload := []byte(strings.Repeat(fmt.Sprintf("cpp-to-mihomo-shadow-tls-v%d-", version), 2048))
+			writeBytes(t, client, payload)
+			if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+				if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+					t.Fatalf("half-close C++ to Mihomo Shadow-TLS v%d stream: %v", version, err)
+				}
+			}
+			echoed := make([]byte, len(payload))
+			readBytes(t, client, echoed)
+			if string(echoed) != string(payload) {
+				t.Fatalf("Mihomo Shadow-TLS v%d returned different bytes", version)
+			}
+		})
+	}
 
 	t.Run("Trojan/TLS", func(t *testing.T) {
 		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{

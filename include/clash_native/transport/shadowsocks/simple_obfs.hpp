@@ -7,7 +7,9 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace clash_native::transport::shadowsocks {
@@ -45,6 +47,11 @@ void async_read_http_obfs_response(std::shared_ptr<boost::asio::ip::tcp::socket>
                                    HttpObfsResponseHandler handler);
 
 using TlsObfsRequestHandler = std::function<void(core::Status)>;
+// Builds the TLS-shaped ClientHello used by simple-obfs and Shadow-TLS. When
+// session_id is empty, a fresh random 32-byte session ID is generated.
+std::vector<std::uint8_t> make_tls_client_hello(std::span<const std::uint8_t> payload,
+                                                std::string_view server_name,
+                                                std::span<const std::uint8_t> session_id = {});
 using TlsObfsResponseHandler = std::function<void(core::Result<std::vector<std::uint8_t>>)>;
 
 // Sends a simple-obfs TLS-shaped ClientHello with the first Shadowsocks wire

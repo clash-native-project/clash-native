@@ -29,6 +29,10 @@ class TlsStream final : public core::StreamHandle {
     void shutdown_send(boost::system::error_code &error) noexcept override;
     void close() noexcept override;
 
+    // Detaches the underlying project stream after a completed handshake.
+    // The SSL layer must not be used after this call.
+    std::unique_ptr<core::StreamHandle> take_transport() noexcept;
+
   private:
     std::shared_ptr<boost::asio::ssl::context> context_;
     std::unique_ptr<SslStream> stream_;

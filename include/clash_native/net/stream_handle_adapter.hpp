@@ -47,6 +47,8 @@ class StreamHandleAdapter final {
         }
     }
 
+    std::unique_ptr<core::StreamHandle> release() noexcept { return std::move(handle_); }
+
   private:
     std::unique_ptr<core::StreamHandle> handle_;
 };

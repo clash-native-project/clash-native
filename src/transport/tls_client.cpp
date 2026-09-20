@@ -114,6 +114,13 @@ class TlsClientHandshakeOperationImpl final
             stream_->stream_->set_verify_mode(boost::asio::ssl::verify_none);
         }
 
+        if (options_.maximum_tls_version) {
+            if (SSL_set_max_proto_version(stream_->stream_->native_handle(),
+                                          *options_.maximum_tls_version) != 1) {
+                return core::fail(configuration_error("failed to configure TLS maximum version"));
+            }
+        }
+
         if (!options_.server_name.empty()) {
             boost::system::error_code address_error;
             (void)boost::asio::ip::make_address(options_.server_name, address_error);
@@ -187,8 +194,19 @@ class TlsClientHandshakeOperationImpl final
                     negotiated_alpn.assign(reinterpret_cast<const char *>(protocol),
                                            protocol_length);
                 }
-                TlsClientConnection connection{std::move(self->stream_),
-                                               std::move(negotiated_alpn)};
+                std::unique_ptr<core::StreamHandle> stream;
+                if (self->options_.handoff_raw_transport) {
+                    stream = self->stream_->take_transport();
+                } else {
+                    stream = std::move(self->stream_);
+                }
+                if (!stream) {
+                    self->finish(core::fail(transport_error(
+                        "TLS client handshake lost its underlying stream",
+                        boost::asio::error::operation_aborted)));
+                    return;
+                }
+                TlsClientConnection connection{std::move(stream), std::move(negotiated_alpn)};
                 self->finish(std::move(connection));
             });
     }

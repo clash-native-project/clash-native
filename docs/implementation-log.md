@@ -1256,3 +1256,15 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   local plain-UDP loopback path.
 - Recorded that the same failures occur in the pre-KCP test binary, so they are
   an existing baseline issue rather than a kcptun/KCP regression.
+
+### 2026-09-21 — Add Shadowsocks Shadow-TLS v1 and v2 outbound carriers
+
+- Added a dedicated Shadow-TLS transport module and connected it to the
+  Shadowsocks TCP outbound path without changing the Shadowsocks cipher layer.
+- Implemented Mihomo-compatible v1 TLS pass-through and v2 handshake hashing,
+  TLS-shaped application records, and the v2 post-handshake data delay.
+- Added real Mihomo interoperability coverage for v1 and v2. The tests skip
+  the existing half-close case because Mihomo's Shadow-TLS listener closes the
+  whole stream after receiving FIN.
+- Shadow-TLS v3 remains explicitly unsupported: the current BoringSSL client
+  wrapper has no safe client-hello SessionID generation hook for the v3 HMAC.
