@@ -75,6 +75,23 @@ header, sends a ping control frame, and checks a 256 KiB binary echo. The
 carrier is limited to HTTP/1.1 Upgrade; HTTP/2 and HTTP/3 Extended CONNECT are
 not covered.
 
+The Shadowsocks `simple-obfs` HTTP and TLS carriers are validated on Windows
+x64 with a real Mihomo listener. The checks cover classic AEAD and Shadowsocks
+2022 TCP; native Shadowsocks UDP is intentionally unwrapped by these plugins.
+The client sends the carrier handshake before opening the stream and consumes
+the HTTP 101 or fake TLS server response lazily on the first read.
+
+The Shadowsocks `v2ray-plugin` and `gost-plugin` WebSocket carriers are also
+validated on Windows x64 with an independent Go/Gorilla WebSocket server. The
+interop test covers both plugin names, a plain HTTP/1.1 Upgrade, and a TLS
+wrapped WebSocket. Plugin multiplexing and WebSocket-wrapped native UDP are
+outside this check.
+
+The Shadowsocks UDP-over-TCP version 1 and version 2 outbound paths are
+validated on Windows x64 with a real Mihomo listener and an independently
+built Go interop executable. The test uses a non-loopback IPv4 UDP echo
+endpoint when required by the Windows networking environment.
+
 The raw QUIC carrier interop check is Windows x64 only. The standard build
 script sets `CLASH_NATIVE_HTTP_TUNNEL_CLIENT` and runs
 `TestQUICCarrierExposesStreamsAndDatagrams` from `tests/interop`. The test uses

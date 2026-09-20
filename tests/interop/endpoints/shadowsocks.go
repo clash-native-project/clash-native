@@ -68,6 +68,16 @@ func StartShadowsocksServer(method, password string) (*ShadowsocksServer, error)
 
 func (s *ShadowsocksServer) Addr() string { return s.tcp.Addr().String() }
 
+// ServeTCPConn runs the Shadowsocks TCP protocol on an externally accepted
+// connection, such as a WebSocket-backed net.Conn used by plugin tests.
+func (s *ShadowsocksServer) ServeTCPConn(conn net.Conn) {
+	s.mu.Lock()
+	s.conns[conn] = struct{}{}
+	s.mu.Unlock()
+	s.wg.Add(1)
+	go s.serveTCP(conn)
+}
+
 func (s *ShadowsocksServer) Close() error {
 	var closeErr error
 	s.once.Do(func() {

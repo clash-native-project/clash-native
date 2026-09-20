@@ -73,6 +73,40 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
     cipher: %s
 `, method, udpHost, port, mihomoTestPassword, method)
 	}
+	obfsAddress := reserveMihomoShadowsocksAddressOnHost(t, udpHost)
+	_, obfsPort, err := net.SplitHostPort(obfsAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(&listenerConfig, `
+  - name: test-shadowsocks-obfs-http
+    type: shadowsocks
+    listen: %s
+    port: %s
+    udp: true
+    password: '%s'
+    cipher: chacha20-ietf-poly1305
+    simple-obfs:
+      enable: true
+      mode: http
+`, udpHost, obfsPort, mihomoTestPassword)
+	tlsObfsAddress := reserveMihomoShadowsocksAddressOnHost(t, udpHost)
+	_, tlsObfsPort, err := net.SplitHostPort(tlsObfsAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(&listenerConfig, `
+  - name: test-shadowsocks-obfs-tls
+    type: shadowsocks
+    listen: %s
+    port: %s
+    udp: true
+    password: '%s'
+    cipher: chacha20-ietf-poly1305
+    simple-obfs:
+      enable: true
+      mode: tls
+`, udpHost, tlsObfsPort, mihomoTestPassword)
 	trojanAddress := reserveMihomoTCPAddress(t)
 	_, trojanPort, err := net.SplitHostPort(trojanAddress)
 	if err != nil {
@@ -117,7 +151,7 @@ listeners:%s
 	}
 
 	mihomo := startMihomo(t, mihomoExecutable, home, configPath,
-		append([]string{trojanAddress}, mapValues(shadowsocksAddresses)...))
+		append([]string{trojanAddress, obfsAddress, tlsObfsAddress}, mapValues(shadowsocksAddresses)...))
 	defer stopInteropProcess(t, mihomo)
 
 	for _, method := range methods {
@@ -160,6 +194,64 @@ listeners:%s
 				udpEcho.Addr().String(), udpEcho.Addr().IP, udpPayload)
 		})
 	}
+
+	t.Run("Shadowsocks/simple-obfs-http", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":             "shadowsocks",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":      obfsAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":    mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_METHOD":      "chacha20-ietf-poly1305",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN":      "obfs",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_MODE": "http",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_HOST": "bing.com",
+			"CLASH_NATIVE_TEST_PROXY_HOST":           udpHost,
+		})
+		defer stopProxy()
+
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-shadowsocks-http-obfs-tcp-", 2048))
+		writeBytes(t, client, payload)
+		if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("half-close C++ to Mihomo Shadowsocks HTTP obfs stream: %v", err)
+			}
+		}
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo Shadowsocks HTTP obfs returned different bytes")
+		}
+	})
+
+	t.Run("Shadowsocks/simple-obfs-tls", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":             "shadowsocks",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":      tlsObfsAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":    mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_METHOD":      "chacha20-ietf-poly1305",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN":      "obfs",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_MODE": "tls",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_HOST": "bing.com",
+			"CLASH_NATIVE_TEST_PROXY_HOST":           udpHost,
+		})
+		defer stopProxy()
+
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-shadowsocks-tls-obfs-tcp-", 2048))
+		writeBytes(t, client, payload)
+		if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("half-close C++ to Mihomo Shadowsocks TLS obfs stream: %v", err)
+			}
+		}
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo Shadowsocks TLS obfs returned different bytes")
+		}
+	})
 
 	t.Run("Trojan/TLS", func(t *testing.T) {
 		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
@@ -213,6 +305,71 @@ listeners:%s
 	})
 }
 
+func TestMihomoActualServerShadowsocksUoT(t *testing.T) {
+	mihomoExecutable := os.Getenv("MIHOMO_EXECUTABLE")
+	if mihomoExecutable == "" {
+		t.Skip("MIHOMO_EXECUTABLE is not set")
+	}
+	if os.Getenv("CLASH_NATIVE_TEST_HOST") == "" {
+		t.Skip("CLASH_NATIVE_TEST_HOST is not set")
+	}
+
+	udpHost := endpoints.LocalIPv4Host()
+	udpEcho, err := endpoints.StartUDPEchoAt(udpHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpEcho.Close()
+	address := reserveMihomoShadowsocksAddress(t)
+	_, port, err := net.SplitHostPort(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const password = mihomoTestPassword
+	config := fmt.Sprintf(`allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: debug
+ipv6: false
+rules:
+  - MATCH,DIRECT
+listeners:
+  - name: test-shadowsocks-uot
+    type: shadowsocks
+    listen: 127.0.0.1
+    port: %s
+    udp: true
+    password: '%s'
+    cipher: chacha20-ietf-poly1305
+`, port, password)
+	home := t.TempDir()
+	configPath := filepath.Join(home, "config.yaml")
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mihomo := startMihomo(t, mihomoExecutable, home, configPath, []string{address})
+	defer stopInteropProcess(t, mihomo)
+
+	for _, version := range []int{1, 2} {
+		version := version
+		t.Run(fmt.Sprintf("version-%d", version), func(t *testing.T) {
+			proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+				"CLASH_NATIVE_TEST_OUTBOUND":                      "shadowsocks",
+				"CLASH_NATIVE_TEST_OUTBOUND_SERVER":               address,
+				"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":             password,
+				"CLASH_NATIVE_TEST_OUTBOUND_METHOD":               "chacha20-ietf-poly1305",
+				"CLASH_NATIVE_TEST_OUTBOUND_UDP_OVER_TCP":         "1",
+				"CLASH_NATIVE_TEST_OUTBOUND_UDP_OVER_TCP_VERSION": strconv.Itoa(version),
+				"CLASH_NATIVE_TEST_PROXY_HOST":                    udpHost,
+			})
+			defer stopProxy()
+			payload := []byte(strings.Repeat("cpp-to-mihomo-uot-", 64))
+			testShadowsocksUDPAssociateWithPayload(t, proxyAddress, udpEcho.Addr().String(),
+				udpEcho.Addr().IP, payload)
+		})
+	}
+}
+
 func TestMihomoActualServerShadowsocks2022TCP(t *testing.T) {
 	mihomoExecutable := os.Getenv("MIHOMO_EXECUTABLE")
 	if mihomoExecutable == "" {
@@ -254,6 +411,40 @@ func TestMihomoActualServerShadowsocks2022TCP(t *testing.T) {
     cipher: %s
 `, key.method, port, key.password, key.method)
 	}
+	obfsAddress := reserveMihomoShadowsocksAddress(t)
+	_, obfsPort, err := net.SplitHostPort(obfsAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(&listenerConfig, `
+  - name: test-2022-shadowsocks-obfs-http
+    type: shadowsocks
+    listen: 127.0.0.1
+    port: %s
+    udp: true
+    password: '%s'
+    cipher: 2022-blake3-aes-128-gcm
+    simple-obfs:
+      enable: true
+      mode: http
+`, obfsPort, keys[0].password)
+	tlsObfsAddress := reserveMihomoShadowsocksAddress(t)
+	_, tlsObfsPort, err := net.SplitHostPort(tlsObfsAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(&listenerConfig, `
+  - name: test-2022-shadowsocks-obfs-tls
+    type: shadowsocks
+    listen: 127.0.0.1
+    port: %s
+    udp: true
+    password: '%s'
+    cipher: 2022-blake3-aes-128-gcm
+    simple-obfs:
+      enable: true
+      mode: tls
+`, tlsObfsPort, keys[0].password)
 
 	home := t.TempDir()
 	configPath := filepath.Join(home, "config.yaml")
@@ -269,10 +460,12 @@ listeners:%s
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	addressesList := make([]string, 0, len(addresses))
+	addressesList := make([]string, 0, len(addresses)+2)
 	for _, address := range addresses {
 		addressesList = append(addressesList, address)
 	}
+	addressesList = append(addressesList, obfsAddress)
+	addressesList = append(addressesList, tlsObfsAddress)
 	mihomo := startMihomo(t, mihomoExecutable, home, configPath, addressesList)
 	defer stopInteropProcess(t, mihomo)
 
@@ -297,6 +490,50 @@ listeners:%s
 			}
 		})
 	}
+
+	t.Run("2022-blake3-aes-128-gcm/simple-obfs-http", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":             "shadowsocks",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":      obfsAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":    keys[0].password,
+			"CLASH_NATIVE_TEST_OUTBOUND_METHOD":      keys[0].method,
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN":      "obfs",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_MODE": "http",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_HOST": "bing.com",
+		})
+		defer stopProxy()
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-shadowsocks-2022-http-obfs-tcp-", 64))
+		writeBytes(t, client, payload)
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo Shadowsocks 2022 HTTP obfs returned different bytes")
+		}
+	})
+
+	t.Run("2022-blake3-aes-128-gcm/simple-obfs-tls", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":             "shadowsocks",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":      tlsObfsAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":    keys[0].password,
+			"CLASH_NATIVE_TEST_OUTBOUND_METHOD":      keys[0].method,
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN":      "obfs",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_MODE": "tls",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_HOST": "bing.com",
+		})
+		defer stopProxy()
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-shadowsocks-2022-tls-obfs-tcp-", 64))
+		writeBytes(t, client, payload)
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo Shadowsocks 2022 TLS obfs returned different bytes")
+		}
+	})
 }
 
 func TestMihomoActualServerShadowsocks2022UDP(t *testing.T) {

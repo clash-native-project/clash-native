@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -52,10 +53,9 @@ std::uint16_t read_u16(std::span<const std::uint8_t> bytes) {
 }
 
 std::uint64_t unix_seconds() {
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                          std::chrono::system_clock::now().time_since_epoch())
+                                          .count());
 }
 
 core::Result<std::vector<std::uint8_t>> encrypt_record(std::string_view method,
@@ -63,8 +63,8 @@ core::Result<std::vector<std::uint8_t>> encrypt_record(std::string_view method,
                                                        std::vector<std::uint8_t> &nonce,
                                                        std::span<const std::uint8_t> payload) {
     if (payload.empty() || payload.size() > kMaxChunkPayload) {
-        return core::fail({core::ErrorCode::protocol_framing,
-                           "invalid Shadowsocks 2022 record payload size"});
+        return core::fail(
+            {core::ErrorCode::protocol_framing, "invalid Shadowsocks 2022 record payload size"});
     }
     std::array<std::uint8_t, 2> length{static_cast<std::uint8_t>(payload.size() >> 8),
                                        static_cast<std::uint8_t>(payload.size())};
@@ -73,8 +73,8 @@ core::Result<std::vector<std::uint8_t>> encrypt_record(std::string_view method,
     auto encrypted_payload = aead_encrypt(method, key, nonce, payload);
     increment_nonce(nonce);
     if (!encrypted_length || !encrypted_payload) {
-        return core::fail({core::ErrorCode::authentication,
-                           "failed to encrypt Shadowsocks 2022 record"});
+        return core::fail(
+            {core::ErrorCode::authentication, "failed to encrypt Shadowsocks 2022 record"});
     }
     std::vector<std::uint8_t> result;
     result.reserve(encrypted_length.value().size() + encrypted_payload.value().size());
@@ -118,10 +118,23 @@ class Shadowsocks2022StreamState final
                                std::string method, std::string password,
                                std::vector<std::uint8_t> write_key,
                                std::vector<std::uint8_t> write_nonce,
-                               std::vector<std::uint8_t> request_salt)
-        : socket_(std::move(socket)), method_(std::move(method)), password_(std::move(password)),
+                               std::vector<std::uint8_t> request_salt,
+                               std::vector<std::uint8_t> initial_wire, ObfsMode obfs_mode)
+        : socket_(std::move(socket)), carrier_(std::make_shared<StreamCarrier>(socket_)),
+          method_(std::move(method)), password_(std::move(password)),
           write_key_(std::move(write_key)), write_nonce_(std::move(write_nonce)),
-          request_salt_(std::move(request_salt)) {}
+          request_salt_(std::move(request_salt)), initial_wire_(std::move(initial_wire)),
+          obfs_mode_(obfs_mode), obfs_response_ready_(obfs_mode == ObfsMode::none) {}
+
+    Shadowsocks2022StreamState(std::shared_ptr<StreamCarrier> carrier, std::string method,
+                               std::string password, std::vector<std::uint8_t> write_key,
+                               std::vector<std::uint8_t> write_nonce,
+                               std::vector<std::uint8_t> request_salt,
+                               std::vector<std::uint8_t> initial_wire)
+        : socket_(carrier ? carrier->socket() : nullptr), carrier_(std::move(carrier)),
+          method_(std::move(method)), password_(std::move(password)),
+          write_key_(std::move(write_key)), write_nonce_(std::move(write_nonce)),
+          request_salt_(std::move(request_salt)), initial_wire_(std::move(initial_wire)) {}
 
     void read(boost::asio::mutable_buffer buffer, core::StreamHandle::ReadHandler handler) {
         if (read_in_progress_) {
@@ -141,7 +154,9 @@ class Shadowsocks2022StreamState final
         read_buffer_ = buffer;
         read_handler_ = std::move(handler);
         read_in_progress_ = true;
-        if (!read_key_) {
+        if (!obfs_response_ready_) {
+            receive_obfs_response();
+        } else if (!read_key_) {
             receive_salt();
         } else if (!response_header_ready_) {
             receive_response_fixed();
@@ -175,35 +190,59 @@ class Shadowsocks2022StreamState final
         auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(encoded));
         write_in_progress_ = true;
         auto self = shared_from_this();
-        boost::asio::async_write(
-            *socket_, boost::asio::buffer(*wire),
-            [self, wire, handler = std::move(handler), size = buffer.size()](
-                const boost::system::error_code &error, std::size_t) mutable {
-                self->write_in_progress_ = false;
-                handler(error, error ? 0 : size);
-            });
+        if (obfs_mode_ == ObfsMode::tls) {
+            async_write_tls_obfs_records(
+                socket_, std::move(*wire),
+                [self, handler = std::move(handler), size = buffer.size()](core::Status result) {
+                    self->write_in_progress_ = false;
+                    handler(result ? boost::system::error_code() : boost::asio::error::fault,
+                            result ? size : 0);
+                });
+            return;
+        }
+        carrier_->async_write(boost::asio::buffer(*wire),
+                              [self, wire, handler = std::move(handler), size = buffer.size()](
+                                  const boost::system::error_code &error, std::size_t) mutable {
+                                  self->write_in_progress_ = false;
+                                  handler(error, error ? 0 : size);
+                              });
     }
 
-    boost::asio::any_io_executor executor() noexcept { return socket_->get_executor(); }
+    boost::asio::any_io_executor executor() noexcept { return carrier_->executor(); }
 
-    boost::asio::ip::tcp::endpoint
-    local_endpoint(boost::system::error_code &error) const noexcept {
-        return socket_->local_endpoint(error);
+    boost::asio::ip::tcp::endpoint local_endpoint(boost::system::error_code &error) const noexcept {
+        return carrier_->local_endpoint(error);
     }
 
     void shutdown_send(boost::system::error_code &error) noexcept {
-        socket_->shutdown(boost::asio::ip::tcp::socket::shutdown_send, error);
+        carrier_->shutdown_send(error);
     }
 
     void close() noexcept {
-        boost::system::error_code ignored;
-        socket_->cancel(ignored);
-        socket_->shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored);
-        socket_->close(ignored);
+        carrier_->close();
         finish_read(boost::asio::error::operation_aborted, 0);
     }
 
   private:
+    void receive_obfs_response() {
+        auto self = shared_from_this();
+        auto handler = [self](core::Result<std::vector<std::uint8_t>> result) {
+            if (!result) {
+                self->finish_read(boost::asio::error::fault, 0);
+                return;
+            }
+            self->initial_wire_ = std::move(result.value());
+            self->initial_wire_offset_ = 0;
+            self->obfs_response_ready_ = true;
+            self->receive_salt();
+        };
+        if (obfs_mode_ == ObfsMode::http) {
+            async_read_http_obfs_response(socket_, std::move(handler));
+        } else {
+            async_read_tls_obfs_response(socket_, std::move(handler));
+        }
+    }
+
     void receive_salt() {
         const auto method = cipher_method(method_);
         if (!method) {
@@ -212,21 +251,20 @@ class Shadowsocks2022StreamState final
         }
         read_salt_.resize(method.value().key_size);
         auto self = shared_from_this();
-        boost::asio::async_read(*socket_, boost::asio::buffer(read_salt_),
-                                [self](const boost::system::error_code &error, std::size_t) {
-                                    if (error) {
-                                        self->finish_read(error, 0);
-                                        return;
-                                    }
-                                    auto key = derive_shadowsocks_2022_session_key(
-                                        self->method_, self->password_, self->read_salt_);
-                                    if (!key) {
-                                        self->finish_read(authentication_error(), 0);
-                                        return;
-                                    }
-                                    self->read_key_ = std::move(key.value());
-                                    self->receive_response_fixed();
-                                });
+        read_exact(boost::asio::buffer(read_salt_), [self](const boost::system::error_code &error) {
+            if (error) {
+                self->finish_read(error, 0);
+                return;
+            }
+            auto key = derive_shadowsocks_2022_session_key(self->method_, self->password_,
+                                                           self->read_salt_);
+            if (!key) {
+                self->finish_read(authentication_error(), 0);
+                return;
+            }
+            self->read_key_ = std::move(key.value());
+            self->receive_response_fixed();
+        });
     }
 
     void receive_response_fixed() {
@@ -236,64 +274,62 @@ class Shadowsocks2022StreamState final
             return;
         }
         const auto fixed_size = 1 + 8 + request_salt_.size() + 2;
-        auto encrypted = std::make_shared<std::vector<std::uint8_t>>(
-            fixed_size + method.value().overhead);
+        auto encrypted =
+            std::make_shared<std::vector<std::uint8_t>>(fixed_size + method.value().overhead);
         auto self = shared_from_this();
-        boost::asio::async_read(
-            *socket_, boost::asio::buffer(*encrypted),
-            [self, encrypted, fixed_size](const boost::system::error_code &error, std::size_t) {
-                if (error) {
-                    self->finish_read(error, 0);
-                    return;
-                }
-                auto fixed = aead_decrypt(self->method_, *self->read_key_, self->read_nonce_,
-                                          *encrypted);
-                self->increment_read_nonce();
-                if (!fixed || fixed.value().size() != fixed_size || fixed.value()[0] != kServerHeader ||
-                    !std::equal(self->request_salt_.begin(), self->request_salt_.end(),
-                                fixed.value().begin() + 1 + 8)) {
-                    self->finish_read(authentication_error(), 0);
-                    return;
-                }
-                const auto variable_size = read_u16(
-                    std::span<const std::uint8_t>(fixed.value()).subspan(fixed_size - 2, 2));
-                if (variable_size > kMaxChunkPayload) {
-                    self->finish_read(protocol_error(), 0);
-                    return;
-                }
-                if (variable_size == 0) {
-                    self->response_header_ready_ = true;
-                    self->finish_pending_or_receive();
-                    return;
-                }
-                self->receive_response_variable(variable_size);
-            });
+        read_exact(boost::asio::buffer(*encrypted), [self, encrypted, fixed_size](
+                                                        const boost::system::error_code &error) {
+            if (error) {
+                self->finish_read(error, 0);
+                return;
+            }
+            auto fixed =
+                aead_decrypt(self->method_, *self->read_key_, self->read_nonce_, *encrypted);
+            self->increment_read_nonce();
+            if (!fixed || fixed.value().size() != fixed_size || fixed.value()[0] != kServerHeader ||
+                !std::equal(self->request_salt_.begin(), self->request_salt_.end(),
+                            fixed.value().begin() + 1 + 8)) {
+                self->finish_read(authentication_error(), 0);
+                return;
+            }
+            const auto variable_size =
+                read_u16(std::span<const std::uint8_t>(fixed.value()).subspan(fixed_size - 2, 2));
+            if (variable_size > kMaxChunkPayload) {
+                self->finish_read(protocol_error(), 0);
+                return;
+            }
+            if (variable_size == 0) {
+                self->response_header_ready_ = true;
+                self->finish_pending_or_receive();
+                return;
+            }
+            self->receive_response_variable(variable_size);
+        });
     }
 
     void receive_response_variable(std::size_t variable_size) {
         const auto method = cipher_method(method_);
-        auto encrypted = std::make_shared<std::vector<std::uint8_t>>(
-            variable_size + method.value().overhead);
+        auto encrypted =
+            std::make_shared<std::vector<std::uint8_t>>(variable_size + method.value().overhead);
         auto self = shared_from_this();
-        boost::asio::async_read(
-            *socket_, boost::asio::buffer(*encrypted),
-            [self, encrypted, variable_size](const boost::system::error_code &error, std::size_t) {
-                if (error) {
-                    self->finish_read(error, 0);
-                    return;
-                }
-                auto variable = aead_decrypt(self->method_, *self->read_key_, self->read_nonce_,
-                                              *encrypted);
-                self->increment_read_nonce();
-                if (!variable || variable.value().size() != variable_size) {
-                    self->finish_read(authentication_error(), 0);
-                    return;
-                }
-                self->pending_plaintext_ = std::move(variable.value());
-                self->pending_offset_ = 0;
-                self->response_header_ready_ = true;
-                self->finish_pending_or_receive();
-            });
+        read_exact(boost::asio::buffer(*encrypted),
+                   [self, encrypted, variable_size](const boost::system::error_code &error) {
+                       if (error) {
+                           self->finish_read(error, 0);
+                           return;
+                       }
+                       auto variable = aead_decrypt(self->method_, *self->read_key_,
+                                                    self->read_nonce_, *encrypted);
+                       self->increment_read_nonce();
+                       if (!variable || variable.value().size() != variable_size) {
+                           self->finish_read(authentication_error(), 0);
+                           return;
+                       }
+                       self->pending_plaintext_ = std::move(variable.value());
+                       self->pending_offset_ = 0;
+                       self->response_header_ready_ = true;
+                       self->finish_pending_or_receive();
+                   });
     }
 
     void finish_pending_or_receive() {
@@ -312,63 +348,121 @@ class Shadowsocks2022StreamState final
         });
     }
 
-    template <typename Handler>
-    void read_record(Handler handler) {
+    template <typename Handler> void read_record(Handler handler) {
         const auto method = cipher_method(method_);
         if (!method || !read_key_) {
             finish_read(protocol_error(), 0);
             return;
         }
-        auto encrypted_length = std::make_shared<std::vector<std::uint8_t>>(
-            2 + method.value().overhead);
+        auto encrypted_length =
+            std::make_shared<std::vector<std::uint8_t>>(2 + method.value().overhead);
         auto self = shared_from_this();
-        boost::asio::async_read(
-            *socket_, boost::asio::buffer(*encrypted_length),
-            [self, encrypted_length, handler = std::move(handler)](
-                const boost::system::error_code &error, std::size_t) mutable {
-                if (error) {
-                    self->finish_read(error, 0);
-                    return;
-                }
-                auto length = aead_decrypt(self->method_, *self->read_key_, self->read_nonce_,
-                                           *encrypted_length);
-                self->increment_read_nonce();
-                if (!length || length.value().size() != 2) {
-                    self->finish_read(authentication_error(), 0);
-                    return;
-                }
-                const auto size = read_u16(length.value());
-                if (size == 0 || size > kMaxChunkPayload) {
-                    self->finish_read(protocol_error(), 0);
-                    return;
-                }
-                const auto method = cipher_method(self->method_);
-                auto encrypted_payload = std::make_shared<std::vector<std::uint8_t>>(
-                    size + method.value().overhead);
-                boost::asio::async_read(
-                    *self->socket_, boost::asio::buffer(*encrypted_payload),
-                    [self, encrypted_payload, handler = std::move(handler)](
-                        const boost::system::error_code &payload_error, std::size_t) mutable {
-                        if (payload_error) {
-                            self->finish_read(payload_error, 0);
-                            return;
-                        }
-                        auto payload = aead_decrypt(self->method_, *self->read_key_,
-                                                    self->read_nonce_, *encrypted_payload);
-                        self->increment_read_nonce();
-                        if (!payload) {
-                            self->finish_read(authentication_error(), 0);
-                            return;
-                        }
-                        handler(std::move(payload.value()));
-                    });
-            });
+        read_exact(boost::asio::buffer(*encrypted_length),
+                   [self, encrypted_length,
+                    handler = std::move(handler)](const boost::system::error_code &error) mutable {
+                       if (error) {
+                           self->finish_read(error, 0);
+                           return;
+                       }
+                       auto length = aead_decrypt(self->method_, *self->read_key_,
+                                                  self->read_nonce_, *encrypted_length);
+                       self->increment_read_nonce();
+                       if (!length || length.value().size() != 2) {
+                           self->finish_read(authentication_error(), 0);
+                           return;
+                       }
+                       const auto size = read_u16(length.value());
+                       if (size == 0 || size > kMaxChunkPayload) {
+                           self->finish_read(protocol_error(), 0);
+                           return;
+                       }
+                       const auto method = cipher_method(self->method_);
+                       auto encrypted_payload = std::make_shared<std::vector<std::uint8_t>>(
+                           size + method.value().overhead);
+                       self->read_exact(
+                           boost::asio::buffer(*encrypted_payload),
+                           [self, encrypted_payload, handler = std::move(handler)](
+                               const boost::system::error_code &payload_error) mutable {
+                               if (payload_error) {
+                                   self->finish_read(payload_error, 0);
+                                   return;
+                               }
+                               auto payload = aead_decrypt(self->method_, *self->read_key_,
+                                                           self->read_nonce_, *encrypted_payload);
+                               self->increment_read_nonce();
+                               if (!payload) {
+                                   self->finish_read(authentication_error(), 0);
+                                   return;
+                               }
+                               handler(std::move(payload.value()));
+                           });
+                   });
+    }
+
+    using ExactReadHandler = std::function<void(const boost::system::error_code &)>;
+
+    void read_exact(boost::asio::mutable_buffer buffer, ExactReadHandler handler) {
+        if (obfs_mode_ == ObfsMode::tls) {
+            read_exact_tls(buffer, std::move(handler), 0);
+            return;
+        }
+        std::size_t copied = 0;
+        if (initial_wire_offset_ < initial_wire_.size()) {
+            copied = std::min(buffer.size(), initial_wire_.size() - initial_wire_offset_);
+            std::memcpy(static_cast<std::uint8_t *>(buffer.data()),
+                        initial_wire_.data() + initial_wire_offset_, copied);
+            initial_wire_offset_ += copied;
+            if (initial_wire_offset_ == initial_wire_.size()) {
+                initial_wire_.clear();
+                initial_wire_offset_ = 0;
+            }
+        }
+        if (copied == buffer.size()) {
+            boost::asio::post(carrier_->executor(),
+                              [handler = std::move(handler)]() mutable { handler({}); });
+            return;
+        }
+        auto remaining = boost::asio::mutable_buffer(
+            static_cast<std::uint8_t *>(buffer.data()) + copied, buffer.size() - copied);
+        read_exact_carrier(remaining, std::move(handler));
+    }
+
+    void read_exact_tls(boost::asio::mutable_buffer buffer, ExactReadHandler handler,
+                        std::size_t copied) {
+        if (initial_wire_offset_ < initial_wire_.size()) {
+            const auto count =
+                std::min(buffer.size() - copied, initial_wire_.size() - initial_wire_offset_);
+            std::memcpy(static_cast<std::uint8_t *>(buffer.data()) + copied,
+                        initial_wire_.data() + initial_wire_offset_, count);
+            initial_wire_offset_ += count;
+            copied += count;
+            if (initial_wire_offset_ == initial_wire_.size()) {
+                initial_wire_.clear();
+                initial_wire_offset_ = 0;
+            }
+        }
+        if (copied == buffer.size()) {
+            boost::asio::post(carrier_->executor(),
+                              [handler = std::move(handler)]() mutable { handler({}); });
+            return;
+        }
+        auto self = shared_from_this();
+        async_read_tls_obfs_record(socket_,
+                                   [self, buffer, handler = std::move(handler), copied](
+                                       core::Result<std::vector<std::uint8_t>> result) mutable {
+                                       if (!result) {
+                                           handler(boost::asio::error::fault);
+                                           return;
+                                       }
+                                       self->initial_wire_ = std::move(result.value());
+                                       self->initial_wire_offset_ = 0;
+                                       self->read_exact_tls(buffer, std::move(handler), copied);
+                                   });
     }
 
     void increment_read_nonce() { increment_nonce(read_nonce_); }
 
-    void copy_pending(boost::asio::mutable_buffer buffer,
-                      core::StreamHandle::ReadHandler handler) {
+    void copy_pending(boost::asio::mutable_buffer buffer, core::StreamHandle::ReadHandler handler) {
         const auto count = std::min(buffer.size(), pending_plaintext_.size() - pending_offset_);
         std::memcpy(buffer.data(), pending_plaintext_.data() + pending_offset_, count);
         pending_offset_ += count;
@@ -393,26 +487,50 @@ class Shadowsocks2022StreamState final
 
     void post_read(core::StreamHandle::ReadHandler handler, boost::system::error_code error,
                    std::size_t size) {
-        boost::asio::post(socket_->get_executor(),
-                          [handler = std::move(handler), error, size]() mutable {
-                              handler(error, size);
-                          });
+        boost::asio::post(carrier_->executor(), [handler = std::move(handler), error,
+                                                 size]() mutable { handler(error, size); });
     }
 
     void post_write(core::StreamHandle::WriteHandler handler, boost::system::error_code error,
                     std::size_t size) {
-        boost::asio::post(socket_->get_executor(),
-                          [handler = std::move(handler), error, size]() mutable {
-                              handler(error, size);
-                          });
+        boost::asio::post(carrier_->executor(), [handler = std::move(handler), error,
+                                                 size]() mutable { handler(error, size); });
+    }
+
+    void read_exact_carrier(boost::asio::mutable_buffer buffer, ExactReadHandler handler) {
+        auto self = shared_from_this();
+        carrier_->async_read_some(
+            buffer, [self, buffer, handler = std::move(handler)](
+                        const boost::system::error_code &error, std::size_t size) mutable {
+                if (error) {
+                    handler(error);
+                    return;
+                }
+                if (size == 0) {
+                    handler(boost::asio::error::eof);
+                    return;
+                }
+                if (size == buffer.size()) {
+                    handler({});
+                    return;
+                }
+                auto remaining = boost::asio::mutable_buffer(
+                    static_cast<std::uint8_t *>(buffer.data()) + size, buffer.size() - size);
+                self->read_exact_carrier(remaining, std::move(handler));
+            });
     }
 
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
+    std::shared_ptr<StreamCarrier> carrier_;
     std::string method_;
     std::string password_;
     std::vector<std::uint8_t> write_key_;
     std::vector<std::uint8_t> write_nonce_;
     std::vector<std::uint8_t> request_salt_;
+    std::vector<std::uint8_t> initial_wire_;
+    std::size_t initial_wire_offset_ = 0;
+    ObfsMode obfs_mode_ = ObfsMode::none;
+    bool obfs_response_ready_ = true;
     std::optional<std::vector<std::uint8_t>> read_key_;
     std::vector<std::uint8_t> read_nonce_ = std::vector<std::uint8_t>(12, 0);
     std::vector<std::uint8_t> read_salt_;
@@ -426,7 +544,7 @@ class Shadowsocks2022StreamState final
 };
 
 void Shadowsocks2022StreamHandle::async_read_some(boost::asio::mutable_buffer buffer,
-                                                   ReadHandler handler) {
+                                                  ReadHandler handler) {
     state_->read(buffer, std::move(handler));
 }
 
@@ -456,8 +574,16 @@ class Shadowsocks2022OpenOperation final
     Shadowsocks2022OpenOperation(std::shared_ptr<boost::asio::ip::tcp::socket> socket,
                                  std::string method, std::string password,
                                  std::vector<std::uint8_t> destination,
+                                 std::optional<ObfsClientOptions> obfs_options,
                                  Shadowsocks2022OpenHandler handler)
         : socket_(std::move(socket)), method_(std::move(method)), password_(std::move(password)),
+          destination_(std::move(destination)), obfs_options_(std::move(obfs_options)),
+          handler_(std::move(handler)) {}
+
+    Shadowsocks2022OpenOperation(std::shared_ptr<StreamCarrier> carrier, std::string method,
+                                 std::string password, std::vector<std::uint8_t> destination,
+                                 Shadowsocks2022OpenHandler handler)
+        : carrier_(std::move(carrier)), method_(std::move(method)), password_(std::move(password)),
           destination_(std::move(destination)), handler_(std::move(handler)) {}
 
     void start() {
@@ -477,7 +603,7 @@ class Shadowsocks2022OpenOperation final
         if (!key || destination_.empty() || destination_.size() + 2 > kMaxChunkPayload) {
             complete(core::StreamOpenResult::failed(
                 key ? core::Error{core::ErrorCode::protocol_framing,
-                                   "invalid Shadowsocks destination address"}
+                                  "invalid Shadowsocks destination address"}
                     : key.error()));
             return;
         }
@@ -495,29 +621,73 @@ class Shadowsocks2022OpenOperation final
         auto variable_record = encrypt_chunk(method_, key.value(), nonce, variable);
         if (!fixed_record || !variable_record) {
             complete(core::StreamOpenResult::failed(
-                {core::ErrorCode::authentication,
-                 "failed to encrypt Shadowsocks 2022 request"}));
+                {core::ErrorCode::authentication, "failed to encrypt Shadowsocks 2022 request"}));
             return;
         }
         auto wire = std::make_shared<std::vector<std::uint8_t>>(request_salt_);
         wire->insert(wire->end(), fixed_record.value().begin(), fixed_record.value().end());
         wire->insert(wire->end(), variable_record.value().begin(), variable_record.value().end());
         auto self = shared_from_this();
+        if (carrier_) {
+            carrier_->async_write(
+                boost::asio::buffer(*wire),
+                [self, wire, key = std::move(key.value()), nonce = std::move(nonce)](
+                    const boost::system::error_code &error, std::size_t) mutable {
+                    if (error) {
+                        self->complete(core::StreamOpenResult::failed(
+                            {core::ErrorCode::transport_io,
+                             "failed to write Shadowsocks 2022 WebSocket request", error}));
+                        return;
+                    }
+                    self->complete(core::StreamOpenResult::opened(
+                        std::make_unique<Shadowsocks2022StreamHandle>(
+                            std::make_shared<Shadowsocks2022StreamState>(
+                                self->carrier_, self->method_, self->password_, std::move(key),
+                                std::move(nonce), std::move(self->request_salt_),
+                                std::vector<std::uint8_t>{}))));
+                });
+            return;
+        }
+        if (obfs_options_) {
+            auto handler = [self, key = std::move(key.value()), nonce = std::move(nonce),
+                            mode = obfs_options_->mode](core::Status result) mutable {
+                if (!result) {
+                    self->complete(core::StreamOpenResult::failed(result.error()));
+                    return;
+                }
+                self->complete(
+                    core::StreamOpenResult::opened(std::make_unique<Shadowsocks2022StreamHandle>(
+                        std::make_shared<Shadowsocks2022StreamState>(
+                            self->socket_, self->method_, self->password_, std::move(key),
+                            std::move(nonce), std::move(self->request_salt_),
+                            std::vector<std::uint8_t>{}, mode))));
+            };
+            if (obfs_options_->mode == ObfsMode::http) {
+                async_write_http_obfs_request(socket_, std::move(*wire),
+                                              {obfs_options_->host, obfs_options_->port},
+                                              std::move(handler));
+            } else {
+                async_write_tls_obfs_request(socket_, std::move(*wire), obfs_options_->host,
+                                             std::move(handler));
+            }
+            return;
+        }
         boost::asio::async_write(
             *socket_, boost::asio::buffer(*wire),
             [self, wire, key = std::move(key.value()), nonce = std::move(nonce)](
                 const boost::system::error_code &error, std::size_t) mutable {
                 if (error) {
                     self->complete(core::StreamOpenResult::failed(
-                        {core::ErrorCode::transport_io,
-                         "failed to write Shadowsocks 2022 request", error}));
+                        {core::ErrorCode::transport_io, "failed to write Shadowsocks 2022 request",
+                         error}));
                     return;
                 }
-                self->complete(core::StreamOpenResult::opened(
-                    std::make_unique<Shadowsocks2022StreamHandle>(
+                self->complete(
+                    core::StreamOpenResult::opened(std::make_unique<Shadowsocks2022StreamHandle>(
                         std::make_shared<Shadowsocks2022StreamState>(
                             self->socket_, self->method_, self->password_, std::move(key),
-                            std::move(nonce), std::move(self->request_salt_)))));
+                            std::move(nonce), std::move(self->request_salt_),
+                            std::vector<std::uint8_t>{}, ObfsMode::none))));
             });
     }
 
@@ -530,22 +700,43 @@ class Shadowsocks2022OpenOperation final
     }
 
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
+    std::shared_ptr<StreamCarrier> carrier_;
     std::string method_;
     std::string password_;
     std::vector<std::uint8_t> destination_;
     std::vector<std::uint8_t> request_salt_;
+    std::optional<ObfsClientOptions> obfs_options_;
     Shadowsocks2022OpenHandler handler_;
 };
 
 } // namespace
 
-void async_open_shadowsocks_2022_stream(
-    runtime::AsioRuntime &, std::shared_ptr<boost::asio::ip::tcp::socket> socket,
-    std::string method, std::string password, std::vector<std::uint8_t> destination,
-    Shadowsocks2022OpenHandler handler) {
-    std::make_shared<Shadowsocks2022OpenOperation>(
-        std::move(socket), std::move(method), std::move(password), std::move(destination),
-        std::move(handler))
+void async_open_shadowsocks_2022_stream(runtime::AsioRuntime &,
+                                        std::shared_ptr<boost::asio::ip::tcp::socket> socket,
+                                        std::string method, std::string password,
+                                        std::vector<std::uint8_t> destination,
+                                        std::optional<ObfsClientOptions> obfs_options,
+                                        Shadowsocks2022OpenHandler handler) {
+    std::make_shared<Shadowsocks2022OpenOperation>(std::move(socket), std::move(method),
+                                                   std::move(password), std::move(destination),
+                                                   std::move(obfs_options), std::move(handler))
+        ->start();
+}
+
+void async_open_shadowsocks_2022_stream(runtime::AsioRuntime &,
+                                        std::shared_ptr<StreamCarrier> carrier, std::string method,
+                                        std::string password, std::vector<std::uint8_t> destination,
+                                        Shadowsocks2022OpenHandler handler) {
+    if (!carrier) {
+        if (handler) {
+            handler(core::StreamOpenResult::failed(
+                {core::ErrorCode::configuration, "Shadowsocks 2022 carrier is required"}));
+        }
+        return;
+    }
+    std::make_shared<Shadowsocks2022OpenOperation>(std::move(carrier), std::move(method),
+                                                   std::move(password), std::move(destination),
+                                                   std::move(handler))
         ->start();
 }
 

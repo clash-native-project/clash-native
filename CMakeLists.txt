@@ -145,6 +145,9 @@ add_library(clash-native-core STATIC
     src/transport/shadowsocks/legacy_stream.cpp
     src/transport/shadowsocks/ss2022_packet.cpp
     src/transport/shadowsocks/ss2022_stream.cpp
+    src/transport/shadowsocks/simple_obfs.cpp
+    src/transport/shadowsocks/websocket_plugin.cpp
+    src/transport/shadowsocks/udp_over_tcp.cpp
     src/outbound/shadowsocks_legacy_datagram.cpp
     src/transport/endpoint_dialer.cpp
     src/transport/quic_client.cpp

@@ -3,10 +3,10 @@
 #include <clash_native/outbound/http_proxy_outbound.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
 #include <clash_native/outbound/shadowsocks_outbound.hpp>
-#include <clash_native/transport/shadowsocks/ss2022_packet.hpp>
 #include <clash_native/outbound/trojan_outbound.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
+#include <clash_native/transport/shadowsocks/ss2022_packet.hpp>
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/ip/address.hpp>
@@ -100,11 +100,35 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
         if (!method) {
             throw std::runtime_error("CLASH_NATIVE_TEST_OUTBOUND_METHOD is required");
         }
+        clash_native::outbound::ShadowsocksOutboundConfig config{"test-proxy", server.host,
+                                                                 server.port, *method, password};
+        if (const auto plugin = environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN"); plugin) {
+            config.plugin = *plugin;
+            config.plugin_mode =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_MODE").value_or("");
+            config.plugin_host =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_HOST").value_or("");
+            config.plugin_path =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_PATH").value_or("");
+            config.plugin_tls =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_TLS").value_or("") == "1";
+            config.plugin_skip_cert_verify =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_SKIP_CERT_VERIFY")
+                    .value_or("") == "1";
+        }
+        config.udp_over_tcp =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_UDP_OVER_TCP").value_or("") == "1";
+        if (const auto version =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_UDP_OVER_TCP_VERSION");
+            version && !version->empty()) {
+            const auto parsed = std::from_chars(version->data(), version->data() + version->size(),
+                                                config.udp_over_tcp_version);
+            if (parsed.ec != std::errc{} || parsed.ptr != version->data() + version->size()) {
+                throw std::runtime_error("invalid CLASH_NATIVE_TEST_OUTBOUND_UDP_OVER_TCP_VERSION");
+            }
+        }
         auto outbound = std::make_shared<clash_native::outbound::ShadowsocksOutbound>(
-            runtime,
-            clash_native::outbound::ShadowsocksOutboundConfig{"test-proxy", server.host,
-                                                              server.port, *method, password},
-            std::move(resolver));
+            runtime, std::move(config), std::move(resolver));
         if (const auto result = outbound->validate(); !result) {
             throw std::runtime_error(result.error().context);
         }
@@ -384,11 +408,16 @@ int run_raw_shadowsocks2022_udp_test() {
 
     clash_native::transport::shadowsocks::Shadowsocks2022DatagramCodec codec(*method, *password);
     const auto target_bytes = target_address.to_v4().to_bytes();
-    std::vector<std::uint8_t> destination{1, target_bytes[0], target_bytes[1], target_bytes[2],
-                                          target_bytes[3], static_cast<std::uint8_t>(target.port >> 8),
+    std::vector<std::uint8_t> destination{1,
+                                          target_bytes[0],
+                                          target_bytes[1],
+                                          target_bytes[2],
+                                          target_bytes[3],
+                                          static_cast<std::uint8_t>(target.port >> 8),
                                           static_cast<std::uint8_t>(target.port)};
-    const std::vector<std::uint8_t> payload{'c', 'l', 'a', 's', 'h', '-', 'n', 'a', 't', 'i', 'v',
-                                            'e', '-', 's', 's', '2', '0', '2', '2', '-', 'u', 'd', 'p'};
+    const std::vector<std::uint8_t> payload{'c', 'l', 'a', 's', 'h', '-', 'n', 'a',
+                                            't', 'i', 'v', 'e', '-', 's', 's', '2',
+                                            '0', '2', '2', '-', 'u', 'd', 'p'};
     const auto wire = codec.encrypt(destination, payload);
     if (!wire) {
         throw std::runtime_error(wire.error().context);
@@ -419,8 +448,9 @@ int run_raw_shadowsocks2022_udp_test() {
             auto plaintext = codec.decrypt(std::span<const std::uint8_t>(buffer.data(), size));
             if (!plaintext || plaintext.value().size() != destination.size() + payload.size() ||
                 !std::equal(destination.begin(), destination.end(), plaintext.value().begin()) ||
-                !std::equal(payload.begin(), payload.end(), plaintext.value().begin() +
-                                                               static_cast<std::ptrdiff_t>(destination.size()))) {
+                !std::equal(payload.begin(), payload.end(),
+                            plaintext.value().begin() +
+                                static_cast<std::ptrdiff_t>(destination.size()))) {
                 throw std::runtime_error("raw Shadowsocks 2022 UDP response payload mismatch");
             }
             std::cout << "clash-native-test-host raw-udp-pass" << std::endl;

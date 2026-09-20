@@ -1124,7 +1124,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
                                  auto payloads = std::move(packets->second);
                                  self->pending_udp_packets_.erase(packets);
                                  if (!result.succeeded()) {
-                                     return;
+                                    return;
                                  }
                                  auto path = std::make_shared<UdpPath>();
                                  path->key = key;
@@ -1149,6 +1149,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
             [self, path, payload](const boost::system::error_code &error, std::size_t) {
                 if (error && error != boost::asio::error::operation_aborted &&
                     !self->closed_.load(std::memory_order_acquire)) {
+                    spdlog::warn("Proxy outbound UDP send failed: {}", error.message());
                     if (error == boost::asio::error::message_size) {
                         spdlog::warn(
                             "Proxy outbound UDP datagram exceeds the supported size limit");

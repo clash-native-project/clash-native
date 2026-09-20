@@ -2,16 +2,19 @@
 
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
-#include <clash_native/transport/shadowsocks/crypto.hpp>
 #include <clash_native/transport/shadowsocks/aead_packet.hpp>
+#include <clash_native/transport/shadowsocks/crypto.hpp>
 #include <clash_native/transport/shadowsocks/legacy_stream.hpp>
+#include <clash_native/transport/shadowsocks/simple_obfs.hpp>
 #include <clash_native/transport/shadowsocks/ss2022_packet.hpp>
 #include <clash_native/transport/shadowsocks/ss2022_stream.hpp>
+#include <clash_native/transport/shadowsocks/stream_carrier.hpp>
+#include <clash_native/transport/shadowsocks/udp_over_tcp.hpp>
+#include <clash_native/transport/shadowsocks/websocket_plugin.hpp>
 
-#include "shadowsocks_legacy_datagram.hpp"
 #include "outbound_utils.hpp"
 #include "proxy_address.hpp"
-
+#include "shadowsocks_legacy_datagram.hpp"
 
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/buffer.hpp>
@@ -22,11 +25,14 @@
 #include <boost/asio/write.hpp>
 #include <boost/system/errc.hpp>
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -47,6 +53,8 @@ constexpr std::size_t kMaxUdpWireSize = 65507;
 constexpr std::size_t kMaxEncryptedUdpDatagramSize = 1500;
 constexpr std::size_t kMaxProxyAddressSize = 1 + 1 + 255 + 2;
 constexpr auto kConnectTimeout = std::chrono::seconds(15);
+constexpr std::string_view kUdpOverTcpMagicAddress = "sp.udp-over-tcp.arpa";
+constexpr std::string_view kUdpOverTcpV2MagicAddress = "sp.v2.udp-over-tcp.arpa";
 
 boost::system::error_code protocol_error() {
     return boost::system::errc::make_error_code(boost::system::errc::protocol_error);
@@ -82,9 +90,24 @@ class ShadowsocksStreamHandle final : public core::StreamHandle {
     struct State : std::enable_shared_from_this<State> {
         State(std::shared_ptr<boost::asio::ip::tcp::socket> socket, std::string method,
               std::string password, std::vector<std::uint8_t> key,
-              std::vector<std::uint8_t> write_nonce)
-            : socket(std::move(socket)), method(std::move(method)), password(std::move(password)),
-              key(std::move(key)), write_nonce(std::move(write_nonce)) {
+              std::vector<std::uint8_t> write_nonce, std::vector<std::uint8_t> initial_wire = {},
+              ss::ObfsMode obfs_mode = ss::ObfsMode::none)
+            : socket(std::move(socket)), carrier(std::make_shared<ss::StreamCarrier>(this->socket)),
+              method(std::move(method)), password(std::move(password)), key(std::move(key)),
+              write_nonce(std::move(write_nonce)), initial_wire(std::move(initial_wire)),
+              obfs_mode(obfs_mode), obfs_response_ready(obfs_mode == ss::ObfsMode::none) {
+            if (const auto spec = ss::cipher_method(this->method)) {
+                read_nonce.assign(spec.value().nonce_size, 0);
+                encrypted_length.resize(2 + spec.value().overhead);
+            }
+        }
+
+        State(std::shared_ptr<ss::StreamCarrier> carrier, std::string method, std::string password,
+              std::vector<std::uint8_t> key, std::vector<std::uint8_t> write_nonce,
+              std::vector<std::uint8_t> initial_wire = {})
+            : socket(carrier ? carrier->socket() : nullptr), carrier(std::move(carrier)),
+              method(std::move(method)), password(std::move(password)), key(std::move(key)),
+              write_nonce(std::move(write_nonce)), initial_wire(std::move(initial_wire)) {
             if (const auto spec = ss::cipher_method(this->method)) {
                 read_nonce.assign(spec.value().nonce_size, 0);
                 encrypted_length.resize(2 + spec.value().overhead);
@@ -93,13 +116,13 @@ class ShadowsocksStreamHandle final : public core::StreamHandle {
 
         void write(boost::asio::const_buffer buffer, WriteHandler handler) {
             if (write_in_progress) {
-                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                boost::asio::post(carrier->executor(), [handler = std::move(handler)]() mutable {
                     handler(boost::asio::error::already_started, 0);
                 });
                 return;
             }
             if (buffer.size() == 0) {
-                boost::asio::post(socket->get_executor(),
+                boost::asio::post(carrier->executor(),
                                   [handler = std::move(handler)]() mutable { handler({}, 0); });
                 return;
             }
@@ -114,7 +137,7 @@ class ShadowsocksStreamHandle final : public core::StreamHandle {
                                       std::span<const std::uint8_t>(data + offset, chunk_size));
                 if (chunk.empty()) {
                     boost::asio::post(
-                        socket->get_executor(),
+                        carrier->executor(),
                         [handler = std::move(handler)]() mutable { handler(protocol_error(), 0); });
                     return;
                 }
@@ -125,24 +148,33 @@ class ShadowsocksStreamHandle final : public core::StreamHandle {
             write_in_progress = true;
             auto self = shared_from_this();
             auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(encoded));
-            boost::asio::async_write(
-                *socket, boost::asio::buffer(*wire),
-                [self, wire, handler = std::move(handler),
-                 size](const boost::system::error_code &error, std::size_t) mutable {
-                    self->write_in_progress = false;
-                    handler(error, error ? 0 : size);
-                });
+            if (obfs_mode == ss::ObfsMode::tls) {
+                ss::async_write_tls_obfs_records(
+                    socket, std::move(*wire),
+                    [self, handler = std::move(handler), size](core::Status result) mutable {
+                        self->write_in_progress = false;
+                        handler(result ? boost::system::error_code() : protocol_error(),
+                                result ? size : 0);
+                    });
+                return;
+            }
+            carrier->async_write(boost::asio::buffer(*wire),
+                                 [self, wire, handler = std::move(handler), size](
+                                     const boost::system::error_code &error, std::size_t) mutable {
+                                     self->write_in_progress = false;
+                                     handler(error, error ? 0 : size);
+                                 });
         }
 
         void read(boost::asio::mutable_buffer buffer, ReadHandler handler) {
             if (read_in_progress) {
-                boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
+                boost::asio::post(carrier->executor(), [handler = std::move(handler)]() mutable {
                     handler(boost::asio::error::already_started, 0);
                 });
                 return;
             }
             if (buffer.size() == 0) {
-                boost::asio::post(socket->get_executor(),
+                boost::asio::post(carrier->executor(),
                                   [handler = std::move(handler)]() mutable { handler({}, 0); });
                 return;
             }
@@ -154,19 +186,16 @@ class ShadowsocksStreamHandle final : public core::StreamHandle {
             read_in_progress = true;
             read_buffer = buffer;
             read_handler = std::move(handler);
-            if (!read_key_ready) {
+            if (!obfs_response_ready) {
+                receive_obfs_response();
+            } else if (!read_key_ready) {
                 receive_salt();
             } else {
                 receive_length();
             }
         }
 
-        void close() noexcept {
-            boost::system::error_code ignored;
-            socket->cancel(ignored);
-            socket->shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored);
-            socket->close(ignored);
-        }
+        void close() noexcept { carrier->close(); }
 
         void receive_salt() {
             const auto method_info = ss::cipher_method(method);
@@ -176,36 +205,54 @@ class ShadowsocksStreamHandle final : public core::StreamHandle {
             }
             auto self = shared_from_this();
             receive_salt_buffer.resize(method_info.value().key_size);
-            boost::asio::async_read(*socket, boost::asio::buffer(receive_salt_buffer),
-                                    [self](const boost::system::error_code &error, std::size_t) {
-                                        if (error) {
-                                            self->finish_read(error, 0);
-                                            return;
-                                        }
-                                        auto key_result = ss::derive_aead_subkey(
-                                            self->method, self->password,
-                                            self->receive_salt_buffer);
-                                        if (!key_result) {
-                                            self->finish_read(authentication_error(), 0);
-                                            return;
-                                        }
-                                        self->read_key = std::move(key_result.value());
-                                        self->read_key_ready = true;
-                                        self->receive_length();
-                                    });
+            read_exact(boost::asio::buffer(receive_salt_buffer),
+                       [self](const boost::system::error_code &error) {
+                           if (error) {
+                               self->finish_read(error, 0);
+                               return;
+                           }
+                           auto key_result = ss::derive_aead_subkey(self->method, self->password,
+                                                                    self->receive_salt_buffer);
+                           if (!key_result) {
+                               self->finish_read(authentication_error(), 0);
+                               return;
+                           }
+                           self->read_key = std::move(key_result.value());
+                           self->read_key_ready = true;
+                           self->receive_length();
+                       });
+        }
+
+        void receive_obfs_response() {
+            auto self = shared_from_this();
+            auto handler = [self](core::Result<std::vector<std::uint8_t>> result) {
+                if (!result) {
+                    self->finish_read(protocol_error(), 0);
+                    return;
+                }
+                self->initial_wire = std::move(result.value());
+                self->initial_wire_offset = 0;
+                self->obfs_response_ready = true;
+                self->receive_salt();
+            };
+            if (obfs_mode == ss::ObfsMode::http) {
+                ss::async_read_http_obfs_response(socket, std::move(handler));
+            } else {
+                ss::async_read_tls_obfs_response(socket, std::move(handler));
+            }
         }
 
         void receive_length() {
             auto self = shared_from_this();
-            boost::asio::async_read(
-                *socket, boost::asio::buffer(encrypted_length),
-                [self](const boost::system::error_code &error, std::size_t) {
+            read_exact(
+                boost::asio::buffer(encrypted_length),
+                [self](const boost::system::error_code &error) {
                     if (error) {
                         self->finish_read(error, 0);
                         return;
                     }
-                    const auto length = ss::aead_decrypt(
-                        self->method, self->read_key, self->read_nonce, self->encrypted_length);
+                    const auto length = ss::aead_decrypt(self->method, self->read_key,
+                                                         self->read_nonce, self->encrypted_length);
                     if (!length || length.value().size() != 2) {
                         self->finish_read(authentication_error(), 0);
                         return;
@@ -229,23 +276,84 @@ class ShadowsocksStreamHandle final : public core::StreamHandle {
                 return;
             }
             encrypted_payload.resize(payload_size + method_info.value().overhead);
-            boost::asio::async_read(
-                *socket, boost::asio::buffer(encrypted_payload),
-                [self](const boost::system::error_code &error, std::size_t) {
-                    if (error) {
-                        self->finish_read(error, 0);
+            read_exact(boost::asio::buffer(encrypted_payload),
+                       [self](const boost::system::error_code &error) {
+                           if (error) {
+                               self->finish_read(error, 0);
+                               return;
+                           }
+                           auto plaintext =
+                               ss::aead_decrypt(self->method, self->read_key, self->read_nonce,
+                                                self->encrypted_payload);
+                           if (!plaintext || plaintext.value().empty()) {
+                               self->finish_read(authentication_error(), 0);
+                               return;
+                           }
+                           ss::increment_nonce(self->read_nonce);
+                           self->pending_plaintext = std::move(plaintext.value());
+                           self->pending_offset = 0;
+                           self->copy_pending(self->read_buffer, std::move(self->read_handler));
+                       });
+        }
+
+        using ExactReadHandler = std::function<void(const boost::system::error_code &)>;
+
+        void read_exact(boost::asio::mutable_buffer buffer, ExactReadHandler handler) {
+            if (obfs_mode == ss::ObfsMode::tls) {
+                read_exact_tls(buffer, std::move(handler), 0);
+                return;
+            }
+            std::size_t copied = 0;
+            if (initial_wire_offset < initial_wire.size()) {
+                copied = std::min(buffer.size(), initial_wire.size() - initial_wire_offset);
+                std::memcpy(static_cast<std::uint8_t *>(buffer.data()),
+                            initial_wire.data() + initial_wire_offset, copied);
+                initial_wire_offset += copied;
+                if (initial_wire_offset == initial_wire.size()) {
+                    initial_wire.clear();
+                    initial_wire_offset = 0;
+                }
+            }
+            if (copied == buffer.size()) {
+                boost::asio::post(carrier->executor(),
+                                  [handler = std::move(handler)]() mutable { handler({}); });
+                return;
+            }
+            auto remaining = boost::asio::mutable_buffer(
+                static_cast<std::uint8_t *>(buffer.data()) + copied, buffer.size() - copied);
+            read_exact_carrier(remaining, std::move(handler));
+        }
+
+        void read_exact_tls(boost::asio::mutable_buffer buffer, ExactReadHandler handler,
+                            std::size_t copied) {
+            if (initial_wire_offset < initial_wire.size()) {
+                const auto count =
+                    std::min(buffer.size() - copied, initial_wire.size() - initial_wire_offset);
+                std::memcpy(static_cast<std::uint8_t *>(buffer.data()) + copied,
+                            initial_wire.data() + initial_wire_offset, count);
+                initial_wire_offset += count;
+                copied += count;
+                if (initial_wire_offset == initial_wire.size()) {
+                    initial_wire.clear();
+                    initial_wire_offset = 0;
+                }
+            }
+            if (copied == buffer.size()) {
+                boost::asio::post(carrier->executor(),
+                                  [handler = std::move(handler)]() mutable { handler({}); });
+                return;
+            }
+            auto self = shared_from_this();
+            ss::async_read_tls_obfs_record(
+                socket, [self, buffer, handler = std::move(handler),
+                         copied](core::Result<std::vector<std::uint8_t>> result) mutable {
+                    if (!result) {
+                        handler(protocol_error());
                         return;
                     }
-                    auto plaintext = ss::aead_decrypt(
-                        self->method, self->read_key, self->read_nonce, self->encrypted_payload);
-                    if (!plaintext || plaintext.value().empty()) {
-                        self->finish_read(authentication_error(), 0);
-                        return;
-                    }
-                    ss::increment_nonce(self->read_nonce);
-                    self->pending_plaintext = std::move(plaintext.value());
-                    self->pending_offset = 0;
-                    self->copy_pending(self->read_buffer, std::move(self->read_handler));
+                    self->initial_wire = std::move(result.value());
+                    self->initial_wire_offset = 0;
+                    self->read_exact_tls(buffer, std::move(handler), copied);
                 });
         }
 
@@ -262,6 +370,29 @@ class ShadowsocksStreamHandle final : public core::StreamHandle {
             handler({}, copied);
         }
 
+        void read_exact_carrier(boost::asio::mutable_buffer buffer, ExactReadHandler handler) {
+            auto self = shared_from_this();
+            carrier->async_read_some(
+                buffer, [self, buffer, handler = std::move(handler)](
+                            const boost::system::error_code &error, std::size_t size) mutable {
+                    if (error) {
+                        handler(error);
+                        return;
+                    }
+                    if (size == 0) {
+                        handler(boost::asio::error::eof);
+                        return;
+                    }
+                    if (size == buffer.size()) {
+                        handler({});
+                        return;
+                    }
+                    auto remaining = boost::asio::mutable_buffer(
+                        static_cast<std::uint8_t *>(buffer.data()) + size, buffer.size() - size);
+                    self->read_exact_carrier(remaining, std::move(handler));
+                });
+        }
+
         void finish_read(const boost::system::error_code &error, std::size_t size) {
             read_in_progress = false;
             auto handler = std::move(read_handler);
@@ -271,6 +402,7 @@ class ShadowsocksStreamHandle final : public core::StreamHandle {
         }
 
         std::shared_ptr<boost::asio::ip::tcp::socket> socket;
+        std::shared_ptr<ss::StreamCarrier> carrier;
         std::string method;
         std::string password;
         std::vector<std::uint8_t> key;
@@ -280,21 +412,38 @@ class ShadowsocksStreamHandle final : public core::StreamHandle {
         std::vector<std::uint8_t> read_key;
         std::vector<std::uint8_t> encrypted_length = std::vector<std::uint8_t>(2 + kAeadTagSize);
         std::vector<std::uint8_t> encrypted_payload;
+        std::vector<std::uint8_t> initial_wire;
+        std::size_t initial_wire_offset = 0;
         std::vector<std::uint8_t> pending_plaintext;
         std::size_t pending_offset = 0;
         boost::asio::mutable_buffer read_buffer;
         ReadHandler read_handler;
         bool read_key_ready = false;
+        ss::ObfsMode obfs_mode = ss::ObfsMode::none;
+        bool obfs_response_ready = true;
         bool read_in_progress = false;
         bool write_in_progress = false;
     };
 
   public:
+    ~ShadowsocksStreamHandle() override = default;
+
     ShadowsocksStreamHandle(std::shared_ptr<boost::asio::ip::tcp::socket> socket,
                             std::string method, std::string password, std::vector<std::uint8_t> key,
-                            std::vector<std::uint8_t> write_nonce)
+                            std::vector<std::uint8_t> write_nonce,
+                            std::vector<std::uint8_t> initial_wire = {},
+                            ss::ObfsMode obfs_mode = ss::ObfsMode::none)
         : state_(std::make_shared<State>(std::move(socket), std::move(method), std::move(password),
-                                         std::move(key), write_nonce)) {}
+                                         std::move(key), std::move(write_nonce),
+                                         std::move(initial_wire), obfs_mode)) {}
+
+    ShadowsocksStreamHandle(std::shared_ptr<ss::StreamCarrier> carrier, std::string method,
+                            std::string password, std::vector<std::uint8_t> key,
+                            std::vector<std::uint8_t> write_nonce,
+                            std::vector<std::uint8_t> initial_wire = {})
+        : state_(std::make_shared<State>(std::move(carrier), std::move(method), std::move(password),
+                                         std::move(key), std::move(write_nonce),
+                                         std::move(initial_wire))) {}
 
     void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
         state_->read(buffer, std::move(handler));
@@ -305,16 +454,16 @@ class ShadowsocksStreamHandle final : public core::StreamHandle {
     }
 
     boost::asio::any_io_executor executor() noexcept override {
-        return state_->socket->get_executor();
+        return state_->carrier->executor();
     }
 
     boost::asio::ip::tcp::endpoint
     local_endpoint(boost::system::error_code &error) const noexcept override {
-        return state_->socket->local_endpoint(error);
+        return state_->carrier->local_endpoint(error);
     }
 
     void shutdown_send(boost::system::error_code &error) noexcept override {
-        state_->socket->shutdown(boost::asio::ip::tcp::socket::shutdown_send, error);
+        state_->carrier->shutdown_send(error);
     }
 
     void close() noexcept override { state_->close(); }
@@ -371,7 +520,57 @@ class ShadowsocksConnectOperation final
         if (!method) {
             return core::fail(method.error());
         }
+        if (!config_.plugin.empty() && config_.plugin != "obfs" &&
+            config_.plugin != "v2ray-plugin" && config_.plugin != "gost-plugin") {
+            return core::fail({core::ErrorCode::unsupported, "unsupported Shadowsocks plugin", {}});
+        }
+        if (config_.plugin == "obfs" && config_.plugin_mode != "http" &&
+            config_.plugin_mode != "tls") {
+            return core::fail({core::ErrorCode::unsupported,
+                               "only Shadowsocks simple-obfs http and tls modes are supported",
+                               {}});
+        }
+        if ((config_.plugin == "v2ray-plugin" || config_.plugin == "gost-plugin") &&
+            config_.plugin_mode != "websocket") {
+            return core::fail({core::ErrorCode::unsupported,
+                               "Shadowsocks WebSocket plugins require websocket mode",
+                               {}});
+        }
+        if (config_.udp_over_tcp_version != 1 && config_.udp_over_tcp_version != 2) {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks UDP-over-TCP version must be 1 or 2",
+                               {}});
+        }
+        if (!config_.plugin_path.empty() && config_.plugin_path.front() != '/') {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks WebSocket plugin path must start with '/'",
+                               {}});
+        }
+        if (config_.plugin_host.find_first_of("\r\n") != std::string::npos) {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks plugin host contains invalid characters",
+                               {}});
+        }
         return {};
+    }
+
+    std::optional<ss::ObfsClientOptions> obfs_options() const {
+        if (config_.plugin != "obfs") {
+            return std::nullopt;
+        }
+        return ss::ObfsClientOptions{
+            config_.plugin_mode == "tls" ? ss::ObfsMode::tls : ss::ObfsMode::http,
+            config_.plugin_host.empty() ? "bing.com" : config_.plugin_host, config_.server_port};
+    }
+
+    bool websocket_plugin() const noexcept {
+        return config_.plugin == "v2ray-plugin" || config_.plugin == "gost-plugin";
+    }
+
+    ss::WebSocketPluginOptions websocket_options() const {
+        return {config_.plugin_host.empty() ? "bing.com" : config_.plugin_host,
+                config_.plugin_path.empty() ? "/" : config_.plugin_path, config_.plugin_tls,
+                config_.plugin_skip_cert_verify};
     }
 
     void resolved(core::Result<detail::AddressList> result) {
@@ -410,9 +609,14 @@ class ShadowsocksConnectOperation final
                 finish(core::StreamOpenResult::failed(address.error()));
                 return;
             }
+            if (websocket_plugin()) {
+                open_websocket_2022(std::move(address.value()));
+                return;
+            }
             auto self = shared_from_this();
             ss::async_open_shadowsocks_2022_stream(
                 runtime_, socket_, config_.method, config_.password, std::move(address.value()),
+                obfs_options(),
                 [self](core::StreamOpenResult result) { self->finish(std::move(result)); });
             return;
         }
@@ -442,6 +646,33 @@ class ShadowsocksConnectOperation final
         salt.insert(salt.end(), record.begin(), record.end());
         auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(salt));
         auto self = shared_from_this();
+        if (websocket_plugin()) {
+            open_websocket_classic(std::move(*wire), std::move(key.value()));
+            return;
+        }
+        if (const auto obfs = obfs_options(); obfs) {
+            auto handler = [self, key = std::move(key.value()),
+                            mode = obfs->mode](core::Status result) mutable {
+                if (!result) {
+                    self->finish(core::StreamOpenResult::failed(result.error()));
+                    return;
+                }
+                auto handler = std::move(self->handler_);
+                self->cancel_timer();
+                self->completed_ = true;
+                handler(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
+                    self->socket_, self->config_.method, self->config_.password, std::move(key),
+                    self->write_nonce_, std::vector<std::uint8_t>{}, mode)));
+            };
+            if (obfs->mode == ss::ObfsMode::http) {
+                ss::async_write_http_obfs_request(socket_, std::move(*wire),
+                                                  {obfs->host, obfs->port}, std::move(handler));
+            } else {
+                ss::async_write_tls_obfs_request(socket_, std::move(*wire), obfs->host,
+                                                 std::move(handler));
+            }
+            return;
+        }
         boost::asio::async_write(
             *socket_, boost::asio::buffer(*wire),
             [self, wire, key = std::move(key.value())](const boost::system::error_code &error,
@@ -458,6 +689,60 @@ class ShadowsocksConnectOperation final
                 handler(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
                     self->socket_, self->config_.method, self->config_.password, std::move(key),
                     self->write_nonce_)));
+            });
+    }
+
+    void open_websocket_classic(std::vector<std::uint8_t> wire, std::vector<std::uint8_t> key) {
+        auto self = shared_from_this();
+        auto stream = std::make_unique<net::TcpStream>(std::move(*socket_));
+        ss::async_open_websocket_plugin(
+            std::move(stream), websocket_options(),
+            [self, wire = std::make_shared<std::vector<std::uint8_t>>(std::move(wire)),
+             key =
+                 std::move(key)](core::Result<std::unique_ptr<core::StreamHandle>> result) mutable {
+                if (!result) {
+                    self->finish(core::StreamOpenResult::failed(result.error()));
+                    return;
+                }
+                self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
+                self->carrier_->async_write(
+                    boost::asio::buffer(*wire),
+                    [self, wire, key = std::move(key)](const boost::system::error_code &error,
+                                                       std::size_t) mutable {
+                        if (error) {
+                            self->finish(core::StreamOpenResult::failed(
+                                {core::ErrorCode::transport_io,
+                                 "failed to write Shadowsocks WebSocket request",
+                                 detail::to_std_error(error)}));
+                            return;
+                        }
+                        auto handler = std::move(self->handler_);
+                        self->cancel_timer();
+                        self->completed_ = true;
+                        handler(core::StreamOpenResult::opened(
+                            std::make_unique<ShadowsocksStreamHandle>(
+                                self->carrier_, self->config_.method, self->config_.password,
+                                std::move(key), self->write_nonce_)));
+                    });
+            });
+    }
+
+    void open_websocket_2022(std::vector<std::uint8_t> destination) {
+        auto self = shared_from_this();
+        auto stream = std::make_unique<net::TcpStream>(std::move(*socket_));
+        ss::async_open_websocket_plugin(
+            std::move(stream), websocket_options(),
+            [self, destination = std::move(destination)](
+                core::Result<std::unique_ptr<core::StreamHandle>> result) mutable {
+                if (!result) {
+                    self->finish(core::StreamOpenResult::failed(result.error()));
+                    return;
+                }
+                self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
+                ss::async_open_shadowsocks_2022_stream(
+                    self->runtime_, self->carrier_, self->config_.method, self->config_.password,
+                    std::move(destination),
+                    [self](core::StreamOpenResult opened) { self->finish(std::move(opened)); });
             });
     }
 
@@ -487,13 +772,46 @@ class ShadowsocksConnectOperation final
         iv.insert(iv.end(), encrypted_address.begin(), encrypted_address.end());
         auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(iv));
         auto self = shared_from_this();
+        if (websocket_plugin()) {
+            open_websocket_legacy(std::move(*wire), std::move(cipher.value()));
+            return;
+        }
+        if (const auto obfs = obfs_options(); obfs) {
+            auto write_cipher = std::make_shared<ss::LegacyStreamCipher>(std::move(cipher.value()));
+            auto handler = [self, write_cipher, mode = obfs->mode](core::Status result) mutable {
+                if (!result) {
+                    self->finish(core::StreamOpenResult::failed(result.error()));
+                    return;
+                }
+                auto handler = std::move(self->handler_);
+                self->cancel_timer();
+                self->completed_ = true;
+                auto stream = ss::make_legacy_stream_handle(self->socket_, self->config_.method,
+                                                            self->config_.password,
+                                                            std::move(*write_cipher), {}, mode);
+                if (!stream) {
+                    handler(core::StreamOpenResult::failed(stream.error()));
+                    return;
+                }
+                handler(core::StreamOpenResult::opened(std::move(stream.value())));
+            };
+            if (obfs->mode == ss::ObfsMode::http) {
+                ss::async_write_http_obfs_request(socket_, std::move(*wire),
+                                                  {obfs->host, obfs->port}, std::move(handler));
+            } else {
+                ss::async_write_tls_obfs_request(socket_, std::move(*wire), obfs->host,
+                                                 std::move(handler));
+            }
+            return;
+        }
         boost::asio::async_write(
             *socket_, boost::asio::buffer(*wire),
-            [self, wire, cipher = std::move(cipher.value())](
-                const boost::system::error_code &error, std::size_t) mutable {
+            [self, wire, cipher = std::move(cipher.value())](const boost::system::error_code &error,
+                                                             std::size_t) mutable {
                 if (error) {
                     self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::transport_io, "failed to write Shadowsocks legacy request",
+                        {core::ErrorCode::transport_io,
+                         "failed to write Shadowsocks legacy request",
                          detail::to_std_error(error)}));
                     return;
                 }
@@ -501,13 +819,53 @@ class ShadowsocksConnectOperation final
                 self->cancel_timer();
                 self->completed_ = true;
                 auto stream = ss::make_legacy_stream_handle(
-                    self->socket_, self->config_.method, self->config_.password,
-                    std::move(cipher));
+                    self->socket_, self->config_.method, self->config_.password, std::move(cipher));
                 if (!stream) {
                     handler(core::StreamOpenResult::failed(stream.error()));
                     return;
                 }
                 handler(core::StreamOpenResult::opened(std::move(stream.value())));
+            });
+    }
+
+    void open_websocket_legacy(std::vector<std::uint8_t> wire,
+                               ss::LegacyStreamCipher write_cipher) {
+        auto self = shared_from_this();
+        auto cipher = std::make_shared<ss::LegacyStreamCipher>(std::move(write_cipher));
+        auto stream = std::make_unique<net::TcpStream>(std::move(*socket_));
+        ss::async_open_websocket_plugin(
+            std::move(stream), websocket_options(),
+            [self, wire = std::make_shared<std::vector<std::uint8_t>>(std::move(wire)),
+             cipher = std::move(cipher)](
+                core::Result<std::unique_ptr<core::StreamHandle>> result) mutable {
+                if (!result) {
+                    self->finish(core::StreamOpenResult::failed(result.error()));
+                    return;
+                }
+                self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
+                self->carrier_->async_write(
+                    boost::asio::buffer(*wire),
+                    [self, wire, cipher](const boost::system::error_code &error,
+                                         std::size_t) mutable {
+                        if (error) {
+                            self->finish(core::StreamOpenResult::failed(
+                                {core::ErrorCode::transport_io,
+                                 "failed to write Shadowsocks WebSocket request",
+                                 detail::to_std_error(error)}));
+                            return;
+                        }
+                        auto handler = std::move(self->handler_);
+                        self->cancel_timer();
+                        self->completed_ = true;
+                        auto stream = ss::make_legacy_stream_handle(
+                            self->carrier_, self->config_.method, self->config_.password,
+                            std::move(*cipher));
+                        if (!stream) {
+                            handler(core::StreamOpenResult::failed(stream.error()));
+                            return;
+                        }
+                        handler(core::StreamOpenResult::opened(std::move(stream.value())));
+                    });
             });
     }
 
@@ -536,6 +894,7 @@ class ShadowsocksConnectOperation final
     ShadowsocksOutboundConfig config_;
     core::StreamRequest request_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
+    std::shared_ptr<ss::StreamCarrier> carrier_;
     boost::asio::steady_timer timer_;
     core::StreamOpenHandler handler_;
     std::vector<std::uint8_t> write_nonce_;
@@ -553,8 +912,8 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
               server(std::move(server)), method(std::move(method)), password(std::move(password)) {
             const auto method_info = ss::cipher_method(this->method);
             if (method_info && method_info.value().shadowsocks_2022) {
-                ss2022_codec = std::make_unique<ss::Shadowsocks2022DatagramCodec>(
-                    this->method, this->password);
+                ss2022_codec = std::make_unique<ss::Shadowsocks2022DatagramCodec>(this->method,
+                                                                                  this->password);
             }
         }
 
@@ -585,8 +944,8 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
                 auto self = shared_from_this();
                 socket->async_send_to(
                     boost::asio::buffer(*packet), server,
-                    [self, packet, handler = std::move(handler), payload_size](
-                        const boost::system::error_code &error, std::size_t) mutable {
+                    [self, packet, handler = std::move(handler),
+                     payload_size](const boost::system::error_code &error, std::size_t) mutable {
                         handler(error, error ? 0 : payload_size);
                     });
                 return;
@@ -693,10 +1052,10 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
             auto self = shared_from_this();
             detail::resolve_host(
                 runtime, resolver, destination.domain(),
-                    [self, plaintext = std::move(plaintext), payload_offset, payload_size,
-                     port = destination.port()](core::Result<detail::AddressList> result) mutable {
-                        if (!result || result.value().empty()) {
-                            self->finish_receive(boost::asio::error::host_not_found, 0, {});
+                [self, plaintext = std::move(plaintext), payload_offset, payload_size,
+                 port = destination.port()](core::Result<detail::AddressList> result) mutable {
+                    if (!result || result.value().empty()) {
+                        self->finish_receive(boost::asio::error::host_not_found, 0, {});
                         return;
                     }
                     self->complete_payload(
@@ -741,7 +1100,7 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
             }
             return std::min<std::size_t>(
                 ss::aead_datagram_payload_limit(method, kMaxEncryptedUdpDatagramSize,
-                                                 kMaxProxyAddressSize),
+                                                kMaxProxyAddressSize),
                 kMaxUdpWireSize);
         }
 
@@ -797,7 +1156,40 @@ core::Status ShadowsocksOutbound::validate() const {
                            "Shadowsocks outbound ID, server, port, and password are required"});
     }
     const auto method = ss::cipher_method(config_.method);
-    return method ? core::Status{} : core::Status(core::fail(method.error()));
+    if (!method) {
+        return core::Status(core::fail(method.error()));
+    }
+    if (!config_.plugin.empty() && config_.plugin != "obfs" && config_.plugin != "v2ray-plugin" &&
+        config_.plugin != "gost-plugin") {
+        return core::fail({core::ErrorCode::unsupported, "unsupported Shadowsocks plugin", {}});
+    }
+    if (config_.plugin == "obfs" && config_.plugin_mode != "http" && config_.plugin_mode != "tls") {
+        return core::fail({core::ErrorCode::unsupported,
+                           "only Shadowsocks simple-obfs http and tls modes are supported",
+                           {}});
+    }
+    if ((config_.plugin == "v2ray-plugin" || config_.plugin == "gost-plugin") &&
+        config_.plugin_mode != "websocket") {
+        return core::fail({core::ErrorCode::unsupported,
+                           "Shadowsocks WebSocket plugins require websocket mode",
+                           {}});
+    }
+    if (config_.udp_over_tcp_version != 1 && config_.udp_over_tcp_version != 2) {
+        return core::fail({core::ErrorCode::configuration,
+                           "Shadowsocks UDP-over-TCP version must be 1 or 2",
+                           {}});
+    }
+    if (!config_.plugin_path.empty() && config_.plugin_path.front() != '/') {
+        return core::fail({core::ErrorCode::configuration,
+                           "Shadowsocks WebSocket plugin path must start with '/'",
+                           {}});
+    }
+    if (config_.plugin_host.find_first_of("\r\n") != std::string::npos) {
+        return core::fail({core::ErrorCode::configuration,
+                           "Shadowsocks plugin host contains invalid characters",
+                           {}});
+    }
+    return {};
 }
 
 const core::OutboundDescriptor &ShadowsocksOutbound::descriptor() const noexcept {
@@ -815,12 +1207,53 @@ void ShadowsocksOutbound::connect_stream(core::StreamRequest request,
     operation->start();
 }
 
-void ShadowsocksOutbound::open_datagram(core::DatagramRequest, core::DatagramOpenHandler handler) {
+void ShadowsocksOutbound::open_datagram(core::DatagramRequest request,
+                                        core::DatagramOpenHandler handler) {
     if (const auto validation = validate(); !validation) {
         boost::asio::post(runtime_.context(),
                           [handler = std::move(handler), error = validation.error()]() mutable {
                               handler(core::DatagramOpenResult::failed(std::move(error)));
                           });
+        return;
+    }
+
+    if (config_.udp_over_tcp) {
+        const auto version = config_.udp_over_tcp_version;
+        const auto magic = version == 2 ? kUdpOverTcpV2MagicAddress : kUdpOverTcpMagicAddress;
+        core::StreamRequest stream_request{core::Destination::domain(std::string(magic), 0),
+                                           std::nullopt, request.dial_trace};
+        auto operation = std::make_shared<ShadowsocksConnectOperation>(
+            runtime_, resolver_, config_, std::move(stream_request),
+            [handler = std::move(handler), initial_destination = request.initial_destination,
+             version, context = &runtime_.context()](
+                core::StreamOpenResult result) mutable {
+                boost::asio::post(
+                    context->get_executor(),
+                    [handler = std::move(handler), initial_destination, version,
+                     result = std::move(result)]() mutable {
+                        if (!result.succeeded()) {
+                            handler(core::DatagramOpenResult::failed(
+                                result.error.value_or(core::Error{
+                                    core::ErrorCode::transport_io,
+                                    "failed to open Shadowsocks UoT stream"})));
+                            return;
+                        }
+                        const auto request_destination =
+                            version == 2 ? initial_destination : std::nullopt;
+                        auto datagram = ss::make_udp_over_tcp_datagram_handle(
+                            std::move(result.handle),
+                            {version == 2 ? ss::UdpOverTcpVersion::version2
+                                          : ss::UdpOverTcpVersion::legacy,
+                             request_destination});
+                        if (!datagram) {
+                            handler(core::DatagramOpenResult::failed(datagram.error()));
+                            return;
+                        }
+                        handler(core::DatagramOpenResult::opened(
+                            std::move(datagram.value()), core::DatagramSemantics::multi_destination));
+                    });
+            });
+        operation->start();
         return;
     }
 

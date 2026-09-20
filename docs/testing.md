@@ -73,6 +73,26 @@ including its 20-round HChaCha key derivation and 8-round payload cipher. The
 full classic matrix, including `xchacha8-ietf-poly1305`, all three Shadowsocks
 2022 TCP methods, and all three Shadowsocks 2022 UDP methods pass against the
 real Mihomo server.
+The same Mihomo listener test also covers the Shadowsocks `obfs` plugin in
+HTTP and TLS modes for a classic AEAD stream and a Shadowsocks 2022 stream.
+The plugin is a TCP carrier; native Shadowsocks UDP remains unwrapped. HTTP
+101 and the fake TLS server response are consumed lazily on the first
+downstream read, matching Mihomo's simple-obfs server timing.
+
+`TestShadowsocksWebSocketPlugins` uses an independent Go/Gorilla WebSocket
+server backed by the test Shadowsocks peer. It covers both `v2ray-plugin` and
+`gost-plugin` in WebSocket mode, including a TLS-wrapped WebSocket case. The
+current implementation intentionally leaves plugin multiplexing disabled and
+does not apply WebSocket plugins to native Shadowsocks UDP.
+
+`TestMihomoActualServerShadowsocksUoT` validates Shadowsocks UDP-over-TCP
+version 1 and version 2 against a real Mihomo Shadowsocks listener. The test
+uses a separately built Go test executable, a UDP echo service, and a
+non-loopback IPv4 bind when required by the Windows UDP environment. Version 2
+uses the standard SOCKS address encoding for its request header and the UoT
+address encoding for each packet frame. The current `DatagramHandle` source
+endpoint is IP-only, so a domain-addressed response frame is rejected instead
+of being returned without its original domain metadata.
 
 Build Mihomo from its source checkout, then run the opt-in integration test
 from `tests/interop` with both executable paths set:
@@ -88,8 +108,24 @@ $interop = 'D:\Project\cpp\clash-native\build\windows-clang-cl-x64\clash-native-
 go test -c -o $interop .
 & $interop '-test.count=1' '-test.run=^TestMihomoActualServerInteroperability$/Shadowsocks/' '-test.v=true'
 
+# Run only the Shadowsocks HTTP simple-obfs case.
+& $interop '-test.count=1' '-test.run=^TestMihomoActualServerInteroperability$/Shadowsocks/simple-obfs-http$' '-test.v=true'
+
+# Run only the Shadowsocks TLS simple-obfs case.
+& $interop '-test.count=1' '-test.run=^TestMihomoActualServerInteroperability$/Shadowsocks/simple-obfs-tls$' '-test.v=true'
+
+# Run the SS2022 TCP matrix, including its HTTP simple-obfs case.
+& $interop '-test.count=1' '-test.run=^TestMihomoActualServerShadowsocks2022TCP$' '-test.v=true'
+
 # Run the Shadowsocks 2022 UDP listener test separately.
 & $interop '-test.count=1' '-test.run=^TestMihomoActualServerShadowsocks2022UDP$' '-test.v=true'
+
+# Run the v2ray-plugin/gost-plugin WebSocket cases.
+$env:CLASH_NATIVE_TEST_HOST = 'D:\Project\cpp\clash-native\build\windows-clang-cl-x64\clash-native-test-host.exe'
+& $interop '-test.count=1' '-test.run=^TestShadowsocksWebSocketPlugins$' '-test.v=true'
+
+# Run Shadowsocks UDP-over-TCP versions 1 and 2.
+& $interop '-test.count=1' '-test.run=^TestMihomoActualServerShadowsocksUoT$' '-test.v=true'
 ```
 
 The classic UDP matrix uses a 1000-byte application payload so every supported

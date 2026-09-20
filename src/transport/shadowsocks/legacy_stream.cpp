@@ -1,6 +1,7 @@
 #include <clash_native/transport/shadowsocks/legacy_stream.hpp>
 
 #include <clash_native/transport/shadowsocks/crypto.hpp>
+#include <clash_native/transport/shadowsocks/simple_obfs.hpp>
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/post.hpp>
@@ -12,6 +13,7 @@
 #include <climits>
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <optional>
 #include <span>
 #include <utility>
@@ -23,9 +25,19 @@ namespace {
 class LegacyStreamState final : public std::enable_shared_from_this<LegacyStreamState> {
   public:
     LegacyStreamState(std::shared_ptr<boost::asio::ip::tcp::socket> socket, std::string method,
-                      std::string password, LegacyStreamCipher write_cipher)
-        : socket_(std::move(socket)), method_(std::move(method)), password_(std::move(password)),
-          write_cipher_(std::move(write_cipher)) {}
+                      std::string password, LegacyStreamCipher write_cipher,
+                      std::vector<std::uint8_t> initial_wire, ObfsMode obfs_mode)
+        : socket_(std::move(socket)), carrier_(std::make_shared<StreamCarrier>(socket_)),
+          method_(std::move(method)), password_(std::move(password)),
+          write_cipher_(std::move(write_cipher)), initial_wire_(std::move(initial_wire)),
+          obfs_mode_(obfs_mode), obfs_response_ready_(obfs_mode == ObfsMode::none) {}
+
+    LegacyStreamState(std::shared_ptr<StreamCarrier> carrier, std::string method,
+                      std::string password, LegacyStreamCipher write_cipher,
+                      std::vector<std::uint8_t> initial_wire)
+        : socket_(carrier ? carrier->socket() : nullptr), carrier_(std::move(carrier)),
+          method_(std::move(method)), password_(std::move(password)),
+          write_cipher_(std::move(write_cipher)), initial_wire_(std::move(initial_wire)) {}
 
     void read(boost::asio::mutable_buffer buffer, core::StreamHandle::ReadHandler handler) {
         if (read_in_progress_) {
@@ -39,7 +51,9 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
         read_in_progress_ = true;
         read_buffer_ = buffer;
         read_handler_ = std::move(handler);
-        if (!read_cipher_) {
+        if (!obfs_response_ready_) {
+            receive_obfs_response();
+        } else if (!read_cipher_) {
             receive_iv();
             return;
         }
@@ -68,35 +82,59 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
         }
         write_in_progress_ = true;
         auto self = shared_from_this();
-        boost::asio::async_write(
-            *socket_, boost::asio::buffer(*wire),
-            [self, wire, handler = std::move(handler), size = buffer.size()](
-                const boost::system::error_code &error, std::size_t) mutable {
-                self->write_in_progress_ = false;
-                handler(error, error ? 0 : size);
-            });
+        if (obfs_mode_ == ObfsMode::tls) {
+            async_write_tls_obfs_records(
+                socket_, std::move(*wire),
+                [self, handler = std::move(handler), size = buffer.size()](core::Status result) {
+                    self->write_in_progress_ = false;
+                    handler(result ? boost::system::error_code() : boost::asio::error::fault,
+                            result ? size : 0);
+                });
+            return;
+        }
+        carrier_->async_write(boost::asio::buffer(*wire),
+                              [self, wire, handler = std::move(handler), size = buffer.size()](
+                                  const boost::system::error_code &error, std::size_t) mutable {
+                                  self->write_in_progress_ = false;
+                                  handler(error, error ? 0 : size);
+                              });
     }
 
     void close() noexcept {
-        boost::system::error_code ignored;
-        socket_->cancel(ignored);
-        socket_->shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored);
-        socket_->close(ignored);
+        carrier_->close();
         finish_read(boost::asio::error::operation_aborted, 0);
     }
 
-    boost::asio::any_io_executor executor() noexcept { return socket_->get_executor(); }
+    boost::asio::any_io_executor executor() noexcept { return carrier_->executor(); }
 
-    boost::asio::ip::tcp::endpoint
-    local_endpoint(boost::system::error_code &error) const noexcept {
-        return socket_->local_endpoint(error);
+    boost::asio::ip::tcp::endpoint local_endpoint(boost::system::error_code &error) const noexcept {
+        return carrier_->local_endpoint(error);
     }
 
     void shutdown_send(boost::system::error_code &error) noexcept {
-        socket_->shutdown(boost::asio::ip::tcp::socket::shutdown_send, error);
+        carrier_->shutdown_send(error);
     }
 
   private:
+    void receive_obfs_response() {
+        auto self = shared_from_this();
+        auto handler = [self](core::Result<std::vector<std::uint8_t>> result) {
+            if (!result) {
+                self->finish_read(boost::asio::error::fault, 0);
+                return;
+            }
+            self->initial_wire_ = std::move(result.value());
+            self->initial_wire_offset_ = 0;
+            self->obfs_response_ready_ = true;
+            self->receive_iv();
+        };
+        if (obfs_mode_ == ObfsMode::http) {
+            async_read_http_obfs_response(socket_, std::move(handler));
+        } else {
+            async_read_tls_obfs_response(socket_, std::move(handler));
+        }
+    }
+
     void receive_iv() {
         const auto spec = cipher_method(method_);
         if (!spec) {
@@ -105,48 +143,135 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
         }
         receive_iv_buffer_.resize(spec.value().iv_size);
         auto self = shared_from_this();
-        boost::asio::async_read(
-            *socket_, boost::asio::buffer(receive_iv_buffer_),
-            [self](const boost::system::error_code &error, std::size_t) {
-                if (error) {
-                    self->finish_read(error, 0);
-                    return;
-                }
-                auto key = derive_legacy_key(self->method_, self->password_,
-                                             self->receive_iv_buffer_);
-                if (!key) {
-                    self->finish_read(boost::asio::error::operation_not_supported, 0);
-                    return;
-                }
-                auto cipher = LegacyStreamCipher::create(
-                    self->method_, key.value(), self->receive_iv_buffer_, false);
-                if (!cipher) {
-                    self->finish_read(boost::asio::error::operation_not_supported, 0);
-                    return;
-                }
-                self->read_cipher_ = std::move(cipher.value());
-                self->receive_plaintext();
-            });
+        read_exact(boost::asio::buffer(receive_iv_buffer_),
+                   [self](const boost::system::error_code &error) {
+                       if (error) {
+                           self->finish_read(error, 0);
+                           return;
+                       }
+                       auto key = derive_legacy_key(self->method_, self->password_,
+                                                    self->receive_iv_buffer_);
+                       if (!key) {
+                           self->finish_read(boost::asio::error::operation_not_supported, 0);
+                           return;
+                       }
+                       auto cipher = LegacyStreamCipher::create(self->method_, key.value(),
+                                                                self->receive_iv_buffer_, false);
+                       if (!cipher) {
+                           self->finish_read(boost::asio::error::operation_not_supported, 0);
+                           return;
+                       }
+                       self->read_cipher_ = std::move(cipher.value());
+                       self->receive_plaintext();
+                   });
     }
 
     void receive_plaintext() {
         auto self = shared_from_this();
-        socket_->async_read_some(
-            read_buffer_,
-            [self](const boost::system::error_code &error, std::size_t size) {
-                if (error && error != boost::asio::error::eof) {
-                    self->finish_read(error, size);
-                    return;
-                }
-                if (const auto result = self->read_cipher_->update(
-                        std::span<std::uint8_t>(static_cast<std::uint8_t *>(self->read_buffer_.data()),
-                                                size));
-                    !result) {
-                    self->finish_read(boost::asio::error::operation_not_supported, 0);
-                    return;
-                }
-                self->finish_read(error, size);
-            });
+        if (initial_wire_offset_ < initial_wire_.size()) {
+            const auto count =
+                std::min(read_buffer_.size(), initial_wire_.size() - initial_wire_offset_);
+            std::memcpy(read_buffer_.data(), initial_wire_.data() + initial_wire_offset_, count);
+            initial_wire_offset_ += count;
+            if (initial_wire_offset_ == initial_wire_.size()) {
+                initial_wire_.clear();
+                initial_wire_offset_ = 0;
+            }
+            process_plaintext({}, count);
+            return;
+        }
+        if (obfs_mode_ == ObfsMode::tls) {
+            async_read_tls_obfs_record(socket_,
+                                       [self](core::Result<std::vector<std::uint8_t>> result) {
+                                           if (!result) {
+                                               self->finish_read(boost::asio::error::fault, 0);
+                                               return;
+                                           }
+                                           self->initial_wire_ = std::move(result.value());
+                                           self->initial_wire_offset_ = 0;
+                                           self->receive_plaintext();
+                                       });
+            return;
+        }
+        carrier_->async_read_some(read_buffer_,
+                                  [self](const boost::system::error_code &error, std::size_t size) {
+                                      if (error && error != boost::asio::error::eof) {
+                                          self->finish_read(error, size);
+                                          return;
+                                      }
+                                      self->process_plaintext(error, size);
+                                  });
+    }
+
+    void process_plaintext(const boost::system::error_code &error, std::size_t size) {
+        if (const auto result = read_cipher_->update(
+                std::span<std::uint8_t>(static_cast<std::uint8_t *>(read_buffer_.data()), size));
+            !result) {
+            finish_read(boost::asio::error::operation_not_supported, 0);
+            return;
+        }
+        finish_read(error, size);
+    }
+
+    using ExactReadHandler = std::function<void(const boost::system::error_code &)>;
+
+    void read_exact(boost::asio::mutable_buffer buffer, ExactReadHandler handler) {
+        if (obfs_mode_ == ObfsMode::tls) {
+            read_exact_tls(buffer, std::move(handler), 0);
+            return;
+        }
+        std::size_t copied = 0;
+        if (initial_wire_offset_ < initial_wire_.size()) {
+            copied = std::min(buffer.size(), initial_wire_.size() - initial_wire_offset_);
+            std::memcpy(static_cast<std::uint8_t *>(buffer.data()),
+                        initial_wire_.data() + initial_wire_offset_, copied);
+            initial_wire_offset_ += copied;
+            if (initial_wire_offset_ == initial_wire_.size()) {
+                initial_wire_.clear();
+                initial_wire_offset_ = 0;
+            }
+        }
+        if (copied == buffer.size()) {
+            boost::asio::post(carrier_->executor(),
+                              [handler = std::move(handler)]() mutable { handler({}); });
+            return;
+        }
+        auto remaining = boost::asio::mutable_buffer(
+            static_cast<std::uint8_t *>(buffer.data()) + copied, buffer.size() - copied);
+        read_exact_carrier(remaining, std::move(handler));
+    }
+
+    void read_exact_tls(boost::asio::mutable_buffer buffer, ExactReadHandler handler,
+                        std::size_t copied) {
+        if (initial_wire_offset_ < initial_wire_.size()) {
+            const auto count =
+                std::min(buffer.size() - copied, initial_wire_.size() - initial_wire_offset_);
+            std::memcpy(static_cast<std::uint8_t *>(buffer.data()) + copied,
+                        initial_wire_.data() + initial_wire_offset_, count);
+            initial_wire_offset_ += count;
+            copied += count;
+            if (initial_wire_offset_ == initial_wire_.size()) {
+                initial_wire_.clear();
+                initial_wire_offset_ = 0;
+            }
+        }
+        if (copied == buffer.size()) {
+            boost::asio::post(carrier_->executor(),
+                              [handler = std::move(handler)]() mutable { handler({}); });
+            return;
+        }
+        auto self = shared_from_this();
+        async_read_tls_obfs_record(socket_,
+                                   [self, buffer, handler = std::move(handler), copied](
+                                       core::Result<std::vector<std::uint8_t>> result) mutable {
+                                       if (!result) {
+                                           handler(boost::asio::error::fault);
+                                           return;
+                                       }
+                                       self->initial_wire_ = std::move(result.value());
+                                       self->initial_wire_offset_ = 0;
+                                       self->read_exact_tls(buffer, std::move(handler), copied);
+                                   });
     }
 
     void finish_read(const boost::system::error_code &error, std::size_t size) {
@@ -157,28 +282,52 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
         }
     }
 
+    void read_exact_carrier(boost::asio::mutable_buffer buffer, ExactReadHandler handler) {
+        auto self = shared_from_this();
+        carrier_->async_read_some(
+            buffer, [self, buffer, handler = std::move(handler)](
+                        const boost::system::error_code &error, std::size_t size) mutable {
+                if (error) {
+                    handler(error);
+                    return;
+                }
+                if (size == 0) {
+                    handler(boost::asio::error::eof);
+                    return;
+                }
+                if (size == buffer.size()) {
+                    handler({});
+                    return;
+                }
+                auto remaining = boost::asio::mutable_buffer(
+                    static_cast<std::uint8_t *>(buffer.data()) + size, buffer.size() - size);
+                self->read_exact_carrier(remaining, std::move(handler));
+            });
+    }
+
     void post_read(core::StreamHandle::ReadHandler handler, boost::system::error_code error,
                    std::size_t size) {
-        boost::asio::post(socket_->get_executor(),
-                          [handler = std::move(handler), error, size]() mutable {
-                              handler(error, size);
-                          });
+        boost::asio::post(carrier_->executor(), [handler = std::move(handler), error,
+                                                 size]() mutable { handler(error, size); });
     }
 
     void post_write(core::StreamHandle::WriteHandler handler, boost::system::error_code error,
                     std::size_t size) {
-        boost::asio::post(socket_->get_executor(),
-                          [handler = std::move(handler), error, size]() mutable {
-                              handler(error, size);
-                          });
+        boost::asio::post(carrier_->executor(), [handler = std::move(handler), error,
+                                                 size]() mutable { handler(error, size); });
     }
 
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
+    std::shared_ptr<StreamCarrier> carrier_;
     std::string method_;
     std::string password_;
     LegacyStreamCipher write_cipher_;
     std::optional<LegacyStreamCipher> read_cipher_;
     std::vector<std::uint8_t> receive_iv_buffer_;
+    std::vector<std::uint8_t> initial_wire_;
+    std::size_t initial_wire_offset_ = 0;
+    ObfsMode obfs_mode_ = ObfsMode::none;
+    bool obfs_response_ready_ = true;
     boost::asio::mutable_buffer read_buffer_;
     core::StreamHandle::ReadHandler read_handler_;
     bool read_in_progress_ = false;
@@ -212,13 +361,30 @@ class LegacyStreamHandle final : public core::StreamHandle {
 
 } // namespace
 
-core::Result<std::unique_ptr<core::StreamHandle>> make_legacy_stream_handle(
-    std::shared_ptr<boost::asio::ip::tcp::socket> socket, std::string method,
-    std::string password, LegacyStreamCipher write_cipher) {
+core::Result<std::unique_ptr<core::StreamHandle>>
+make_legacy_stream_handle(std::shared_ptr<boost::asio::ip::tcp::socket> socket, std::string method,
+                          std::string password, LegacyStreamCipher write_cipher,
+                          std::vector<std::uint8_t> initial_wire, ObfsMode obfs_mode) {
     auto state = std::make_shared<LegacyStreamState>(std::move(socket), std::move(method),
-                                                     std::move(password), std::move(write_cipher));
-    return std::unique_ptr<core::StreamHandle>(std::make_unique<LegacyStreamHandle>(
-        std::move(state)));
+                                                     std::move(password), std::move(write_cipher),
+                                                     std::move(initial_wire), obfs_mode);
+    return std::unique_ptr<core::StreamHandle>(
+        std::make_unique<LegacyStreamHandle>(std::move(state)));
+}
+
+core::Result<std::unique_ptr<core::StreamHandle>>
+make_legacy_stream_handle(std::shared_ptr<StreamCarrier> carrier, std::string method,
+                          std::string password, LegacyStreamCipher write_cipher,
+                          std::vector<std::uint8_t> initial_wire) {
+    if (!carrier) {
+        return core::fail(
+            {core::ErrorCode::configuration, "legacy Shadowsocks carrier is required", {}});
+    }
+    auto state = std::make_shared<LegacyStreamState>(std::move(carrier), std::move(method),
+                                                     std::move(password), std::move(write_cipher),
+                                                     std::move(initial_wire));
+    return std::unique_ptr<core::StreamHandle>(
+        std::make_unique<LegacyStreamHandle>(std::move(state)));
 }
 
 } // namespace clash_native::transport::shadowsocks

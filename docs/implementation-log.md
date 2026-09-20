@@ -1,5 +1,18 @@
 # Implementation Log
 
+### 2026-09-20 — Add Shadowsocks WebSocket plugin carriers
+
+- Added a reusable Shadowsocks byte carrier that can wrap a raw TCP socket or
+  an existing `StreamHandle`.
+- Added `v2ray-plugin` and `gost-plugin` WebSocket mode for classic AEAD,
+  legacy stream ciphers, and Shadowsocks 2022 TCP. The carrier supports the
+  optional TLS layer and deliberately leaves plugin mux disabled.
+- Added independent Go/Gorilla WebSocket interoperability coverage for both
+  plugin names and a TLS WebSocket case.
+- Routed generic-carrier read completion and endpoint operations through the
+  carrier executor so WebSocket-backed legacy and SS2022 streams do not depend
+  on a raw TCP socket.
+
 ### 2026-09-19 — Complete QUIC handle completion paths
 
 - Routed ngtcp2 stream-consumption notifications to both legacy QUIC events and
@@ -1115,3 +1128,38 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   temporary Go test image for every run.
 - Documented the same build-then-run workflow for focused Mihomo tests so
   Windows firewall approval can remain associated with one executable path.
+
+### 2026-09-20 — Add Shadowsocks HTTP simple-obfs transport
+
+- Added the client side `simple-obfs` HTTP carrier for Shadowsocks TCP, with
+  the first encrypted request carried as an HTTP Upgrade body.
+- Made the 101 response lazy and preserve any coalesced encrypted bytes so the
+  carrier does not deadlock before application data is written.
+- Applied the carrier to classic and Shadowsocks 2022 streams, while keeping
+  native Shadowsocks UDP unwrapped.
+- Added real Mihomo interoperability coverage for classic AEAD and SS2022
+  HTTP simple-obfs streams.
+
+### 2026-09-20 — Add Shadowsocks TLS simple-obfs transport
+
+- Added the Mihomo-compatible fake TLS ClientHello and application-record
+  carrier for Shadowsocks TCP.
+- Applied the carrier to classic AEAD, legacy stream ciphers, and Shadowsocks
+  2022 streams, with lazy server-response parsing and record reassembly.
+- Added real Mihomo interoperability coverage for classic AEAD and SS2022 TLS
+  simple-obfs streams; native Shadowsocks UDP remains unwrapped.
+
+### 2026-09-20 — Add Shadowsocks UDP-over-TCP outbound transport
+
+- Added the standardized Shadowsocks UDP-over-TCP version 1 and version 2
+  datagram adapters. Version 2 writes the request header with the standard
+  SOCKS address encoding, while packet frames use the UoT address encoding.
+- Routed the outbound's `udp-over-tcp` mode through a Shadowsocks TCP stream
+  and preserved the multi-destination `DatagramHandle` contract.
+- Added real Mihomo listener interoperability coverage for both UoT versions
+  using the independently built Go test binary and a UDP echo service.
+
+### 2026-09-20 — Finalize Shadowsocks UDP-over-TCP cancellation behavior
+
+- Made closed UoT datagram handles reject new reads immediately and complete an
+  in-flight read with `operation_aborted` when the underlying stream is closed.
