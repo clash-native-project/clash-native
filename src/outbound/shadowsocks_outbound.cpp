@@ -477,9 +477,11 @@ class ShadowsocksConnectOperation final
   public:
     ShadowsocksConnectOperation(runtime::AsioRuntime &runtime,
                                 std::shared_ptr<dns::ResolverService> resolver,
+                                std::shared_ptr<ss::KcptunClientPool> kcptun_pool,
                                 ShadowsocksOutboundConfig config, core::StreamRequest request,
                                 core::StreamOpenHandler handler)
         : runtime_(runtime), resolver_(std::move(resolver)), config_(std::move(config)),
+          kcptun_pool_(std::move(kcptun_pool)),
           request_(std::move(request)),
           socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.context())),
           timer_(runtime.context()), handler_(std::move(handler)) {}
@@ -498,7 +500,11 @@ class ShadowsocksConnectOperation final
                     self->resolver_request_id_.reset();
                 }
                 boost::system::error_code ignored;
-                self->socket_->cancel(ignored);
+                if (self->carrier_) {
+                    self->carrier_->close();
+                } else {
+                    self->socket_->cancel(ignored);
+                }
                 self->finish(core::StreamOpenResult::failed(
                     {core::ErrorCode::timeout, "timed out opening Shadowsocks TCP stream"}));
             }
@@ -521,7 +527,8 @@ class ShadowsocksConnectOperation final
             return core::fail(method.error());
         }
         if (!config_.plugin.empty() && config_.plugin != "obfs" &&
-            config_.plugin != "v2ray-plugin" && config_.plugin != "gost-plugin") {
+            config_.plugin != "v2ray-plugin" && config_.plugin != "gost-plugin" &&
+            config_.plugin != "kcptun") {
             return core::fail({core::ErrorCode::unsupported, "unsupported Shadowsocks plugin", {}});
         }
         if (config_.plugin == "obfs" && config_.plugin_mode != "http" &&
@@ -534,6 +541,12 @@ class ShadowsocksConnectOperation final
             config_.plugin_mode != "websocket") {
             return core::fail({core::ErrorCode::unsupported,
                                "Shadowsocks WebSocket plugins require websocket mode",
+                               {}});
+        }
+        if (config_.plugin == "kcptun" &&
+            (config_.plugin_mode != "" || config_.plugin_tls || config_.plugin_skip_cert_verify)) {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks kcptun does not use WebSocket plugin options",
                                {}});
         }
         if (config_.udp_over_tcp_version != 1 && config_.udp_over_tcp_version != 2) {
@@ -567,6 +580,8 @@ class ShadowsocksConnectOperation final
         return config_.plugin == "v2ray-plugin" || config_.plugin == "gost-plugin";
     }
 
+    bool kcptun_plugin() const noexcept { return config_.plugin == "kcptun"; }
+
     ss::WebSocketPluginOptions websocket_options() const {
         return {config_.plugin_host.empty() ? "bing.com" : config_.plugin_host,
                 config_.plugin_path.empty() ? "/" : config_.plugin_path, config_.plugin_tls,
@@ -579,6 +594,39 @@ class ShadowsocksConnectOperation final
         }
         if (!result) {
             finish(core::StreamOpenResult::failed(result.error()));
+            return;
+        }
+        if (kcptun_plugin()) {
+            if (result.value().empty()) {
+                finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::resolution,
+                     "Shadowsocks kcptun server hostname resolved to no addresses",
+                     {}}));
+                return;
+            }
+            const auto endpoint =
+                boost::asio::ip::udp::endpoint(result.value().front(), config_.server_port);
+            if (!kcptun_pool_) {
+                auto options = config_.kcptun.value_or(ss::KcptunClientOptions{});
+                auto stream = ss::make_kcptun_client_stream(runtime_, endpoint, std::move(options));
+                if (!stream) {
+                    finish(core::StreamOpenResult::failed(stream.error()));
+                    return;
+                }
+                carrier_ = std::make_shared<ss::StreamCarrier>(std::move(stream.value()));
+                send_initial_request();
+                return;
+            }
+            auto self = shared_from_this();
+            kcptun_pool_->async_open_stream(
+                endpoint, [self](core::StreamOpenResult stream) mutable {
+                    if (!stream.succeeded()) {
+                        self->finish(std::move(stream));
+                        return;
+                    }
+                    self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(stream.handle));
+                    self->send_initial_request();
+                });
             return;
         }
         auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
@@ -614,10 +662,17 @@ class ShadowsocksConnectOperation final
                 return;
             }
             auto self = shared_from_this();
-            ss::async_open_shadowsocks_2022_stream(
-                runtime_, socket_, config_.method, config_.password, std::move(address.value()),
-                obfs_options(),
-                [self](core::StreamOpenResult result) { self->finish(std::move(result)); });
+            if (self->carrier_) {
+                ss::async_open_shadowsocks_2022_stream(
+                    runtime_, self->carrier_, self->config_.method, self->config_.password,
+                    std::move(address.value()),
+                    [self](core::StreamOpenResult result) { self->finish(std::move(result)); });
+            } else {
+                ss::async_open_shadowsocks_2022_stream(
+                    runtime_, self->socket_, self->config_.method, self->config_.password,
+                    std::move(address.value()), self->obfs_options(),
+                    [self](core::StreamOpenResult result) { self->finish(std::move(result)); });
+            }
             return;
         }
         if (method.value().kind == ss::CipherKind::stream) {
@@ -673,23 +728,33 @@ class ShadowsocksConnectOperation final
             }
             return;
         }
-        boost::asio::async_write(
-            *socket_, boost::asio::buffer(*wire),
-            [self, wire, key = std::move(key.value())](const boost::system::error_code &error,
-                                                       std::size_t) mutable {
-                if (error) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::transport_io, "failed to write Shadowsocks TCP request",
-                         detail::to_std_error(error)}));
-                    return;
-                }
-                auto handler = std::move(self->handler_);
-                self->cancel_timer();
-                self->completed_ = true;
+        auto write_handler = [self, wire, key = std::move(key.value())](
+                                 const boost::system::error_code &error, std::size_t) mutable {
+            if (error) {
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "failed to write Shadowsocks TCP request",
+                     detail::to_std_error(error)}));
+                return;
+            }
+            auto handler = std::move(self->handler_);
+            self->cancel_timer();
+            self->completed_ = true;
+            if (self->carrier_) {
+                handler(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
+                    self->carrier_, self->config_.method, self->config_.password, std::move(key),
+                    self->write_nonce_)));
+            } else {
                 handler(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
                     self->socket_, self->config_.method, self->config_.password, std::move(key),
                     self->write_nonce_)));
-            });
+            }
+        };
+        if (carrier_) {
+            carrier_->async_write(boost::asio::buffer(*wire), std::move(write_handler));
+        } else {
+            boost::asio::async_write(*socket_, boost::asio::buffer(*wire),
+                                     std::move(write_handler));
+        }
     }
 
     void open_websocket_classic(std::vector<std::uint8_t> wire, std::vector<std::uint8_t> key) {
@@ -804,28 +869,37 @@ class ShadowsocksConnectOperation final
             }
             return;
         }
-        boost::asio::async_write(
-            *socket_, boost::asio::buffer(*wire),
-            [self, wire, cipher = std::move(cipher.value())](const boost::system::error_code &error,
-                                                             std::size_t) mutable {
-                if (error) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::transport_io,
-                         "failed to write Shadowsocks legacy request",
-                         detail::to_std_error(error)}));
-                    return;
-                }
-                auto handler = std::move(self->handler_);
-                self->cancel_timer();
-                self->completed_ = true;
-                auto stream = ss::make_legacy_stream_handle(
-                    self->socket_, self->config_.method, self->config_.password, std::move(cipher));
-                if (!stream) {
-                    handler(core::StreamOpenResult::failed(stream.error()));
-                    return;
-                }
-                handler(core::StreamOpenResult::opened(std::move(stream.value())));
-            });
+        auto write_cipher = std::make_shared<ss::LegacyStreamCipher>(std::move(cipher.value()));
+        auto write_handler = [self, wire, write_cipher](const boost::system::error_code &error,
+                                                        std::size_t) mutable {
+            if (error) {
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "failed to write Shadowsocks legacy request",
+                     detail::to_std_error(error)}));
+                return;
+            }
+            auto handler = std::move(self->handler_);
+            self->cancel_timer();
+            self->completed_ = true;
+            auto stream = self->carrier_
+                              ? ss::make_legacy_stream_handle(self->carrier_, self->config_.method,
+                                                              self->config_.password,
+                                                              std::move(*write_cipher))
+                              : ss::make_legacy_stream_handle(self->socket_, self->config_.method,
+                                                              self->config_.password,
+                                                              std::move(*write_cipher));
+            if (!stream) {
+                handler(core::StreamOpenResult::failed(stream.error()));
+                return;
+            }
+            handler(core::StreamOpenResult::opened(std::move(stream.value())));
+        };
+        if (carrier_) {
+            carrier_->async_write(boost::asio::buffer(*wire), std::move(write_handler));
+        } else {
+            boost::asio::async_write(*socket_, boost::asio::buffer(*wire),
+                                     std::move(write_handler));
+        }
     }
 
     void open_websocket_legacy(std::vector<std::uint8_t> wire,
@@ -884,6 +958,9 @@ class ShadowsocksConnectOperation final
         if (!result.succeeded()) {
             boost::system::error_code ignored;
             socket_->close(ignored);
+            if (carrier_) {
+                carrier_->close();
+            }
         }
         auto handler = std::move(handler_);
         handler(std::move(result));
@@ -891,6 +968,7 @@ class ShadowsocksConnectOperation final
 
     runtime::AsioRuntime &runtime_;
     std::shared_ptr<dns::ResolverService> resolver_;
+    std::shared_ptr<ss::KcptunClientPool> kcptun_pool_;
     ShadowsocksOutboundConfig config_;
     core::StreamRequest request_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
@@ -1135,7 +1213,12 @@ ShadowsocksOutbound::ShadowsocksOutbound(runtime::AsioRuntime &runtime,
                                          ShadowsocksOutboundConfig config,
                                          std::shared_ptr<dns::ResolverService> resolver)
     : runtime_(runtime), config_(std::move(config)), resolver_(std::move(resolver)),
-      descriptor_{config_.id, "shadowsocks"} {}
+      descriptor_{config_.id, "shadowsocks"} {
+    if (config_.plugin == "kcptun") {
+        kcptun_pool_ = std::make_shared<transport::shadowsocks::KcptunClientPool>(
+            runtime_, config_.kcptun.value_or(transport::shadowsocks::KcptunClientOptions{}));
+    }
+}
 
 core::Status ShadowsocksOutbound::validate() const {
     if (config_.id.empty() || config_.server_host.empty() || config_.server_port == 0 ||
@@ -1148,7 +1231,7 @@ core::Status ShadowsocksOutbound::validate() const {
         return core::Status(core::fail(method.error()));
     }
     if (!config_.plugin.empty() && config_.plugin != "obfs" && config_.plugin != "v2ray-plugin" &&
-        config_.plugin != "gost-plugin") {
+        config_.plugin != "gost-plugin" && config_.plugin != "kcptun") {
         return core::fail({core::ErrorCode::unsupported, "unsupported Shadowsocks plugin", {}});
     }
     if (config_.plugin == "obfs" && config_.plugin_mode != "http" && config_.plugin_mode != "tls") {
@@ -1161,6 +1244,19 @@ core::Status ShadowsocksOutbound::validate() const {
         return core::fail({core::ErrorCode::unsupported,
                            "Shadowsocks WebSocket plugins require websocket mode",
                            {}});
+    }
+    if (config_.plugin == "kcptun" &&
+        (config_.plugin_mode != "" || config_.plugin_tls || config_.plugin_skip_cert_verify)) {
+        return core::fail({core::ErrorCode::configuration,
+                           "Shadowsocks kcptun does not use WebSocket plugin options",
+                           {}});
+    }
+    if (config_.plugin == "kcptun") {
+        if (const auto validation = transport::shadowsocks::validate_kcptun_client_options(
+                config_.kcptun.value_or(transport::shadowsocks::KcptunClientOptions{}));
+            !validation) {
+            return validation;
+        }
     }
     if (config_.udp_over_tcp_version != 1 && config_.udp_over_tcp_version != 2) {
         return core::fail({core::ErrorCode::configuration,
@@ -1191,7 +1287,7 @@ core::OutboundCapabilities ShadowsocksOutbound::capabilities() const noexcept {
 void ShadowsocksOutbound::connect_stream(core::StreamRequest request,
                                          core::StreamOpenHandler handler) {
     auto operation = std::make_shared<ShadowsocksConnectOperation>(
-        runtime_, resolver_, config_, std::move(request), std::move(handler));
+        runtime_, resolver_, kcptun_pool_, config_, std::move(request), std::move(handler));
     operation->start();
 }
 
@@ -1205,13 +1301,13 @@ void ShadowsocksOutbound::open_datagram(core::DatagramRequest request,
         return;
     }
 
-    if (config_.udp_over_tcp) {
+    if (config_.udp_over_tcp || config_.plugin == "kcptun") {
         const auto version = config_.udp_over_tcp_version;
         const auto magic = version == 2 ? kUdpOverTcpV2MagicAddress : kUdpOverTcpMagicAddress;
         core::StreamRequest stream_request{core::Destination::domain(std::string(magic), 0),
                                            std::nullopt, request.dial_trace};
         auto operation = std::make_shared<ShadowsocksConnectOperation>(
-            runtime_, resolver_, config_, std::move(stream_request),
+            runtime_, resolver_, kcptun_pool_, config_, std::move(stream_request),
             [handler = std::move(handler), initial_destination = request.initial_destination,
              version, context = &runtime_.context()](core::StreamOpenResult result) mutable {
                 boost::asio::post(context->get_executor(), [handler = std::move(handler),

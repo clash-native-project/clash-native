@@ -3,9 +3,12 @@
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/dns/resolver_service.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
+#include <clash_native/transport/shadowsocks/kcptun.hpp>
+#include <clash_native/transport/shadowsocks/kcptun_session.hpp>
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace clash_native::outbound {
@@ -25,6 +28,7 @@ struct ShadowsocksOutboundConfig {
     std::string plugin_path;
     bool plugin_tls = false;
     bool plugin_skip_cert_verify = false;
+    std::optional<transport::shadowsocks::KcptunClientOptions> kcptun;
     // Use the Shadowsocks TCP stream with the standardized UDP-over-TCP
     // framing. Version 1 is the legacy per-packet framing; version 2 adds a
     // packet-mode request before the first frame.
@@ -47,6 +51,7 @@ class ShadowsocksOutbound final : public core::Outbound {
     runtime::AsioRuntime &runtime_;
     ShadowsocksOutboundConfig config_;
     std::shared_ptr<dns::ResolverService> resolver_;
+    std::shared_ptr<transport::shadowsocks::KcptunClientPool> kcptun_pool_;
     core::OutboundDescriptor descriptor_;
     core::OutboundCapabilities capabilities_{true, core::DatagramSemantics::multi_destination,
                                              core::TargetRequirement::domain_or_ip,

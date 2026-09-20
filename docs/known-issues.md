@@ -2,6 +2,25 @@
 
 This document records observed issues that are deferred for later investigation. It distinguishes measured behavior from suspected causes.
 
+## Mihomo SMUX peer closes the full stream after FIN
+
+- **Status:** Deferred; interoperability limitation in the tested Mihomo
+  server path.
+- **Scope:** Shadowsocks `kcptun` over KCP/SMUX on Windows x64.
+
+The C++ kcptun stream adapter sends an SMUX FIN when the local caller invokes
+`shutdown_send`. In the tested Mihomo listener, receiving that FIN causes the
+listener-side stream to be closed completely. The peer therefore does not keep
+the reverse direction available for a true bidirectional half-close. This is
+different from a KCP packet-crypt, FEC, Snappy, or SMUX framing failure: normal
+bidirectional streams and concurrent pooled streams interoperate successfully.
+
+The current evidence only establishes the behavior of the tested Mihomo
+listener and handler. It does not prove that every SMUX implementation has the
+same behavior, nor does it justify claiming full half-close interoperability.
+Revisit this issue with a peer that preserves the opposite direction after FIN,
+then add an end-to-end test before changing the transport contract.
+
 ## Large UDP DNS bursts can lose datagrams on Windows
 
 - **Status:** Deferred; root cause is not isolated.

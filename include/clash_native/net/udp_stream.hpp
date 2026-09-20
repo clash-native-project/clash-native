@@ -21,6 +21,8 @@ class UdpStream final : public core::DatagramHandle {
 
     void open(boost::asio::ip::udp protocol, boost::system::error_code &error);
     void bind(boost::asio::ip::udp::endpoint endpoint, boost::system::error_code &error);
+    void set_buffer_size(int bytes, boost::system::error_code &error);
+    void set_dscp(int dscp, boost::system::error_code &error);
     template <typename SettableSocketOption>
     void set_option(const SettableSocketOption &option, boost::system::error_code &error) {
         socket_->set_option(option, error);

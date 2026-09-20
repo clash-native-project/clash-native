@@ -370,6 +370,163 @@ listeners:
 	}
 }
 
+func TestMihomoActualServerShadowsocksKcpTun(t *testing.T) {
+	mihomoExecutable := os.Getenv("MIHOMO_EXECUTABLE")
+	if mihomoExecutable == "" {
+		t.Skip("MIHOMO_EXECUTABLE is not set")
+	}
+	if os.Getenv("CLASH_NATIVE_TEST_HOST") == "" {
+		t.Skip("CLASH_NATIVE_TEST_HOST is not set")
+	}
+
+	tcpEcho, err := endpoints.StartTCPEcho()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcpEcho.Close()
+	udpHost := endpoints.LocalIPv4Host()
+	udpEcho, err := endpoints.StartUDPEchoAt(udpHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpEcho.Close()
+
+	address := reserveMihomoShadowsocksAddressOnHost(t, udpHost)
+	_, port, err := net.SplitHostPort(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readinessAddress := reserveMihomoTCPAddress(t)
+	_, readinessPort, err := net.SplitHostPort(readinessAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		password = mihomoTestPassword
+		kcpKey   = "clash-native-kcptun-test-key"
+	)
+	kcpCrypt := os.Getenv("CLASH_NATIVE_TEST_KCPTUN_CRYPT")
+	if kcpCrypt == "" {
+		kcpCrypt = "aes"
+	}
+	kcpDataShard := os.Getenv("CLASH_NATIVE_TEST_KCPTUN_DATASHARD")
+	if kcpDataShard == "" {
+		kcpDataShard = "10"
+	}
+	kcpParityShard := os.Getenv("CLASH_NATIVE_TEST_KCPTUN_PARITYSHARD")
+	if kcpParityShard == "" {
+		kcpParityShard = "3"
+	}
+	kcpSmuxVersion := os.Getenv("CLASH_NATIVE_TEST_KCPTUN_SMUXVER")
+	if kcpSmuxVersion == "" {
+		kcpSmuxVersion = "1"
+	}
+	kcpNoComp := os.Getenv("CLASH_NATIVE_TEST_KCPTUN_NOCOMP") == "1"
+	config := fmt.Sprintf(`allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: debug
+ipv6: false
+rules:
+  - MATCH,DIRECT
+listeners:
+  - name: test-shadowsocks-kcptun
+    type: shadowsocks
+    listen: %s
+    port: %s
+    udp: true
+    password: '%s'
+    cipher: chacha20-ietf-poly1305
+    kcp-tun:
+      enable: true
+      key: '%s'
+      crypt: '%s'
+      datashard: %s
+      parityshard: %s
+      nocomp: %t
+      smuxver: %s
+      framesize: 8192
+  - name: test-readiness
+    type: mixed
+    listen: 127.0.0.1
+    port: %s
+`, udpHost, port, password, kcpKey, kcpCrypt, kcpDataShard, kcpParityShard, kcpNoComp, kcpSmuxVersion, readinessPort)
+	home := t.TempDir()
+	configPath := filepath.Join(home, "config.yaml")
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mihomo := startMihomo(t, mihomoExecutable, home, configPath, []string{readinessAddress})
+	defer stopInteropProcess(t, mihomo)
+
+	proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+		"CLASH_NATIVE_TEST_OUTBOUND":                    "shadowsocks",
+		"CLASH_NATIVE_TEST_OUTBOUND_SERVER":             address,
+		"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":           password,
+		"CLASH_NATIVE_TEST_OUTBOUND_METHOD":             "chacha20-ietf-poly1305",
+		"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN":             "kcptun",
+		"CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_KEY":         kcpKey,
+		"CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_CRYPT":       kcpCrypt,
+		"CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_NOCOMP":      map[bool]string{true: "1", false: "0"}[kcpNoComp],
+		"CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_DATASHARD":   kcpDataShard,
+		"CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_PARITYSHARD": kcpParityShard,
+		"CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_SMUXVER":     kcpSmuxVersion,
+		"CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_CONN":        "2",
+		"CLASH_NATIVE_TEST_PROXY_HOST":                  udpHost,
+	})
+	defer stopProxy()
+
+	t.Run("TCP", func(t *testing.T) {
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		repetitions := 4096
+		if os.Getenv("CLASH_NATIVE_TEST_KCPTUN_LARGE") == "1" {
+			repetitions = 65536
+		}
+		payload := []byte(strings.Repeat("cpp-to-mihomo-kcptun-tcp-", repetitions))
+		writeBytes(t, client, payload)
+		if os.Getenv("CLASH_NATIVE_TEST_KCPTUN_HALF_CLOSE") == "1" {
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("half-close C++ to Mihomo kcptun TCP stream: %v", err)
+			}
+		}
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo kcptun TCP returned different bytes")
+		}
+	})
+
+	t.Run("UDP-over-TCP", func(t *testing.T) {
+		payload := []byte(strings.Repeat("cpp-to-mihomo-kcptun-uot-", 64))
+		testShadowsocksUDPAssociateWithPayload(t, proxyAddress, udpEcho.Addr().String(),
+			udpEcho.Addr().IP, payload)
+	})
+
+	t.Run("Concurrent TCP streams across pooled sessions", func(t *testing.T) {
+		const streamCount = 4
+		clients := make([]net.Conn, 0, streamCount)
+		defer func() {
+			for _, client := range clients {
+				_ = client.Close()
+			}
+		}()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-kcptun-pooled-", 512))
+		for index := 0; index < streamCount; index++ {
+			client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+			clients = append(clients, client)
+			writeBytes(t, client, payload)
+		}
+		for _, client := range clients {
+			echoed := make([]byte, len(payload))
+			readBytes(t, client, echoed)
+			if string(echoed) != string(payload) {
+				t.Fatal("Mihomo kcptun pooled stream returned different bytes")
+			}
+		}
+	})
+}
+
 func TestMihomoActualServerShadowsocks2022TCP(t *testing.T) {
 	mihomoExecutable := os.Getenv("MIHOMO_EXECUTABLE")
 	if mihomoExecutable == "" {

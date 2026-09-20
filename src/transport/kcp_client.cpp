@@ -13,6 +13,7 @@
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <utility>
@@ -35,7 +36,15 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
                    boost::asio::ip::udp::endpoint remote_endpoint, KcpClientOptions options,
                    ikcpcb *kcp)
         : datagram_(std::move(datagram)), remote_endpoint_(std::move(remote_endpoint)),
-          options_(options), kcp_(kcp), timer_(datagram_->executor()) {}
+          options_(std::move(options)), kcp_(kcp), timer_(datagram_->executor()),
+          rate_timer_(datagram_->executor()) {
+        if (options_.rate_limit > 0) {
+            rate_capacity_ = std::max<std::size_t>(
+                static_cast<std::size_t>(options_.rate_limit),
+                static_cast<std::size_t>(16 * std::max(options_.mtu, kKcpOverhead)));
+            rate_tokens_ = rate_capacity_;
+        }
+    }
 
     ~KcpStreamState() { close(); }
 
@@ -123,6 +132,7 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
         closed_ = true;
         boost::system::error_code ignored;
         timer_.cancel();
+        rate_timer_.cancel();
         if (datagram_) {
             datagram_->cancel();
             datagram_->close();
@@ -143,9 +153,21 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
             static_cast<std::size_t>(length) > kMaximumDatagramSize) {
             return -1;
         }
-        state->send_queue_.push_back(std::make_shared<std::vector<std::uint8_t>>(
-            reinterpret_cast<const std::uint8_t *>(data),
-            reinterpret_cast<const std::uint8_t *>(data) + length));
+        const auto packet = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t *>(data), static_cast<std::size_t>(length));
+        std::vector<std::vector<std::uint8_t>> encoded;
+        if (state->options_.encode_packet) {
+            encoded = state->options_.encode_packet(packet);
+        } else {
+            encoded.emplace_back(packet.begin(), packet.end());
+        }
+        for (auto &wire : encoded) {
+            if (wire.size() > kMaximumDatagramSize) {
+                return -1;
+            }
+            state->send_queue_.push_back(
+                std::make_shared<std::vector<std::uint8_t>>(std::move(wire)));
+        }
         state->pump_output();
         return 0;
     }
@@ -172,11 +194,23 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
                     self->start_receive();
                     return;
                 }
-                if (ikcp_input(self->kcp_,
-                               reinterpret_cast<const char *>(self->receive_buffer_.data()),
-                               static_cast<long>(size)) < 0) {
-                    self->start_receive();
-                    return;
+                const auto packet =
+                    std::span<const std::uint8_t>(self->receive_buffer_.data(), size);
+                std::vector<std::vector<std::uint8_t>> decoded;
+                if (self->options_.decode_packet) {
+                    decoded = self->options_.decode_packet(packet);
+                } else {
+                    decoded.emplace_back(packet.begin(), packet.end());
+                }
+                for (const auto &payload : decoded) {
+                    if (payload.empty() ||
+                        ikcp_input(self->kcp_, reinterpret_cast<const char *>(payload.data()),
+                                   static_cast<long>(payload.size())) < 0) {
+                        continue;
+                    }
+                }
+                if (self->options_.ack_nodelay) {
+                    ikcp_flush(self->kcp_);
                 }
                 self->deliver_read();
                 self->update_now();
@@ -220,6 +254,39 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
         }
         send_in_progress_ = true;
         auto packet = send_queue_.front();
+        if (options_.rate_limit > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (rate_last_refill_.time_since_epoch().count() == 0) {
+                rate_last_refill_ = now;
+            }
+            const auto elapsed =
+                std::chrono::duration_cast<std::chrono::microseconds>(now - rate_last_refill_);
+            if (elapsed.count() > 0) {
+                const auto refill = static_cast<std::size_t>(
+                    (static_cast<std::uint64_t>(elapsed.count()) *
+                     static_cast<std::uint64_t>(options_.rate_limit)) /
+                    1'000'000ULL);
+                rate_tokens_ = std::min(rate_capacity_, rate_tokens_ + refill);
+                rate_last_refill_ = now;
+            }
+            if (rate_tokens_ < packet->size()) {
+                send_in_progress_ = false;
+                const auto missing = packet->size() - rate_tokens_;
+                const auto micros =
+                    (static_cast<std::uint64_t>(missing) * 1'000'000ULL +
+                     static_cast<std::uint64_t>(options_.rate_limit) - 1ULL) /
+                    static_cast<std::uint64_t>(options_.rate_limit);
+                rate_timer_.expires_after(std::chrono::microseconds(micros));
+                auto self = shared_from_this();
+                rate_timer_.async_wait([self](const boost::system::error_code &error) {
+                    if (!error && !self->closed_) {
+                        self->pump_output();
+                    }
+                });
+                return;
+            }
+            rate_tokens_ -= packet->size();
+        }
         auto self = shared_from_this();
         datagram_->async_send_to(
             boost::asio::buffer(*packet), core::DatagramAddress::from_endpoint(remote_endpoint_),
@@ -243,11 +310,36 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
         if (closed_ || !read_handler_ || kcp_ == nullptr || read_buffer_.size() > INT_MAX) {
             return;
         }
-        const auto result = ikcp_recv(kcp_, static_cast<char *>(read_buffer_.data()),
-                                      static_cast<int>(read_buffer_.size()));
-        if (result >= 0) {
-            finish_read({}, static_cast<std::size_t>(result));
+        if (pending_read_offset_ == pending_read_.size()) {
+            pending_read_.clear();
+            pending_read_offset_ = 0;
         }
+        if (!pending_read_.empty()) {
+            const auto size =
+                std::min(read_buffer_.size(), pending_read_.size() - pending_read_offset_);
+            std::memcpy(read_buffer_.data(), pending_read_.data() + pending_read_offset_, size);
+            pending_read_offset_ += size;
+            finish_read({}, size);
+            return;
+        }
+
+        const auto peek_size = ikcp_peeksize(kcp_);
+        if (peek_size <= 0) {
+            return;
+        }
+        pending_read_.resize(static_cast<std::size_t>(peek_size));
+        const auto result =
+            ikcp_recv(kcp_, reinterpret_cast<char *>(pending_read_.data()), peek_size);
+        if (result < 0) {
+            pending_read_.clear();
+            pending_read_offset_ = 0;
+            return;
+        }
+        pending_read_.resize(static_cast<std::size_t>(result));
+        const auto size = std::min(read_buffer_.size(), pending_read_.size());
+        std::memcpy(read_buffer_.data(), pending_read_.data(), size);
+        pending_read_offset_ = size;
+        finish_read({}, size);
     }
 
     void fail(const boost::system::error_code &error) {
@@ -308,13 +400,19 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
     ikcpcb *kcp_ = nullptr;
     std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
     boost::asio::steady_timer timer_;
+    boost::asio::steady_timer rate_timer_;
     std::array<std::uint8_t, kMaximumDatagramSize> receive_buffer_{};
     std::deque<std::shared_ptr<std::vector<std::uint8_t>>> send_queue_;
     boost::asio::mutable_buffer read_buffer_;
+    std::vector<std::uint8_t> pending_read_;
+    std::size_t pending_read_offset_ = 0;
     core::StreamHandle::ReadHandler read_handler_;
     core::StreamHandle::WriteHandler write_handler_;
     std::size_t write_size_ = 0;
     bool send_in_progress_ = false;
+    std::size_t rate_capacity_ = 0;
+    std::size_t rate_tokens_ = 0;
+    std::chrono::steady_clock::time_point rate_last_refill_{};
     bool closed_ = false;
 };
 
@@ -362,7 +460,7 @@ make_kcp_client_stream(std::unique_ptr<core::DatagramHandle> datagram,
     if (options.conversation_id == 0 || options.mtu <= kKcpOverhead ||
         options.mtu > static_cast<int>(kMaximumDatagramSize) || options.send_window <= 0 ||
         options.receive_window <= 0 || options.interval_ms <= 0 || options.interval_ms > 1000 ||
-        options.nodelay < 0 || options.fast_resend < 0 ||
+        options.nodelay < 0 || options.fast_resend < 0 || options.rate_limit < 0 ||
         (options.disable_congestion_control != 0 && options.disable_congestion_control != 1)) {
         return core::fail(configuration_error("invalid KCP stream options"));
     }

@@ -1830,10 +1830,14 @@ injected `DatagramHandle`, owns ARQ sequence state, retransmission, congestion
 behavior, timers, windowing, and MTU limits, and produces a reliable ordered
 stream capability. It does not pass through the HTTP or QUIC interfaces.
 
-The current implementation is a client-side raw KCP carrier. Its Windows x64
+The current implementation is a client-side KCP carrier. Its Windows x64
 validation includes a 256 KiB bidirectional exchange with an independent
-`kcp-go` server. This validates the carrier and wire interoperability, but does
-not mark mKCP or any KCP-based proxy protocol complete.
+`kcp-go` server. The Shadowsocks `kcptun` client composes this carrier with
+SMUX, kcp-go-compatible outer packet crypt, optional FEC, the Mihomo Snappy
+stream wrapper, and a bounded session pool. The complete default profile is
+validated against a real Mihomo listener for TCP and UDP-over-TCP relay,
+including concurrent streams across pooled sessions. This does not mark VMess
+mKCP or other KCP-based proxy protocols complete.
 
 mKCP is a protocol-specific layer over the KCP engine. Its conversation IDs,
 masquerade headers, seeding, and configuration validation remain separate from
@@ -2261,9 +2265,9 @@ but it must not introduce a second protocol-local QUIC or HTTP/3 stack.
 
 The HTTP/1.1 WebSocket carrier is implemented and independently validated, but
 HTTP/2 and HTTP/3 Extended CONNECT plus WS-based proxy composition remain
-outside this milestone. The raw KCP carrier is implemented and independently
-validated, but no KCP-based proxy protocol is claimed. Their remaining
-implementation phases use the separate Section 15 support gates.
+outside this milestone. The raw KCP carrier and the selected Shadowsocks
+`kcptun` composition are implemented and independently validated. VMess mKCP
+and other KCP-based proxy protocols remain separate support gates.
 
 ### Portable core exit gate
 

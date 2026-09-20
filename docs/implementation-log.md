@@ -1,5 +1,69 @@
 # Implementation Log
 
+### 2026-09-20 — Record the kcptun half-close interoperability boundary
+
+- Added a known-issues entry documenting that the tested Mihomo SMUX listener
+  closes the complete stream after receiving an SMUX FIN. The record separates
+  this peer behavior from the C++ FIN submission and from KCP packet, FEC,
+  Snappy, and SMUX framing interoperability.
+
+### 2026-09-20 — Complete kcptun session reuse and transport controls
+
+- Added a bounded Shadowsocks kcptun session pool with configurable connection
+  count, round-robin stream allocation, auto-expiry, scavenging, and SMUX
+  stream multiplexing. Each opened stream remains exposed through the common
+  `StreamHandle` interface.
+- Applied Mihomo mode defaults, ACK-no-delay flushing, rate limiting, UDP
+  socket buffer sizing, and DSCP configuration to the shared KCP carrier.
+- Added a pooled-session interop case with four concurrent TCP streams and
+  reran the independent Go packet pipeline plus Mihomo AES and AES-GCM
+  profiles on Windows x64.
+
+### 2026-09-20 — Match kcptun AES-GCM key width
+
+- Corrected the `aes-128-gcm` kcptun packet codec to use the first 16 bytes of
+  the PBKDF2-HMAC-SHA1 key, matching Mihomo's kcp-go profile. Updated the
+  independent Go interoperability fixture to use the same AES-128 key width.
+  The default AES profile and the AES-GCM profile now pass the real Mihomo
+  listener check.
+
+### 2026-09-20 — Complete the kcptun packet and compression pipeline
+
+- Added kcp-go-compatible packet crypt methods, including AES CFB variants,
+  legacy block methods, Salsa20, AES-GCM, the simple XOR construction, CRC32,
+  and PBKDF2-HMAC-SHA1 key derivation.
+- Added Botan ZFEC encoding and recovery with kcp-go's FEC headers and shard
+  sequencing, plus a vcpkg Snappy dependency and the framed Snappy stream used
+  below SMUX by Mihomo.
+- Changed the kcptun default profile to Mihomo-compatible AES, 10/3 FEC, and
+  compression-enabled settings. Added packet round-trip, FEC recovery, and
+  Windows x64 Mihomo full-profile relay coverage. The external Mihomo listener
+  still closes the complete stream after a peer FIN, so half-close behavior is
+  recorded as an interop limitation rather than claimed as independently
+  validated. FEC receive groups are now bounded like kcp-go, sequence numbers
+  wrap at the protocol protection boundary, and encrypted data/parity loss is
+  covered by a focused codec test. Added an independent Go kcp-go + SMUX +
+  Shadowsocks relay fixture for AES-GCM/FEC packet-pipeline interoperability.
+
+### 2026-09-20 — Complete SMUX v2 flow control for kcptun streams
+
+- Added SMUX v2 peer-window accounting, update-frame handling, consumed-byte
+  acknowledgements, and ordered FIN scheduling to the kcptun stream adapter.
+- Added optional real-Mihomo coverage for SMUX version 2 and a payload larger
+  than the initial peer window.
+
+### 2026-09-20 — Add the initial Shadowsocks kcptun raw-KCP carrier
+
+- Added a Shadowsocks `kcptun` client carrier that composes the shared KCP
+  stream with a SMUX stream over UDP, then uses the existing Shadowsocks TCP
+  framing and UDP-over-TCP adapters above it.
+- Added Windows x64 Mihomo interoperability coverage for TCP relay and
+  UDP-over-TCP relay, plus configuration validation for unsupported profiles.
+- This initial subset was subsequently extended by the packet crypt, FEC, and
+  Snappy implementation recorded below. The focused Mihomo relay case does not
+  exercise TCP half-close because that listener closes the full kcptun stream
+  when its peer sends FIN.
+
 ### 2026-09-20 — Add fixed-address bootstrap DNS fallback
 
 - Added an asynchronous bootstrap resolver chain for hostname-based DNS

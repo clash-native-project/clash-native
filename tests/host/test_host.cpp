@@ -115,6 +115,61 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
             config.plugin_skip_cert_verify =
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_SKIP_CERT_VERIFY")
                     .value_or("") == "1";
+            if (config.plugin == "kcptun") {
+                auto options = clash_native::transport::shadowsocks::KcptunClientOptions{};
+                options.key = environment_value("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_KEY")
+                                  .value_or(options.key);
+                options.crypt = environment_value("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_CRYPT")
+                                    .value_or(options.crypt);
+                const auto parse_option = [](const char *name, int &target) {
+                    const auto value = environment_value(name);
+                    if (!value || value->empty()) {
+                        return;
+                    }
+                    const auto parsed =
+                        std::from_chars(value->data(), value->data() + value->size(), target);
+                    if (parsed.ec != std::errc{} || parsed.ptr != value->data() + value->size()) {
+                        throw std::runtime_error(std::string("invalid ") + name);
+                    }
+                };
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_MTU", options.mtu);
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_CONN", options.connection_count);
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_AUTOEXPIRE",
+                             options.auto_expire_seconds);
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_SCAVENGETTL",
+                             options.scavenge_ttl_seconds);
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_RATELIMIT", options.rate_limit);
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_SNDWND", options.send_window);
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_RCVWND", options.receive_window);
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_DSCP", options.dscp);
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_NODELAY", options.nodelay);
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_INTERVAL", options.interval_ms);
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_RESEND", options.fast_resend);
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_NC",
+                             options.disable_congestion_control);
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_SOCKBUF", options.socket_buffer);
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_DATASHARD", options.data_shard);
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_PARITYSHARD", options.parity_shard);
+                if (const auto mode = environment_value("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_MODE");
+                    mode && !mode->empty()) {
+                    options.mode = *mode;
+                }
+                options.ack_nodelay =
+                    environment_value("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_ACKNODELAY")
+                        .value_or(options.ack_nodelay ? "1" : "0") != "0";
+                if (options.data_shard < 0) {
+                    options.data_shard = 0;
+                }
+                if (options.parity_shard < 0) {
+                    options.parity_shard = 0;
+                }
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_SMUXVER", options.smux_version);
+                parse_option("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_FRAMESIZE", options.frame_size);
+                options.no_compression =
+                    environment_value("CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_NOCOMP")
+                        .value_or(options.no_compression ? "1" : "0") != "0";
+                config.kcptun = std::move(options);
+            }
         }
         config.udp_over_tcp =
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_UDP_OVER_TCP").value_or("") == "1";

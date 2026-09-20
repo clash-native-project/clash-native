@@ -92,6 +92,17 @@ validated on Windows x64 with a real Mihomo listener and an independently
 built Go interop executable. The test uses a non-loopback IPv4 UDP echo
 endpoint when required by the Windows networking environment.
 
+The Shadowsocks `kcptun` outbound path is also validated on Windows x64 with a
+real Mihomo listener and the same separately built Go interop executable. The
+focused test covers TCP and UDP-over-TCP relay through KCP, SMUX, AES packet
+encryption, 10/3 FEC, and Snappy framing. The default `aes` and the
+`aes-128-gcm` packet profiles pass this real listener check; alternate crypt and
+FEC profiles can be selected as described in `docs/testing.md`. The focused relay case does not
+exercise TCP half-close because the tested Mihomo listener closes the full
+kcptun stream when its peer sends FIN. It also opens concurrent streams through
+the bounded KCP/SMUX session pool. The independent Go packet-pipeline fixture
+separately validates AES-GCM + 10/3 FEC without that listener wrapper.
+
 The raw QUIC carrier interop check is Windows x64 only. The standard build
 script sets `CLASH_NATIVE_HTTP_TUNNEL_CLIENT` and runs
 `TestQUICCarrierExposesStreamsAndDatagrams` from `tests/interop`. The test uses

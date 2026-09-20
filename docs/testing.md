@@ -94,12 +94,44 @@ address encoding for each packet frame. `DatagramHandle` preserves either an IP
 address or a domain name returned by the protocol. Native UDP socket adapters
 still require an IP address when sending to the operating system.
 
+`TestMihomoActualServerShadowsocksKcpTun` validates the Shadowsocks `kcptun`
+carrier against a real Mihomo listener. It covers TCP relay and UDP-over-TCP
+relay through KCP, SMUX, packet encryption, FEC framing, and the Snappy stream
+wrapper. The default profile uses Mihomo's `aes`, `datashard: 10`,
+`parityshard: 3`, and compression-enabled settings. The test also accepts
+profile overrides through `CLASH_NATIVE_TEST_KCPTUN_CRYPT`,
+`CLASH_NATIVE_TEST_KCPTUN_DATASHARD`, `CLASH_NATIVE_TEST_KCPTUN_PARITYSHARD`,
+and `CLASH_NATIVE_TEST_KCPTUN_NOCOMP`. The focused relay case does not claim
+independent half-close behavior because the tested Mihomo listener closes the
+full kcptun stream when its peer sends FIN. The default `aes` profile and the
+`aes-128-gcm` profile both pass the real listener check; the latter uses the
+first 16 bytes of the kcptun PBKDF2 key, matching Mihomo. The test also opens
+four concurrent TCP streams through a two-session pool to exercise SMUX stream
+reuse and connection rotation.
+Set `CLASH_NATIVE_TEST_KCPTUN_SMUXVER=2` to exercise SMUX version 2, and set
+`CLASH_NATIVE_TEST_KCPTUN_LARGE=1` to send a payload larger than the initial
+SMUX v2 peer window and exercise window-update flow control.
+The test host accepts `CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_CONN`,
+`CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_AUTOEXPIRE`,
+`CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_RATELIMIT`,
+`CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_SOCKBUF`, and
+`CLASH_NATIVE_TEST_OUTBOUND_KCPTUN_DSCP` for transport-control checks.
+
+`TestShadowsocksKcptunIndependentGoPeerPacketPipeline` uses a separately
+built Go service composed from kcp-go, SMUX, and the independent Shadowsocks
+fixture. It verifies the AES-GCM + 10/3 FEC packet pipeline with compression
+disabled, so packet compatibility is checked independently of Mihomo's
+listener wrapper. Neither this test nor the Mihomo listener test claims
+SMUX half-close interoperability; SMUX peers used here treat FIN as terminal
+for the stream's write side.
+
 Build Mihomo from its source checkout, then run the opt-in integration test
 from `tests/interop` with both executable paths set:
 
 ```powershell
-# From D:\Project\golang\mihomo
-go build -o D:\Project\cpp\clash-native\build\windows-clang-cl-x64\mihomo-interop.exe .
+# From D:\Project\golang\mihomo. Build the selected entry point so the
+# repository's optional debug helper is not included as a second main package.
+go build -o D:\Project\cpp\clash-native\build\windows-clang-cl-x64\mihomo-interop.exe main.go
 
 # From D:\Project\cpp\clash-native\tests\interop
 $env:MIHOMO_EXECUTABLE = 'D:\Project\cpp\clash-native\build\windows-clang-cl-x64\mihomo-interop.exe'
@@ -126,6 +158,19 @@ $env:CLASH_NATIVE_TEST_HOST = 'D:\Project\cpp\clash-native\build\windows-clang-c
 
 # Run Shadowsocks UDP-over-TCP versions 1 and 2.
 & $interop '-test.count=1' '-test.run=^TestMihomoActualServerShadowsocksUoT$' '-test.v=true'
+
+# Run the Shadowsocks kcptun full KCP/SMUX profile.
+& $interop '-test.count=1' '-test.run=^TestMihomoActualServerShadowsocksKcpTun$' '-test.v=true'
+
+# Run the independent Go KCP/SMUX/AES-GCM/FEC packet-pipeline fixture.
+& $interop '-test.count=1' '-test.run=^TestShadowsocksKcptunIndependentGoPeerPacketPipeline$' '-test.v=true'
+
+# Optional compatibility profiles can be selected before running the test:
+$env:CLASH_NATIVE_TEST_KCPTUN_CRYPT = 'aes-128-gcm'
+$env:CLASH_NATIVE_TEST_KCPTUN_DATASHARD = '10'
+$env:CLASH_NATIVE_TEST_KCPTUN_PARITYSHARD = '3'
+$env:CLASH_NATIVE_TEST_KCPTUN_NOCOMP = '0'
+& $interop '-test.count=1' '-test.run=^TestMihomoActualServerShadowsocksKcpTun$' '-test.v=true'
 ```
 
 The classic UDP matrix uses a 1000-byte application payload so every supported

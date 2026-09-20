@@ -21,6 +21,7 @@ find_package(botan CONFIG REQUIRED)
 find_package(nghttp3 CONFIG REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
+find_package(Snappy CONFIG REQUIRED)
 find_package(tl-expected CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
@@ -148,6 +149,10 @@ add_library(clash-native-core STATIC
     src/transport/shadowsocks/simple_obfs.cpp
     src/transport/shadowsocks/websocket_plugin.cpp
     src/transport/shadowsocks/udp_over_tcp.cpp
+    src/transport/shadowsocks/kcptun.cpp
+    src/transport/shadowsocks/kcptun_session.cpp
+    src/transport/shadowsocks/kcptun_packet_codec.cpp
+    src/transport/shadowsocks/kcptun_snappy.cpp
     src/outbound/shadowsocks_legacy_datagram.cpp
     src/transport/endpoint_dialer.cpp
     src/transport/quic_client.cpp
@@ -187,6 +192,7 @@ target_link_libraries(clash-native-core
         clash-native-boringssl
         BLAKE3::blake3
         Botan::Botan-static
+        Snappy::snappy
         clash-native-nghttp2
         kcp::kcp
         ngtcp2_static
