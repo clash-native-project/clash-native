@@ -26,6 +26,12 @@ int Application::run(const ApplicationOptions &options) {
     proxy_server_.set_endpoint(*options.listen_endpoint);
     proxy_server_.set_inbound_mode(options.inbound_mode);
     proxy_server_.set_http_authentication(options.http_username, options.http_password);
+    proxy_server_.set_socks5_users(options.socks5_users);
+    if (options.socks5_udp_endpoint) {
+        proxy_server_.set_socks5_udp_endpoint(*options.socks5_udp_endpoint);
+    } else {
+        proxy_server_.clear_socks5_udp_endpoint();
+    }
     proxy_server_.set_tls_server_credentials(options.tls_certificate_pem,
                                              options.tls_private_key_pem);
     proxy_server_.set_default_action(options.default_route_action);
@@ -91,11 +97,12 @@ int Application::run(const ApplicationOptions &options) {
     }
 
     const auto endpoint = proxy_server_.endpoint();
-    const auto listener_name = options.inbound_mode == proxy::ProxyInboundMode::http
-                                   ? "HTTP"
-                                   : "HTTP/SOCKS5 mixed";
-    const auto authentication_name = options.http_username.empty() ? "no HTTP authentication"
-                                                                    : "HTTP Basic authentication";
+    const auto listener_name = options.inbound_mode == proxy::ProxyInboundMode::http ? "HTTP"
+                               : options.inbound_mode == proxy::ProxyInboundMode::socks
+                                   ? "SOCKS4/5"
+                                   : "HTTP/SOCKS4/5 mixed";
+    const auto authentication_name =
+        options.http_username.empty() ? "no HTTP authentication" : "HTTP Basic authentication";
     spdlog::info("{} proxy listening on {}:{} ({}). Press Ctrl+C to stop.", listener_name,
                  endpoint.address().to_string(), endpoint.port(), authentication_name);
 

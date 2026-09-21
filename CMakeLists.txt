@@ -176,6 +176,8 @@ add_library(clash-native-core STATIC
     src/proxy/proxy_session.cpp
     src/proxy/proxy_session_http.cpp
     src/proxy/proxy_session_socks.cpp
+    src/proxy/proxy_session_socks4.cpp
+    src/proxy/socks5_udp_listener.cpp
     src/proxy/proxy_stream.cpp
     src/proxy/tcp_relay.cpp
     src/router/traffic_router.cpp

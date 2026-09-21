@@ -130,17 +130,22 @@ paths. Revisit the limit only together with an explicit fragmentation, PMTU,
 or transport policy rather than treating the current rejection as a cipher
 interoperability failure.
 
-## Local proxy listener TLS and SOCKS5 authentication remain limited
+## Local proxy listener TLS and SOCKS listener configuration remain limited
 
-- **Status:** Partly implemented; inbound TLS is available through the native
-  API, while SOCKS5 authentication and CLI/config-file wiring remain deferred.
+- **Status:** Partly implemented; inbound TLS and the core Mihomo-style SOCKS4,
+  SOCKS4a, and SOCKS5
+  authentication/UDP listener paths are available through the native API, while
+  CLI/config-file wiring and advanced listener policies remain deferred.
 - **Scope:** `ProxyServer::set_tls_server_credentials` and the corresponding
   `ApplicationOptions` fields accept PEM encoded server certificate and private
   key byte vectors before `start()`. When configured, the
   whole local TCP listener performs a TLS server handshake and then routes the
-  decrypted stream through the existing HTTP-only or mixed HTTP/SOCKS5 parser.
-  Without credentials, the listener remains plaintext. The SOCKS5 listener
-  still negotiates only the no-authentication method.
+  decrypted stream through the existing HTTP-only, SOCKS4/5-only, or mixed
+  HTTP/SOCKS4/5 parser. SOCKS4/4a CONNECT and SOCKS5 CONNECT/UDP ASSOCIATE are
+  supported. `ProxyServer::set_socks5_users` enables RFC 1929 username/password
+  authentication and records the authenticated user in connection metadata.
+  `set_socks5_udp_endpoint` enables a separate SOCKS5 UDP listener; TCP `UDP
+  ASSOCIATE` remains available without that option.
 
 For HTTPS destinations, the HTTP listener supports `CONNECT`; TLS then runs between the client and destination inside that tunnel. Configuring listener TLS additionally encrypts the client-to-proxy hop. The TLS and Basic authentication options on an upstream HTTP proxy outbound are separate capabilities from the local listener settings.
 
@@ -150,10 +155,40 @@ response. This covers WebSocket-style and other single-protocol HTTP/1.1
 upgrades. Upgrade requests with a request body or multiple protocol tokens are
 not accepted. HTTP/2 and HTTP/3 proxy ingress remain outside this listener.
 
-The current API does not load certificate files or expose listener TLS through
-the CLI because CLI configuration is scheduled for a later milestone. Revisit
-file-based configuration and client certificate authentication when that
-configuration surface is added.
+The current API does not load certificate files, expose SOCKS5 users or the
+separate UDP endpoint through the CLI because CLI configuration is scheduled
+for a later milestone. Client certificate authentication, ECH, Reality, remote
+address policy, and multiple listener management remain outside the current
+native listener surface.
+
+## SOCKS4a interoperability is deferred
+
+- **Status:** Deferred; SOCKS4a is not currently accepted as complete and is
+  intentionally skipped for now.
+- **Scope:** Windows x64, real TCP interoperability checks against the native
+  listener and a separately built Mihomo listener.
+
+The SOCKS4 IPv4 CONNECT case passes for both the native listener and Mihomo.
+The SOCKS4a case does not pass in the current interoperability harness for
+either implementation. A valid SOCKS4a request is expected to contain the
+8-byte request header, `USERID\\0`, and the domain name followed by `\\0`, with
+the destination address encoded as `0.0.0.1`. In the failing runs, the native
+listener received bytes from the fixed request header again when it attempted
+to read the domain and then rejected the request after the resulting DNS
+failure. Mihomo likewise logged a binary request prefix as the destination
+host and timed out.
+
+Mihomo's source contains an explicit SOCKS4a parsing branch, so this result is
+not evidence that Mihomo lacks SOCKS4a support. It also does not yet prove that
+the native parser is the sole cause: the same malformed-looking byte sequence
+was observed in both server paths. The current suspects are a shared request
+framing or Windows loopback test-path problem, the native asynchronous read
+state, or buffering around Mihomo's initial `Peek` and SOCKS4 reader.
+
+Before resuming this issue, capture and verify the bytes received on the wire
+with a minimal standalone client, then add a parser test that asserts the
+extracted domain (rather than only checking a rejection status). No SOCKS4a
+implementation change is made as part of this issue record.
 
 ## HTTP/3 is not integrated as a proxy endpoint
 

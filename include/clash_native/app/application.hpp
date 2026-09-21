@@ -11,8 +11,8 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ip/udp.hpp>
 
-#include <functional>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -26,6 +26,8 @@ struct ApplicationOptions {
     proxy::ProxyInboundMode inbound_mode = proxy::ProxyInboundMode::mixed;
     std::string http_username;
     std::string http_password;
+    std::vector<proxy::Socks5User> socks5_users;
+    std::optional<boost::asio::ip::udp::endpoint> socks5_udp_endpoint;
     std::vector<std::uint8_t> tls_certificate_pem;
     std::vector<std::uint8_t> tls_private_key_pem;
     std::optional<dns::DnsResolverConfig> dns_config;

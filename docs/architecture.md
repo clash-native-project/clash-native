@@ -596,10 +596,11 @@ through a shared conformance suite covering:
 - operation and handle lifetime across configuration reload;
 - independent implementation interoperability for each wire protocol.
 
-The current experimental SOCKS5 server proves only the earliest loopback flow.
-It is not the base class or control-flow template for this contract and should
-be decomposed when the real inbound, outbound, and relay modules are
-introduced.
+The current SOCKS inbound is split into listener lifecycle, session, stream
+relay, and UDP listener modules. It supports SOCKS4/4a CONNECT, SOCKS5 CONNECT,
+UDP ASSOCIATE, RFC 1929 username/password authentication, and an optional
+standalone UDP listener through the native API. Advanced listener policy and
+CLI configuration remain separate work.
 
 ## 8. Runtime model
 

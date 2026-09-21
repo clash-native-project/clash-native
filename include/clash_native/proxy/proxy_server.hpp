@@ -12,6 +12,7 @@
 #include <clash_native/runtime/runtime_snapshot.hpp>
 
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/ip/udp.hpp>
 #include <boost/asio/ssl/context.hpp>
 
 #include <atomic>
@@ -20,6 +21,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -29,10 +31,17 @@
 namespace clash_native::proxy {
 
 class ProxySession;
+class Socks5UdpListener;
+
+struct Socks5User {
+    std::string username;
+    std::string password;
+};
 
 enum class ProxyInboundMode {
     mixed,
     http,
+    socks,
 };
 
 class ProxyServer {
@@ -47,6 +56,9 @@ class ProxyServer {
     void set_endpoint(boost::asio::ip::tcp::endpoint endpoint);
     void set_inbound_mode(ProxyInboundMode mode);
     void set_http_authentication(std::string username, std::string password);
+    void set_socks5_users(std::vector<Socks5User> users);
+    void set_socks5_udp_endpoint(boost::asio::ip::udp::endpoint endpoint);
+    void clear_socks5_udp_endpoint();
     // Enable TLS for the local listener with PEM encoded server credentials.
     // Both byte vectors must be provided together. The credentials must be set before start().
     void set_tls_server_credentials(std::vector<std::uint8_t> certificate_pem,
@@ -66,14 +78,17 @@ class ProxyServer {
     void stop() noexcept;
     bool running() const noexcept;
     boost::asio::ip::tcp::endpoint endpoint() const noexcept;
+    std::optional<boost::asio::ip::udp::endpoint> socks5_udp_endpoint() const noexcept;
 
   private:
     friend class ProxySession;
+    friend class Socks5UdpListener;
     using SessionPtr = std::shared_ptr<ProxySession>;
     using DatagramRouteHandler =
         std::function<void(core::DatagramOpenResult, boost::asio::ip::udp::endpoint)>;
 
     void accept();
+    core::Status start_socks5_udp_listener();
     void open_stream(core::ConnectionMetadata metadata,
                      std::optional<observability::ConnectionRegistry::ConnectionId> connection_id,
                      core::StreamOpenHandler handler);
@@ -94,6 +109,9 @@ class ProxyServer {
     ProxyInboundMode inbound_mode_ = ProxyInboundMode::mixed;
     std::string http_username_;
     std::string http_password_;
+    std::vector<Socks5User> socks5_users_;
+    std::optional<boost::asio::ip::udp::endpoint> socks5_udp_endpoint_;
+    std::shared_ptr<Socks5UdpListener> socks5_udp_listener_;
     std::vector<std::uint8_t> tls_certificate_pem_;
     std::vector<std::uint8_t> tls_private_key_pem_;
     std::shared_ptr<boost::asio::ssl::context> tls_context_;

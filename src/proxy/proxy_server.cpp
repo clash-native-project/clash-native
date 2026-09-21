@@ -43,6 +43,7 @@
 
 #include "http_proxy_utils.hpp"
 #include "proxy_session.hpp"
+#include "socks5_udp_listener.hpp"
 
 namespace clash_native::proxy {
 
@@ -98,6 +99,39 @@ void ProxyServer::set_http_authentication(std::string username, std::string pass
     }
     http_username_ = std::move(username);
     http_password_ = std::move(password);
+}
+
+void ProxyServer::set_socks5_users(std::vector<Socks5User> users) {
+    if (running()) {
+        throw std::logic_error("Cannot change SOCKS5 users on a running proxy");
+    }
+    std::unordered_set<std::string> names;
+    for (const auto &user : users) {
+        if (user.username.empty() || user.username.size() > 255 || user.password.size() > 255) {
+            throw std::invalid_argument("SOCKS5 usernames and passwords must fit in one byte");
+        }
+        if (!http_detail::has_valid_http_credentials(user.username, user.password)) {
+            throw std::invalid_argument("SOCKS5 credentials contain invalid characters");
+        }
+        if (!names.emplace(user.username).second) {
+            throw std::invalid_argument("SOCKS5 usernames must be unique");
+        }
+    }
+    socks5_users_ = std::move(users);
+}
+
+void ProxyServer::set_socks5_udp_endpoint(boost::asio::ip::udp::endpoint endpoint) {
+    if (running()) {
+        throw std::logic_error("Cannot change the SOCKS5 UDP endpoint on a running proxy");
+    }
+    socks5_udp_endpoint_ = endpoint;
+}
+
+void ProxyServer::clear_socks5_udp_endpoint() {
+    if (running()) {
+        throw std::logic_error("Cannot change the SOCKS5 UDP endpoint on a running proxy");
+    }
+    socks5_udp_endpoint_.reset();
 }
 
 void ProxyServer::set_tls_server_credentials(std::vector<std::uint8_t> certificate_pem,
@@ -264,6 +298,22 @@ core::Status ProxyServer::start() {
     }
 
     callback_gate_ = std::make_shared<std::atomic_bool>(true);
+    if (socks5_udp_endpoint_ && inbound_mode_ == ProxyInboundMode::http) {
+        spdlog::error("Proxy server cannot enable a SOCKS5 UDP listener in HTTP-only mode");
+        callback_gate_->store(false, std::memory_order_release);
+        acceptor_.close();
+        running_ = false;
+        return core::fail(
+            {core::ErrorCode::configuration, "SOCKS5 UDP listener requires a SOCKS-capable mode"});
+    }
+    if (socks5_udp_endpoint_) {
+        if (const auto result = start_socks5_udp_listener(); !result) {
+            callback_gate_->store(false, std::memory_order_release);
+            acceptor_.close();
+            running_ = false;
+            return result;
+        }
+    }
     spdlog::info("Proxy server listening on {}:{}{}", endpoint_.address().to_string(),
                  endpoint_.port(), tls_enabled() ? " (TLS)" : "");
     accept();
@@ -302,6 +352,10 @@ void ProxyServer::stop_on_owner() noexcept {
     boost::system::error_code ignored;
     acceptor_.cancel(ignored);
     acceptor_.close(ignored);
+    if (socks5_udp_listener_) {
+        socks5_udp_listener_->stop();
+        socks5_udp_listener_.reset();
+    }
 
     std::vector<SessionPtr> sessions;
     {
@@ -344,6 +398,26 @@ ProxyServer::runtime_snapshot_store() const noexcept {
 bool ProxyServer::running() const noexcept { return running_.load(); }
 
 boost::asio::ip::tcp::endpoint ProxyServer::endpoint() const noexcept { return endpoint_; }
+
+std::optional<boost::asio::ip::udp::endpoint> ProxyServer::socks5_udp_endpoint() const noexcept {
+    if (socks5_udp_listener_) {
+        return socks5_udp_listener_->endpoint();
+    }
+    return socks5_udp_endpoint_;
+}
+
+core::Status ProxyServer::start_socks5_udp_listener() {
+    if (!socks5_udp_endpoint_) {
+        return {};
+    }
+    socks5_udp_listener_ = std::make_shared<Socks5UdpListener>(*this);
+    if (const auto result = socks5_udp_listener_->start(*socks5_udp_endpoint_); !result) {
+        socks5_udp_listener_.reset();
+        return result;
+    }
+    socks5_udp_endpoint_ = socks5_udp_listener_->endpoint();
+    return {};
+}
 
 void ProxyServer::accept() {
     if (!running()) {

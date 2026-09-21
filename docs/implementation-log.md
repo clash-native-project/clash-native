@@ -1459,3 +1459,24 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   HTTP, SOCKS5, stream adapter, and HTTP parsing utility modules. Existing HTTP,
   CONNECT, Upgrade, SOCKS5 TCP, and SOCKS5 UDP behavior remains on the same
   runtime path.
+
+### 2026-09-21 — Align SOCKS listener authentication and UDP behavior
+
+- Added RFC 1929 username/password authentication with multiple configured
+  users, authenticated-user metadata, and a SOCKS-only inbound mode.
+- Added an optional standalone SOCKS5 UDP listener matching the Mihomo listener
+  split while retaining TCP `UDP ASSOCIATE` compatibility.
+- Added focused Windows tests for authenticated TCP CONNECT and standalone UDP
+  relay behavior.
+- Added SOCKS4 and SOCKS4a CONNECT parsing, USERID handling, status replies, and
+  focused relay/parser tests.
+
+### 2026-09-21 — Record deferred SOCKS4a interoperability failure
+
+- Recorded that SOCKS4 IPv4 interoperability passes for both the native
+  listener and Mihomo, while the current Windows x64 SOCKS4a checks fail in
+  both server paths.
+- Documented the repeated request-header bytes observed during domain parsing,
+  the remaining uncertainty about the shared framing or loopback test path,
+  and the standalone wire verification required before resuming the work.
+- Intentionally skipped implementation changes for SOCKS4a.

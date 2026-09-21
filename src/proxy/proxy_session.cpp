@@ -56,10 +56,30 @@ void ProxySession::read_protocol_byte() {
                                     return;
                                 }
 
+                                if (self->protocol_byte_[0] == 0x04) {
+                                    if (self->owner_.inbound_mode_ == ProxyInboundMode::http) {
+                                        self->close();
+                                        return;
+                                    }
+                                    self->protocol_ = Protocol::socks4;
+                                    self->socks4_request_[0] = self->protocol_byte_[0];
+                                    self->read_socks4_request();
+                                    return;
+                                }
+
                                 if (self->protocol_byte_[0] == kSocksVersion) {
+                                    if (self->owner_.inbound_mode_ == ProxyInboundMode::http) {
+                                        self->close();
+                                        return;
+                                    }
                                     self->protocol_ = Protocol::socks5;
                                     self->method_header_[0] = self->protocol_byte_[0];
                                     self->read_method_count();
+                                    return;
+                                }
+
+                                if (self->owner_.inbound_mode_ == ProxyInboundMode::socks) {
+                                    self->close();
                                     return;
                                 }
 
@@ -86,9 +106,13 @@ void ProxySession::open_target(core::Destination destination) {
     core::ConnectionMetadata metadata{core::Network::tcp,
                                       source_endpoint,
                                       std::move(destination),
-                                      protocol_ == Protocol::socks5 ? "socks5" : "http",
-                                      protocol_ == Protocol::socks5 ? "socks5" : "http",
-                                      {},
+                                      protocol_ == Protocol::socks4   ? "socks4"
+                                      : protocol_ == Protocol::socks5 ? "socks5"
+                                                                      : "http",
+                                      protocol_ == Protocol::socks4   ? "socks4"
+                                      : protocol_ == Protocol::socks5 ? "socks5"
+                                                                      : "http",
+                                      authenticated_user_,
                                       {}};
     if (owner_.connection_registry_) {
         connection_id_ = owner_.connection_registry_->add(metadata, {});
@@ -111,7 +135,9 @@ void ProxySession::handle_open_result(core::StreamOpenResult result) {
                          result.error->cause ? fmt::format(": {}", result.error->cause.message())
                                              : std::string{});
         }
-        if (protocol_ == Protocol::socks5) {
+        if (protocol_ == Protocol::socks4) {
+            send_socks4_reply(0x5b, false);
+        } else if (protocol_ == Protocol::socks5) {
             send_socks_reply(socks_error_code(result.error), false);
         } else if (http_forward_) {
             const auto status =
@@ -126,7 +152,9 @@ void ProxySession::handle_open_result(core::StreamOpenResult result) {
     }
 
     remote_ = std::move(result.handle);
-    if (protocol_ == Protocol::socks5) {
+    if (protocol_ == Protocol::socks4) {
+        send_socks4_reply(0x5a, true);
+    } else if (protocol_ == Protocol::socks5) {
         send_socks_reply(0x00, true);
     } else if (http_forward_) {
         if (http_upgrade_forward_) {

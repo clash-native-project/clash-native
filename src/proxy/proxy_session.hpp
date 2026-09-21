@@ -33,7 +33,9 @@ namespace clash_native::proxy {
 
 inline constexpr std::uint8_t kSocksVersion = 0x05;
 inline constexpr std::uint8_t kNoAuthentication = 0x00;
+inline constexpr std::uint8_t kUsernamePasswordAuthentication = 0x02;
 inline constexpr std::uint8_t kNoAcceptableMethods = 0xff;
+inline constexpr std::uint8_t kSocksAuthVersion = 0x01;
 inline constexpr std::uint8_t kConnectCommand = 0x01;
 inline constexpr std::uint8_t kUdpAssociateCommand = 0x03;
 inline constexpr auto kHandshakeTimeout = std::chrono::seconds(10);
@@ -151,6 +153,7 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     };
 
     enum class Protocol {
+        socks4,
         socks5,
         http,
     };
@@ -158,6 +161,10 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     void reset_handshake_timer();
     void cancel_handshake_timer() noexcept;
     void read_protocol_byte();
+    void read_socks4_request();
+    void read_socks4_user_id();
+    void read_socks4_domain();
+    void open_socks4_target();
     void open_target(core::Destination destination);
     void handle_open_result(core::StreamOpenResult result);
     void start_relay();
@@ -166,6 +173,11 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     void read_method_count();
     void read_methods();
     void send_method_response(std::uint8_t method);
+    void read_auth_header();
+    void read_auth_username();
+    void read_auth_password_length();
+    void read_auth_password();
+    void send_auth_response(bool accepted);
     void read_request_header();
     void read_domain_length();
     void read_request_body();
@@ -182,6 +194,7 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     void receive_udp_response(const std::shared_ptr<UdpPath> &path);
     void send_socks_udp_response(core::DatagramAddress source,
                                  std::span<const std::uint8_t> payload);
+    void send_socks4_reply(std::uint8_t status, bool start_relay);
     void send_socks_reply(std::uint8_t reply, bool start_relay);
 
     void read_http_headers();
@@ -222,9 +235,21 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     bool http_upgrade_forward_ = false;
 
     std::array<std::uint8_t, 1> protocol_byte_{};
+    std::array<std::uint8_t, 8> socks4_request_{};
+    std::array<std::uint8_t, 1024> socks4_read_buffer_{};
+    std::vector<std::uint8_t> socks4_payload_;
+    std::vector<std::uint8_t> socks4_user_id_;
+    std::vector<std::uint8_t> socks4_domain_;
     std::array<std::uint8_t, 2> method_header_{};
     std::array<std::uint8_t, 2> method_response_{};
     std::vector<std::uint8_t> methods_;
+    std::array<std::uint8_t, 2> auth_header_{};
+    std::array<std::uint8_t, 1> auth_password_length_{};
+    std::vector<std::uint8_t> auth_username_;
+    std::vector<std::uint8_t> auth_password_;
+    std::array<std::uint8_t, 2> auth_response_{};
+    std::optional<std::string> authenticated_user_;
+    std::array<std::uint8_t, 8> socks4_reply_{};
     std::array<std::uint8_t, 4> request_header_{};
     std::array<std::uint8_t, 1> domain_length_{};
     std::vector<std::uint8_t> request_body_;

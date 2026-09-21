@@ -2,6 +2,7 @@
 
 #include "outbound/outbound_utils.hpp"
 #include "outbound/proxy_address.hpp"
+#include "socks5_udp_listener.hpp"
 
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
@@ -60,10 +61,13 @@ void ProxySession::read_methods() {
                 return;
             }
 
+            const auto required_method = self->owner_.socks5_users_.empty()
+                                             ? kNoAuthentication
+                                             : kUsernamePasswordAuthentication;
             const auto method =
-                std::find(self->methods_.begin(), self->methods_.end(), kNoAuthentication);
+                std::find(self->methods_.begin(), self->methods_.end(), required_method);
             self->send_method_response(method == self->methods_.end() ? kNoAcceptableMethods
-                                                                      : kNoAuthentication);
+                                                                      : required_method);
         });
 }
 
@@ -73,11 +77,95 @@ void ProxySession::send_method_response(std::uint8_t method) {
     auto self = shared_from_this();
     boost::asio::async_write(client_, boost::asio::buffer(method_response_),
                              [self, method](const boost::system::error_code &error, std::size_t) {
-                                 if (error || method != kNoAuthentication) {
+                                 if (error || (method != kNoAuthentication &&
+                                               method != kUsernamePasswordAuthentication)) {
                                      self->close();
                                      return;
                                  }
 
+                                 if (method == kUsernamePasswordAuthentication) {
+                                     self->read_auth_header();
+                                 } else {
+                                     self->read_request_header();
+                                 }
+                             });
+}
+
+void ProxySession::read_auth_header() {
+    auto self = shared_from_this();
+    boost::asio::async_read(client_, boost::asio::buffer(auth_header_),
+                            [self](const boost::system::error_code &error, std::size_t) {
+                                if (error || self->auth_header_[0] != kSocksAuthVersion ||
+                                    self->auth_header_[1] == 0) {
+                                    self->send_auth_response(false);
+                                    return;
+                                }
+                                self->auth_username_.resize(self->auth_header_[1]);
+                                self->read_auth_username();
+                            });
+}
+
+void ProxySession::read_auth_username() {
+    auto self = shared_from_this();
+    boost::asio::async_read(client_, boost::asio::buffer(auth_username_),
+                            [self](const boost::system::error_code &error, std::size_t) {
+                                if (error) {
+                                    self->close();
+                                    return;
+                                }
+                                self->read_auth_password_length();
+                            });
+}
+
+void ProxySession::read_auth_password_length() {
+    auto self = shared_from_this();
+    boost::asio::async_read(client_, boost::asio::buffer(auth_password_length_),
+                            [self](const boost::system::error_code &error, std::size_t) {
+                                if (error || self->auth_password_length_[0] == 0) {
+                                    self->send_auth_response(false);
+                                    return;
+                                }
+                                self->auth_password_.resize(self->auth_password_length_[0]);
+                                self->read_auth_password();
+                            });
+}
+
+void ProxySession::read_auth_password() {
+    auto self = shared_from_this();
+    boost::asio::async_read(
+        client_, boost::asio::buffer(auth_password_),
+        [self](const boost::system::error_code &error, std::size_t) {
+            if (error) {
+                self->close();
+                return;
+            }
+            const auto username =
+                std::string(self->auth_username_.begin(), self->auth_username_.end());
+            const auto password =
+                std::string(self->auth_password_.begin(), self->auth_password_.end());
+            const auto user = std::find_if(
+                self->owner_.socks5_users_.begin(), self->owner_.socks5_users_.end(),
+                [&username, &password](const Socks5User &candidate) {
+                    return candidate.username == username && candidate.password == password;
+                });
+            if (user == self->owner_.socks5_users_.end()) {
+                self->send_auth_response(false);
+                return;
+            }
+            self->authenticated_user_ = user->username;
+            self->send_auth_response(true);
+        });
+}
+
+void ProxySession::send_auth_response(bool accepted) {
+    auth_response_ = {kSocksAuthVersion, static_cast<std::uint8_t>(accepted ? 0x00 : 0x01)};
+    auto self = shared_from_this();
+    boost::asio::async_write(client_, boost::asio::buffer(auth_response_),
+                             [self, accepted](const boost::system::error_code &error, std::size_t) {
+                                 if (error || !accepted) {
+                                     self->close();
+                                     return;
+                                 }
                                  self->read_request_header();
                              });
 }
@@ -191,6 +279,16 @@ void ProxySession::open_socks_udp_association() {
         return;
     }
 
+    if (owner_.socks5_udp_listener_) {
+        const auto endpoint = owner_.socks5_udp_listener_->endpoint();
+        if (!endpoint) {
+            send_socks_reply(0x01, false);
+            return;
+        }
+        send_socks_udp_associate_reply(*endpoint);
+        return;
+    }
+
     boost::system::error_code error;
     const auto peer = client_.remote_endpoint(error);
     if (error) {
@@ -271,9 +369,14 @@ void ProxySession::send_socks_udp_associate_reply(const boost::asio::ip::udp::en
 
 void ProxySession::read_udp_control() {
     auto self = shared_from_this();
-    client_.async_read_some(
-        boost::asio::buffer(udp_control_probe_),
-        [self](const boost::system::error_code &, std::size_t) { self->close(); });
+    client_.async_read_some(boost::asio::buffer(udp_control_probe_),
+                            [self](const boost::system::error_code &error, std::size_t) {
+                                if (error) {
+                                    self->close();
+                                    return;
+                                }
+                                self->read_udp_control();
+                            });
 }
 
 void ProxySession::read_socks_udp_packet() {
@@ -359,7 +462,7 @@ void ProxySession::process_socks_udp_packet(std::size_t size) {
         decoded.value().destination,
         "socks5",
         "socks5",
-        {},
+        authenticated_user_,
         {}};
     auto self = shared_from_this();
     owner_.open_datagram(udp_snapshot_, std::move(metadata),
