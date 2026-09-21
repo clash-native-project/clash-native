@@ -5,6 +5,7 @@
 #include <clash_native/runtime/asio_runtime.hpp>
 #include <clash_native/transport/shadowsocks/kcptun.hpp>
 #include <clash_native/transport/shadowsocks/kcptun_session.hpp>
+#include <clash_native/transport/shadowsocks/websocket_plugin.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -31,6 +32,9 @@ struct ShadowsocksOutboundConfig {
     std::string plugin_path;
     bool plugin_tls = false;
     bool plugin_skip_cert_verify = false;
+    // Reuse one WebSocket carrier for multiple logical Shadowsocks streams.
+    // v2ray-plugin uses its native mux framing; gost-plugin uses smux.
+    bool plugin_mux = false;
     std::optional<transport::shadowsocks::KcptunClientOptions> kcptun;
     // Use the Shadowsocks TCP stream with the standardized UDP-over-TCP
     // framing. Version 1 is the legacy per-packet framing; version 2 adds a
@@ -61,6 +65,7 @@ class ShadowsocksOutbound final : public core::Outbound {
     ShadowsocksOutboundConfig config_;
     std::shared_ptr<dns::ResolverService> resolver_;
     std::shared_ptr<transport::shadowsocks::KcptunClientPool> kcptun_pool_;
+    std::shared_ptr<transport::shadowsocks::WebSocketPluginMuxPool> websocket_mux_pool_;
     core::OutboundDescriptor descriptor_;
     core::OutboundCapabilities capabilities_{true, core::DatagramSemantics::multi_destination,
                                              core::TargetRequirement::domain_or_ip,

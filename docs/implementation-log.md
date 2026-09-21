@@ -1,5 +1,13 @@
 # Implementation Log
 
+### 2026-09-21 — Record Shadowsocks Windows and UDP known limitations
+
+- Added the classic Shadowsocks TCP half-close/Windows relay EOF behavior to
+  `docs/known-issues.md`, with the passing cipher-wire scope and current
+  isolation boundary documented separately.
+- Recorded the intentional `message_size` rejection for encrypted Shadowsocks
+  UDP wire payloads above 1,500 bytes as an accepted transport guardrail.
+
 ### 2026-09-21 — Add the Shadowsocks JLS TLS 1.3 carrier
 
 - Added the JLS username/password authentication primitives, ClientHello and
@@ -1306,3 +1314,12 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - The native client currently accepts only the `tls12` version hint; `tls13`
   remains an explicit unsupported result until Botan's TLS 1.3 session-ID
   derivation and ResTLS record hooks are wired.
+
+### 2026-09-21 — Add WebSocket plugin multiplexing
+
+- Added a common `MultiplexedSession` implementation for v2ray-plugin mux and
+  gost-plugin smux v1, exposing each logical stream through `StreamHandle`.
+- Added a per-outbound WebSocket carrier pool so concurrent Shadowsocks TCP
+  streams reuse one upgraded WebSocket connection.
+- Added independent Go interoperability coverage for two logical streams over
+  one v2ray mux or smux v1 carrier. Native Shadowsocks UDP remains unwrapped.

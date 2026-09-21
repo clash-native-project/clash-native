@@ -486,10 +486,12 @@ class ShadowsocksConnectOperation final
     ShadowsocksConnectOperation(runtime::AsioRuntime &runtime,
                                 std::shared_ptr<dns::ResolverService> resolver,
                                 std::shared_ptr<ss::KcptunClientPool> kcptun_pool,
+                                std::shared_ptr<ss::WebSocketPluginMuxPool> websocket_mux_pool,
                                 ShadowsocksOutboundConfig config, core::StreamRequest request,
                                 core::StreamOpenHandler handler)
         : runtime_(runtime), resolver_(std::move(resolver)), config_(std::move(config)),
           kcptun_pool_(std::move(kcptun_pool)),
+          websocket_mux_pool_(std::move(websocket_mux_pool)),
           request_(std::move(request)),
           socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.context())),
           timer_(runtime.context()), handler_(std::move(handler)) {}
@@ -595,6 +597,11 @@ class ShadowsocksConnectOperation final
                                    "Shadowsocks ResTLS host and password are required", {}});
             }
         }
+        if (config_.plugin_mux && !websocket_plugin()) {
+            return core::fail({core::ErrorCode::unsupported,
+                               "Shadowsocks plugin mux requires v2ray-plugin or gost-plugin",
+                               {}});
+        }
         if (config_.plugin == "jls") {
             if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() || config_.plugin_tls) {
                 return core::fail({core::ErrorCode::configuration,
@@ -647,9 +654,16 @@ class ShadowsocksConnectOperation final
     bool jls_plugin() const noexcept { return config_.plugin == "jls"; }
 
     ss::WebSocketPluginOptions websocket_options() const {
-        return {config_.plugin_host.empty() ? "bing.com" : config_.plugin_host,
-                config_.plugin_path.empty() ? "/" : config_.plugin_path, config_.plugin_tls,
-                config_.plugin_skip_cert_verify};
+        ss::WebSocketPluginOptions options;
+        options.host = config_.plugin_host.empty() ? "bing.com" : config_.plugin_host;
+        options.path = config_.plugin_path.empty() ? "/" : config_.plugin_path;
+        options.tls = config_.plugin_tls;
+        options.skip_cert_verify = config_.plugin_skip_cert_verify;
+        options.mux = config_.plugin_mux;
+        options.mux_protocol = config_.plugin == "gost-plugin"
+                                   ? ss::WebSocketMuxProtocol::smux
+                                   : ss::WebSocketMuxProtocol::v2ray;
+        return options;
     }
 
     void resolved(core::Result<detail::AddressList> result) {
@@ -699,6 +713,25 @@ class ShadowsocksConnectOperation final
             endpoints->emplace_back(address, config_.server_port);
         }
         auto self = shared_from_this();
+        if (websocket_plugin() && config_.plugin_mux) {
+            if (!websocket_mux_pool_) {
+                finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::configuration,
+                     "Shadowsocks WebSocket mux pool is not initialized", {}}));
+                return;
+            }
+            websocket_mux_pool_->async_open_stream(
+                std::move(*endpoints), websocket_options(),
+                [self](core::Result<std::unique_ptr<core::StreamHandle>> stream) mutable {
+                    if (!stream) {
+                        self->finish(core::StreamOpenResult::failed(stream.error()));
+                        return;
+                    }
+                    self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(stream.value()));
+                    self->send_initial_request();
+                });
+            return;
+        }
         boost::asio::async_connect(
             *socket_, *endpoints,
             [self, endpoints](const boost::system::error_code &error,
@@ -798,7 +831,7 @@ class ShadowsocksConnectOperation final
                 finish(core::StreamOpenResult::failed(address.error()));
                 return;
             }
-            if (websocket_plugin()) {
+            if (websocket_plugin() && !config_.plugin_mux) {
                 open_websocket_2022(std::move(address.value()));
                 return;
             }
@@ -842,7 +875,7 @@ class ShadowsocksConnectOperation final
         salt.insert(salt.end(), record.begin(), record.end());
         auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(salt));
         auto self = shared_from_this();
-        if (websocket_plugin()) {
+        if (websocket_plugin() && !config_.plugin_mux) {
             open_websocket_classic(std::move(*wire), std::move(key.value()));
             return;
         }
@@ -978,7 +1011,7 @@ class ShadowsocksConnectOperation final
         iv.insert(iv.end(), encrypted_address.begin(), encrypted_address.end());
         auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(iv));
         auto self = shared_from_this();
-        if (websocket_plugin()) {
+        if (websocket_plugin() && !config_.plugin_mux) {
             open_websocket_legacy(std::move(*wire), std::move(cipher.value()));
             return;
         }
@@ -1110,6 +1143,7 @@ class ShadowsocksConnectOperation final
     runtime::AsioRuntime &runtime_;
     std::shared_ptr<dns::ResolverService> resolver_;
     std::shared_ptr<ss::KcptunClientPool> kcptun_pool_;
+    std::shared_ptr<ss::WebSocketPluginMuxPool> websocket_mux_pool_;
     ShadowsocksOutboundConfig config_;
     core::StreamRequest request_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
@@ -1359,6 +1393,11 @@ ShadowsocksOutbound::ShadowsocksOutbound(runtime::AsioRuntime &runtime,
         kcptun_pool_ = std::make_shared<transport::shadowsocks::KcptunClientPool>(
             runtime_, config_.kcptun.value_or(transport::shadowsocks::KcptunClientOptions{}));
     }
+    if (config_.plugin_mux &&
+        (config_.plugin == "v2ray-plugin" || config_.plugin == "gost-plugin")) {
+        websocket_mux_pool_ = std::make_shared<transport::shadowsocks::WebSocketPluginMuxPool>(
+            runtime_.context().get_executor());
+    }
 }
 
 core::Status ShadowsocksOutbound::validate() const {
@@ -1429,6 +1468,11 @@ core::Status ShadowsocksOutbound::validate() const {
                                "Shadowsocks ResTLS host and password are required", {}});
         }
     }
+    if (config_.plugin_mux && config_.plugin != "v2ray-plugin" &&
+        config_.plugin != "gost-plugin") {
+        return core::fail({core::ErrorCode::unsupported,
+                           "Shadowsocks plugin mux requires v2ray-plugin or gost-plugin", {}});
+    }
     if (config_.plugin == "jls") {
         if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() || config_.plugin_tls) {
             return core::fail({core::ErrorCode::configuration,
@@ -1477,7 +1521,8 @@ core::OutboundCapabilities ShadowsocksOutbound::capabilities() const noexcept {
 void ShadowsocksOutbound::connect_stream(core::StreamRequest request,
                                          core::StreamOpenHandler handler) {
     auto operation = std::make_shared<ShadowsocksConnectOperation>(
-        runtime_, resolver_, kcptun_pool_, config_, std::move(request), std::move(handler));
+        runtime_, resolver_, kcptun_pool_, websocket_mux_pool_, config_, std::move(request),
+        std::move(handler));
     operation->start();
 }
 
@@ -1497,7 +1542,7 @@ void ShadowsocksOutbound::open_datagram(core::DatagramRequest request,
         core::StreamRequest stream_request{core::Destination::domain(std::string(magic), 0),
                                            std::nullopt, request.dial_trace};
         auto operation = std::make_shared<ShadowsocksConnectOperation>(
-            runtime_, resolver_, kcptun_pool_, config_, std::move(stream_request),
+            runtime_, resolver_, kcptun_pool_, websocket_mux_pool_, config_, std::move(stream_request),
             [handler = std::move(handler), initial_destination = request.initial_destination,
              version, context = &runtime_.context()](core::StreamOpenResult result) mutable {
                 boost::asio::post(context->get_executor(), [handler = std::move(handler),

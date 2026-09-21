@@ -115,6 +115,8 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
             config.plugin_skip_cert_verify =
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_SKIP_CERT_VERIFY")
                     .value_or("") == "1";
+            config.plugin_mux =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_MUX").value_or("") == "1";
             config.plugin_password =
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_PASSWORD").value_or("");
             config.plugin_username =

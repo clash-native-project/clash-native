@@ -30,6 +30,22 @@ The failures were reproduced with the current build and with the pre-KCP
 change and are not evidence of a KCP or encrypted-DNS regression. The exact
 Windows UDP scheduling or loopback interaction remains to be isolated.
 
+## Classic Shadowsocks half-close exposes Windows relay EOF behavior
+
+- **Status:** Deferred; the failure boundary is in the Windows relay/runtime
+  path and has not been isolated to a specific component.
+- **Scope:** Classic Shadowsocks TCP interoperability on the Windows x64 test
+  profile.
+
+The classic Shadowsocks cipher and framing exchange succeeds, but the retained
+TCP half-close check can observe EOF from the relay before the reverse
+direction completes. Running the same Mihomo matrix with
+`CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE=1` passes the complete Shadowsocks
+request and response wire checks. The current evidence therefore does not
+indicate a classic Shadowsocks encryption or framing defect. Revisit this with
+separate relay and socket-level tracing before changing the Shadowsocks
+transport contract.
+
 ## Mihomo SMUX peer closes the full stream after FIN
 
 - **Status:** Deferred; interoperability limitation in the tested Mihomo
@@ -97,6 +113,22 @@ This is not evidence that ordinary-sized DNS queries fail, nor does it establish
 ### Deferred investigation
 
 When this issue is resumed, preserve a repeatable Go burst probe, record send and receive counts separately, inspect the effective socket receive-buffer size, and exercise the C++ DNS UDP listener independently from QUIC. Test pacing and burst sizes separately, then validate large packets over a real network interface before attributing loss to IP fragmentation. No production behavior change is made as part of this issue record.
+
+## Shadowsocks encrypted UDP wire-size guardrail
+
+- **Status:** Accepted limitation; enforced intentionally by the current
+  outbound policy.
+- **Scope:** Shadowsocks UDP datagrams after encryption and framing, before the
+  UDP socket write.
+
+The outbound returns `message_size` when an encrypted Shadowsocks UDP datagram
+exceeds 1,500 bytes. The limit applies to the encrypted Shadowsocks wire
+payload and excludes the IP and UDP headers; it is a conservative application
+guardrail and is not a complete path-MTU guarantee. The check avoids sending
+large encrypted datagrams that may be fragmented or lost on ordinary network
+paths. Revisit the limit only together with an explicit fragmentation, PMTU,
+or transport policy rather than treating the current rejection as a cipher
+interoperability failure.
 
 ## Local HTTP and SOCKS5 proxy listeners are plaintext and unauthenticated
 
