@@ -12,8 +12,10 @@
 #include <boost/asio/ip/udp.hpp>
 
 #include <functional>
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -21,6 +23,11 @@ namespace clash_native::app {
 
 struct ApplicationOptions {
     std::optional<boost::asio::ip::tcp::endpoint> listen_endpoint;
+    proxy::ProxyInboundMode inbound_mode = proxy::ProxyInboundMode::mixed;
+    std::string http_username;
+    std::string http_password;
+    std::vector<std::uint8_t> tls_certificate_pem;
+    std::vector<std::uint8_t> tls_private_key_pem;
     std::optional<dns::DnsResolverConfig> dns_config;
     std::optional<boost::asio::ip::udp::endpoint> dns_udp_endpoint;
     std::optional<boost::asio::ip::tcp::endpoint> dns_tcp_endpoint;

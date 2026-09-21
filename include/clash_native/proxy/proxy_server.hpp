@@ -12,6 +12,7 @@
 #include <clash_native/runtime/runtime_snapshot.hpp>
 
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/ssl/context.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -20,10 +21,17 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
 #include <string_view>
 #include <unordered_set>
+#include <vector>
 
 namespace clash_native::proxy {
+
+enum class ProxyInboundMode {
+    mixed,
+    http,
+};
 
 class ProxyServer {
   public:
@@ -35,6 +43,14 @@ class ProxyServer {
     ProxyServer &operator=(const ProxyServer &) = delete;
 
     void set_endpoint(boost::asio::ip::tcp::endpoint endpoint);
+    void set_inbound_mode(ProxyInboundMode mode);
+    void set_http_authentication(std::string username, std::string password);
+    // Enable TLS for the local listener with PEM encoded server credentials.
+    // Both byte vectors must be provided together. The credentials must be set before start().
+    void set_tls_server_credentials(std::vector<std::uint8_t> certificate_pem,
+                                    std::vector<std::uint8_t> private_key_pem);
+    void clear_tls_server_credentials();
+    bool tls_enabled() const noexcept;
     void set_default_action(router::RouteAction action);
     void add_rule(router::TrafficRule rule);
     void set_resolver(std::shared_ptr<dns::ResolverService> resolver);
@@ -73,6 +89,12 @@ class ProxyServer {
     runtime::AsioRuntime &runtime_;
     boost::asio::ip::tcp::acceptor acceptor_;
     boost::asio::ip::tcp::endpoint endpoint_;
+    ProxyInboundMode inbound_mode_ = ProxyInboundMode::mixed;
+    std::string http_username_;
+    std::string http_password_;
+    std::vector<std::uint8_t> tls_certificate_pem_;
+    std::vector<std::uint8_t> tls_private_key_pem_;
+    std::shared_ptr<boost::asio::ssl::context> tls_context_;
     mutable std::mutex sessions_mutex_;
     std::set<SessionPtr> sessions_;
     std::atomic_bool running_{false};

@@ -24,7 +24,6 @@
 #include <fstream>
 #include <functional>
 #include <future>
-#include <iostream>
 #include <istream>
 #include <iterator>
 #include <limits>
@@ -36,6 +35,9 @@
 #include <system_error>
 #include <thread>
 #include <unordered_map>
+
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 
 namespace {
 
@@ -542,7 +544,7 @@ int run_raw_shadowsocks2022_udp_test() {
         throw std::system_error(error, "bind raw Shadowsocks 2022 UDP socket");
     }
     const boost::asio::ip::udp::endpoint server_endpoint(server_address, server.port);
-    std::cout << "clash-native-test-host raw-udp-ready" << std::endl;
+    spdlog::info("clash-native-test-host raw-udp-ready");
     socket.send_to(boost::asio::buffer(wire.value()), server_endpoint, 0, error);
     if (error) {
         throw std::system_error(error, "send raw Shadowsocks 2022 UDP packet");
@@ -565,7 +567,7 @@ int run_raw_shadowsocks2022_udp_test() {
                                 static_cast<std::ptrdiff_t>(destination.size()))) {
                 throw std::runtime_error("raw Shadowsocks 2022 UDP response payload mismatch");
             }
-            std::cout << "clash-native-test-host raw-udp-pass" << std::endl;
+            spdlog::info("clash-native-test-host raw-udp-pass");
             return 0;
         }
         if (error != boost::asio::error::would_block && error != boost::asio::error::try_again) {
@@ -579,8 +581,14 @@ int run_raw_shadowsocks2022_udp_test() {
 } // namespace
 
 int main(int argc, char **) {
+    auto logger = spdlog::stdout_color_mt("clash-native-test-host");
+    logger->set_pattern("%v");
+    logger->set_level(spdlog::level::info);
+    logger->flush_on(spdlog::level::info);
+    spdlog::set_default_logger(std::move(logger));
+
     if (argc != 1) {
-        std::cerr << "clash-native-test-host does not accept command-line arguments.\n";
+        spdlog::error("clash-native-test-host does not accept command-line arguments.");
         return 2;
     }
 
@@ -757,21 +765,19 @@ int main(int argc, char **) {
         }
 
         const auto endpoint = proxy.endpoint();
-        std::cout << "clash-native-test-host ready " << endpoint.address().to_string() << ":"
-                  << endpoint.port() << std::endl;
+        spdlog::info("clash-native-test-host ready {}:{}", endpoint.address().to_string(),
+                     endpoint.port());
         if (dns_server) {
             const auto udp_endpoint = dns_server->udp_endpoint();
             const auto tcp_endpoint = dns_server->tcp_endpoint();
-            std::cout << "clash-native-test-host dns-ready udp="
-                      << udp_endpoint.address().to_string() << ":" << udp_endpoint.port()
-                      << " tcp=" << tcp_endpoint.address().to_string() << ":" << tcp_endpoint.port()
-                      << std::endl;
+            spdlog::info("clash-native-test-host dns-ready udp={}:{} tcp={}:{}",
+                         udp_endpoint.address().to_string(), udp_endpoint.port(),
+                         tcp_endpoint.address().to_string(), tcp_endpoint.port());
         }
         if (reload_control) {
             const auto control_endpoint = reload_control->endpoint();
-            std::cout << "clash-native-test-host control-ready tcp="
-                      << control_endpoint.address().to_string() << ":" << control_endpoint.port()
-                      << std::endl;
+            spdlog::info("clash-native-test-host control-ready tcp={}:{}",
+                         control_endpoint.address().to_string(), control_endpoint.port());
         }
 
         stopped_future.wait();
@@ -786,7 +792,7 @@ int main(int argc, char **) {
         runtime.stop();
         return 0;
     } catch (const std::exception &error) {
-        std::cerr << "clash-native-test-host error: " << error.what() << "\n";
+        spdlog::error("clash-native-test-host error: {}", error.what());
         return 1;
     }
 }

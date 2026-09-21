@@ -16,7 +16,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
-#include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -24,6 +23,9 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 
 namespace {
 
@@ -333,7 +335,7 @@ int run_probe(const ServerAddress &server, const std::string &mode) {
         });
     context.run();
     if (!probe->succeeded()) {
-        std::cerr << probe->error() << '\n';
+        spdlog::error("{}", probe->error());
         return 1;
     }
     return 0;
@@ -342,20 +344,26 @@ int run_probe(const ServerAddress &server, const std::string &mode) {
 } // namespace
 
 int main(int argc, char **argv) {
+    auto logger = spdlog::stdout_color_mt("clash-native-grpc-client");
+    logger->set_pattern("%v");
+    logger->set_level(spdlog::level::info);
+    logger->flush_on(spdlog::level::info);
+    spdlog::set_default_logger(std::move(logger));
+
     if (argc != 3) {
-        std::cerr << "usage: clash-native-grpc-client <IPv4:port> <unary|trailers-only|bidi>\n";
+        spdlog::error("usage: clash-native-grpc-client <IPv4:port> <unary|trailers-only|bidi>");
         return 2;
     }
     try {
         const auto server = parse_address(argv[1]);
         const std::string mode(argv[2]);
         if (mode != "unary" && mode != "trailers-only" && mode != "bidi") {
-            std::cerr << "unsupported gRPC interoperability mode\n";
+            spdlog::error("unsupported gRPC interoperability mode");
             return 2;
         }
         return run_probe(server, mode);
     } catch (const std::exception &error) {
-        std::cerr << error.what() << '\n';
+        spdlog::error("{}", error.what());
         return 1;
     }
 }

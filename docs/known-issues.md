@@ -130,14 +130,24 @@ paths. Revisit the limit only together with an explicit fragmentation, PMTU,
 or transport policy rather than treating the current rejection as a cipher
 interoperability failure.
 
-## Local HTTP and SOCKS5 proxy listeners are plaintext and unauthenticated
+## Local proxy listener TLS and SOCKS5 authentication remain limited
 
-- **Status:** Accepted for the current local-proxy scope; inbound TLS and authentication are not implemented.
-- **Scope:** The local HTTP listener accepts plaintext HTTP/1.1, and the SOCKS5 listener negotiates only the no-authentication method. Neither listener wraps the client-to-proxy connection in TLS.
+- **Status:** Partly implemented; inbound TLS is available through the native
+  API, while SOCKS5 authentication and CLI/config-file wiring remain deferred.
+- **Scope:** `ProxyServer::set_tls_server_credentials` and the corresponding
+  `ApplicationOptions` fields accept PEM encoded server certificate and private
+  key byte vectors before `start()`. When configured, the
+  whole local TCP listener performs a TLS server handshake and then routes the
+  decrypted stream through the existing HTTP-only or mixed HTTP/SOCKS5 parser.
+  Without credentials, the listener remains plaintext. The SOCKS5 listener
+  still negotiates only the no-authentication method.
 
-For HTTPS destinations, the HTTP listener supports `CONNECT`; TLS then runs between the client and destination inside that tunnel. This does not encrypt the client-to-proxy hop. The TLS and Basic authentication options on an upstream HTTP proxy outbound are separate capabilities and do not add TLS or authentication to the local listeners.
+For HTTPS destinations, the HTTP listener supports `CONNECT`; TLS then runs between the client and destination inside that tunnel. Configuring listener TLS additionally encrypts the client-to-proxy hop. The TLS and Basic authentication options on an upstream HTTP proxy outbound are separate capabilities from the local listener settings.
 
-This is recorded as a scope limitation, not a current blocker for local use. Revisit it if the listeners are intended to serve remote clients.
+The current API does not load certificate files or expose listener TLS through
+the CLI because CLI configuration is scheduled for a later milestone. Revisit
+file-based configuration and client certificate authentication when that
+configuration surface is added.
 
 ## HTTP/3 is not integrated as a proxy endpoint
 

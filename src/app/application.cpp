@@ -6,7 +6,6 @@
 
 #include <csignal>
 #include <future>
-#include <iostream>
 #include <stdexcept>
 #include <system_error>
 
@@ -17,17 +16,18 @@ namespace clash_native::app {
 Application::Application() : runtime_(), proxy_server_(runtime_) {}
 
 int Application::run(const ApplicationOptions &options) {
-    spdlog::set_level(spdlog::level::info);
-
     if (!options.listen_endpoint) {
-        std::cout << "clash-native is an experimental native proxy core on " << platform::name()
-                  << ".\n";
+        spdlog::info("clash-native is an experimental native proxy core on {}.", platform::name());
         runtime_.start();
         runtime_.stop();
         return 0;
     }
 
     proxy_server_.set_endpoint(*options.listen_endpoint);
+    proxy_server_.set_inbound_mode(options.inbound_mode);
+    proxy_server_.set_http_authentication(options.http_username, options.http_password);
+    proxy_server_.set_tls_server_credentials(options.tls_certificate_pem,
+                                             options.tls_private_key_pem);
     proxy_server_.set_default_action(options.default_route_action);
     for (const auto &rule : options.route_rules) {
         proxy_server_.add_rule(rule);
@@ -91,8 +91,13 @@ int Application::run(const ApplicationOptions &options) {
     }
 
     const auto endpoint = proxy_server_.endpoint();
-    std::cout << "SOCKS5 proxy listening on " << endpoint.address().to_string() << ":"
-              << endpoint.port() << " (no authentication). Press Ctrl+C to stop.\n";
+    const auto listener_name = options.inbound_mode == proxy::ProxyInboundMode::http
+                                   ? "HTTP"
+                                   : "HTTP/SOCKS5 mixed";
+    const auto authentication_name = options.http_username.empty() ? "no HTTP authentication"
+                                                                    : "HTTP Basic authentication";
+    spdlog::info("{} proxy listening on {}:{} ({}). Press Ctrl+C to stop.", listener_name,
+                 endpoint.address().to_string(), endpoint.port(), authentication_name);
 
     stopped_future.wait();
     signals.cancel();

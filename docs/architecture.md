@@ -10,10 +10,12 @@ of this project.
 This document defines the intended boundaries of the project before the
 protocol surface becomes large. It is a blueprint, not a claim that every
 described component is already implemented or production-ready. The current
-implementation includes ordinary SOCKS5 and HTTP CONNECT entry paths,
-stream/datagram outbound contracts, Direct, Reject, Shadowsocks, Trojan, and
-encrypted DNS transports. Current protocol code and tests remain the evidence for actual
-support; a planned boundary in this document is not implementation proof.
+implementation includes SOCKS5 and HTTP/1.1 inbound entry paths, including
+CONNECT, ordinary forwarding, optional Basic authentication, and HTTP/1.1
+keep-alive exchanges. It also includes stream/datagram outbound contracts,
+Direct, Reject, Shadowsocks, Trojan, and encrypted DNS transports. Current
+protocol code and tests remain the evidence for actual support; a planned
+boundary in this document is not implementation proof.
 
 The current `ProxyServer::Session` integration path is transitional. It must
 not become the base class or control-flow template for future inbound,
@@ -478,6 +480,12 @@ Inbound code may parse, authenticate, and encode its own replies. It must not
 select an outbound, implement traffic rules, call Direct directly, or own the
 common relay. Native TUN and transparent-proxy adapters eventually produce the
 same normalized requests without adding a second routing path.
+
+The local `ProxyServer` may terminate TLS before this protocol boundary when
+PEM server credentials are configured before `start()`. The TLS wrapper is a
+carrier decoration: after the asynchronous server handshake, HTTP-only and
+mixed HTTP/SOCKS5 sessions use the same parser and relay path as plaintext
+connections. Listener TLS does not add HTTP/2 or HTTP/3 proxy semantics.
 
 ### 7.9 Groups and management concerns
 

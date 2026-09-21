@@ -22,7 +22,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -30,6 +29,9 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 
 namespace {
 
@@ -682,7 +684,7 @@ int run_http1(const ServerAddress &server, const std::string &mode) {
         });
         context.run();
         if (!probe->succeeded()) {
-            std::cerr << probe->error() << '\n';
+            spdlog::error("{}", probe->error());
             return 1;
         }
         return 0;
@@ -694,7 +696,7 @@ int run_http1(const ServerAddress &server, const std::string &mode) {
     });
     context.run();
     if (!probe->succeeded()) {
-        std::cerr << probe->error() << '\n';
+        spdlog::error("{}", probe->error());
         return 1;
     }
     return 0;
@@ -746,7 +748,7 @@ int run_http2(const ServerAddress &server, const std::string &mode) {
     context.run();
     const auto success = streaming_probe ? streaming_probe->succeeded() : tunnel_probe->succeeded();
     if (!success) {
-        std::cerr << (streaming_probe ? streaming_probe->error() : tunnel_probe->error()) << '\n';
+        spdlog::error("{}", streaming_probe ? streaming_probe->error() : tunnel_probe->error());
         return 1;
     }
     return 0;
@@ -777,7 +779,7 @@ int run_http3(const ServerAddress &server, const std::string &mode) {
         context.get_executor(), std::move(datagram), {server.address, server.port},
         std::move(options), {});
     if (!connection) {
-        std::cerr << "failed to create QUIC client connection\n";
+        spdlog::error("failed to create QUIC client connection");
         return 1;
     }
     const auto session = clash_native::transport::make_http3_exchange_session(
@@ -800,7 +802,7 @@ int run_http3(const ServerAddress &server, const std::string &mode) {
     context.run();
     const auto success = streaming_probe ? streaming_probe->succeeded() : tunnel_probe->succeeded();
     if (!success) {
-        std::cerr << (streaming_probe ? streaming_probe->error() : tunnel_probe->error()) << '\n';
+        spdlog::error("{}", streaming_probe ? streaming_probe->error() : tunnel_probe->error());
         return 1;
     }
     return 0;
@@ -826,14 +828,14 @@ int run_raw_quic(const ServerAddress &server) {
         context.get_executor(), std::move(datagram), {server.address, server.port},
         std::move(options), {});
     if (!connection) {
-        std::cerr << "failed to create QUIC client connection\n";
+        spdlog::error("failed to create QUIC client connection");
         return 1;
     }
     const auto probe = std::make_shared<RawQuicProbe>(context);
     probe->start(connection);
     context.run();
     if (!probe->succeeded()) {
-        std::cerr << probe->error() << '\n';
+        spdlog::error("{}", probe->error());
         return 1;
     }
     return 0;
@@ -842,9 +844,15 @@ int run_raw_quic(const ServerAddress &server) {
 } // namespace
 
 int main(int argc, char **argv) {
+    auto logger = spdlog::stdout_color_mt("clash-native-http-tunnel-client");
+    logger->set_pattern("%v");
+    logger->set_level(spdlog::level::info);
+    logger->flush_on(spdlog::level::info);
+    spdlog::set_default_logger(std::move(logger));
+
     if (argc < 3 || argc > 4) {
-        std::cerr << "usage: clash-native-http-tunnel-client <http1|http2|http3|quic> "
-                     "<IPv4:port> [connect|upgrade|streaming]\n";
+        spdlog::error("usage: clash-native-http-tunnel-client <http1|http2|http3|quic> "
+                      "<IPv4:port> [connect|upgrade|streaming]");
         return 2;
     }
     try {
@@ -866,10 +874,10 @@ int main(int argc, char **argv) {
         if (protocol == "quic" && argc == 3) {
             return run_raw_quic(server);
         }
-        std::cerr << "unsupported protocol/mode combination\n";
+        spdlog::error("unsupported protocol/mode combination");
         return 2;
     } catch (const std::exception &error) {
-        std::cerr << error.what() << '\n';
+        spdlog::error("{}", error.what());
         return 1;
     }
 }

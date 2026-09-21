@@ -13,12 +13,14 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 
 namespace {
 
@@ -155,7 +157,7 @@ class KcpProbe final : public std::enable_shared_from_this<KcpProbe> {
         finished_ = true;
         timer_.cancel();
         stream_->close();
-        std::cout << "KCP_OK\n";
+        spdlog::info("KCP_OK");
         context_.stop();
     }
 
@@ -169,7 +171,7 @@ class KcpProbe final : public std::enable_shared_from_this<KcpProbe> {
         if (stream_) {
             stream_->close();
         }
-        std::cerr << error_ << '\n';
+        spdlog::error("{}", error_);
         context_.stop();
     }
 
@@ -187,8 +189,14 @@ class KcpProbe final : public std::enable_shared_from_this<KcpProbe> {
 } // namespace
 
 int main(int argc, char **argv) {
+    auto logger = spdlog::stdout_color_mt("clash-native-kcp-client");
+    logger->set_pattern("%v");
+    logger->set_level(spdlog::level::info);
+    logger->flush_on(spdlog::level::info);
+    spdlog::set_default_logger(std::move(logger));
+
     if (argc != 2) {
-        std::cerr << "usage: clash-native-kcp-client IPv4:port\n";
+        spdlog::error("usage: clash-native-kcp-client IPv4:port");
         return EXIT_FAILURE;
     }
 
@@ -200,7 +208,7 @@ int main(int argc, char **argv) {
         context.run();
         return probe->succeeded() ? EXIT_SUCCESS : EXIT_FAILURE;
     } catch (const std::exception &error) {
-        std::cerr << error.what() << '\n';
+        spdlog::error("{}", error.what());
         return EXIT_FAILURE;
     }
 }

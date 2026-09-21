@@ -6,13 +6,16 @@
 #include <charconv>
 #include <cstdint>
 #include <exception>
-#include <iostream>
 #include <string_view>
+#include <utility>
+
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 
 namespace {
 
 void print_usage(std::string_view program_name) {
-    std::cout << "Usage: " << program_name << " [--help|--version|--listen <address:port>]\n";
+    spdlog::info("Usage: {} [--help|--version|--listen <address:port>]", program_name);
 }
 
 bool parse_port(std::string_view text, std::uint16_t &port) {
@@ -70,11 +73,17 @@ bool parse_endpoint(std::string_view text, boost::asio::ip::tcp::endpoint &endpo
 } // namespace
 
 int main(int argc, char **argv) {
+    auto logger = spdlog::stdout_color_mt("clash-native");
+    logger->set_pattern("%v");
+    logger->set_level(spdlog::level::info);
+    logger->flush_on(spdlog::level::info);
+    spdlog::set_default_logger(std::move(logger));
+
     if (argc > 1) {
         const std::string_view argument{argv[1]};
 
         if (argument == "--version") {
-            std::cout << "clash-native " << clash_native::core::version << "\n";
+            spdlog::info("clash-native {}", clash_native::core::version);
             return 0;
         }
 
@@ -85,14 +94,14 @@ int main(int argc, char **argv) {
 
         if (argument == "--listen") {
             if (argc != 3) {
-                std::cerr << "--listen requires an address:port value.\n";
+                spdlog::error("--listen requires an address:port value.");
                 print_usage(argv[0]);
                 return 2;
             }
 
             boost::asio::ip::tcp::endpoint endpoint;
             if (!parse_endpoint(argv[2], endpoint)) {
-                std::cerr << "Invalid listen endpoint: " << argv[2] << "\n";
+                spdlog::error("Invalid listen endpoint: {}", argv[2]);
                 print_usage(argv[0]);
                 return 2;
             }
@@ -100,12 +109,12 @@ int main(int argc, char **argv) {
             try {
                 return clash_native::app::Application{}.run({.listen_endpoint = endpoint});
             } catch (const std::exception &error) {
-                std::cerr << "clash-native error: " << error.what() << "\n";
+                spdlog::error("clash-native error: {}", error.what());
                 return 1;
             }
         }
 
-        std::cerr << "Unknown argument: " << argument << "\n";
+        spdlog::error("Unknown argument: {}", argument);
         print_usage(argv[0]);
         return 2;
     }
@@ -113,7 +122,7 @@ int main(int argc, char **argv) {
     try {
         return clash_native::app::Application{}.run();
     } catch (const std::exception &error) {
-        std::cerr << "clash-native error: " << error.what() << "\n";
+        spdlog::error("clash-native error: {}", error.what());
         return 1;
     }
 }

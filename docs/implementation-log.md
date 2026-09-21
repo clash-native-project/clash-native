@@ -1,5 +1,20 @@
 # Implementation Log
 
+### 2026-09-21 — Keep logging configuration at the process boundary
+
+- Removed the project-specific logging configuration API and kept library code
+  on direct `spdlog` calls.
+- CLI and interoperability hosts configure their own default logger directly;
+  embedded callers can install any spdlog sink, formatter, level, or async
+  adapter before invoking the library.
+
+### 2026-09-21 — Route command-line and test-host output through spdlog
+
+- Replaced direct C++ standard-stream writes with direct `spdlog::info` and
+  `spdlog::error` calls in the application and interoperability hosts.
+- Kept the process-wide default logger configuration at the executable boundary
+  so library embedding remains free to provide its own spdlog adapter.
+
 ### 2026-09-21 — Complete ResTLS TLS 1.3 outbound validation
 
 - Added the native Botan TLS 1.3 ResTLS handshaker. Its ClientHello callback
@@ -1379,3 +1394,43 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Loaded the existing embedded CA bundle into Botan's in-memory certificate
   store so v3 can perform normal certificate and hostname verification.
 - Kept the skip-verification path free of an empty trust-store object.
+
+### 2026-09-21 — Complete the HTTP inbound core path
+
+- Added an explicit HTTP-only inbound mode while preserving the existing mixed
+  HTTP/SOCKS5 listener.
+- Added optional HTTP Basic proxy authentication through `ProxyServer`.
+- Added HTTP/1.1 client connection reuse for ordinary proxy exchanges, including
+  repeated requests, proxy keep-alive headers, and streamed response framing.
+- Kept HTTP/1.1 Upgrade out of scope; Upgrade requests continue to return
+  `501 Not Implemented`. Inbound TLS and CLI configuration remain deferred.
+- Added Windows x64 CTest coverage for HTTP-only authentication and two requests
+  over one HTTP/1.1 proxy connection.
+
+### 2026-09-21 — Add local HTTPS proxy listener support
+
+- Added PEM-configured TLS byte-vector credentials to `ProxyServer` and
+  `ApplicationOptions`, with certificate and private-key validation during
+  listener startup.
+- Added a shared local stream adapter that performs an asynchronous TLS server
+  handshake and then exposes the decrypted connection through the existing
+  `StreamHandle`, HTTP parser, SOCKS5 parser, and TCP relay paths.
+- Added a Windows x64 CTest case covering an HTTPS proxy CONNECT request and
+  bidirectional relay through a configured self-signed certificate.
+- Kept certificate file loading, client certificate authentication, and CLI
+  configuration outside this change; the API must be configured before
+  `ProxyServer::start()`.
+
+### 2026-09-21 — Store local TLS credentials as byte vectors
+
+- Changed local certificate and private-key configuration from `std::string` to
+  `std::vector<std::uint8_t>` in both `ProxyServer` and `ApplicationOptions`.
+- Kept the TLS context setup and validation on the same PEM byte buffers and
+  updated the HTTPS proxy test call site.
+
+### 2026-09-21 — Validate a custom local TLS certificate chain
+
+- Added a Windows x64 HTTPS proxy test with a custom leaf certificate and
+  custom trusted root certificate in one PEM chain buffer.
+- Enabled client certificate verification against the custom root and verified
+  the HTTP CONNECT relay after the chain handshake.

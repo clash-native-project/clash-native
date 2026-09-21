@@ -1,5 +1,5 @@
-#include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
+#include <clash_native/core/base64.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
 #include <clash_native/proxy/tcp_relay.hpp>
 #include <clash_native/transport/exchange_session.hpp>
@@ -13,6 +13,7 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/steady_timer.hpp>
+#include <boost/asio/ssl/stream.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/beast/core/flat_buffer.hpp>
 #include <boost/beast/http.hpp>
@@ -61,6 +62,12 @@ constexpr std::uint8_t kConnectCommand = 0x01;
 constexpr std::uint8_t kUdpAssociateCommand = 0x03;
 constexpr auto kHandshakeTimeout = std::chrono::seconds(10);
 constexpr std::size_t kMaxUdpPathsPerAssociation = 128;
+
+enum class HttpAuthenticationResult {
+    accepted,
+    missing,
+    rejected,
+};
 
 core::Error listener_error(std::string_view operation, const boost::system::error_code &error) {
     return {core::ErrorCode::transport_io, fmt::format("failed to {} proxy listener", operation),
@@ -160,6 +167,28 @@ std::string_view trim_http_whitespace(std::string_view value) {
         value.remove_suffix(1);
     }
     return value;
+}
+
+bool has_valid_http_credentials(std::string_view username, std::string_view password) {
+    return username.find_first_of("\r\n") == std::string_view::npos &&
+           password.find_first_of("\r\n") == std::string_view::npos;
+}
+
+bool basic_authorization_matches(std::string_view header, std::string_view username,
+                                 std::string_view password) {
+    header = trim_http_whitespace(header);
+    const auto separator = header.find_first_of(" \t");
+    if (separator == std::string_view::npos ||
+        lowercase_ascii(header.substr(0, separator)) != "basic") {
+        return false;
+    }
+
+    const auto encoded = trim_http_whitespace(header.substr(separator + 1));
+    const auto decoded = core::base64_decode(encoded);
+    if (!decoded) {
+        return false;
+    }
+    return *decoded == std::string(username) + ':' + std::string(password);
 }
 
 bool collect_connection_options(const http::fields &fields,
@@ -346,13 +375,177 @@ std::optional<ParsedHttpTarget> parse_http_absolute_target(std::string_view targ
                             std::move(origin_target), target_end == std::string_view::npos};
 }
 
+// The local listener can expose either a plain TCP stream or a server-side TLS
+// stream. Keeping both forms behind StreamHandle lets the proxy parser and
+// relay use the same asynchronous interface after the TLS handshake.
+class ProxyStream : public core::StreamHandle {
+  private:
+    using Socket = boost::asio::ip::tcp::socket;
+    using TlsSocket = boost::asio::ssl::stream<Socket>;
+    using Stream = std::variant<std::unique_ptr<Socket>, std::unique_ptr<TlsSocket>>;
+
+  public:
+    using executor_type = boost::asio::any_io_executor;
+
+    ProxyStream(Socket socket, std::shared_ptr<boost::asio::ssl::context> tls_context)
+        : executor_(socket.get_executor()), tls_context_(std::move(tls_context)) {
+        if (tls_context_) {
+            stream_ = std::make_unique<TlsSocket>(std::move(socket), *tls_context_);
+        } else {
+            stream_ = std::make_unique<Socket>(std::move(socket));
+        }
+    }
+
+    void async_server_handshake(
+        std::function<void(const boost::system::error_code &)> handler) {
+        if (!tls_enabled()) {
+            boost::asio::post(executor_, [handler = std::move(handler)]() mutable {
+                handler(boost::system::error_code{});
+            });
+            return;
+        }
+        std::get<std::unique_ptr<TlsSocket>>(stream_)->async_handshake(
+            boost::asio::ssl::stream_base::server, std::move(handler));
+    }
+
+    bool tls_enabled() const noexcept {
+        return std::holds_alternative<std::unique_ptr<TlsSocket>>(stream_);
+    }
+
+    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+        std::visit(
+            [buffer, &handler](auto &stream) {
+                stream->async_read_some(buffer, std::move(handler));
+            },
+            stream_);
+    }
+
+    template <typename Handler>
+    void async_read_some(boost::asio::mutable_buffer buffer, Handler &&handler) {
+        std::visit(
+            [buffer, &handler](auto &stream) {
+                stream->async_read_some(buffer, std::forward<Handler>(handler));
+            },
+            stream_);
+    }
+
+    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
+        std::visit(
+            [buffer, &handler](auto &stream) {
+                boost::asio::async_write(*stream, buffer, std::move(handler));
+            },
+            stream_);
+    }
+
+    void async_write_some(boost::asio::const_buffer buffer, WriteHandler handler) {
+        std::visit(
+            [buffer, &handler](auto &stream) {
+                stream->async_write_some(buffer, std::move(handler));
+            },
+            stream_);
+    }
+
+    template <typename Handler>
+    void async_write_some(boost::asio::const_buffer buffer, Handler &&handler) {
+        std::visit(
+            [buffer, &handler](auto &stream) {
+                stream->async_write_some(buffer, std::forward<Handler>(handler));
+            },
+            stream_);
+    }
+
+    boost::asio::any_io_executor executor() noexcept override { return executor_; }
+    boost::asio::any_io_executor get_executor() const noexcept { return executor_; }
+
+    boost::asio::ip::tcp::endpoint
+    local_endpoint(boost::system::error_code &error) const noexcept override {
+        return endpoint([](const auto &stream, auto &endpoint_error) {
+            return stream->lowest_layer().local_endpoint(endpoint_error);
+        }, error);
+    }
+
+    boost::asio::ip::tcp::endpoint
+    remote_endpoint(boost::system::error_code &error) const noexcept {
+        return endpoint([](const auto &stream, auto &endpoint_error) {
+            return stream->lowest_layer().remote_endpoint(endpoint_error);
+        }, error);
+    }
+
+    void shutdown_send(boost::system::error_code &error) noexcept override {
+        shutdown(Socket::shutdown_send, error);
+    }
+
+    void shutdown_receive(boost::system::error_code &error) noexcept {
+        shutdown(Socket::shutdown_receive, error);
+    }
+
+    void cancel(boost::system::error_code &error) noexcept {
+        visit_socket([&](auto &stream) { stream.lowest_layer().cancel(error); });
+    }
+
+    void close() noexcept override {
+        if (detached_) {
+            return;
+        }
+        boost::system::error_code ignored;
+        cancel(ignored);
+        shutdown(Socket::shutdown_both, ignored);
+        visit_socket([&](auto &stream) { stream.lowest_layer().close(ignored); });
+    }
+
+    std::unique_ptr<core::StreamHandle> detach() {
+        detached_ = true;
+        return std::unique_ptr<core::StreamHandle>(
+            new ProxyStream(std::move(stream_), executor_, std::move(tls_context_)));
+    }
+
+  private:
+    ProxyStream(Stream stream, boost::asio::any_io_executor executor,
+                std::shared_ptr<boost::asio::ssl::context> tls_context)
+        : stream_(std::move(stream)), executor_(std::move(executor)),
+          tls_context_(std::move(tls_context)) {}
+
+    template <typename Function>
+    boost::asio::ip::tcp::endpoint endpoint(Function function,
+                                             boost::system::error_code &error) const noexcept {
+        return std::visit(
+            [&function, &error](const auto &stream) {
+                if (!stream) {
+                    error = boost::asio::error::operation_aborted;
+                    return boost::asio::ip::tcp::endpoint{};
+                }
+                return function(stream, error);
+            },
+            stream_);
+    }
+
+    template <typename Function> void visit_socket(Function function) noexcept {
+        std::visit(
+            [&function](auto &stream) {
+                if (stream) {
+                    function(*stream);
+                }
+            },
+            stream_);
+    }
+
+    void shutdown(Socket::shutdown_type direction, boost::system::error_code &error) noexcept {
+        visit_socket([&](auto &stream) { stream.lowest_layer().shutdown(direction, error); });
+    }
+
+    Stream stream_;
+    boost::asio::any_io_executor executor_;
+    std::shared_ptr<boost::asio::ssl::context> tls_context_;
+    bool detached_ = false;
+};
+
 class ProxyRequestBodyStream final : public transport::ExchangeBodyStream,
                                      public std::enable_shared_from_this<ProxyRequestBodyStream> {
   public:
     using Parser = http::request_parser<http::buffer_body>;
     using ByteHandler = std::function<void(std::size_t)>;
 
-    ProxyRequestBodyStream(boost::asio::ip::tcp::socket &socket, boost::beast::flat_buffer &buffer,
+    ProxyRequestBodyStream(ProxyStream &socket, boost::beast::flat_buffer &buffer,
                            std::shared_ptr<Parser> parser, std::size_t initial_header_count,
                            std::unordered_set<std::string> declared_trailers,
                            ByteHandler byte_handler)
@@ -446,7 +639,7 @@ class ProxyRequestBodyStream final : public transport::ExchangeBodyStream,
             }
             self->cancelled_ = true;
             boost::system::error_code ignored;
-            self->socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_receive, ignored);
+            self->socket_.shutdown_receive(ignored);
         });
     }
 
@@ -466,7 +659,7 @@ class ProxyRequestBodyStream final : public transport::ExchangeBodyStream,
         });
     }
 
-    boost::asio::ip::tcp::socket &socket_;
+    ProxyStream &socket_;
     boost::beast::flat_buffer &buffer_;
     std::shared_ptr<Parser> parser_;
     boost::asio::any_io_executor executor_;
@@ -501,12 +694,26 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     using CloseHandler = std::function<void(const std::shared_ptr<Session> &)>;
 
     Session(ProxyServer &owner, boost::asio::ip::tcp::socket client, CloseHandler close_handler)
-        : owner_(owner), client_(std::move(client)), handshake_timer_(client_.get_executor()),
+        : owner_(owner), client_(std::move(client), owner.tls_context_),
+          handshake_timer_(client_.executor()),
           close_handler_(std::move(close_handler)) {}
 
     void start() {
         reset_handshake_timer();
-        read_protocol_byte();
+        auto self = shared_from_this();
+        client_.async_server_handshake([self](const boost::system::error_code &error) {
+            if (error) {
+                spdlog::debug("Local proxy TLS handshake failed: {}", error.message());
+                self->close();
+                return;
+            }
+            if (self->owner_.inbound_mode_ == ProxyInboundMode::http) {
+                self->protocol_ = Protocol::http;
+                self->read_http_headers();
+            } else {
+                self->read_protocol_byte();
+            }
+        });
     }
 
     void stop() noexcept { close(); }
@@ -730,6 +937,15 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
                 }
 
                 const auto &request = self->http_request_parser_->get();
+                self->http_client_keep_alive_ = self->http_request_keep_alive(request);
+                const auto authentication = self->authenticate_http_request(request);
+                if (authentication != HttpAuthenticationResult::accepted) {
+                    self->send_http_auth_response(
+                        authentication == HttpAuthenticationResult::missing,
+                        self->http_client_keep_alive_ && self->http_request_parser_->is_done());
+                    return;
+                }
+
                 const auto method = copy_view(request.method_string());
                 if (method != "CONNECT") {
                     self->begin_http_forward();
@@ -758,6 +974,71 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
             });
     }
 
+    HttpAuthenticationResult authenticate_http_request(
+        const http::request<http::buffer_body> &request) const {
+        if (owner_.http_username_.empty() && owner_.http_password_.empty()) {
+            return HttpAuthenticationResult::accepted;
+        }
+
+        for (const auto &field : request.base()) {
+            if (is_http_header(as_std_view(field.name_string()), "proxy-authorization")) {
+                const auto value = trim_http_whitespace(as_std_view(field.value()));
+                if (value.empty()) {
+                    return HttpAuthenticationResult::missing;
+                }
+                return basic_authorization_matches(value, owner_.http_username_,
+                                                   owner_.http_password_)
+                           ? HttpAuthenticationResult::accepted
+                           : HttpAuthenticationResult::rejected;
+            }
+        }
+        return HttpAuthenticationResult::missing;
+    }
+
+    bool http_request_keep_alive(const http::request<http::buffer_body> &request) const {
+        auto keep_alive = request.keep_alive();
+        for (const auto &field : request.base()) {
+            if (!is_http_header(as_std_view(field.name_string()), "proxy-connection")) {
+                continue;
+            }
+            const auto value = lowercase_ascii(trim_http_whitespace(as_std_view(field.value())));
+            if (value == "keep-alive") {
+                keep_alive = true;
+            } else if (value == "close") {
+                keep_alive = false;
+            }
+        }
+        return keep_alive;
+    }
+
+    void send_http_auth_response(bool missing, bool keep_alive) {
+        if (closed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        const auto connection_headers =
+            keep_alive ? "Connection: keep-alive\r\nProxy-Connection: keep-alive\r\n"
+                         "Keep-Alive: timeout=4\r\n"
+                       : "Connection: close\r\n";
+        http_response_ =
+            fmt::format("HTTP/1.1 {}\r\n{}{}Content-Length: 0\r\n"
+                        "Proxy-Agent: clash-native\r\n\r\n",
+                        missing ? "407 Proxy Authentication Required" : "403 Forbidden",
+                        missing ? "Proxy-Authenticate: Basic\r\n" : "", connection_headers);
+        auto self = shared_from_this();
+        boost::asio::async_write(
+            client_, boost::asio::buffer(http_response_),
+            [self, keep_alive](const boost::system::error_code &error, std::size_t) {
+                if (error) {
+                    self->close();
+                } else if (keep_alive) {
+                    self->http_exchange_keep_alive_ = true;
+                    self->finish_http_forward();
+                } else {
+                    self->close();
+                }
+            });
+    }
+
     void begin_http_forward() {
         const auto &request = http_request_parser_->get();
         if (request.version() != 11) {
@@ -767,7 +1048,9 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
 
         const auto target_text = copy_view(request.target());
         if (target_text == "*" && request.method() == http::verb::options) {
-            send_http_forward_response(200, "OK", "Allow: CONNECT, OPTIONS\r\n");
+            http_exchange_keep_alive_ = http_client_keep_alive_;
+            send_http_forward_response(200, "OK", "Allow: CONNECT, OPTIONS\r\n",
+                                       http_client_keep_alive_);
             return;
         }
         const auto parsed_target = parse_http_absolute_target(target_text);
@@ -835,7 +1118,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         if (request.method() == http::verb::options && parsed_target->empty_path_and_query) {
             http_forward_request_.request.target = "*";
         }
-        http_forward_request_.request.keep_alive = false;
+        http_forward_request_.request.keep_alive = true;
         if (const auto content_length = http_request_parser_->content_length()) {
             http_forward_request_.content_length = *content_length;
         }
@@ -1282,6 +1565,8 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         const bool has_body = !http_forward_request_method_is("HEAD") && status != 204 &&
                               status != 205 && status != 304 &&
                               static_cast<bool>(http_forward_response_.body);
+        http_exchange_keep_alive_ = http_client_keep_alive_ &&
+                                    http_forward_response_.response.keep_alive;
         http_response_ =
             build_http_forward_response_headers(http_forward_response_.response, has_body);
         auto self = shared_from_this();
@@ -1346,7 +1631,13 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         if (has_body) {
             output.append("Transfer-Encoding: chunked\r\n");
         }
-        output.append("Connection: close\r\nProxy-Agent: clash-native\r\n\r\n");
+        if (http_exchange_keep_alive_) {
+            output.append("Connection: keep-alive\r\nProxy-Connection: keep-alive\r\n"
+                          "Keep-Alive: timeout=4\r\n");
+        } else {
+            output.append("Connection: close\r\n");
+        }
+        output.append("Proxy-Agent: clash-native\r\n\r\n");
         return output;
     }
 
@@ -1430,27 +1721,84 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
                                  });
     }
 
+    void reset_http_forward_exchange() {
+        if (http_request_body_) {
+            http_request_body_->cancel();
+            http_request_body_.reset();
+        }
+        if (http_forward_response_.body) {
+            http_forward_response_.body->cancel();
+            http_forward_response_.body.reset();
+        }
+        if (http_session_) {
+            if (http_exchange_id_ != 0) {
+                http_session_->cancel(http_exchange_id_);
+            }
+            http_session_->stop();
+            http_session_.reset();
+        }
+        if (remote_) {
+            remote_->close();
+            remote_.reset();
+        }
+        if (connection_id_ && owner_.connection_registry_) {
+            owner_.connection_registry_->remove(*connection_id_);
+            connection_id_.reset();
+        }
+
+        http_forward_ = false;
+        http_exchange_id_ = 0;
+        http_forward_request_ = {};
+        http_forward_response_ = {};
+        http_request_parser_.reset();
+        http_response_.clear();
+        http_initial_data_.clear();
+        http_forward_request_method_.clear();
+        http_client_keep_alive_ = false;
+        http_exchange_keep_alive_ = false;
+        http_forward_request_bytes_ = 0;
+        http_forward_response_bytes_ = 0;
+    }
+
     void finish_http_forward() {
         if (connection_id_ && owner_.connection_registry_) {
             owner_.connection_registry_->update_stats(*connection_id_, http_forward_request_bytes_,
                                                       http_forward_response_bytes_);
         }
-        close();
+        const bool keep_alive = http_client_keep_alive_ && http_exchange_keep_alive_;
+        reset_http_forward_exchange();
+        if (!keep_alive || closed_.load(std::memory_order_acquire)) {
+            close();
+            return;
+        }
+        reset_handshake_timer();
+        read_http_headers();
     }
 
     void send_http_forward_response(int status, std::string_view reason,
-                                    std::string_view extra_headers = {}) {
+                                    std::string_view extra_headers = {}, bool keep_alive = false) {
         if (closed_.load(std::memory_order_acquire)) {
             return;
         }
-        http_response_ =
-            fmt::format("HTTP/1.1 {} {}\r\n{}Content-Length: 0\r\nConnection: close\r\n"
-                        "Proxy-Agent: clash-native\r\n\r\n",
-                        status, reason, extra_headers);
+        const auto connection_headers =
+            keep_alive ? "Connection: keep-alive\r\nProxy-Connection: keep-alive\r\n"
+                         "Keep-Alive: timeout=4\r\n"
+                       : "Connection: close\r\n";
+        http_response_ = fmt::format("HTTP/1.1 {} {}\r\n{}Content-Length: 0\r\n{}"
+                                     "Proxy-Agent: clash-native\r\n\r\n",
+                                     status, reason, extra_headers, connection_headers);
         auto self = shared_from_this();
         boost::asio::async_write(
             client_, boost::asio::buffer(http_response_),
-            [self](const boost::system::error_code &, std::size_t) { self->close(); });
+            [self, keep_alive](const boost::system::error_code &error, std::size_t) {
+                if (error) {
+                    self->close();
+                } else if (keep_alive) {
+                    self->finish_http_forward();
+                } else {
+                    self->close();
+                }
+            });
     }
 
     void send_socks_reply(std::uint8_t reply, bool start_relay) {
@@ -1524,7 +1872,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
 
         auto self = shared_from_this();
         relay_ = TcpRelay::start(
-            std::make_unique<net::TcpStream>(std::move(client_)), std::move(remote_),
+            client_.detach(), std::move(remote_),
             [self](RelayStats stats) {
                 if (self->connection_id_ && self->owner_.connection_registry_) {
                     self->owner_.connection_registry_->update_stats(*self->connection_id_,
@@ -1582,8 +1930,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
 
         boost::system::error_code ignored;
         client_.cancel(ignored);
-        client_.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored);
-        client_.close(ignored);
+        client_.close();
 
         if (close_handler_) {
             close_handler_(shared_from_this());
@@ -1591,7 +1938,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     }
 
     ProxyServer &owner_;
-    boost::asio::ip::tcp::socket client_;
+    ProxyStream client_;
     boost::asio::steady_timer handshake_timer_;
     std::unique_ptr<core::StreamHandle> remote_;
     std::shared_ptr<TcpRelay> relay_;
@@ -1617,6 +1964,8 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     std::shared_ptr<transport::ExchangeSession> http_session_;
     transport::ExchangeSession::ExchangeId http_exchange_id_ = 0;
     transport::StreamingExchangeResponse http_forward_response_;
+    bool http_client_keep_alive_ = false;
+    bool http_exchange_keep_alive_ = false;
     std::array<std::uint8_t, 16 * 1024> http_forward_response_buffer_{};
     std::uint64_t http_forward_request_bytes_ = 0;
     std::uint64_t http_forward_response_bytes_ = 0;
@@ -1657,6 +2006,55 @@ void ProxyServer::set_endpoint(boost::asio::ip::tcp::endpoint endpoint) {
     }
 
     endpoint_ = endpoint;
+}
+
+void ProxyServer::set_inbound_mode(ProxyInboundMode mode) {
+    if (running()) {
+        throw std::logic_error("Cannot change the inbound mode on a running proxy");
+    }
+    inbound_mode_ = mode;
+}
+
+void ProxyServer::set_http_authentication(std::string username, std::string password) {
+    if (running()) {
+        throw std::logic_error("Cannot change HTTP authentication on a running proxy");
+    }
+    if (username.empty() != password.empty()) {
+        throw std::invalid_argument(
+            "HTTP proxy username and password must be provided together");
+    }
+    if (!has_valid_http_credentials(username, password)) {
+        throw std::invalid_argument("HTTP proxy credentials contain invalid characters");
+    }
+    http_username_ = std::move(username);
+    http_password_ = std::move(password);
+}
+
+void ProxyServer::set_tls_server_credentials(std::vector<std::uint8_t> certificate_pem,
+                                              std::vector<std::uint8_t> private_key_pem) {
+    if (running()) {
+        throw std::logic_error("Cannot change TLS credentials on a running proxy");
+    }
+    if (certificate_pem.empty() != private_key_pem.empty()) {
+        throw std::invalid_argument(
+            "TLS server certificate and private key must be provided together");
+    }
+    tls_certificate_pem_ = std::move(certificate_pem);
+    tls_private_key_pem_ = std::move(private_key_pem);
+    tls_context_.reset();
+}
+
+void ProxyServer::clear_tls_server_credentials() {
+    if (running()) {
+        throw std::logic_error("Cannot change TLS credentials on a running proxy");
+    }
+    tls_certificate_pem_.clear();
+    tls_private_key_pem_.clear();
+    tls_context_.reset();
+}
+
+bool ProxyServer::tls_enabled() const noexcept {
+    return !tls_certificate_pem_.empty() && !tls_private_key_pem_.empty();
 }
 
 void ProxyServer::set_default_action(router::RouteAction action) {
@@ -1744,6 +2142,30 @@ core::Status ProxyServer::start() {
         return result;
     }
 
+    if (tls_enabled()) {
+        auto context = std::make_shared<boost::asio::ssl::context>(
+            boost::asio::ssl::context::tls_server);
+        context->set_options(boost::asio::ssl::context::default_workarounds |
+                             boost::asio::ssl::context::no_sslv2 |
+                             boost::asio::ssl::context::no_sslv3);
+        boost::system::error_code tls_error;
+        context->use_certificate_chain(boost::asio::buffer(tls_certificate_pem_), tls_error);
+        if (!tls_error) {
+            context->use_private_key(boost::asio::buffer(tls_private_key_pem_),
+                                     boost::asio::ssl::context::pem, tls_error);
+        }
+        if (tls_error) {
+            spdlog::error("Proxy server TLS credentials are invalid: {}", tls_error.message());
+            running_ = false;
+            return core::fail({core::ErrorCode::configuration,
+                               "invalid proxy TLS certificate or private key",
+                               std::error_code(tls_error.value(), std::system_category())});
+        }
+        tls_context_ = std::move(context);
+    } else {
+        tls_context_.reset();
+    }
+
     boost::system::error_code error;
     acceptor_.open(endpoint_.protocol(), error);
     if (!error) {
@@ -1772,8 +2194,8 @@ core::Status ProxyServer::start() {
     }
 
     callback_gate_ = std::make_shared<std::atomic_bool>(true);
-    spdlog::info("Proxy server listening on {}:{}", endpoint_.address().to_string(),
-                 endpoint_.port());
+    spdlog::info("Proxy server listening on {}:{}{}", endpoint_.address().to_string(),
+                 endpoint_.port(), tls_enabled() ? " (TLS)" : "");
     accept();
     return {};
 }
