@@ -143,8 +143,7 @@ class WebSocketPluginMuxOperation final
       public std::enable_shared_from_this<WebSocketPluginMuxOperation> {
   public:
     WebSocketPluginMuxOperation(std::unique_ptr<core::StreamHandle> stream,
-                                WebSocketPluginOptions options,
-                                WebSocketPluginMuxHandler handler)
+                                WebSocketPluginOptions options, WebSocketPluginMuxHandler handler)
         : executor_(stream->executor()), stream_(std::move(stream)), options_(std::move(options)),
           handler_(std::move(handler)) {}
 
@@ -172,9 +171,11 @@ class WebSocketPluginMuxOperation final
                 if (self->stream_) {
                     self->stream_->close();
                 }
-                self->finish(core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>(
-                    core::fail({core::ErrorCode::cancelled,
-                                "WebSocket plugin mux handshake was cancelled", {}})));
+                self->finish(
+                    core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>(
+                        core::fail({core::ErrorCode::cancelled,
+                                    "WebSocket plugin mux handshake was cancelled",
+                                    {}})));
             });
         } catch (...) {
             if (stream_) {
@@ -206,7 +207,8 @@ class WebSocketPluginMuxOperation final
                 [self](core::Result<TlsClientConnection> result) mutable {
                     self->tls_.reset();
                     if (!result) {
-                        self->finish(core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>(
+                        self->finish(core::Result<
+                                     std::shared_ptr<clash_native::transport::MultiplexedSession>>(
                             core::fail(result.error())));
                         return;
                     }
@@ -231,8 +233,9 @@ class WebSocketPluginMuxOperation final
             [self](core::Result<std::unique_ptr<core::StreamHandle>> result) mutable {
                 self->websocket_.reset();
                 if (!result) {
-                    self->finish(core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>(
-                        core::fail(result.error())));
+                    self->finish(
+                        core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>(
+                            core::fail(result.error())));
                     return;
                 }
                 WebSocketMuxOptions mux_options;
@@ -240,8 +243,9 @@ class WebSocketPluginMuxOperation final
                 mux_options.smux_version = self->options_.smux_version;
                 self->mux_ = async_open_websocket_mux(
                     std::move(result.value()), mux_options,
-                    [self](core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>
-                               mux_result) mutable {
+                    [self](
+                        core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>
+                            mux_result) mutable {
                         self->mux_.reset();
                         self->finish(std::move(mux_result));
                     });
@@ -296,8 +300,7 @@ async_open_websocket_plugin(std::unique_ptr<core::StreamHandle> stream,
 
 std::shared_ptr<WebSocketMuxHandshake>
 async_open_websocket_plugin_mux(std::unique_ptr<core::StreamHandle> stream,
-                                WebSocketPluginOptions options,
-                                WebSocketPluginMuxHandler handler) {
+                                WebSocketPluginOptions options, WebSocketPluginMuxHandler handler) {
     if (!stream || !handler) {
         if (stream) {
             stream->close();
@@ -322,25 +325,27 @@ void WebSocketPluginMuxPool::async_open_stream(
         return;
     }
     auto self = shared_from_this();
-    boost::asio::post(executor_, [self, endpoints = std::move(endpoints), options = std::move(options),
+    boost::asio::post(executor_, [self, endpoints = std::move(endpoints),
+                                  options = std::move(options),
                                   handler = std::move(handler)]() mutable {
         if (self->stopped_) {
-            handler(core::fail({core::ErrorCode::cancelled,
-                                 "WebSocket plugin mux pool is stopped", {}}));
+            handler(core::fail(
+                {core::ErrorCode::cancelled, "WebSocket plugin mux pool is stopped", {}}));
             return;
         }
         if (self->session_ && self->session_->retired()) {
             self->session_.reset();
         }
         if (self->session_) {
-            self->session_->open_stream(
-                {}, std::chrono::steady_clock::now() + std::chrono::seconds(15),
-                std::move(handler));
+            self->session_->open_stream({},
+                                        std::chrono::steady_clock::now() + std::chrono::seconds(15),
+                                        std::move(handler));
             return;
         }
         if (endpoints.empty()) {
             handler(core::fail({core::ErrorCode::endpoint_connection,
-                                 "WebSocket plugin mux received no server endpoints", {}}));
+                                "WebSocket plugin mux received no server endpoints",
+                                {}}));
             return;
         }
         self->pending_.push_back({std::move(endpoints), std::move(options), std::move(handler)});
@@ -361,7 +366,7 @@ void WebSocketPluginMuxPool::start_carrier() {
     boost::asio::async_connect(
         *connecting_socket_, request.endpoints,
         [self, options = request.options](const boost::system::error_code &error,
-                                           const boost::asio::ip::tcp::endpoint &) mutable {
+                                          const boost::asio::ip::tcp::endpoint &) mutable {
             if (error) {
                 self->connecting_socket_.reset();
                 self->opening_ = false;
@@ -395,16 +400,16 @@ void WebSocketPluginMuxPool::async_open_carrier(std::unique_ptr<core::StreamHand
 void WebSocketPluginMuxPool::drain_pending() {
     if (!session_ || session_->retired()) {
         fail_pending({core::ErrorCode::transport_io,
-                      "WebSocket plugin mux session retired while opening", {}});
+                      "WebSocket plugin mux session retired while opening",
+                      {}});
         session_.reset();
         return;
     }
     auto pending = std::move(pending_);
     pending_.clear();
     for (auto &request : pending) {
-        session_->open_stream(
-            {}, std::chrono::steady_clock::now() + std::chrono::seconds(15),
-            std::move(request.handler));
+        session_->open_stream({}, std::chrono::steady_clock::now() + std::chrono::seconds(15),
+                              std::move(request.handler));
     }
 }
 

@@ -262,20 +262,19 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
             const auto elapsed =
                 std::chrono::duration_cast<std::chrono::microseconds>(now - rate_last_refill_);
             if (elapsed.count() > 0) {
-                const auto refill = static_cast<std::size_t>(
-                    (static_cast<std::uint64_t>(elapsed.count()) *
-                     static_cast<std::uint64_t>(options_.rate_limit)) /
-                    1'000'000ULL);
+                const auto refill =
+                    static_cast<std::size_t>((static_cast<std::uint64_t>(elapsed.count()) *
+                                              static_cast<std::uint64_t>(options_.rate_limit)) /
+                                             1'000'000ULL);
                 rate_tokens_ = std::min(rate_capacity_, rate_tokens_ + refill);
                 rate_last_refill_ = now;
             }
             if (rate_tokens_ < packet->size()) {
                 send_in_progress_ = false;
                 const auto missing = packet->size() - rate_tokens_;
-                const auto micros =
-                    (static_cast<std::uint64_t>(missing) * 1'000'000ULL +
-                     static_cast<std::uint64_t>(options_.rate_limit) - 1ULL) /
-                    static_cast<std::uint64_t>(options_.rate_limit);
+                const auto micros = (static_cast<std::uint64_t>(missing) * 1'000'000ULL +
+                                     static_cast<std::uint64_t>(options_.rate_limit) - 1ULL) /
+                                    static_cast<std::uint64_t>(options_.rate_limit);
                 rate_timer_.expires_after(std::chrono::microseconds(micros));
                 auto self = shared_from_this();
                 rate_timer_.async_wait([self](const boost::system::error_code &error) {

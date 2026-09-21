@@ -224,15 +224,11 @@ core::Result<std::array<std::uint8_t, 16>> derive_restls_tls13_session_id(
     return output;
 }
 
-RestlsApplicationCodec::RestlsApplicationCodec(std::array<std::uint8_t, 32> secret,
-                                               std::vector<std::uint8_t> server_random,
-                                               bool to_client, bool tls12_gcm,
-                                               std::vector<std::uint8_t> initial_auth_extra) noexcept
-    : secret_(secret),
-      server_random_(std::move(server_random)),
-      to_client_(to_client),
-      tls12_gcm_(tls12_gcm),
-      initial_auth_extra_(std::move(initial_auth_extra)) {}
+RestlsApplicationCodec::RestlsApplicationCodec(
+    std::array<std::uint8_t, 32> secret, std::vector<std::uint8_t> server_random, bool to_client,
+    bool tls12_gcm, std::vector<std::uint8_t> initial_auth_extra) noexcept
+    : secret_(secret), server_random_(std::move(server_random)), to_client_(to_client),
+      tls12_gcm_(tls12_gcm), initial_auth_extra_(std::move(initial_auth_extra)) {}
 
 core::Result<std::vector<std::uint8_t>>
 RestlsApplicationCodec::encode(std::span<const std::uint8_t> data, std::size_t data_length,
@@ -241,8 +237,8 @@ RestlsApplicationCodec::encode(std::span<const std::uint8_t> data, std::size_t d
         padding_length > std::numeric_limits<std::uint16_t>::max()) {
         return core::fail(restls_error("ResTLS application record payload is too large"));
     }
-    const auto payload_length = (tls12_gcm_ ? 8 : 0) + kRestlsAuthHeaderLength + data_length +
-                                padding_length;
+    const auto payload_length =
+        (tls12_gcm_ ? 8 : 0) + kRestlsAuthHeaderLength + data_length + padding_length;
     if (payload_length > std::numeric_limits<std::uint16_t>::max()) {
         return core::fail(restls_error("ResTLS application record exceeds TLS record size"));
     }
@@ -293,10 +289,9 @@ RestlsApplicationCodec::encode(std::span<const std::uint8_t> data, std::size_t d
 
 core::Result<RestlsDecodedRecord>
 RestlsApplicationCodec::decode(std::span<const std::uint8_t> record) {
-    const auto minimum_size = kTlsRecordHeaderLength + (tls12_gcm_ ? 8 : 0) +
-                              kRestlsAuthHeaderLength;
-    if (record.size() < minimum_size || record[0] != 23 ||
-        record[1] != 3 || record[2] != 3 ||
+    const auto minimum_size =
+        kTlsRecordHeaderLength + (tls12_gcm_ ? 8 : 0) + kRestlsAuthHeaderLength;
+    if (record.size() < minimum_size || record[0] != 23 || record[1] != 3 || record[2] != 3 ||
         static_cast<std::size_t>((record[3] << 8) | record[4]) !=
             record.size() - kTlsRecordHeaderLength) {
         return core::fail(restls_error("invalid ResTLS application record"));
@@ -311,9 +306,8 @@ RestlsApplicationCodec::decode(std::span<const std::uint8_t> record) {
             return core::fail(restls_error("ResTLS TLS 1.2 GCM record counter is invalid"));
         }
     }
-    auto payload = std::vector<std::uint8_t>(record.begin() +
-                                                 static_cast<std::ptrdiff_t>(payload_offset),
-                                             record.end());
+    auto payload = std::vector<std::uint8_t>(
+        record.begin() + static_cast<std::ptrdiff_t>(payload_offset), record.end());
     const auto header = record.first(payload_offset);
     std::vector<std::uint8_t> auth_input;
     auth_input.reserve(header.size() + payload.size() - kRestlsApplicationMacLength);

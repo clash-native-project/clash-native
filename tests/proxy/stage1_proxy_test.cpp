@@ -8,9 +8,9 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/read_until.hpp>
-#include <boost/asio/streambuf.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/stream.hpp>
+#include <boost/asio/streambuf.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/beast/core/flat_buffer.hpp>
 #include <boost/beast/http.hpp>
@@ -208,8 +208,7 @@ class HttpTargetSession : public std::enable_shared_from_this<HttpTargetSession>
     void start() {
         auto self = shared_from_this();
         http::async_read(
-            socket_, buffer_, parser_,
-            [self](const boost::system::error_code &error, std::size_t) {
+            socket_, buffer_, parser_, [self](const boost::system::error_code &error, std::size_t) {
                 if (error) {
                     return;
                 }
@@ -219,18 +218,16 @@ class HttpTargetSession : public std::enable_shared_from_this<HttpTargetSession>
                 self->response_.result(http::status::ok);
                 self->response_.keep_alive(true);
                 self->response_.set(http::field::content_type, "text/plain");
-                self->response_.body() =
-                    "http-target-response-" + std::to_string(request_number);
+                self->response_.body() = "http-target-response-" + std::to_string(request_number);
                 self->response_.prepare_payload();
 
-                http::async_write(
-                    self->socket_, self->response_,
-                    [self](const boost::system::error_code &, std::size_t) {
-                        boost::system::error_code ignored;
-                        self->socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_both,
-                                               ignored);
-                        self->socket_.close(ignored);
-                    });
+                http::async_write(self->socket_, self->response_,
+                                  [self](const boost::system::error_code &, std::size_t) {
+                                      boost::system::error_code ignored;
+                                      self->socket_.shutdown(
+                                          boost::asio::ip::tcp::socket::shutdown_both, ignored);
+                                      self->socket_.close(ignored);
+                                  });
             });
     }
 
@@ -289,19 +286,16 @@ class HttpUpgradeTargetSession final
                     return;
                 }
 
-                const std::string request(
-                    boost::asio::buffers_begin(self->request_buffer_.data()),
-                    boost::asio::buffers_end(self->request_buffer_.data()));
-                self->valid_request_ = request.find("GET /upgrade HTTP/1.1\r\n") != std::string::npos &&
-                                       request.find("Upgrade: test-protocol\r\n") !=
-                                           std::string::npos &&
-                                       request.find("X-Upgrade-Test: forwarded\r\n") !=
-                                           std::string::npos;
+                const std::string request(boost::asio::buffers_begin(self->request_buffer_.data()),
+                                          boost::asio::buffers_end(self->request_buffer_.data()));
+                self->valid_request_ =
+                    request.find("GET /upgrade HTTP/1.1\r\n") != std::string::npos &&
+                    request.find("Upgrade: test-protocol\r\n") != std::string::npos &&
+                    request.find("X-Upgrade-Test: forwarded\r\n") != std::string::npos;
 
                 self->request_buffer_.consume(header_size);
-                self->initial_data_.assign(
-                    boost::asio::buffers_begin(self->request_buffer_.data()),
-                    boost::asio::buffers_end(self->request_buffer_.data()));
+                self->initial_data_.assign(boost::asio::buffers_begin(self->request_buffer_.data()),
+                                           boost::asio::buffers_end(self->request_buffer_.data()));
                 self->request_buffer_.consume(self->request_buffer_.size());
                 self->write_response();
             });
@@ -313,14 +307,13 @@ class HttpUpgradeTargetSession final
                     "Upgrade: test-protocol\r\n"
                     "X-Upgrade-Ack: yes\r\n\r\n";
         auto self = shared_from_this();
-        boost::asio::async_write(
-            socket_, boost::asio::buffer(response_),
-            [self](const boost::system::error_code &error, std::size_t) {
-                if (error) {
-                    return;
-                }
-                self->write_initial_data();
-            });
+        boost::asio::async_write(socket_, boost::asio::buffer(response_),
+                                 [self](const boost::system::error_code &error, std::size_t) {
+                                     if (error) {
+                                         return;
+                                     }
+                                     self->write_initial_data();
+                                 });
     }
 
     void write_initial_data() {
@@ -329,14 +322,13 @@ class HttpUpgradeTargetSession final
             return;
         }
         auto self = shared_from_this();
-        boost::asio::async_write(
-            socket_, boost::asio::buffer(initial_data_),
-            [self](const boost::system::error_code &error, std::size_t) {
-                if (!error) {
-                    self->initial_data_.clear();
-                    self->read_data();
-                }
-            });
+        boost::asio::async_write(socket_, boost::asio::buffer(initial_data_),
+                                 [self](const boost::system::error_code &error, std::size_t) {
+                                     if (!error) {
+                                         self->initial_data_.clear();
+                                         self->read_data();
+                                     }
+                                 });
     }
 
     void read_data() {
@@ -441,8 +433,7 @@ TEST(Stage1ProxyTest, AcceptsHttpConnectAndRelaysBufferedData) {
 TEST(HttpProxyTest, AcceptsHttpsProxyConnectionsWithConfiguredServerCredentials) {
     clash_native::runtime::AsioRuntime runtime;
     EchoTarget target(runtime);
-    clash_native::proxy::ProxyServer proxy(runtime,
-                                           {boost::asio::ip::address_v4::loopback(), 0});
+    clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
     proxy.set_inbound_mode(clash_native::proxy::ProxyInboundMode::http);
     proxy.set_tls_server_credentials(
         std::vector<std::uint8_t>(kLocalProxyCertificate.begin(), kLocalProxyCertificate.end()),
@@ -451,18 +442,16 @@ TEST(HttpProxyTest, AcceptsHttpsProxyConnectionsWithConfiguredServerCredentials)
     ASSERT_TRUE(proxy.start());
     runtime.start();
 
-    auto tls_context = std::make_shared<boost::asio::ssl::context>(
-        boost::asio::ssl::context::tls_client);
+    auto tls_context =
+        std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_client);
     tls_context->set_verify_mode(boost::asio::ssl::verify_none);
-    boost::asio::ssl::stream<boost::asio::ip::tcp::socket> client(runtime.context(),
-                                                                    *tls_context);
+    boost::asio::ssl::stream<boost::asio::ip::tcp::socket> client(runtime.context(), *tls_context);
     client.lowest_layer().connect(proxy.endpoint());
     client.handshake(boost::asio::ssl::stream_base::client);
 
     const auto authority = "127.0.0.1:" + std::to_string(target.endpoint.port());
-    const std::string request = "CONNECT " + authority +
-                                 " HTTP/1.1\r\nHost: " + authority +
-                                 "\r\n\r\nhttps-proxy-test";
+    const std::string request =
+        "CONNECT " + authority + " HTTP/1.1\r\nHost: " + authority + "\r\n\r\nhttps-proxy-test";
     boost::asio::write(client, boost::asio::buffer(request));
 
     boost::asio::streambuf response;
@@ -495,8 +484,7 @@ TEST(HttpProxyTest, AcceptsHttpsProxyConnectionsWithConfiguredServerCredentials)
 TEST(HttpProxyTest, SendsConfiguredCertificateChainToVerifiedHttpsClient) {
     clash_native::runtime::AsioRuntime runtime;
     EchoTarget target(runtime);
-    clash_native::proxy::ProxyServer proxy(runtime,
-                                           {boost::asio::ip::address_v4::loopback(), 0});
+    clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
     proxy.set_inbound_mode(clash_native::proxy::ProxyInboundMode::http);
 
     std::vector<std::uint8_t> certificate_chain;
@@ -511,23 +499,21 @@ TEST(HttpProxyTest, SendsConfiguredCertificateChainToVerifiedHttpsClient) {
     ASSERT_TRUE(proxy.start());
     runtime.start();
 
-    auto tls_context = std::make_shared<boost::asio::ssl::context>(
-        boost::asio::ssl::context::tls_client);
+    auto tls_context =
+        std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_client);
     boost::system::error_code ca_error;
     const std::vector<std::uint8_t> root_certificate(kLocalProxyChainRootCertificate.begin(),
                                                      kLocalProxyChainRootCertificate.end());
     tls_context->add_certificate_authority(boost::asio::buffer(root_certificate), ca_error);
     ASSERT_FALSE(ca_error) << ca_error.message();
     tls_context->set_verify_mode(boost::asio::ssl::verify_peer);
-    boost::asio::ssl::stream<boost::asio::ip::tcp::socket> client(runtime.context(),
-                                                                    *tls_context);
+    boost::asio::ssl::stream<boost::asio::ip::tcp::socket> client(runtime.context(), *tls_context);
     client.lowest_layer().connect(proxy.endpoint());
     client.handshake(boost::asio::ssl::stream_base::client);
 
     const auto authority = "127.0.0.1:" + std::to_string(target.endpoint.port());
-    const std::string request = "CONNECT " + authority +
-                                 " HTTP/1.1\r\nHost: " + authority +
-                                 "\r\n\r\ncertificate-chain-test";
+    const std::string request = "CONNECT " + authority + " HTTP/1.1\r\nHost: " + authority +
+                                "\r\n\r\ncertificate-chain-test";
     boost::asio::write(client, boost::asio::buffer(request));
 
     boost::asio::streambuf response;
@@ -650,8 +636,8 @@ TEST(HttpProxyTest, HttpOnlyModeRequiresBasicAuthentication) {
     {
         boost::asio::ip::tcp::socket client(runtime.context());
         client.connect(proxy.endpoint());
-        const auto request = "CONNECT " + authority + " HTTP/1.1\r\nHost: " + authority +
-                             "\r\n\r\n";
+        const auto request =
+            "CONNECT " + authority + " HTTP/1.1\r\nHost: " + authority + "\r\n\r\n";
         boost::asio::write(client, boost::asio::buffer(request));
 
         boost::asio::streambuf response;
@@ -674,8 +660,7 @@ TEST(HttpProxyTest, HttpOnlyModeRequiresBasicAuthentication) {
         boost::asio::read_until(client, response, "\r\n\r\n");
         const std::string response_bytes(boost::asio::buffers_begin(response.data()),
                                          boost::asio::buffers_end(response.data()));
-        EXPECT_EQ(response_bytes.substr(0, response_bytes.find("\r\n")),
-                  "HTTP/1.1 403 Forbidden");
+        EXPECT_EQ(response_bytes.substr(0, response_bytes.find("\r\n")), "HTTP/1.1 403 Forbidden");
     }
 
     boost::asio::ip::tcp::socket client(runtime.context());
@@ -719,7 +704,8 @@ TEST(HttpProxyTest, KeepsHttp11ClientConnectionForMultipleRequests) {
 
     for (const auto path : {"/first", "/second"}) {
         const auto request = "GET http://127.0.0.1:" + std::to_string(target.endpoint.port()) +
-                             path + " HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                             path +
+                             " HTTP/1.1\r\nHost: 127.0.0.1\r\n"
                              "Proxy-Connection: keep-alive\r\n\r\n";
         boost::asio::write(client, boost::asio::buffer(request));
 
@@ -729,9 +715,8 @@ TEST(HttpProxyTest, KeepsHttp11ClientConnectionForMultipleRequests) {
         ASSERT_FALSE(error) << error.message();
         EXPECT_EQ(response.result(), http::status::ok);
         EXPECT_TRUE(response.keep_alive());
-        EXPECT_EQ(response.body(),
-                  path == std::string_view("/first") ? "http-target-response-1"
-                                                       : "http-target-response-2");
+        EXPECT_EQ(response.body(), path == std::string_view("/first") ? "http-target-response-1"
+                                                                      : "http-target-response-2");
     }
 
     EXPECT_EQ(target.request_count.load(), 2);
@@ -754,10 +739,11 @@ TEST(HttpProxyTest, ForwardsHttp11UpgradeAndRelaysTheUpgradedStream) {
     client.connect(proxy.endpoint());
     const auto authority = "127.0.0.1:" + std::to_string(target.endpoint.port());
     const std::string initial_data = "upgrade-initial-data";
-    const std::string request =
-        "GET http://" + authority + "/upgrade HTTP/1.1\r\nHost: " + authority +
-        "\r\nConnection: Upgrade\r\nUpgrade: test-protocol\r\n"
-        "X-Upgrade-Test: forwarded\r\n\r\n" + initial_data;
+    const std::string request = "GET http://" + authority +
+                                "/upgrade HTTP/1.1\r\nHost: " + authority +
+                                "\r\nConnection: Upgrade\r\nUpgrade: test-protocol\r\n"
+                                "X-Upgrade-Test: forwarded\r\n\r\n" +
+                                initial_data;
     boost::asio::write(client, boost::asio::buffer(request));
 
     boost::asio::streambuf response;

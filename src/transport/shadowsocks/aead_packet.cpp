@@ -16,18 +16,19 @@ core::Error packet_error(std::string message) {
 }
 } // namespace
 
-core::Result<std::vector<std::uint8_t>> encrypt_aead_datagram(
-    std::string_view method, std::string_view password, std::span<const std::uint8_t> plaintext) {
+core::Result<std::vector<std::uint8_t>>
+encrypt_aead_datagram(std::string_view method, std::string_view password,
+                      std::span<const std::uint8_t> plaintext) {
     const auto spec = cipher_method(method);
     if (!spec || spec.value().kind != CipherKind::aead || spec.value().shadowsocks_2022) {
         return core::fail(spec ? core::Error{core::ErrorCode::configuration,
-                                              "classic AEAD datagram requires a classic method"}
+                                             "classic AEAD datagram requires a classic method"}
                                : spec.error());
     }
     std::vector<std::uint8_t> salt(spec.value().key_size);
     if (!random_bytes(salt)) {
-        return core::fail({core::ErrorCode::authentication,
-                           "failed to generate Shadowsocks AEAD datagram salt"});
+        return core::fail(
+            {core::ErrorCode::authentication, "failed to generate Shadowsocks AEAD datagram salt"});
     }
     auto key = derive_aead_subkey(method, password, salt);
     if (!key) {
@@ -42,12 +43,13 @@ core::Result<std::vector<std::uint8_t>> encrypt_aead_datagram(
     return salt;
 }
 
-core::Result<std::vector<std::uint8_t>> decrypt_aead_datagram(
-    std::string_view method, std::string_view password, std::span<const std::uint8_t> wire) {
+core::Result<std::vector<std::uint8_t>> decrypt_aead_datagram(std::string_view method,
+                                                              std::string_view password,
+                                                              std::span<const std::uint8_t> wire) {
     const auto spec = cipher_method(method);
     if (!spec || spec.value().kind != CipherKind::aead || spec.value().shadowsocks_2022) {
         return core::fail(spec ? core::Error{core::ErrorCode::configuration,
-                                              "classic AEAD datagram requires a classic method"}
+                                             "classic AEAD datagram requires a classic method"}
                                : spec.error());
     }
     if (wire.size() < spec.value().key_size + spec.value().overhead) {

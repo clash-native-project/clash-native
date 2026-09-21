@@ -20,10 +20,9 @@ struct RestlsClientOptions {
     std::string version_hint = "tls12";
 };
 
-using RestlsOpenHandler =
-    std::function<void(core::Result<std::unique_ptr<core::StreamHandle>>) >;
+using RestlsOpenHandler = std::function<void(core::Result<std::unique_ptr<core::StreamHandle>>)>;
 
-void async_open_restls(std::unique_ptr<core::StreamHandle> stream,
-                       RestlsClientOptions options, RestlsOpenHandler handler);
+void async_open_restls(std::unique_ptr<core::StreamHandle> stream, RestlsClientOptions options,
+                       RestlsOpenHandler handler);
 
 } // namespace clash_native::transport::shadowsocks

@@ -96,17 +96,17 @@ void ProxySession::read_socks4_user_id() {
     auto buffer = std::make_shared<std::array<std::uint8_t, 1024>>();
     client_.async_read_some(
         boost::asio::buffer(*buffer),
-        ProxyStream::ReadHandler([self, buffer](const boost::system::error_code &error,
-                                                std::size_t size) {
-            if (error || size == 0 ||
-                self->socks4_payload_.size() + size > kSocks4MaximumStringLength + 1) {
-                self->close();
-                return;
-            }
-            self->socks4_payload_.insert(self->socks4_payload_.end(), buffer->begin(),
-                                         buffer->begin() + static_cast<std::ptrdiff_t>(size));
-            self->read_socks4_user_id();
-        }));
+        ProxyStream::ReadHandler(
+            [self, buffer](const boost::system::error_code &error, std::size_t size) {
+                if (error || size == 0 ||
+                    self->socks4_payload_.size() + size > kSocks4MaximumStringLength + 1) {
+                    self->close();
+                    return;
+                }
+                self->socks4_payload_.insert(self->socks4_payload_.end(), buffer->begin(),
+                                             buffer->begin() + static_cast<std::ptrdiff_t>(size));
+                self->read_socks4_user_id();
+            }));
 }
 
 void ProxySession::read_socks4_domain() {
@@ -131,17 +131,17 @@ void ProxySession::read_socks4_domain() {
     auto buffer = std::make_shared<std::array<std::uint8_t, 1024>>();
     client_.async_read_some(
         boost::asio::buffer(*buffer),
-        ProxyStream::ReadHandler([self, buffer](const boost::system::error_code &error,
-                                                std::size_t size) {
-            if (error || size == 0 ||
-                self->socks4_payload_.size() + size > kSocks4MaximumStringLength + 1) {
-                self->close();
-                return;
-            }
-            self->socks4_payload_.insert(self->socks4_payload_.end(), buffer->begin(),
-                                         buffer->begin() + static_cast<std::ptrdiff_t>(size));
-            self->read_socks4_domain();
-        }));
+        ProxyStream::ReadHandler(
+            [self, buffer](const boost::system::error_code &error, std::size_t size) {
+                if (error || size == 0 ||
+                    self->socks4_payload_.size() + size > kSocks4MaximumStringLength + 1) {
+                    self->close();
+                    return;
+                }
+                self->socks4_payload_.insert(self->socks4_payload_.end(), buffer->begin(),
+                                             buffer->begin() + static_cast<std::ptrdiff_t>(size));
+                self->read_socks4_domain();
+            }));
 }
 
 void ProxySession::open_socks4_target() {

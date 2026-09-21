@@ -36,8 +36,8 @@
 #include <thread>
 #include <unordered_map>
 
-#include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
 
 namespace {
 
@@ -124,9 +124,9 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
                     environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_SMUX_VERSION");
                 smux_version && !smux_version->empty()) {
                 unsigned int parsed_version = 0;
-                const auto parsed = std::from_chars(smux_version->data(),
-                                                    smux_version->data() + smux_version->size(),
-                                                    parsed_version);
+                const auto parsed =
+                    std::from_chars(smux_version->data(),
+                                    smux_version->data() + smux_version->size(), parsed_version);
                 if (parsed.ec != std::errc{} ||
                     parsed.ptr != smux_version->data() + smux_version->size() ||
                     parsed_version > std::numeric_limits<std::uint8_t>::max()) {
@@ -139,12 +139,10 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_PASSWORD").value_or("");
             config.plugin_username =
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_USERNAME").value_or("");
-            if (const auto version =
-                    environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_VERSION");
+            if (const auto version = environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_VERSION");
                 version && !version->empty()) {
-                const auto parsed = std::from_chars(version->data(),
-                                                    version->data() + version->size(),
-                                                    config.plugin_version);
+                const auto parsed = std::from_chars(
+                    version->data(), version->data() + version->size(), config.plugin_version);
                 if (parsed.ec != std::errc{} || parsed.ptr != version->data() + version->size()) {
                     throw std::runtime_error("invalid CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_VERSION");
                 }
@@ -153,17 +151,14 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_VERSION_HINT")
                     .value_or(config.plugin_version_hint);
             config.plugin_restls_script =
-                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_RESTLS_SCRIPT")
-                    .value_or("");
-            if (const auto alpn =
-                    environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_ALPN");
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_RESTLS_SCRIPT").value_or("");
+            if (const auto alpn = environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_ALPN");
                 alpn && !alpn->empty()) {
                 std::size_t offset = 0;
                 while (offset <= alpn->size()) {
                     const auto separator = alpn->find(',', offset);
-                    const auto length = separator == std::string::npos
-                                            ? alpn->size() - offset
-                                            : separator - offset;
+                    const auto length =
+                        separator == std::string::npos ? alpn->size() - offset : separator - offset;
                     if (length == 0) {
                         throw std::runtime_error("invalid CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_ALPN");
                     }

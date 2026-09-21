@@ -17,8 +17,9 @@ core::Error packet_error(std::string context) {
 
 } // namespace
 
-core::Result<std::vector<std::uint8_t>> encrypt_legacy_datagram(
-    std::string_view method, std::string_view password, std::span<const std::uint8_t> plaintext) {
+core::Result<std::vector<std::uint8_t>>
+encrypt_legacy_datagram(std::string_view method, std::string_view password,
+                        std::span<const std::uint8_t> plaintext) {
     const auto spec = cipher_method(method);
     if (!spec) {
         return core::fail(spec.error());
@@ -29,8 +30,8 @@ core::Result<std::vector<std::uint8_t>> encrypt_legacy_datagram(
     }
     std::vector<std::uint8_t> iv(spec.value().iv_size);
     if (!random_bytes(iv)) {
-        return core::fail({core::ErrorCode::authentication,
-                           "failed to generate Shadowsocks datagram IV"});
+        return core::fail(
+            {core::ErrorCode::authentication, "failed to generate Shadowsocks datagram IV"});
     }
     auto key = derive_legacy_key(method, password, iv);
     if (!key) {
@@ -48,8 +49,9 @@ core::Result<std::vector<std::uint8_t>> encrypt_legacy_datagram(
     return iv;
 }
 
-core::Result<std::vector<std::uint8_t>> decrypt_legacy_datagram(
-    std::string_view method, std::string_view password, std::span<const std::uint8_t> wire) {
+core::Result<std::vector<std::uint8_t>>
+decrypt_legacy_datagram(std::string_view method, std::string_view password,
+                        std::span<const std::uint8_t> wire) {
     const auto spec = cipher_method(method);
     if (!spec) {
         return core::fail(spec.error());

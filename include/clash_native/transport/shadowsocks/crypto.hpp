@@ -35,22 +35,25 @@ struct CipherMethod {
 
 core::Result<CipherMethod> cipher_method(std::string_view name);
 
-core::Result<std::vector<std::uint8_t>> derive_aead_subkey(
-    std::string_view method, std::string_view password, std::span<const std::uint8_t> salt);
+core::Result<std::vector<std::uint8_t>> derive_aead_subkey(std::string_view method,
+                                                           std::string_view password,
+                                                           std::span<const std::uint8_t> salt);
 
 // Shadowsocks 2022 passwords are standard Base64 encoded pre-shared keys.
 // The returned key is the per-session BLAKE3 derive-key output.
-core::Result<std::vector<std::uint8_t>> derive_shadowsocks_2022_session_key(
-    std::string_view method, std::string_view password, std::span<const std::uint8_t> salt);
+core::Result<std::vector<std::uint8_t>>
+derive_shadowsocks_2022_session_key(std::string_view method, std::string_view password,
+                                    std::span<const std::uint8_t> salt);
 
 // Derive a Shadowsocks 2022 subkey with the protocol's BLAKE3 context. UDP
 // sessions use an eight-byte session identifier as the salt, while stream
 // handshakes use a full-size random salt.
-core::Result<std::vector<std::uint8_t>> derive_shadowsocks_2022_subkey(
-    std::string_view method, std::string_view password, std::span<const std::uint8_t> salt);
+core::Result<std::vector<std::uint8_t>>
+derive_shadowsocks_2022_subkey(std::string_view method, std::string_view password,
+                               std::span<const std::uint8_t> salt);
 
-core::Result<std::vector<std::uint8_t>> decode_shadowsocks_2022_psk(
-    std::string_view method, std::string_view password);
+core::Result<std::vector<std::uint8_t>> decode_shadowsocks_2022_psk(std::string_view method,
+                                                                    std::string_view password);
 
 core::Result<std::vector<std::uint8_t>> derive_legacy_key(std::string_view method,
                                                           std::string_view password,
@@ -66,13 +69,13 @@ core::Result<std::vector<std::uint8_t>> aead_decrypt(std::string_view method,
                                                      std::span<const std::uint8_t> nonce,
                                                      std::span<const std::uint8_t> ciphertext);
 
-core::Result<std::vector<std::uint8_t>> xchacha20_poly1305_encrypt(
-    std::span<const std::uint8_t> key, std::span<const std::uint8_t> nonce,
-    std::span<const std::uint8_t> plaintext);
+core::Result<std::vector<std::uint8_t>>
+xchacha20_poly1305_encrypt(std::span<const std::uint8_t> key, std::span<const std::uint8_t> nonce,
+                           std::span<const std::uint8_t> plaintext);
 
-core::Result<std::vector<std::uint8_t>> xchacha20_poly1305_decrypt(
-    std::span<const std::uint8_t> key, std::span<const std::uint8_t> nonce,
-    std::span<const std::uint8_t> ciphertext);
+core::Result<std::vector<std::uint8_t>>
+xchacha20_poly1305_decrypt(std::span<const std::uint8_t> key, std::span<const std::uint8_t> nonce,
+                           std::span<const std::uint8_t> ciphertext);
 
 class LegacyStreamCipher final {
   public:
@@ -84,9 +87,8 @@ class LegacyStreamCipher final {
     ~LegacyStreamCipher();
 
     static core::Result<LegacyStreamCipher> create(std::string_view method,
-                                                    std::span<const std::uint8_t> key,
-                                                    std::span<const std::uint8_t> iv,
-                                                    bool encrypt);
+                                                   std::span<const std::uint8_t> key,
+                                                   std::span<const std::uint8_t> iv, bool encrypt);
 
     core::Status update(std::span<std::uint8_t> data) noexcept;
 

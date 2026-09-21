@@ -38,9 +38,7 @@ boost::system::error_code protocol_error() {
     return boost::system::errc::make_error_code(boost::system::errc::protocol_error);
 }
 
-boost::system::error_code pool_closed_error() {
-    return boost::asio::error::operation_aborted;
-}
+boost::system::error_code pool_closed_error() { return boost::asio::error::operation_aborted; }
 
 void put_u16(std::uint8_t *output, std::uint16_t value) {
     output[0] = static_cast<std::uint8_t>(value);
@@ -163,7 +161,8 @@ class KcptunMuxStreamState final : public std::enable_shared_from_this<KcptunMux
 
     ~KcptunMuxStreamState() { close(); }
 
-    void async_read_some(boost::asio::mutable_buffer buffer, core::StreamHandle::ReadHandler handler) {
+    void async_read_some(boost::asio::mutable_buffer buffer,
+                         core::StreamHandle::ReadHandler handler) {
         if (closed_) {
             post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
             return;
@@ -329,8 +328,8 @@ class KcptunMuxStreamState final : public std::enable_shared_from_this<KcptunMux
             if (in_flight >= peer_window_) {
                 return;
             }
-            available = std::min<std::size_t>(
-                available, static_cast<std::size_t>(peer_window_ - in_flight));
+            available = std::min<std::size_t>(available,
+                                              static_cast<std::size_t>(peer_window_ - in_flight));
         }
         if (available == 0) {
             return;
@@ -385,8 +384,8 @@ class KcptunMuxStreamState final : public std::enable_shared_from_this<KcptunMux
         }
         finish_read({}, copied);
         if (!closed_ && options_.smux_version == 2 &&
-            (first_read || consumed_since_update_ >=
-                               static_cast<std::uint32_t>(options_.stream_buffer / 2))) {
+            (first_read ||
+             consumed_since_update_ >= static_cast<std::uint32_t>(options_.stream_buffer / 2))) {
             consumed_since_update_ = 0;
             std::vector<std::uint8_t> update(8);
             put_u32(update.data(), bytes_consumed_);
@@ -416,8 +415,8 @@ class KcptunMuxStreamState final : public std::enable_shared_from_this<KcptunMux
         }
     }
 
-    void post_read(core::StreamHandle::ReadHandler handler,
-                   const boost::system::error_code &error, std::size_t size) {
+    void post_read(core::StreamHandle::ReadHandler handler, const boost::system::error_code &error,
+                   std::size_t size) {
         boost::asio::post(executor(), [handler = std::move(handler), error, size]() mutable {
             handler(error, size);
         });
@@ -510,10 +509,9 @@ void KcptunMuxSession::enqueue_frame(
         }
         return;
     }
-    queued_frames_.push_back(
-        {std::make_shared<std::vector<std::uint8_t>>(
-             make_frame(command, stream_id, std::move(payload))),
-         std::move(completed)});
+    queued_frames_.push_back({std::make_shared<std::vector<std::uint8_t>>(
+                                  make_frame(command, stream_id, std::move(payload))),
+                              std::move(completed)});
     pump_write();
 }
 
@@ -528,19 +526,18 @@ void KcptunMuxSession::pump_write() {
     auto completed = std::move(frame.completed);
     auto self = shared_from_this();
     const auto buffer = boost::asio::buffer(*bytes);
-    carrier_->async_write(
-        buffer, [self, bytes, completed = std::move(completed)](
-            const boost::system::error_code &error, std::size_t) mutable {
-            self->write_in_progress_ = false;
-            if (completed) {
-                completed(error);
-            }
-            if (error) {
-                self->fail(error);
-                return;
-            }
-            self->pump_write();
-        });
+    carrier_->async_write(buffer, [self, bytes, completed = std::move(completed)](
+                                      const boost::system::error_code &error, std::size_t) mutable {
+        self->write_in_progress_ = false;
+        if (completed) {
+            completed(error);
+        }
+        if (error) {
+            self->fail(error);
+            return;
+        }
+        self->pump_write();
+    });
 }
 
 void KcptunMuxSession::read_header() {
@@ -568,7 +565,7 @@ void KcptunMuxSession::read_header() {
 }
 
 void KcptunMuxSession::read_payload(const std::array<std::uint8_t, kHeaderSize> &header,
-                                     std::shared_ptr<std::vector<std::uint8_t>> payload) {
+                                    std::shared_ptr<std::vector<std::uint8_t>> payload) {
     auto self = shared_from_this();
     read_exact(boost::asio::buffer(*payload),
                [self, header, payload](const boost::system::error_code &error) {
@@ -584,7 +581,7 @@ void KcptunMuxSession::read_payload(const std::array<std::uint8_t, kHeaderSize> 
 }
 
 void KcptunMuxSession::handle_frame(const std::array<std::uint8_t, kHeaderSize> &header,
-                                     const std::vector<std::uint8_t> &payload) {
+                                    const std::vector<std::uint8_t> &payload) {
     const auto command = header[1];
     const auto stream_id = get_u32(header.data() + 4);
     if (command == kNop) {
@@ -611,7 +608,7 @@ void KcptunMuxSession::handle_frame(const std::array<std::uint8_t, kHeaderSize> 
 }
 
 void KcptunMuxSession::read_exact(boost::asio::mutable_buffer buffer, ReadExactHandler handler,
-                                   std::size_t offset) {
+                                  std::size_t offset) {
     if (closed_) {
         handler(boost::asio::error::operation_aborted);
         return;
@@ -624,8 +621,8 @@ void KcptunMuxSession::read_exact(boost::asio::mutable_buffer buffer, ReadExactH
     carrier_->async_read_some(
         boost::asio::buffer(static_cast<std::uint8_t *>(buffer.data()) + offset,
                             buffer.size() - offset),
-        [self, buffer, handler = std::move(handler), offset](
-            const boost::system::error_code &error, std::size_t size) mutable {
+        [self, buffer, handler = std::move(handler), offset](const boost::system::error_code &error,
+                                                             std::size_t size) mutable {
             if (error) {
                 handler(error);
                 return;
@@ -749,8 +746,8 @@ struct KcptunClientPool::Impl final : public std::enable_shared_from_this<Kcptun
                     handler(core::StreamOpenResult::failed(carrier.error()));
                     return;
                 }
-                slot.session = std::make_shared<KcptunMuxSession>(std::move(carrier.value()),
-                                                                  options);
+                slot.session =
+                    std::make_shared<KcptunMuxSession>(std::move(carrier.value()), options);
                 slot.created = now;
                 slot.session->start();
             }

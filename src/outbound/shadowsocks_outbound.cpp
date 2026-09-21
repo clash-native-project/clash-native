@@ -6,9 +6,9 @@
 #include <clash_native/transport/shadowsocks/crypto.hpp>
 #include <clash_native/transport/shadowsocks/jls_client.hpp>
 #include <clash_native/transport/shadowsocks/legacy_stream.hpp>
-#include <clash_native/transport/shadowsocks/simple_obfs.hpp>
-#include <clash_native/transport/shadowsocks/shadow_tls.hpp>
 #include <clash_native/transport/shadowsocks/restls_client.hpp>
+#include <clash_native/transport/shadowsocks/shadow_tls.hpp>
+#include <clash_native/transport/shadowsocks/simple_obfs.hpp>
 #include <clash_native/transport/shadowsocks/ss2022_packet.hpp>
 #include <clash_native/transport/shadowsocks/ss2022_stream.hpp>
 #include <clash_native/transport/shadowsocks/stream_carrier.hpp>
@@ -490,8 +490,7 @@ class ShadowsocksConnectOperation final
                                 ShadowsocksOutboundConfig config, core::StreamRequest request,
                                 core::StreamOpenHandler handler)
         : runtime_(runtime), resolver_(std::move(resolver)), config_(std::move(config)),
-          kcptun_pool_(std::move(kcptun_pool)),
-          websocket_mux_pool_(std::move(websocket_mux_pool)),
+          kcptun_pool_(std::move(kcptun_pool)), websocket_mux_pool_(std::move(websocket_mux_pool)),
           request_(std::move(request)),
           socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.context())),
           timer_(runtime.context()), handler_(std::move(handler)) {}
@@ -561,14 +560,16 @@ class ShadowsocksConnectOperation final
                                {}});
         }
         if (config_.plugin == "shadow-tls") {
-            if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() || config_.plugin_tls) {
+            if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() ||
+                config_.plugin_tls) {
                 return core::fail({core::ErrorCode::configuration,
                                    "Shadowsocks Shadow-TLS does not use WebSocket plugin options",
                                    {}});
             }
             if (config_.plugin_version < 1 || config_.plugin_version > 3) {
                 return core::fail({core::ErrorCode::configuration,
-                                   "Shadowsocks Shadow-TLS version must be 1, 2, or 3", {}});
+                                   "Shadowsocks Shadow-TLS version must be 1, 2, or 3",
+                                   {}});
             }
             if (config_.plugin_version >= 2 && config_.plugin_password.empty()) {
                 return core::fail({core::ErrorCode::configuration,
@@ -577,24 +578,26 @@ class ShadowsocksConnectOperation final
             }
             if (config_.plugin_host.empty()) {
                 return core::fail({core::ErrorCode::configuration,
-                                   "Shadowsocks Shadow-TLS host is required", {}});
+                                   "Shadowsocks Shadow-TLS host is required",
+                                   {}});
             }
         }
         if (config_.plugin == "restls") {
-            if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() || config_.plugin_tls ||
-                config_.plugin_version_hint.empty()) {
+            if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() ||
+                config_.plugin_tls || config_.plugin_version_hint.empty()) {
                 return core::fail({core::ErrorCode::configuration,
                                    "Shadowsocks ResTLS does not use WebSocket plugin options",
                                    {}});
             }
-            if (config_.plugin_version_hint != "tls12" &&
-                config_.plugin_version_hint != "tls13") {
+            if (config_.plugin_version_hint != "tls12" && config_.plugin_version_hint != "tls13") {
                 return core::fail({core::ErrorCode::configuration,
-                                   "Shadowsocks ResTLS version hint must be tls12 or tls13", {}});
+                                   "Shadowsocks ResTLS version hint must be tls12 or tls13",
+                                   {}});
             }
             if (config_.plugin_password.empty() || config_.plugin_host.empty()) {
                 return core::fail({core::ErrorCode::configuration,
-                                   "Shadowsocks ResTLS host and password are required", {}});
+                                   "Shadowsocks ResTLS host and password are required",
+                                   {}});
             }
         }
         if (config_.plugin_mux && !websocket_plugin()) {
@@ -605,23 +608,28 @@ class ShadowsocksConnectOperation final
         if (config_.plugin_mux && config_.plugin_smux_version != 1 &&
             config_.plugin_smux_version != 2) {
             return core::fail({core::ErrorCode::configuration,
-                               "Shadowsocks WebSocket smux version must be 1 or 2", {}});
+                               "Shadowsocks WebSocket smux version must be 1 or 2",
+                               {}});
         }
         if (config_.plugin == "v2ray-plugin" && config_.plugin_mux &&
             config_.plugin_smux_version != 1) {
             return core::fail({core::ErrorCode::unsupported,
-                               "v2ray-plugin does not use smux version selection", {}});
+                               "v2ray-plugin does not use smux version selection",
+                               {}});
         }
         if (config_.plugin == "jls") {
-            if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() || config_.plugin_tls) {
-                return core::fail({core::ErrorCode::configuration,
-                                   "Shadowsocks JLS requires the TLS 1.3 carrier without WebSocket options",
-                                   {}});
+            if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() ||
+                config_.plugin_tls) {
+                return core::fail(
+                    {core::ErrorCode::configuration,
+                     "Shadowsocks JLS requires the TLS 1.3 carrier without WebSocket options",
+                     {}});
             }
             if (config_.plugin_username.empty() || config_.plugin_password.empty() ||
                 config_.plugin_host.empty()) {
                 return core::fail({core::ErrorCode::configuration,
-                                   "Shadowsocks JLS host, username, and password are required", {}});
+                                   "Shadowsocks JLS host, username, and password are required",
+                                   {}});
             }
         }
         if (config_.udp_over_tcp_version != 1 && config_.udp_over_tcp_version != 2) {
@@ -670,9 +678,8 @@ class ShadowsocksConnectOperation final
         options.tls = config_.plugin_tls;
         options.skip_cert_verify = config_.plugin_skip_cert_verify;
         options.mux = config_.plugin_mux;
-        options.mux_protocol = config_.plugin == "gost-plugin"
-                                   ? ss::WebSocketMuxProtocol::smux
-                                   : ss::WebSocketMuxProtocol::v2ray;
+        options.mux_protocol = config_.plugin == "gost-plugin" ? ss::WebSocketMuxProtocol::smux
+                                                               : ss::WebSocketMuxProtocol::v2ray;
         options.smux_version = config_.plugin_smux_version;
         return options;
     }
@@ -728,7 +735,8 @@ class ShadowsocksConnectOperation final
             if (!websocket_mux_pool_) {
                 finish(core::StreamOpenResult::failed(
                     {core::ErrorCode::configuration,
-                     "Shadowsocks WebSocket mux pool is not initialized", {}}));
+                     "Shadowsocks WebSocket mux pool is not initialized",
+                     {}}));
                 return;
             }
             websocket_mux_pool_->async_open_stream(
@@ -1423,8 +1431,7 @@ core::Status ShadowsocksOutbound::validate() const {
     }
     if (!config_.plugin.empty() && config_.plugin != "obfs" && config_.plugin != "v2ray-plugin" &&
         config_.plugin != "gost-plugin" && config_.plugin != "kcptun" &&
-        config_.plugin != "shadow-tls" && config_.plugin != "restls" &&
-        config_.plugin != "jls") {
+        config_.plugin != "shadow-tls" && config_.plugin != "restls" && config_.plugin != "jls") {
         return core::fail({core::ErrorCode::unsupported, "unsupported Shadowsocks plugin", {}});
     }
     if (config_.plugin == "obfs" && config_.plugin_mode != "http" && config_.plugin_mode != "tls") {
@@ -1452,58 +1459,65 @@ core::Status ShadowsocksOutbound::validate() const {
         }
         if (config_.plugin_version < 1 || config_.plugin_version > 3) {
             return core::fail({core::ErrorCode::configuration,
-                               "Shadowsocks Shadow-TLS version must be 1, 2, or 3", {}});
+                               "Shadowsocks Shadow-TLS version must be 1, 2, or 3",
+                               {}});
         }
         if (config_.plugin_version >= 2 && config_.plugin_password.empty()) {
             return core::fail({core::ErrorCode::configuration,
-                               "Shadowsocks Shadow-TLS v2 and v3 require a plugin password", {}});
+                               "Shadowsocks Shadow-TLS v2 and v3 require a plugin password",
+                               {}});
         }
         if (config_.plugin_host.empty()) {
-            return core::fail({core::ErrorCode::configuration,
-                               "Shadowsocks Shadow-TLS host is required", {}});
+            return core::fail(
+                {core::ErrorCode::configuration, "Shadowsocks Shadow-TLS host is required", {}});
         }
     }
     if (config_.plugin == "restls") {
         if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() || config_.plugin_tls ||
             config_.plugin_version_hint.empty()) {
             return core::fail({core::ErrorCode::configuration,
-                               "Shadowsocks ResTLS does not use WebSocket plugin options", {}});
+                               "Shadowsocks ResTLS does not use WebSocket plugin options",
+                               {}});
         }
-        if (config_.plugin_version_hint != "tls12" &&
-            config_.plugin_version_hint != "tls13") {
+        if (config_.plugin_version_hint != "tls12" && config_.plugin_version_hint != "tls13") {
             return core::fail({core::ErrorCode::configuration,
-                               "Shadowsocks ResTLS version hint must be tls12 or tls13", {}});
+                               "Shadowsocks ResTLS version hint must be tls12 or tls13",
+                               {}});
         }
         if (config_.plugin_password.empty() || config_.plugin_host.empty()) {
             return core::fail({core::ErrorCode::configuration,
-                               "Shadowsocks ResTLS host and password are required", {}});
+                               "Shadowsocks ResTLS host and password are required",
+                               {}});
         }
     }
-    if (config_.plugin_mux && config_.plugin != "v2ray-plugin" &&
-        config_.plugin != "gost-plugin") {
+    if (config_.plugin_mux && config_.plugin != "v2ray-plugin" && config_.plugin != "gost-plugin") {
         return core::fail({core::ErrorCode::unsupported,
-                           "Shadowsocks plugin mux requires v2ray-plugin or gost-plugin", {}});
+                           "Shadowsocks plugin mux requires v2ray-plugin or gost-plugin",
+                           {}});
     }
     if (config_.plugin_mux && config_.plugin_smux_version != 1 &&
         config_.plugin_smux_version != 2) {
         return core::fail({core::ErrorCode::configuration,
-                           "Shadowsocks WebSocket smux version must be 1 or 2", {}});
+                           "Shadowsocks WebSocket smux version must be 1 or 2",
+                           {}});
     }
     if (config_.plugin == "v2ray-plugin" && config_.plugin_mux &&
         config_.plugin_smux_version != 1) {
-        return core::fail({core::ErrorCode::unsupported,
-                           "v2ray-plugin does not use smux version selection", {}});
+        return core::fail(
+            {core::ErrorCode::unsupported, "v2ray-plugin does not use smux version selection", {}});
     }
     if (config_.plugin == "jls") {
         if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() || config_.plugin_tls) {
-            return core::fail({core::ErrorCode::configuration,
-                               "Shadowsocks JLS requires the TLS 1.3 carrier without WebSocket options",
-                               {}});
+            return core::fail(
+                {core::ErrorCode::configuration,
+                 "Shadowsocks JLS requires the TLS 1.3 carrier without WebSocket options",
+                 {}});
         }
         if (config_.plugin_username.empty() || config_.plugin_password.empty() ||
             config_.plugin_host.empty()) {
             return core::fail({core::ErrorCode::configuration,
-                               "Shadowsocks JLS host, username, and password are required", {}});
+                               "Shadowsocks JLS host, username, and password are required",
+                               {}});
         }
     }
     if (config_.plugin == "kcptun") {
@@ -1563,7 +1577,8 @@ void ShadowsocksOutbound::open_datagram(core::DatagramRequest request,
         core::StreamRequest stream_request{core::Destination::domain(std::string(magic), 0),
                                            std::nullopt, request.dial_trace};
         auto operation = std::make_shared<ShadowsocksConnectOperation>(
-            runtime_, resolver_, kcptun_pool_, websocket_mux_pool_, config_, std::move(stream_request),
+            runtime_, resolver_, kcptun_pool_, websocket_mux_pool_, config_,
+            std::move(stream_request),
             [handler = std::move(handler), initial_destination = request.initial_destination,
              version, context = &runtime_.context()](core::StreamOpenResult result) mutable {
                 boost::asio::post(context->get_executor(), [handler = std::move(handler),

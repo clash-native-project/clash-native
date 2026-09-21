@@ -61,9 +61,9 @@ std::uint16_t read_u16(std::span<const std::uint8_t> input) {
     return static_cast<std::uint16_t>((static_cast<std::uint16_t>(input[0]) << 8) | input[1]);
 }
 
-std::vector<std::uint8_t> make_tls_client_hello_impl(
-    std::span<const std::uint8_t> payload, std::string_view server_name,
-    std::span<const std::uint8_t> requested_session_id) {
+std::vector<std::uint8_t>
+make_tls_client_hello_impl(std::span<const std::uint8_t> payload, std::string_view server_name,
+                           std::span<const std::uint8_t> requested_session_id) {
     if (server_name.empty() || server_name.size() > 0xff ||
         payload.size() > std::numeric_limits<std::uint16_t>::max() ||
         server_name.size() + payload.size() > 0xff00) {

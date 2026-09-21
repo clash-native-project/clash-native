@@ -121,9 +121,8 @@ class FramedStreamBase {
     void read_exact_impl(boost::asio::mutable_buffer buffer, std::size_t offset,
                          ExactHandler handler) {
         if (offset == buffer.size()) {
-            boost::asio::post(stream_->executor(), [handler = std::move(handler)]() mutable {
-                handler({});
-            });
+            boost::asio::post(stream_->executor(),
+                              [handler = std::move(handler)]() mutable { handler({}); });
             return;
         }
         auto self = shared_from_this_base();
@@ -172,9 +171,8 @@ class ShadowTlsV2Stream final : public core::StreamHandle,
             }
         }
         if (buffer.size() == 0) {
-            boost::asio::post(executor(), [handler = std::move(handler)]() mutable {
-                handler({}, 0);
-            });
+            boost::asio::post(executor(),
+                              [handler = std::move(handler)]() mutable { handler({}, 0); });
             return;
         }
         read_busy_ = true;
@@ -191,9 +189,8 @@ class ShadowTlsV2Stream final : public core::StreamHandle,
             return;
         }
         if (buffer.size() == 0) {
-            boost::asio::post(executor(), [handler = std::move(handler)]() mutable {
-                handler({}, 0);
-            });
+            boost::asio::post(executor(),
+                              [handler = std::move(handler)]() mutable { handler({}, 0); });
             return;
         }
         write_busy_ = true;
@@ -238,9 +235,9 @@ class ShadowTlsV2Stream final : public core::StreamHandle,
         framed.reserve(payload.size() + (payload.size() / kMaxTlsPlaintext + 1) * kTlsHeaderSize);
         for (std::size_t offset = 0; offset < payload.size();) {
             const auto size = std::min(kMaxTlsPlaintext, payload.size() - offset);
-            framed.insert(framed.end(), {kApplicationRecord, 0x03, 0x03,
-                                         static_cast<std::uint8_t>(size >> 8),
-                                         static_cast<std::uint8_t>(size)});
+            framed.insert(framed.end(),
+                          {kApplicationRecord, 0x03, 0x03, static_cast<std::uint8_t>(size >> 8),
+                           static_cast<std::uint8_t>(size)});
             framed.insert(framed.end(), payload.begin() + static_cast<std::ptrdiff_t>(offset),
                           payload.begin() + static_cast<std::ptrdiff_t>(offset + size));
             offset += size;
@@ -250,11 +247,10 @@ class ShadowTlsV2Stream final : public core::StreamHandle,
 
     void write_frame() {
         auto self = shared_from_this();
-        stream_->async_write(
-            boost::asio::buffer(write_wire_),
-            [self](const boost::system::error_code &error, std::size_t) {
-                self->finish_write(error);
-            });
+        stream_->async_write(boost::asio::buffer(write_wire_),
+                             [self](const boost::system::error_code &error, std::size_t) {
+                                 self->finish_write(error);
+                             });
     }
 
     void finish_write(const boost::system::error_code &error) {
@@ -267,38 +263,40 @@ class ShadowTlsV2Stream final : public core::StreamHandle,
 
     void read_header() {
         auto self = shared_from_this();
-        read_exact(boost::asio::buffer(read_header_), [self](const boost::system::error_code &error) {
-            if (error) {
-                self->finish_read(error, 0);
-                return;
-            }
-            if (self->read_header_[0] != kApplicationRecord || self->read_header_[1] != 0x03 ||
-                self->read_header_[2] != 0x03) {
-                self->finish_read(boost::asio::error::fault, 0);
-                return;
-            }
-            const auto size = (static_cast<std::size_t>(self->read_header_[3]) << 8) |
-                              self->read_header_[4];
-            if (size == 0 || size > 0xffff) {
-                self->finish_read(boost::asio::error::fault, 0);
-                return;
-            }
-            self->read_payload_.resize(size);
-            self->read_payload();
-        });
+        read_exact(boost::asio::buffer(read_header_),
+                   [self](const boost::system::error_code &error) {
+                       if (error) {
+                           self->finish_read(error, 0);
+                           return;
+                       }
+                       if (self->read_header_[0] != kApplicationRecord ||
+                           self->read_header_[1] != 0x03 || self->read_header_[2] != 0x03) {
+                           self->finish_read(boost::asio::error::fault, 0);
+                           return;
+                       }
+                       const auto size = (static_cast<std::size_t>(self->read_header_[3]) << 8) |
+                                         self->read_header_[4];
+                       if (size == 0 || size > 0xffff) {
+                           self->finish_read(boost::asio::error::fault, 0);
+                           return;
+                       }
+                       self->read_payload_.resize(size);
+                       self->read_payload();
+                   });
     }
 
     void read_payload() {
         auto self = shared_from_this();
-        read_exact(boost::asio::buffer(read_payload_), [self](const boost::system::error_code &error) {
-            if (error) {
-                self->finish_read(error, 0);
-                return;
-            }
-            self->pending_ = std::move(self->read_payload_);
-            self->pending_offset_ = 0;
-            self->copy_pending(self->read_buffer_, self->read_handler_);
-        });
+        read_exact(boost::asio::buffer(read_payload_),
+                   [self](const boost::system::error_code &error) {
+                       if (error) {
+                           self->finish_read(error, 0);
+                           return;
+                       }
+                       self->pending_ = std::move(self->read_payload_);
+                       self->pending_offset_ = 0;
+                       self->copy_pending(self->read_buffer_, self->read_handler_);
+                   });
     }
 
     bool copy_pending(boost::asio::mutable_buffer buffer,
@@ -341,8 +339,7 @@ class ShadowTlsV2Stream final : public core::StreamHandle,
     WriteHandler write_handler_;
 };
 
-template <typename T>
-class SharedStreamAdapter final : public core::StreamHandle {
+template <typename T> class SharedStreamAdapter final : public core::StreamHandle {
   public:
     explicit SharedStreamAdapter(std::shared_ptr<T> stream) : stream_(std::move(stream)) {}
 
@@ -413,14 +410,14 @@ class ShadowTlsOpenOperation final : public std::enable_shared_from_this<ShadowT
                 }
                 auto *hashing = dynamic_cast<HashingReadStream *>(result.value().stream.get());
                 if (!hashing) {
-                    self->finish(core::fail(protocol_error(
-                        "Shadow-TLS v2 handshake lost its hash stream")));
+                    self->finish(
+                        core::fail(protocol_error("Shadow-TLS v2 handshake lost its hash stream")));
                     return;
                 }
                 auto hash = hashing->digest8();
                 if (hash.size() != 8) {
-                    self->finish(core::fail(protocol_error(
-                        "Shadow-TLS v2 handshake did not produce a server hash")));
+                    self->finish(core::fail(
+                        protocol_error("Shadow-TLS v2 handshake did not produce a server hash")));
                     return;
                 }
                 auto raw = std::move(result.value().stream);
@@ -430,8 +427,8 @@ class ShadowTlsOpenOperation final : public std::enable_shared_from_this<ShadowT
                 self->delay_timer_.expires_after(std::chrono::milliseconds(20));
                 self->delay_timer_.async_wait([self](const boost::system::error_code &error) {
                     if (error) {
-                        self->finish(core::fail(io_error(
-                            "Shadow-TLS v2 post-handshake delay failed", error)));
+                        self->finish(core::fail(
+                            io_error("Shadow-TLS v2 post-handshake delay failed", error)));
                         return;
                     }
                     self->finish(std::move(self->delayed_stream_));
@@ -473,8 +470,8 @@ void async_open_shadow_tls(std::unique_ptr<core::StreamHandle> stream,
             stream->close();
         }
         if (handler) {
-            handler(core::fail(configuration_error(
-                "Shadow-TLS requires a stream and completion handler")));
+            handler(core::fail(
+                configuration_error("Shadow-TLS requires a stream and completion handler")));
         }
         return;
     }

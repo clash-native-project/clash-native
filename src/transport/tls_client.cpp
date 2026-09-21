@@ -201,9 +201,9 @@ class TlsClientHandshakeOperationImpl final
                     stream = std::move(self->stream_);
                 }
                 if (!stream) {
-                    self->finish(core::fail(transport_error(
-                        "TLS client handshake lost its underlying stream",
-                        boost::asio::error::operation_aborted)));
+                    self->finish(core::fail(
+                        transport_error("TLS client handshake lost its underlying stream",
+                                        boost::asio::error::operation_aborted)));
                     return;
                 }
                 TlsClientConnection connection{std::move(stream), std::move(negotiated_alpn)};

@@ -587,8 +587,7 @@ core::Status validate_kcptun_client_options(const KcptunClientOptions &options) 
 }
 
 core::Result<std::unique_ptr<core::StreamHandle>>
-make_kcptun_carrier(runtime::AsioRuntime &runtime,
-                    boost::asio::ip::udp::endpoint remote_endpoint,
+make_kcptun_carrier(runtime::AsioRuntime &runtime, boost::asio::ip::udp::endpoint remote_endpoint,
                     KcptunClientOptions options) {
     apply_mode_defaults(options);
     if (const auto validation = validate_options(options); !validation) {
@@ -618,8 +617,9 @@ make_kcptun_carrier(runtime::AsioRuntime &runtime,
     if (options.socket_buffer > 0) {
         socket->set_buffer_size(options.socket_buffer, error);
         if (error) {
-            return core::fail(
-                {core::ErrorCode::transport_io, "failed to configure kcptun UDP socket buffer", {}});
+            return core::fail({core::ErrorCode::transport_io,
+                               "failed to configure kcptun UDP socket buffer",
+                               {}});
         }
     }
     if (options.dscp > 0) {

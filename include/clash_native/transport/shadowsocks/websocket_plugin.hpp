@@ -2,12 +2,12 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
+#include <clash_native/transport/shadowsocks/websocket_mux.hpp>
 #include <clash_native/transport/tls_client.hpp>
 #include <clash_native/transport/websocket_client.hpp>
-#include <clash_native/transport/shadowsocks/websocket_mux.hpp>
 
-#include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/ip/tcp.hpp>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -36,22 +36,20 @@ std::shared_ptr<clash_native::transport::WebSocketClientHandshake>
 async_open_websocket_plugin(std::unique_ptr<core::StreamHandle> stream,
                             WebSocketPluginOptions options, WebSocketPluginHandler handler);
 
-using WebSocketPluginMuxHandler = std::function<void(
-    core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>)>;
+using WebSocketPluginMuxHandler =
+    std::function<void(core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>)>;
 
 // Establishes a WebSocket carrier and exposes the selected plugin mux as a
 // common MultiplexedSession. The caller owns the returned handshake operation
 // until the callback completes or it is cancelled.
 std::shared_ptr<WebSocketMuxHandshake>
 async_open_websocket_plugin_mux(std::unique_ptr<core::StreamHandle> stream,
-                                WebSocketPluginOptions options,
-                                WebSocketPluginMuxHandler handler);
+                                WebSocketPluginOptions options, WebSocketPluginMuxHandler handler);
 
 // Reuses one WebSocket carrier for multiple logical plugin streams. A pool is
 // scoped to one outbound configuration, so it does not mix hosts or plugin
 // protocols. If the carrier retires, the next request establishes a new one.
-class WebSocketPluginMuxPool final
-    : public std::enable_shared_from_this<WebSocketPluginMuxPool> {
+class WebSocketPluginMuxPool final : public std::enable_shared_from_this<WebSocketPluginMuxPool> {
   public:
     using StreamHandler = WebSocketPluginHandler;
 

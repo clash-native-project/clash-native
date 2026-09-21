@@ -42,7 +42,7 @@ void append_u64(std::vector<std::uint8_t> &output, std::uint64_t value) {
 
 std::uint16_t read_u16(std::span<const std::uint8_t> input, std::size_t offset) {
     return static_cast<std::uint16_t>((static_cast<std::uint16_t>(input[offset]) << 8) |
-                                       input[offset + 1]);
+                                      input[offset + 1]);
 }
 
 std::uint64_t read_u64(std::span<const std::uint8_t> input, std::size_t offset) {
@@ -54,15 +54,13 @@ std::uint64_t read_u64(std::span<const std::uint8_t> input, std::size_t offset) 
 }
 
 std::uint64_t unix_seconds() {
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                          std::chrono::system_clock::now().time_since_epoch())
+                                          .count());
 }
 
 bool is_aes_method(const CipherMethod &method) {
-    return method.name == "2022-blake3-aes-128-gcm" ||
-           method.name == "2022-blake3-aes-256-gcm";
+    return method.name == "2022-blake3-aes-128-gcm" || method.name == "2022-blake3-aes-256-gcm";
 }
 
 const EVP_CIPHER *aes_ecb_cipher(std::size_t key_size) {
@@ -76,8 +74,8 @@ const EVP_CIPHER *aes_ecb_cipher(std::size_t key_size) {
 }
 
 core::Result<std::vector<std::uint8_t>> aes_ecb_crypt(std::span<const std::uint8_t> key,
-                                                       std::span<const std::uint8_t> block,
-                                                       bool encrypt) {
+                                                      std::span<const std::uint8_t> block,
+                                                      bool encrypt) {
     if (block.size() != kPacketHeaderSize) {
         return core::fail(packet_error("invalid Shadowsocks 2022 packet header size"));
     }
@@ -87,8 +85,9 @@ core::Result<std::vector<std::uint8_t>> aes_ecb_crypt(std::span<const std::uint8
     }
     using Context = std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)>;
     Context context(EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free);
-    if (!context || EVP_CipherInit_ex(context.get(), cipher, nullptr, key.data(), nullptr,
-                                      encrypt ? 1 : 0) != 1 ||
+    if (!context ||
+        EVP_CipherInit_ex(context.get(), cipher, nullptr, key.data(), nullptr, encrypt ? 1 : 0) !=
+            1 ||
         EVP_CIPHER_CTX_set_padding(context.get(), 0) != 1) {
         return core::fail({core::ErrorCode::authentication,
                            "failed to initialize Shadowsocks 2022 packet header cipher"});
@@ -100,8 +99,8 @@ core::Result<std::vector<std::uint8_t>> aes_ecb_crypt(std::span<const std::uint8
                          static_cast<int>(block.size())) != 1 ||
         EVP_CipherFinal_ex(context.get(), result.data() + written, &final_written) != 1 ||
         static_cast<std::size_t>(written + final_written) != result.size()) {
-        return core::fail({core::ErrorCode::authentication,
-                           "failed to process Shadowsocks 2022 packet header"});
+        return core::fail(
+            {core::ErrorCode::authentication, "failed to process Shadowsocks 2022 packet header"});
     }
     return result;
 }
@@ -111,8 +110,8 @@ bool timestamp_is_recent(std::uint64_t timestamp) {
     return timestamp <= now + 30 && now <= timestamp + 30;
 }
 
-core::Result<std::vector<std::uint8_t>> strip_response_header(
-    std::span<const std::uint8_t> plaintext, std::uint64_t expected_session_id) {
+core::Result<std::vector<std::uint8_t>>
+strip_response_header(std::span<const std::uint8_t> plaintext, std::uint64_t expected_session_id) {
     if (plaintext.size() < kFixedBodySize || plaintext[0] != kServerHeader ||
         !timestamp_is_recent(read_u64(plaintext, 1))) {
         return core::fail(packet_error("invalid Shadowsocks 2022 UDP response header"));
@@ -125,14 +124,13 @@ core::Result<std::vector<std::uint8_t>> strip_response_header(
     if (payload_offset > plaintext.size()) {
         return core::fail(packet_error("invalid Shadowsocks 2022 UDP response padding"));
     }
-    return std::vector<std::uint8_t>(plaintext.begin() + static_cast<std::ptrdiff_t>(payload_offset),
-                                     plaintext.end());
+    return std::vector<std::uint8_t>(
+        plaintext.begin() + static_cast<std::ptrdiff_t>(payload_offset), plaintext.end());
 }
 
 } // namespace
 
-Shadowsocks2022DatagramCodec::Shadowsocks2022DatagramCodec(std::string method,
-                                                           std::string password)
+Shadowsocks2022DatagramCodec::Shadowsocks2022DatagramCodec(std::string method, std::string password)
     : method_(std::move(method)), password_(std::move(password)) {
     const auto method_info = cipher_method(method_);
     if (method_info && method_info.value().shadowsocks_2022) {
@@ -147,16 +145,17 @@ Shadowsocks2022DatagramCodec::Shadowsocks2022DatagramCodec(std::string method,
     }
 }
 
-core::Result<std::vector<std::uint8_t>> Shadowsocks2022DatagramCodec::encrypt(
-    std::span<const std::uint8_t> destination, std::span<const std::uint8_t> payload) {
+core::Result<std::vector<std::uint8_t>>
+Shadowsocks2022DatagramCodec::encrypt(std::span<const std::uint8_t> destination,
+                                      std::span<const std::uint8_t> payload) {
     const auto method_info = cipher_method(method_);
     if (!method_info || !method_info.value().shadowsocks_2022 || psk_.empty() ||
         destination.empty()) {
         return core::fail(packet_error("invalid Shadowsocks 2022 UDP configuration"));
     }
     if (!session_id_) {
-        return core::fail({core::ErrorCode::authentication,
-                           "failed to initialize Shadowsocks 2022 UDP session"});
+        return core::fail(
+            {core::ErrorCode::authentication, "failed to initialize Shadowsocks 2022 UDP session"});
     }
 
     const auto packet_id = packet_id_++;
@@ -197,8 +196,8 @@ core::Result<std::vector<std::uint8_t>> Shadowsocks2022DatagramCodec::encrypt(
 
     std::array<std::uint8_t, kPacketNonceSize> nonce{};
     if (!random_bytes(nonce)) {
-        return core::fail({core::ErrorCode::authentication,
-                           "failed to generate Shadowsocks 2022 UDP nonce"});
+        return core::fail(
+            {core::ErrorCode::authentication, "failed to generate Shadowsocks 2022 UDP nonce"});
     }
     std::vector<std::uint8_t> encrypted_body;
     encrypted_body.reserve(sizeof(session_id_) * 2 + body.size());
@@ -214,8 +213,8 @@ core::Result<std::vector<std::uint8_t>> Shadowsocks2022DatagramCodec::encrypt(
     return result;
 }
 
-core::Result<std::vector<std::uint8_t>> Shadowsocks2022DatagramCodec::decrypt(
-    std::span<const std::uint8_t> wire) {
+core::Result<std::vector<std::uint8_t>>
+Shadowsocks2022DatagramCodec::decrypt(std::span<const std::uint8_t> wire) {
     const auto method_info = cipher_method(method_);
     if (!method_info || !method_info.value().shadowsocks_2022 || psk_.empty()) {
         return core::fail(packet_error("invalid Shadowsocks 2022 UDP configuration"));
@@ -234,19 +233,18 @@ core::Result<std::vector<std::uint8_t>> Shadowsocks2022DatagramCodec::decrypt(
             return core::fail(session_key.error());
         }
         const auto nonce = std::span<const std::uint8_t>(*packet_header).subspan(4, 12);
-        auto plaintext = aead_decrypt(method_, session_key.value(), nonce,
-                                      wire.subspan(kPacketHeaderSize));
+        auto plaintext =
+            aead_decrypt(method_, session_key.value(), nonce, wire.subspan(kPacketHeaderSize));
         if (!plaintext) {
             return core::fail(plaintext.error());
         }
         return strip_response_header(plaintext.value(), session_id_);
     }
-    if (wire.size() < kPacketNonceSize + kAeadTagSize + sizeof(session_id_) * 2 +
-                          kFixedBodySize) {
+    if (wire.size() < kPacketNonceSize + kAeadTagSize + sizeof(session_id_) * 2 + kFixedBodySize) {
         return core::fail(packet_error("Shadowsocks 2022 UDP response is too short"));
     }
     auto plaintext = xchacha20_poly1305_decrypt(psk_, wire.first(kPacketNonceSize),
-                                                  wire.subspan(kPacketNonceSize));
+                                                wire.subspan(kPacketNonceSize));
     if (!plaintext) {
         return core::fail(plaintext.error());
     }
@@ -256,16 +254,17 @@ core::Result<std::vector<std::uint8_t>> Shadowsocks2022DatagramCodec::decrypt(
     return strip_response_header(body.subspan(sizeof(session_id_) * 2), session_id_);
 }
 
-std::size_t Shadowsocks2022DatagramCodec::max_datagram_size(
-    std::size_t wire_limit, std::size_t destination_limit) const noexcept {
+std::size_t
+Shadowsocks2022DatagramCodec::max_datagram_size(std::size_t wire_limit,
+                                                std::size_t destination_limit) const noexcept {
     const auto method_info = cipher_method(method_);
     if (!method_info || !method_info.value().shadowsocks_2022) {
         return 0;
     }
-    const auto overhead = is_aes_method(method_info.value())
-                              ? kPacketHeaderSize + kAeadTagSize + kFixedBodySize
-                              : kPacketNonceSize + kAeadTagSize + sizeof(session_id_) * 2 +
-                                    kFixedBodySize;
+    const auto overhead =
+        is_aes_method(method_info.value())
+            ? kPacketHeaderSize + kAeadTagSize + kFixedBodySize
+            : kPacketNonceSize + kAeadTagSize + sizeof(session_id_) * 2 + kFixedBodySize;
     if (wire_limit <= overhead + destination_limit) {
         return 0;
     }

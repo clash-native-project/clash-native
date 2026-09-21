@@ -34,9 +34,9 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
-#include <stdexcept>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -94,8 +94,7 @@ std::vector<std::uint8_t> concat(std::string_view first, std::span<const std::ui
     return result;
 }
 
-std::vector<std::uint8_t> handshake_wire(std::uint8_t type,
-                                         std::span<const std::uint8_t> body) {
+std::vector<std::uint8_t> handshake_wire(std::uint8_t type, std::span<const std::uint8_t> body) {
     if (body.size() > 0xFFFFFFU) {
         return {};
     }
@@ -213,15 +212,15 @@ class V3Callbacks final : public Botan::TLS::Callbacks {
     void tls_modify_client_hello_random(std::vector<std::uint8_t> &random,
                                         const Botan::TLS::Client_Hello &hello) override {
         if (random.size() != kTlsRandomSize) {
-            throw Botan::TLS::TLS_Exception(Botan::TLS::Alert::IllegalParameter,
-                                            "Shadow-TLS v3 ClientHello random has an invalid length");
+            throw Botan::TLS::TLS_Exception(
+                Botan::TLS::Alert::IllegalParameter,
+                "Shadow-TLS v3 ClientHello random has an invalid length");
         }
         // Botan exposes the session ID through a const accessor, although the
         // callback runs before the ClientHello enters the transcript. Mutating
         // the underlying strong value here keeps the authenticated bytes and
         // Botan's transcript in sync.
-        auto &session_id =
-            const_cast<Botan::TLS::Session_ID &>(hello.session_id()).get();
+        auto &session_id = const_cast<Botan::TLS::Session_ID &>(hello.session_id()).get();
         if (session_id.size() != kTlsSessionIdSize) {
             throw Botan::TLS::TLS_Exception(Botan::TLS::Alert::IllegalParameter,
                                             "Shadow-TLS v3 requires a 32-byte session ID");
@@ -273,9 +272,8 @@ bool verify_chain(std::string_view password, const std::vector<std::uint8_t> &ch
     std::vector<std::uint8_t> input = chain;
     input.insert(input.end(), payload.begin(), payload.end());
     const auto digest = hmac_sha1(password, input);
-    if (digest.size() < kTlsHmacSize ||
-        !std::equal(digest.begin(), digest.begin() + kTlsHmacSize,
-                    frame.begin() + kTlsHeaderSize)) {
+    if (digest.size() < kTlsHmacSize || !std::equal(digest.begin(), digest.begin() + kTlsHmacSize,
+                                                    frame.begin() + kTlsHeaderSize)) {
         return false;
     }
     if (updated_chain) {
@@ -342,9 +340,10 @@ class ShadowTlsV3Stream final : public core::StreamHandle,
             }
             write_chain_ = std::move(input);
             write_chain_.insert(write_chain_.end(), digest.begin(), digest.begin() + kTlsHmacSize);
-            write_wire_.insert(write_wire_.end(), {kApplicationRecord, 0x03, 0x03,
-                                                   static_cast<std::uint8_t>((size + kTlsHmacSize) >> 8),
-                                                   static_cast<std::uint8_t>(size + kTlsHmacSize)});
+            write_wire_.insert(write_wire_.end(),
+                               {kApplicationRecord, 0x03, 0x03,
+                                static_cast<std::uint8_t>((size + kTlsHmacSize) >> 8),
+                                static_cast<std::uint8_t>(size + kTlsHmacSize)});
             write_wire_.insert(write_wire_.end(), digest.begin(), digest.begin() + kTlsHmacSize);
             write_wire_.insert(write_wire_.end(), payload.begin(), payload.end());
             offset += size;
@@ -429,7 +428,8 @@ class ShadowTlsV3Stream final : public core::StreamHandle,
     void read_exact(boost::asio::mutable_buffer buffer, std::size_t offset,
                     std::function<void(const boost::system::error_code &)> handler) {
         if (offset == buffer.size()) {
-            boost::asio::post(executor(), [handler = std::move(handler)]() mutable { handler({}); });
+            boost::asio::post(executor(),
+                              [handler = std::move(handler)]() mutable { handler({}); });
             return;
         }
         if (initial_offset_ < initial_wire_.size()) {
@@ -466,7 +466,8 @@ class ShadowTlsV3Stream final : public core::StreamHandle,
                            self->finish_read(error, 0);
                            return;
                        }
-                       const auto size = (static_cast<std::size_t>((*header)[3]) << 8) | (*header)[4];
+                       const auto size =
+                           (static_cast<std::size_t>((*header)[3]) << 8) | (*header)[4];
                        if (size == 0 || size > 0xffff) {
                            self->finish_read(boost::asio::error::fault, 0);
                            return;
@@ -487,7 +488,8 @@ class ShadowTlsV3Stream final : public core::StreamHandle,
                        std::vector<std::uint8_t> frame;
                        frame.reserve(kTlsHeaderSize + self->read_payload_.size());
                        frame.insert(frame.end(), header.begin(), header.end());
-                       frame.insert(frame.end(), self->read_payload_.begin(), self->read_payload_.end());
+                       frame.insert(frame.end(), self->read_payload_.begin(),
+                                    self->read_payload_.end());
                        self->handle_frame(std::move(frame));
                    });
     }
@@ -502,8 +504,8 @@ class ShadowTlsV3Stream final : public core::StreamHandle,
             }
             bridge_chain_.clear();
         }
-        if (frame[0] != kApplicationRecord || !verify_chain(password_, read_chain_, frame, true,
-                                                            &read_chain_)) {
+        if (frame[0] != kApplicationRecord ||
+            !verify_chain(password_, read_chain_, frame, true, &read_chain_)) {
             finish_read(boost::asio::error::fault, 0);
             return;
         }
@@ -558,8 +560,7 @@ class ShadowTlsV3Stream final : public core::StreamHandle,
     bool closed_ = false;
 };
 
-template <typename T>
-class SharedStreamAdapter final : public core::StreamHandle {
+template <typename T> class SharedStreamAdapter final : public core::StreamHandle {
   public:
     explicit SharedStreamAdapter(std::shared_ptr<T> stream) : stream_(std::move(stream)) {}
 
@@ -583,7 +584,8 @@ class SharedStreamAdapter final : public core::StreamHandle {
     std::shared_ptr<T> stream_;
 };
 
-class ShadowTlsV3OpenOperation final : public std::enable_shared_from_this<ShadowTlsV3OpenOperation> {
+class ShadowTlsV3OpenOperation final
+    : public std::enable_shared_from_this<ShadowTlsV3OpenOperation> {
   public:
     ShadowTlsV3OpenOperation(std::unique_ptr<core::StreamHandle> stream,
                              ShadowTlsClientOptions options, ShadowTlsOpenHandler handler)
@@ -611,7 +613,8 @@ class ShadowTlsV3OpenOperation final : public std::enable_shared_from_this<Shado
                     self->emit_tls(data);
                 },
                 [self = shared_from_this()](std::span<const std::uint8_t> data) {
-                    self->pending_plain_.insert(self->pending_plain_.end(), data.begin(), data.end());
+                    self->pending_plain_.insert(self->pending_plain_.end(), data.begin(),
+                                                data.end());
                 });
             policy_ = std::make_shared<V3Policy>();
             credentials_ = std::make_shared<V3Credentials>(!options_.skip_cert_verify);
@@ -627,8 +630,8 @@ class ShadowTlsV3OpenOperation final : public std::enable_shared_from_this<Shado
             read_wire();
             start_tls_write();
         } catch (const std::exception &exception) {
-            finish(core::fail(v3_exception("failed to initialize Shadow-TLS v3 TLS client",
-                                           exception)));
+            finish(core::fail(
+                v3_exception("failed to initialize Shadow-TLS v3 TLS client", exception)));
         } catch (...) {
             finish(core::fail(v3_error(core::ErrorCode::carrier_handshake,
                                        "failed to initialize Shadow-TLS v3 TLS client")));
@@ -653,19 +656,18 @@ class ShadowTlsV3OpenOperation final : public std::enable_shared_from_this<Shado
         tls_write_current_ = std::move(tls_write_queue_.front());
         tls_write_queue_.erase(tls_write_queue_.begin());
         auto self = shared_from_this();
-        stream_->async_write(
-            boost::asio::buffer(tls_write_current_),
-            [self](const boost::system::error_code &error, std::size_t) {
-                self->tls_write_in_progress_ = false;
-                self->tls_write_current_.clear();
-                if (error) {
-                    self->finish(core::fail(v3_io_error(
-                        "failed to write Shadow-TLS v3 TLS record", error)));
-                    return;
-                }
-                self->start_tls_write();
-                self->maybe_open();
-            });
+        stream_->async_write(boost::asio::buffer(tls_write_current_),
+                             [self](const boost::system::error_code &error, std::size_t) {
+                                 self->tls_write_in_progress_ = false;
+                                 self->tls_write_current_.clear();
+                                 if (error) {
+                                     self->finish(core::fail(v3_io_error(
+                                         "failed to write Shadow-TLS v3 TLS record", error)));
+                                     return;
+                                 }
+                                 self->start_tls_write();
+                                 self->maybe_open();
+                             });
     }
 
     void read_wire() {
@@ -679,13 +681,13 @@ class ShadowTlsV3OpenOperation final : public std::enable_shared_from_this<Shado
             [self](const boost::system::error_code &error, std::size_t size) {
                 self->read_in_progress_ = false;
                 if (error) {
-                    self->finish(core::fail(v3_io_error(
-                        "failed to read Shadow-TLS v3 TLS record", error)));
+                    self->finish(
+                        core::fail(v3_io_error("failed to read Shadow-TLS v3 TLS record", error)));
                     return;
                 }
                 if (size == 0) {
-                    self->finish(core::fail(v3_error(
-                        core::ErrorCode::transport_io, "Shadow-TLS v3 handshake reached EOF")));
+                    self->finish(core::fail(v3_error(core::ErrorCode::transport_io,
+                                                     "Shadow-TLS v3 handshake reached EOF")));
                     return;
                 }
                 self->input_.insert(self->input_.end(), self->read_temp_.begin(),
@@ -693,12 +695,12 @@ class ShadowTlsV3OpenOperation final : public std::enable_shared_from_this<Shado
                 try {
                     self->process_input();
                 } catch (const std::exception &exception) {
-                    self->finish(core::fail(v3_exception("Shadow-TLS v3 handshake failed",
-                                                         exception)));
+                    self->finish(
+                        core::fail(v3_exception("Shadow-TLS v3 handshake failed", exception)));
                     return;
                 } catch (...) {
-                    self->finish(core::fail(v3_error(
-                        core::ErrorCode::carrier_handshake, "Shadow-TLS v3 handshake failed")));
+                    self->finish(core::fail(v3_error(core::ErrorCode::carrier_handshake,
+                                                     "Shadow-TLS v3 handshake failed")));
                     return;
                 }
                 if (!self->handshake_complete_) {
@@ -720,8 +722,8 @@ class ShadowTlsV3OpenOperation final : public std::enable_shared_from_this<Shado
             if (input_.size() < frame_size) {
                 return;
             }
-            std::vector<std::uint8_t> frame(input_.begin(),
-                                            input_.begin() + static_cast<std::ptrdiff_t>(frame_size));
+            std::vector<std::uint8_t> frame(
+                input_.begin(), input_.begin() + static_cast<std::ptrdiff_t>(frame_size));
             input_.erase(input_.begin(), input_.begin() + static_cast<std::ptrdiff_t>(frame_size));
             process_frame(frame);
         }
@@ -743,7 +745,8 @@ class ShadowTlsV3OpenOperation final : public std::enable_shared_from_this<Shado
             if (!verify_chain(options_.password, bridge_chain_, frame, false, &next)) {
                 throw std::runtime_error("Shadow-TLS v3 bridge HMAC mismatch");
             }
-            const auto payload = std::span<std::uint8_t>(frame).subspan(kTlsHeaderSize + kTlsHmacSize);
+            const auto payload =
+                std::span<std::uint8_t>(frame).subspan(kTlsHeaderSize + kTlsHmacSize);
             bridge_chain_ = std::move(next);
             xor_with_key(payload, read_key_);
             std::vector<std::uint8_t> decoded;
@@ -770,9 +773,9 @@ class ShadowTlsV3OpenOperation final : public std::enable_shared_from_this<Shado
         (void)timer_.cancel();
         completed_ = true;
         auto lower = std::move(stream_);
-        auto stream = ShadowTlsV3Stream::create(
-            std::move(lower), options_.password, std::move(server_random_),
-            std::move(bridge_chain_), std::move(pending_plain_), std::move(input_));
+        auto stream = ShadowTlsV3Stream::create(std::move(lower), options_.password,
+                                                std::move(server_random_), std::move(bridge_chain_),
+                                                std::move(pending_plain_), std::move(input_));
         auto handler = std::move(handler_);
         if (handler) {
             handler(core::Result<std::unique_ptr<core::StreamHandle>>(

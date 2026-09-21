@@ -49,8 +49,7 @@ core::Status validate_kcptun_client_options(const KcptunClientOptions &options);
 // The returned stream is owned by the caller and is suitable for exactly one
 // Kcptun SMUX session.
 core::Result<std::unique_ptr<core::StreamHandle>>
-make_kcptun_carrier(runtime::AsioRuntime &runtime,
-                    boost::asio::ip::udp::endpoint remote_endpoint,
+make_kcptun_carrier(runtime::AsioRuntime &runtime, boost::asio::ip::udp::endpoint remote_endpoint,
                     KcptunClientOptions options = {});
 
 core::Result<std::unique_ptr<core::StreamHandle>>

@@ -17,8 +17,8 @@ class Shadowsocks2022DatagramCodec final {
   public:
     Shadowsocks2022DatagramCodec(std::string method, std::string password);
 
-    core::Result<std::vector<std::uint8_t>> encrypt(
-        std::span<const std::uint8_t> destination, std::span<const std::uint8_t> payload);
+    core::Result<std::vector<std::uint8_t>> encrypt(std::span<const std::uint8_t> destination,
+                                                    std::span<const std::uint8_t> payload);
 
     // Returns destination address bytes followed by payload bytes after
     // validating and removing the Shadowsocks 2022 response header.

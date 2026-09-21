@@ -8,7 +8,6 @@ namespace clash_native::transport::shadowsocks {
 // handshake uses a password-authenticated TLS 1.3 ClientHello and preserves
 // the carrier's record authentication after the TLS handshake completes.
 void async_open_shadow_tls_v3(std::unique_ptr<core::StreamHandle> stream,
-                              ShadowTlsClientOptions options,
-                              ShadowTlsOpenHandler handler);
+                              ShadowTlsClientOptions options, ShadowTlsOpenHandler handler);
 
 } // namespace clash_native::transport::shadowsocks

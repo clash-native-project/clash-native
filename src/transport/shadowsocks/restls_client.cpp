@@ -2,24 +2,24 @@
 
 #include <clash_native/transport/shadowsocks/restls.hpp>
 
-#include <botan/auto_rng.h>
 #include <botan/asn1_obj.h>
+#include <botan/auto_rng.h>
 #include <botan/credentials_manager.h>
-#include <botan/exceptn.h>
 #include <botan/dl_group.h>
-#include <botan/ecdh.h>
 #include <botan/ec_group.h>
+#include <botan/ecdh.h>
+#include <botan/exceptn.h>
 #include <botan/tls_callbacks.h>
 #include <botan/tls_client.h>
 #include <botan/tls_exceptn.h>
+#include <botan/tls_messages.h>
 #include <botan/tls_policy.h>
 #include <botan/tls_server_info.h>
-#include <botan/tls_messages.h>
 #include <botan/tls_session.h>
 #include <botan/tls_session_manager.h>
 #include <botan/tls_session_manager_noop.h>
-#include <botan/x509cert.h>
 #include <botan/x25519.h>
+#include <botan/x509cert.h>
 
 #include <openssl/curve25519.h>
 
@@ -30,6 +30,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -37,7 +38,6 @@
 #include <optional>
 #include <span>
 #include <string>
-#include <cstring>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -56,12 +56,12 @@ core::Error restls_error(core::ErrorCode code, std::string message) {
     return {code, std::move(message), {}};
 }
 
-core::Error restls_io_error(std::string context, const boost::system::error_code& error) {
+core::Error restls_io_error(std::string context, const boost::system::error_code &error) {
     return {core::ErrorCode::transport_io, std::move(context),
             std::error_code(error.value(), std::system_category())};
 }
 
-core::Error restls_exception(std::string context, const std::exception& exception) {
+core::Error restls_exception(std::string context, const std::exception &exception) {
     context.append(": ");
     context.append(exception.what());
     return restls_error(core::ErrorCode::carrier_handshake, std::move(context));
@@ -105,8 +105,7 @@ parse_restls_tls13_client_hello(std::span<const std::uint8_t> body) {
     offset += session_id_length;
 
     std::uint16_t cipher_suites_length = 0;
-    if (!read_u16(offset, cipher_suites_length) ||
-        offset + cipher_suites_length > body.size()) {
+    if (!read_u16(offset, cipher_suites_length) || offset + cipher_suites_length > body.size()) {
         return std::nullopt;
     }
     offset += cipher_suites_length;
@@ -154,13 +153,15 @@ parse_restls_tls13_client_hello(std::span<const std::uint8_t> body) {
             }
         } else if (extension_type == 0x0029) { // pre_shared_key
             std::uint16_t identities_length = 0;
-            if (!read_u16(offset, identities_length) || offset + identities_length > extension_end) {
+            if (!read_u16(offset, identities_length) ||
+                offset + identities_length > extension_end) {
                 return std::nullopt;
             }
             const auto identities_end = offset + identities_length;
             while (offset < identities_end) {
                 std::uint16_t identity_length = 0;
-                if (!read_u16(offset, identity_length) || offset + identity_length + 4 > identities_end) {
+                if (!read_u16(offset, identity_length) ||
+                    offset + identity_length + 4 > identities_end) {
                     return std::nullopt;
                 }
                 result.psk_labels.emplace_back(body.begin() + offset,
@@ -211,33 +212,33 @@ class RestlsPolicy final : public Botan::TLS::Text_Policy {
 
 class RestlsCredentials final : public Botan::Credentials_Manager {
   public:
-    std::vector<Botan::Certificate_Store*> trusted_certificate_authorities(
-        const std::string&, const std::string&) override {
+    std::vector<Botan::Certificate_Store *>
+    trusted_certificate_authorities(const std::string &, const std::string &) override {
         return {};
     }
 
     std::vector<Botan::X509_Certificate> find_cert_chain(
-        const std::vector<std::string>&, const std::vector<Botan::AlgorithmIdentifier>&,
-        const std::vector<Botan::X509_DN>&, const std::string&, const std::string&) override {
+        const std::vector<std::string> &, const std::vector<Botan::AlgorithmIdentifier> &,
+        const std::vector<Botan::X509_DN> &, const std::string &, const std::string &) override {
         return {};
     }
 
-    std::shared_ptr<Botan::Private_Key> private_key_for(
-        const Botan::X509_Certificate&, const std::string&, const std::string&) override {
+    std::shared_ptr<Botan::Private_Key> private_key_for(const Botan::X509_Certificate &,
+                                                        const std::string &,
+                                                        const std::string &) override {
         return {};
     }
 };
 
 class RestlsX25519Key final : public Botan::PK_Key_Agreement_Key {
   public:
-    explicit RestlsX25519Key(Botan::RandomNumberGenerator& rng) {
+    explicit RestlsX25519Key(Botan::RandomNumberGenerator &rng) {
         const auto generated = rng.random_vec(32);
         std::copy(generated.begin(), generated.end(), private_key_.begin());
         X25519_public_from_private(public_key_.data(), private_key_.data());
     }
 
-    explicit RestlsX25519Key(std::array<std::uint8_t, 32> private_key)
-        : private_key_(private_key) {
+    explicit RestlsX25519Key(std::array<std::uint8_t, 32> private_key) : private_key_(private_key) {
         X25519_public_from_private(public_key_.data(), private_key_.data());
     }
 
@@ -246,11 +247,11 @@ class RestlsX25519Key final : public Botan::PK_Key_Agreement_Key {
     bool supports_operation(Botan::PublicKeyOperation op) const override {
         return op == Botan::PublicKeyOperation::KeyAgreement;
     }
-    std::unique_ptr<Botan::Private_Key> generate_another(
-        Botan::RandomNumberGenerator& rng) const override {
+    std::unique_ptr<Botan::Private_Key>
+    generate_another(Botan::RandomNumberGenerator &rng) const override {
         return std::make_unique<RestlsX25519Key>(rng);
     }
-    bool check_key(Botan::RandomNumberGenerator&, bool) const override { return true; }
+    bool check_key(Botan::RandomNumberGenerator &, bool) const override { return true; }
     std::size_t key_length() const override { return 255; }
     Botan::AlgorithmIdentifier algorithm_identifier() const override {
         return {"X25519", Botan::AlgorithmIdentifier::USE_EMPTY_PARAM};
@@ -258,9 +259,7 @@ class RestlsX25519Key final : public Botan::PK_Key_Agreement_Key {
     std::vector<std::uint8_t> raw_public_key_bits() const override {
         return {public_key_.begin(), public_key_.end()};
     }
-    std::vector<std::uint8_t> public_key_bits() const override {
-        return raw_public_key_bits();
-    }
+    std::vector<std::uint8_t> public_key_bits() const override { return raw_public_key_bits(); }
     Botan::secure_vector<std::uint8_t> private_key_bits() const override {
         return {private_key_.begin(), private_key_.end()};
     }
@@ -281,27 +280,27 @@ class RestlsSessionManager final : public Botan::TLS::Session_Manager {
   public:
     RestlsSessionManager(std::shared_ptr<Botan::RandomNumberGenerator> rng,
                          Botan::TLS::Session session, Botan::TLS::Session_Handle handle)
-        : Botan::TLS::Session_Manager(std::move(rng)),
-          session_(std::move(session)),
+        : Botan::TLS::Session_Manager(std::move(rng)), session_(std::move(session)),
           handle_(std::move(handle)) {}
 
-    void store(const Botan::TLS::Session&, const Botan::TLS::Session_Handle&) override {}
+    void store(const Botan::TLS::Session &, const Botan::TLS::Session_Handle &) override {}
 
-    std::vector<Botan::TLS::Session_with_Handle>
-    find(const Botan::TLS::Server_Information&, Botan::TLS::Callbacks&,
-         const Botan::TLS::Policy&) override {
+    std::vector<Botan::TLS::Session_with_Handle> find(const Botan::TLS::Server_Information &,
+                                                      Botan::TLS::Callbacks &,
+                                                      const Botan::TLS::Policy &) override {
         return {{session_, handle_}};
     }
 
-    std::size_t remove(const Botan::TLS::Session_Handle&) override { return 0; }
+    std::size_t remove(const Botan::TLS::Session_Handle &) override { return 0; }
     std::size_t remove_all() override { return 0; }
 
   protected:
-    std::optional<Botan::TLS::Session>
-    retrieve_one(const Botan::TLS::Session_Handle&) override { return session_; }
+    std::optional<Botan::TLS::Session> retrieve_one(const Botan::TLS::Session_Handle &) override {
+        return session_;
+    }
 
-    std::vector<Botan::TLS::Session_with_Handle>
-    find_some(const Botan::TLS::Server_Information&, std::size_t) override {
+    std::vector<Botan::TLS::Session_with_Handle> find_some(const Botan::TLS::Server_Information &,
+                                                           std::size_t) override {
         return {{session_, handle_}};
     }
 
@@ -316,14 +315,10 @@ class RestlsCallbacks final : public Botan::TLS::Callbacks {
     using RecordHandler = std::function<void(std::span<const std::uint8_t>)>;
 
     RestlsCallbacks(std::shared_ptr<Botan::RandomNumberGenerator> rng,
-                    std::array<std::uint8_t, 32> secret, EmitHandler emit,
-                    RecordHandler record, bool skip_cert_verify, bool tls13)
-        : rng_(std::move(rng)),
-          secret_(secret),
-          emit_(std::move(emit)),
-          record_(std::move(record)),
-          skip_cert_verify_(skip_cert_verify),
-          tls13_(tls13) {
+                    std::array<std::uint8_t, 32> secret, EmitHandler emit, RecordHandler record,
+                    bool skip_cert_verify, bool tls13)
+        : rng_(std::move(rng)), secret_(secret), emit_(std::move(emit)), record_(std::move(record)),
+          skip_cert_verify_(skip_cert_verify), tls13_(tls13) {
         x25519_key_ = std::make_unique<RestlsX25519Key>(*rng_);
         p256_key_ = std::make_unique<Botan::ECDH_PrivateKey>(
             *rng_, Botan::EC_Group::from_name("secp256r1"));
@@ -333,10 +328,8 @@ class RestlsCallbacks final : public Botan::TLS::Callbacks {
         const auto x25519_private = x25519_key_->raw_private_key_bits();
         std::copy(x25519_private.begin(), x25519_private.end(), x25519_private_.begin());
         public_keys_.push_back(x25519_key_->raw_public_key_bits());
-        public_keys_.push_back(
-            p256_key_->public_value(Botan::EC_Point_Format::Uncompressed));
-        public_keys_.push_back(
-            p384_key_->public_value(Botan::EC_Point_Format::Uncompressed));
+        public_keys_.push_back(p256_key_->public_value(Botan::EC_Point_Format::Uncompressed));
+        public_keys_.push_back(p384_key_->public_value(Botan::EC_Point_Format::Uncompressed));
     }
 
     std::vector<std::vector<std::uint8_t>> public_keys() const { return public_keys_; }
@@ -353,9 +346,7 @@ class RestlsCallbacks final : public Botan::TLS::Callbacks {
         }
     }
 
-    void tls_alert(Botan::TLS::Alert alert) override {
-        last_alert_ = alert.type_string();
-    }
+    void tls_alert(Botan::TLS::Alert alert) override { last_alert_ = alert.type_string(); }
 
     void tls_modify_client_hello_random(std::vector<std::uint8_t> &random,
                                         const Botan::TLS::Client_Hello &hello) override {
@@ -369,9 +360,8 @@ class RestlsCallbacks final : public Botan::TLS::Callbacks {
         }
         auto &session_id = const_cast<Botan::TLS::Session_ID &>(hello.session_id()).get();
         if (session_id.size() != kTls13SessionIdLength) {
-            throw Botan::TLS::TLS_Exception(
-                Botan::TLS::Alert::IllegalParameter,
-                "ResTLS TLS 1.3 requires a 32-byte session ID");
+            throw Botan::TLS::TLS_Exception(Botan::TLS::Alert::IllegalParameter,
+                                            "ResTLS TLS 1.3 requires a 32-byte session ID");
         }
         const auto materials = parse_restls_tls13_client_hello(hello.serialize());
         if (!materials) {
@@ -379,8 +369,8 @@ class RestlsCallbacks final : public Botan::TLS::Callbacks {
                 Botan::TLS::Alert::DecodeError,
                 "ResTLS TLS 1.3 ClientHello is missing key-share materials");
         }
-        const auto session_id_prefix = derive_restls_tls13_session_id(
-            secret_, materials->key_shares, materials->psk_labels);
+        const auto session_id_prefix =
+            derive_restls_tls13_session_id(secret_, materials->key_shares, materials->psk_labels);
         if (!session_id_prefix) {
             throw Botan::TLS::TLS_Exception(
                 Botan::TLS::Alert::InternalError,
@@ -390,20 +380,20 @@ class RestlsCallbacks final : public Botan::TLS::Callbacks {
                   session_id.begin());
     }
 
-    void tls_verify_cert_chain(
-        const std::vector<Botan::X509_Certificate>&,
-        const std::vector<std::optional<Botan::OCSP::Response>>&,
-        const std::vector<Botan::Certificate_Store*>&, Botan::Usage_Type,
-        std::string_view, const Botan::TLS::Policy&) override {
+    void tls_verify_cert_chain(const std::vector<Botan::X509_Certificate> &,
+                               const std::vector<std::optional<Botan::OCSP::Response>> &,
+                               const std::vector<Botan::Certificate_Store *> &, Botan::Usage_Type,
+                               std::string_view, const Botan::TLS::Policy &) override {
         if (!skip_cert_verify_) {
             throw Botan::TLS::TLS_Exception(Botan::TLS::Alert::BadCertificate,
-                                             "ResTLS native trust store is not configured");
+                                            "ResTLS native trust store is not configured");
         }
     }
 
-    std::unique_ptr<Botan::PK_Key_Agreement_Key> tls12_generate_ephemeral_ecdh_key(
-        Botan::TLS::Group_Params group, Botan::RandomNumberGenerator& rng,
-        Botan::EC_Point_Format format) override {
+    std::unique_ptr<Botan::PK_Key_Agreement_Key>
+    tls12_generate_ephemeral_ecdh_key(Botan::TLS::Group_Params group,
+                                      Botan::RandomNumberGenerator &rng,
+                                      Botan::EC_Point_Format format) override {
         switch (group.wire_code()) {
         case 29:
             if (x25519_key_) {
@@ -424,53 +414,53 @@ class RestlsCallbacks final : public Botan::TLS::Callbacks {
             break;
         }
         throw Botan::TLS::TLS_Exception(Botan::TLS::Alert::IllegalParameter,
-                                         "ResTLS requested an unsupported ECDHE group");
+                                        "ResTLS requested an unsupported ECDHE group");
     }
 
-    std::unique_ptr<Botan::PK_Key_Agreement_Key> tls_generate_ephemeral_key(
-        const std::variant<Botan::TLS::Group_Params, Botan::DL_Group>& group,
-        Botan::RandomNumberGenerator& rng) override {
+    std::unique_ptr<Botan::PK_Key_Agreement_Key>
+    tls_generate_ephemeral_key(const std::variant<Botan::TLS::Group_Params, Botan::DL_Group> &group,
+                               Botan::RandomNumberGenerator &rng) override {
         if (std::holds_alternative<Botan::TLS::Group_Params>(group)) {
             const auto selected = std::get<Botan::TLS::Group_Params>(group);
             if (selected == Botan::TLS::Group_Params::X25519) {
                 if (!x25519_key_) {
                     throw Botan::TLS::TLS_Exception(Botan::TLS::Alert::IllegalParameter,
-                                                     "ResTLS X25519 key already consumed");
+                                                    "ResTLS X25519 key already consumed");
                 }
                 x25519_active_ = true;
                 return std::move(x25519_key_);
             }
-            return tls12_generate_ephemeral_ecdh_key(
-                selected, rng, Botan::EC_Point_Format::Uncompressed);
+            return tls12_generate_ephemeral_ecdh_key(selected, rng,
+                                                     Botan::EC_Point_Format::Uncompressed);
         }
         return Botan::TLS::Callbacks::tls_generate_ephemeral_key(group, rng);
     }
 
     Botan::secure_vector<std::uint8_t> tls_ephemeral_key_agreement(
-        const std::variant<Botan::TLS::Group_Params, Botan::DL_Group>& group,
-        const Botan::PK_Key_Agreement_Key& private_key,
-        const std::vector<std::uint8_t>& public_value, Botan::RandomNumberGenerator& rng,
-        const Botan::TLS::Policy& policy) override {
+        const std::variant<Botan::TLS::Group_Params, Botan::DL_Group> &group,
+        const Botan::PK_Key_Agreement_Key &private_key,
+        const std::vector<std::uint8_t> &public_value, Botan::RandomNumberGenerator &rng,
+        const Botan::TLS::Policy &policy) override {
         if (std::holds_alternative<Botan::TLS::Group_Params>(group) &&
             std::get<Botan::TLS::Group_Params>(group) == Botan::TLS::Group_Params::X25519) {
             if (!x25519_active_ || public_value.size() != X25519_PUBLIC_VALUE_LEN) {
                 throw Botan::TLS::TLS_Exception(Botan::TLS::Alert::IllegalParameter,
-                                                 "ResTLS X25519 key agreement input is invalid");
+                                                "ResTLS X25519 key agreement input is invalid");
             }
             std::array<std::uint8_t, X25519_SHARED_KEY_LEN> shared{};
             if (X25519(shared.data(), x25519_private_.data(), public_value.data()) == 0) {
                 throw Botan::TLS::TLS_Exception(Botan::TLS::Alert::IllegalParameter,
-                                                 "ResTLS X25519 key agreement failed");
+                                                "ResTLS X25519 key agreement failed");
             }
             Botan::secure_vector<std::uint8_t> result(shared.begin(), shared.end());
             return result;
         }
-        auto result = Botan::TLS::Callbacks::tls_ephemeral_key_agreement(
-            group, private_key, public_value, rng, policy);
+        auto result = Botan::TLS::Callbacks::tls_ephemeral_key_agreement(group, private_key,
+                                                                         public_value, rng, policy);
         return result;
     }
 
-    const std::string& last_alert() const noexcept { return last_alert_; }
+    const std::string &last_alert() const noexcept { return last_alert_; }
 
   private:
     std::shared_ptr<Botan::RandomNumberGenerator> rng_;
@@ -491,18 +481,15 @@ class RestlsCallbacks final : public Botan::TLS::Callbacks {
 class RestlsStream final : public core::StreamHandle,
                            public std::enable_shared_from_this<RestlsStream> {
   public:
-    RestlsStream(std::unique_ptr<core::StreamHandle> lower,
-                 std::array<std::uint8_t, 32> secret, std::vector<std::uint8_t> server_random,
+    RestlsStream(std::unique_ptr<core::StreamHandle> lower, std::array<std::uint8_t, 32> secret,
+                 std::vector<std::uint8_t> server_random,
                  std::shared_ptr<Botan::RandomNumberGenerator> rng,
                  std::vector<RestlsScriptLine> script, std::vector<std::uint8_t> initial_wire,
                  bool tls12_gcm, std::vector<std::uint8_t> initial_auth_extra)
         : lower_(std::move(lower)),
           encoder_(secret, server_random, false, tls12_gcm, std::move(initial_auth_extra)),
-          decoder_(secret, std::move(server_random), true, tls12_gcm),
-          rng_(std::move(rng)),
-          script_(std::move(script)),
-          read_wire_(std::move(initial_wire)),
-          read_temp_(16 * 1024) {}
+          decoder_(secret, std::move(server_random), true, tls12_gcm), rng_(std::move(rng)),
+          script_(std::move(script)), read_wire_(std::move(initial_wire)), read_temp_(16 * 1024) {}
 
     ~RestlsStream() override = default;
 
@@ -532,7 +519,7 @@ class RestlsStream final : public core::StreamHandle,
             post_write(std::move(handler), {}, 0);
             return;
         }
-        const auto* data = static_cast<const std::uint8_t*>(buffer.data());
+        const auto *data = static_cast<const std::uint8_t *>(buffer.data());
         pending_write_.assign(data, data + buffer.size());
         pending_write_offset_ = 0;
         pending_write_size_ = buffer.size();
@@ -543,11 +530,11 @@ class RestlsStream final : public core::StreamHandle,
     boost::asio::any_io_executor executor() noexcept override { return lower_->executor(); }
 
     boost::asio::ip::tcp::endpoint
-    local_endpoint(boost::system::error_code& error) const noexcept override {
+    local_endpoint(boost::system::error_code &error) const noexcept override {
         return lower_->local_endpoint(error);
     }
 
-    void shutdown_send(boost::system::error_code& error) noexcept override {
+    void shutdown_send(boost::system::error_code &error) noexcept override {
         lower_->shutdown_send(error);
     }
 
@@ -588,13 +575,13 @@ class RestlsStream final : public core::StreamHandle,
             pending_plain_offset_ = 0;
             return false;
         }
-        const auto size = std::min(read_buffer_.size(), pending_plain_.size() - pending_plain_offset_);
+        const auto size =
+            std::min(read_buffer_.size(), pending_plain_.size() - pending_plain_offset_);
         std::memcpy(read_buffer_.data(), pending_plain_.data() + pending_plain_offset_, size);
         pending_plain_offset_ += size;
         auto handler = std::move(read_handler_);
-        boost::asio::post(executor(), [handler = std::move(handler), size]() mutable {
-            handler({}, size);
-        });
+        boost::asio::post(executor(),
+                          [handler = std::move(handler), size]() mutable { handler({}, size); });
         return true;
     }
 
@@ -607,35 +594,37 @@ class RestlsStream final : public core::StreamHandle,
         }
         lower_read_pending_ = true;
         auto self = shared_from_this();
-        lower_->async_read_some(
-            boost::asio::buffer(read_temp_),
-            [self](const boost::system::error_code& error, std::size_t size) {
-                self->lower_read_pending_ = false;
-                if (error) {
-                    self->finish_read(error, 0);
-                    return;
-                }
-                if (size == 0) {
-                    self->finish_read(boost::asio::error::eof, 0);
-                    return;
-                }
-                self->read_wire_.insert(self->read_wire_.end(), self->read_temp_.begin(),
-                                        self->read_temp_.begin() + static_cast<std::ptrdiff_t>(size));
-                self->pump_read();
-            });
+        lower_->async_read_some(boost::asio::buffer(read_temp_),
+                                [self](const boost::system::error_code &error, std::size_t size) {
+                                    self->lower_read_pending_ = false;
+                                    if (error) {
+                                        self->finish_read(error, 0);
+                                        return;
+                                    }
+                                    if (size == 0) {
+                                        self->finish_read(boost::asio::error::eof, 0);
+                                        return;
+                                    }
+                                    self->read_wire_.insert(self->read_wire_.end(),
+                                                            self->read_temp_.begin(),
+                                                            self->read_temp_.begin() +
+                                                                static_cast<std::ptrdiff_t>(size));
+                                    self->pump_read();
+                                });
     }
 
     bool process_wire() {
         while (read_wire_.size() >= kTlsRecordHeaderLength) {
-            const auto payload_size = (static_cast<std::size_t>(read_wire_[3]) << 8) |
-                                       read_wire_[4];
+            const auto payload_size =
+                (static_cast<std::size_t>(read_wire_[3]) << 8) | read_wire_[4];
             if (payload_size > kMaxTlsRecordPayload ||
                 read_wire_.size() < kTlsRecordHeaderLength + payload_size) {
                 return false;
             }
             std::vector<std::uint8_t> record(
                 read_wire_.begin(),
-                read_wire_.begin() + static_cast<std::ptrdiff_t>(kTlsRecordHeaderLength + payload_size));
+                read_wire_.begin() +
+                    static_cast<std::ptrdiff_t>(kTlsRecordHeaderLength + payload_size));
             read_wire_.erase(read_wire_.begin(),
                              read_wire_.begin() + static_cast<std::ptrdiff_t>(record.size()));
             const auto decoded = decoder_.decode(record);
@@ -690,8 +679,8 @@ class RestlsStream final : public core::StreamHandle,
         if (scripted) {
             line = script_[script_index_];
         }
-        std::size_t target = scripted ? script_target(line)
-                                      : pending_write_.size() - pending_write_offset_;
+        std::size_t target =
+            scripted ? script_target(line) : pending_write_.size() - pending_write_offset_;
         if (target == 0) {
             target = std::min<std::size_t>(16384, pending_write_.size() - pending_write_offset_);
         }
@@ -711,7 +700,7 @@ class RestlsStream final : public core::StreamHandle,
         auto self = shared_from_this();
         lower_->async_write(boost::asio::buffer(write_wire_),
                             [self, chunk, needs_response = line.command.needs_peer_response()](
-                                const boost::system::error_code& error, std::size_t) {
+                                const boost::system::error_code &error, std::size_t) {
                                 self->write_in_progress_ = false;
                                 if (error) {
                                     self->finish_write(error, 0);
@@ -719,8 +708,8 @@ class RestlsStream final : public core::StreamHandle,
                                 }
                                 self->pending_write_offset_ += chunk;
                                 ++self->script_index_;
-                                if (needs_response && self->pending_write_offset_ <
-                                                            self->pending_write_.size()) {
+                                if (needs_response &&
+                                    self->pending_write_offset_ < self->pending_write_.size()) {
                                     self->write_waiting_response_ = true;
                                 }
                                 self->pump_write();
@@ -735,9 +724,9 @@ class RestlsStream final : public core::StreamHandle,
         if (script_index_ < script_.size()) {
             line = script_[script_index_];
         }
-        const auto target = std::min<std::size_t>(
-            (script_index_ < script_.size() ? script_target(line) : 32),
-            std::numeric_limits<std::uint16_t>::max());
+        const auto target =
+            std::min<std::size_t>((script_index_ < script_.size() ? script_target(line) : 32),
+                                  std::numeric_limits<std::uint16_t>::max());
         const auto wire = encoder_.encode({}, 0, target, line.command);
         if (!wire) {
             finish_read(boost::asio::error::fault, 0);
@@ -747,20 +736,19 @@ class RestlsStream final : public core::StreamHandle,
         write_wire_ = std::move(wire.value());
         write_in_progress_ = true;
         auto self = shared_from_this();
-        lower_->async_write(
-            boost::asio::buffer(write_wire_),
-            [self](const boost::system::error_code &error, std::size_t) {
-                self->write_in_progress_ = false;
-                if (error) {
-                    self->finish_read(error, 0);
-                    self->finish_write(error, 0);
-                    return;
-                }
-                --self->pending_control_responses_;
-                ++self->script_index_;
-                self->pump_control_write();
-                self->pump_write();
-            });
+        lower_->async_write(boost::asio::buffer(write_wire_),
+                            [self](const boost::system::error_code &error, std::size_t) {
+                                self->write_in_progress_ = false;
+                                if (error) {
+                                    self->finish_read(error, 0);
+                                    self->finish_write(error, 0);
+                                    return;
+                                }
+                                --self->pending_control_responses_;
+                                ++self->script_index_;
+                                self->pump_control_write();
+                                self->pump_write();
+                            });
     }
 
     void ensure_control_read() {
@@ -769,22 +757,23 @@ class RestlsStream final : public core::StreamHandle,
         }
         lower_read_pending_ = true;
         auto self = shared_from_this();
-        lower_->async_read_some(
-            boost::asio::buffer(read_temp_),
-            [self](const boost::system::error_code& error, std::size_t size) {
-                self->lower_read_pending_ = false;
-                if (error) {
-                    self->finish_write(error, 0);
-                    self->finish_read(error, 0);
-                    return;
-                }
-                self->read_wire_.insert(self->read_wire_.end(), self->read_temp_.begin(),
-                                        self->read_temp_.begin() + static_cast<std::ptrdiff_t>(size));
-                (void)self->process_wire();
-                if (self->write_waiting_response_) {
-                    self->ensure_control_read();
-                }
-            });
+        lower_->async_read_some(boost::asio::buffer(read_temp_),
+                                [self](const boost::system::error_code &error, std::size_t size) {
+                                    self->lower_read_pending_ = false;
+                                    if (error) {
+                                        self->finish_write(error, 0);
+                                        self->finish_read(error, 0);
+                                        return;
+                                    }
+                                    self->read_wire_.insert(self->read_wire_.end(),
+                                                            self->read_temp_.begin(),
+                                                            self->read_temp_.begin() +
+                                                                static_cast<std::ptrdiff_t>(size));
+                                    (void)self->process_wire();
+                                    if (self->write_waiting_response_) {
+                                        self->ensure_control_read();
+                                    }
+                                });
     }
 
     void finish_read(boost::system::error_code error, std::size_t size) {
@@ -868,9 +857,7 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
   public:
     RestlsOpenOperation(std::unique_ptr<core::StreamHandle> stream, RestlsClientOptions options,
                         RestlsOpenHandler handler)
-        : stream_(std::move(stream)),
-          options_(std::move(options)),
-          handler_(std::move(handler)),
+        : stream_(std::move(stream)), options_(std::move(options)), handler_(std::move(handler)),
           timer_(stream_->executor()) {}
 
     void start() {
@@ -880,9 +867,9 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
             return;
         }
         if (options_.version_hint != "tls12" && options_.version_hint != "tls13") {
-            finish(core::fail(restls_error(
-                core::ErrorCode::unsupported,
-                "native ResTLS supports only the tls12 and tls13 version hints")));
+            finish(core::fail(
+                restls_error(core::ErrorCode::unsupported,
+                             "native ResTLS supports only the tls12 and tls13 version hints")));
             return;
         }
         const bool tls13 = options_.version_hint == "tls13";
@@ -897,10 +884,10 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
         script_ = std::move(script.value());
         timer_.expires_after(kHandshakeTimeout);
         auto self = shared_from_this();
-        timer_.async_wait([self](const boost::system::error_code& error) {
+        timer_.async_wait([self](const boost::system::error_code &error) {
             if (!error && !self->completed_) {
-                self->finish(core::fail(restls_error(core::ErrorCode::timeout,
-                                                     "ResTLS TLS handshake timed out")));
+                self->finish(core::fail(
+                    restls_error(core::ErrorCode::timeout, "ResTLS TLS handshake timed out")));
             }
         });
         try {
@@ -931,18 +918,18 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
                 Botan::TLS::Session session(master_secret, protocol_version, 0xC02F,
                                             Botan::TLS::Connection_Side::Client, true, false, {},
                                             info, 0, std::chrono::system_clock::now());
-                Botan::TLS::Session_Handle handle(Botan::TLS::Session_ID(
-                    std::vector<std::uint8_t>(session_id.value().begin(), session_id.value().end())));
-                session_manager_ = std::make_shared<RestlsSessionManager>(
-                    rng_, std::move(session), std::move(handle));
+                Botan::TLS::Session_Handle handle(Botan::TLS::Session_ID(std::vector<std::uint8_t>(
+                    session_id.value().begin(), session_id.value().end())));
+                session_manager_ = std::make_shared<RestlsSessionManager>(rng_, std::move(session),
+                                                                          std::move(handle));
             }
             policy_ = std::make_shared<RestlsPolicy>(tls13);
             credentials_ = std::make_shared<RestlsCredentials>();
             tls_client_ = std::make_unique<Botan::TLS::Client>(
-                callbacks_, session_manager_, credentials_, policy_, rng_, info,
-                protocol_version, std::vector<std::string>{});
+                callbacks_, session_manager_, credentials_, policy_, rng_, info, protocol_version,
+                std::vector<std::string>{});
             read_tls_records();
-        } catch (const std::exception& exception) {
+        } catch (const std::exception &exception) {
             finish(core::fail(restls_exception("failed to initialize native ResTLS", exception)));
         }
     }
@@ -959,19 +946,21 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
 
     void record_received(std::span<const std::uint8_t>) {}
 
-    void remember_finished_record(const std::vector<std::uint8_t>& bytes) {
+    void remember_finished_record(const std::vector<std::uint8_t> &bytes) {
         std::size_t offset = 0;
         while (offset + kTlsRecordHeaderLength <= bytes.size()) {
-            const auto size = (static_cast<std::size_t>(bytes[offset + 3]) << 8) |
-                              bytes[offset + 4];
-            if (size > kMaxTlsRecordPayload || offset + kTlsRecordHeaderLength + size > bytes.size()) {
+            const auto size =
+                (static_cast<std::size_t>(bytes[offset + 3]) << 8) | bytes[offset + 4];
+            if (size > kMaxTlsRecordPayload ||
+                offset + kTlsRecordHeaderLength + size > bytes.size()) {
                 break;
             }
             const auto type = bytes[offset];
             if (type == 22 || type == 23) {
                 last_client_finished_.assign(
                     bytes.begin() + static_cast<std::ptrdiff_t>(offset),
-                    bytes.begin() + static_cast<std::ptrdiff_t>(offset + kTlsRecordHeaderLength + size));
+                    bytes.begin() +
+                        static_cast<std::ptrdiff_t>(offset + kTlsRecordHeaderLength + size));
             }
             offset += kTlsRecordHeaderLength + size;
         }
@@ -986,7 +975,7 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
         tls_write_queue_.erase(tls_write_queue_.begin());
         auto self = shared_from_this();
         stream_->async_write(boost::asio::buffer(tls_write_current_),
-                             [self](const boost::system::error_code& error, std::size_t) {
+                             [self](const boost::system::error_code &error, std::size_t) {
                                  self->tls_write_in_progress_ = false;
                                  if (error) {
                                      self->finish(core::fail(restls_io_error(
@@ -1005,20 +994,21 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
         auto self = shared_from_this();
         stream_->async_read_some(
             boost::asio::buffer(read_temp_),
-            [self](const boost::system::error_code& error, std::size_t size) {
+            [self](const boost::system::error_code &error, std::size_t size) {
                 self->read_in_progress_ = false;
                 if (error) {
-                    self->finish(core::fail(restls_io_error(
-                        "failed to read ResTLS TLS handshake", error)));
+                    self->finish(
+                        core::fail(restls_io_error("failed to read ResTLS TLS handshake", error)));
                     return;
                 }
                 if (size == 0) {
-                    self->finish(core::fail(restls_error(
-                        core::ErrorCode::transport_io, "ResTLS TLS handshake reached EOF")));
+                    self->finish(core::fail(restls_error(core::ErrorCode::transport_io,
+                                                         "ResTLS TLS handshake reached EOF")));
                     return;
                 }
                 self->tls_input_.insert(self->tls_input_.end(), self->read_temp_.begin(),
-                                       self->read_temp_.begin() + static_cast<std::ptrdiff_t>(size));
+                                        self->read_temp_.begin() +
+                                            static_cast<std::ptrdiff_t>(size));
                 self->process_tls_records();
                 if (!self->completed_ && !self->tls_client_->is_handshake_complete()) {
                     self->read_tls_records();
@@ -1028,8 +1018,8 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
 
     void process_tls_records() {
         while (!completed_ && tls_input_.size() >= kTlsRecordHeaderLength) {
-            const auto payload_size = (static_cast<std::size_t>(tls_input_[3]) << 8) |
-                                       tls_input_[4];
+            const auto payload_size =
+                (static_cast<std::size_t>(tls_input_[3]) << 8) | tls_input_[4];
             if (payload_size > kMaxTlsRecordPayload) {
                 finish(core::fail(restls_error(core::ErrorCode::protocol_framing,
                                                "invalid ResTLS TLS record length")));
@@ -1040,7 +1030,8 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
             }
             std::vector<std::uint8_t> record(
                 tls_input_.begin(),
-                tls_input_.begin() + static_cast<std::ptrdiff_t>(kTlsRecordHeaderLength + payload_size));
+                tls_input_.begin() +
+                    static_cast<std::ptrdiff_t>(kTlsRecordHeaderLength + payload_size));
             tls_input_.erase(tls_input_.begin(),
                              tls_input_.begin() + static_cast<std::ptrdiff_t>(record.size()));
             remember_server_random(record);
@@ -1054,12 +1045,13 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
             }
             try {
                 tls_client_->received_data(record);
-            } catch (const std::exception& exception) {
+            } catch (const std::exception &exception) {
                 finish(core::fail(restls_exception("ResTLS TLS handshake failed", exception)));
                 return;
             } catch (...) {
-                finish(core::fail(restls_error(core::ErrorCode::carrier_handshake,
-                                               "ResTLS TLS handshake failed with unknown exception")));
+                finish(
+                    core::fail(restls_error(core::ErrorCode::carrier_handshake,
+                                            "ResTLS TLS handshake failed with unknown exception")));
                 return;
             }
             if (tls_client_->is_handshake_complete()) {
@@ -1069,21 +1061,19 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
         }
     }
 
-    void remember_server_random(const std::vector<std::uint8_t>& record) {
+    void remember_server_random(const std::vector<std::uint8_t> &record) {
         if (!server_random_.empty() || record.size() < 5 + 4 + 2 + 32 || record[0] != 22 ||
             record[5] != 2) {
             return;
         }
-        server_random_.assign(record.begin() + 5 + 4 + 2,
-                              record.begin() + 5 + 4 + 2 + 32);
+        server_random_.assign(record.begin() + 5 + 4 + 2, record.begin() + 5 + 4 + 2 + 32);
         const auto session_id_offset = 5 + 4 + 2 + 32;
         if (record.size() > session_id_offset) {
             const auto session_id_length = static_cast<std::size_t>(record[session_id_offset]);
             const auto cipher_offset = session_id_offset + 1 + session_id_length;
             if (cipher_offset + 2 <= record.size()) {
-                const auto cipher_suite =
-                    (static_cast<std::uint16_t>(record[cipher_offset]) << 8) |
-                    record[cipher_offset + 1];
+                const auto cipher_suite = (static_cast<std::uint16_t>(record[cipher_offset]) << 8) |
+                                          record[cipher_offset + 1];
                 server_tls12_gcm_ = is_tls12_gcm_cipher(cipher_suite);
             }
         }
@@ -1094,12 +1084,12 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
                cipher_suite == 0xC02C;
     }
 
-    void unmask_server_auth(std::vector<std::uint8_t>& record) {
+    void unmask_server_auth(std::vector<std::uint8_t> &record) {
         if (server_random_.size() != 32 || record.size() <= kTlsRecordHeaderLength) {
             return;
         }
-        const auto mask = restls_hmac(
-            secret_, std::array<std::span<const std::uint8_t>, 1>{server_random_});
+        const auto mask =
+            restls_hmac(secret_, std::array<std::span<const std::uint8_t>, 1>{server_random_});
         if (!mask) {
             return;
         }
@@ -1191,14 +1181,12 @@ void async_open_restls(std::unique_ptr<core::StreamHandle> stream, RestlsClientO
             stream->close();
         }
         if (handler) {
-            handler(core::fail(restls_error(
-                core::ErrorCode::configuration,
-                "ResTLS requires a stream and completion handler")));
+            handler(core::fail(restls_error(core::ErrorCode::configuration,
+                                            "ResTLS requires a stream and completion handler")));
         }
         return;
     }
-    std::make_shared<RestlsOpenOperation>(std::move(stream), std::move(options),
-                                          std::move(handler))
+    std::make_shared<RestlsOpenOperation>(std::move(stream), std::move(options), std::move(handler))
         ->start();
 }
 

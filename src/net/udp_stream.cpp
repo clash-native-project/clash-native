@@ -57,8 +57,8 @@ void UdpStream::set_dscp(int dscp, boost::system::error_code &error) {
     int result = 0;
     if (endpoint.address().is_v4()) {
 #if defined(_WIN32)
-        result = ::setsockopt(native, IPPROTO_IP, IP_TOS,
-                              reinterpret_cast<const char *>(&value), sizeof(value));
+        result = ::setsockopt(native, IPPROTO_IP, IP_TOS, reinterpret_cast<const char *>(&value),
+                              sizeof(value));
 #else
         result = ::setsockopt(native, IPPROTO_IP, IP_TOS, &value, sizeof(value));
 #endif

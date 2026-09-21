@@ -146,8 +146,9 @@ std::size_t configured_legacy_key_size(std::string_view name) {
     return legacy_key_size(name);
 }
 
-std::unique_ptr<Botan::StreamCipher> create_chacha_cipher(
-    int rounds, std::span<const std::uint8_t> key, std::span<const std::uint8_t> nonce) {
+std::unique_ptr<Botan::StreamCipher> create_chacha_cipher(int rounds,
+                                                          std::span<const std::uint8_t> key,
+                                                          std::span<const std::uint8_t> nonce) {
     auto cipher = Botan::StreamCipher::create("ChaCha(" + std::to_string(rounds) + ")");
     if (!cipher) {
         return nullptr;
@@ -158,8 +159,7 @@ std::unique_ptr<Botan::StreamCipher> create_chacha_cipher(
 }
 
 std::uint32_t load_little_endian_u32(const std::uint8_t *input) {
-    return static_cast<std::uint32_t>(input[0]) |
-           (static_cast<std::uint32_t>(input[1]) << 8) |
+    return static_cast<std::uint32_t>(input[0]) | (static_cast<std::uint32_t>(input[1]) << 8) |
            (static_cast<std::uint32_t>(input[2]) << 16) |
            (static_cast<std::uint32_t>(input[3]) << 24);
 }
@@ -172,7 +172,7 @@ void store_little_endian_u32(std::uint8_t *output, std::uint32_t value) {
 }
 
 std::array<std::uint8_t, 32> hchacha20_subkey(std::span<const std::uint8_t> key,
-                                               std::span<const std::uint8_t> nonce) {
+                                              std::span<const std::uint8_t> nonce) {
     // BoringSSL exposes the standard 20-round ChaCha20 primitive. Its first
     // keystream block is the ChaCha state after feed-forward; subtracting the
     // known initial state words yields the HChaCha20 output words required by
@@ -187,8 +187,8 @@ std::array<std::uint8_t, 32> hchacha20_subkey(std::span<const std::uint8_t> key,
     CRYPTO_chacha_20(block.data(), zeros.data(), block.size(), key.data(), chacha_nonce.data(),
                      counter);
 
-    constexpr std::array<std::uint32_t, 4> constants{
-        0x61707865U, 0x3320646eU, 0x79622d32U, 0x6b206574U};
+    constexpr std::array<std::uint32_t, 4> constants{0x61707865U, 0x3320646eU, 0x79622d32U,
+                                                     0x6b206574U};
     std::array<std::uint8_t, 32> subkey{};
     for (std::size_t index = 0; index < constants.size(); ++index) {
         const auto word = load_little_endian_u32(block.data() + index * 4) - constants[index];
@@ -210,8 +210,8 @@ bool is_chacha8_method(std::string_view method) {
     return method == "chacha8-ietf-poly1305" || method == "xchacha8-ietf-poly1305";
 }
 
-core::Result<std::vector<std::uint8_t>> poly1305_mac(
-    std::span<const std::uint8_t> key, std::span<const std::uint8_t> message) {
+core::Result<std::vector<std::uint8_t>> poly1305_mac(std::span<const std::uint8_t> key,
+                                                     std::span<const std::uint8_t> message) {
     if (key.size() != 32) {
         return core::fail({core::ErrorCode::configuration, "invalid Poly1305 key size"});
     }
@@ -228,9 +228,10 @@ core::Result<std::vector<std::uint8_t>> poly1305_mac(
     }
 }
 
-core::Result<std::vector<std::uint8_t>> chacha8_poly1305_crypt(
-    std::span<const std::uint8_t> key, std::span<const std::uint8_t> nonce,
-    std::span<const std::uint8_t> input, bool encrypt, int rounds) {
+core::Result<std::vector<std::uint8_t>> chacha8_poly1305_crypt(std::span<const std::uint8_t> key,
+                                                               std::span<const std::uint8_t> nonce,
+                                                               std::span<const std::uint8_t> input,
+                                                               bool encrypt, int rounds) {
     if (key.size() != 32 || (nonce.size() != 12 && nonce.size() != 24)) {
         return core::fail({core::ErrorCode::configuration, "invalid ChaCha8 parameters"});
     }
@@ -252,15 +253,16 @@ core::Result<std::vector<std::uint8_t>> chacha8_poly1305_crypt(
             return core::fail(crypto_error("Botan ChaCha is unavailable"));
         }
     } catch (const std::exception &error) {
-        return core::fail(crypto_error(std::string("failed to initialize ChaCha: ") + error.what()));
+        return core::fail(
+            crypto_error(std::string("failed to initialize ChaCha: ") + error.what()));
     }
     std::array<std::uint8_t, 64> poly_block{};
     try {
         cipher->write_keystream(poly_block);
         cipher->seek(64);
     } catch (const std::exception &error) {
-        return core::fail(crypto_error(std::string("failed to generate ChaCha keystream: ") +
-                                       error.what()));
+        return core::fail(
+            crypto_error(std::string("failed to generate ChaCha keystream: ") + error.what()));
     }
     std::vector<std::uint8_t> ciphertext;
     if (encrypt) {
@@ -268,8 +270,8 @@ core::Result<std::vector<std::uint8_t>> chacha8_poly1305_crypt(
         try {
             cipher->cipher1(ciphertext);
         } catch (const std::exception &error) {
-            return core::fail(crypto_error(std::string("failed to encrypt ChaCha data: ") +
-                                           error.what()));
+            return core::fail(
+                crypto_error(std::string("failed to encrypt ChaCha data: ") + error.what()));
         }
     } else {
         if (input.size() < 16) {
@@ -290,21 +292,21 @@ core::Result<std::vector<std::uint8_t>> chacha8_poly1305_crypt(
     for (int index = 0; index < 8; ++index) {
         authenticated.push_back(static_cast<std::uint8_t>(ciphertext_size >> (index * 8)));
     }
-    const auto tag = poly1305_mac(std::span<const std::uint8_t>(poly_block).first<32>(),
-                                  authenticated);
+    const auto tag =
+        poly1305_mac(std::span<const std::uint8_t>(poly_block).first<32>(), authenticated);
     if (!tag) {
         return core::fail(tag.error());
     }
     if (!encrypt && CRYPTO_memcmp(tag.value().data(), input.data() + ciphertext.size(), 16) != 0) {
-        return core::fail({core::ErrorCode::authentication,
-                           "ChaCha8-Poly1305 authentication failed"});
+        return core::fail(
+            {core::ErrorCode::authentication, "ChaCha8-Poly1305 authentication failed"});
     }
     if (!encrypt) {
         try {
             cipher->cipher1(ciphertext);
         } catch (const std::exception &error) {
-            return core::fail(crypto_error(std::string("failed to decrypt ChaCha data: ") +
-                                           error.what()));
+            return core::fail(
+                crypto_error(std::string("failed to decrypt ChaCha data: ") + error.what()));
         }
     } else {
         ciphertext.insert(ciphertext.end(), tag.value().begin(), tag.value().end());
@@ -312,9 +314,10 @@ core::Result<std::vector<std::uint8_t>> chacha8_poly1305_crypt(
     return ciphertext;
 }
 
-core::Result<std::vector<std::uint8_t>> aes_ccm_crypt(
-    std::span<const std::uint8_t> key, std::span<const std::uint8_t> nonce,
-    std::span<const std::uint8_t> input, bool encrypt) {
+core::Result<std::vector<std::uint8_t>> aes_ccm_crypt(std::span<const std::uint8_t> key,
+                                                      std::span<const std::uint8_t> nonce,
+                                                      std::span<const std::uint8_t> input,
+                                                      bool encrypt) {
     if ((key.size() != 16 && key.size() != 24 && key.size() != 32) || nonce.size() != 12 ||
         input.size() > 0xFFFFFF || (!encrypt && input.size() < 16)) {
         return core::fail({core::ErrorCode::configuration, "invalid AES-CCM parameters"});
@@ -382,57 +385,102 @@ core::Result<CipherMethod> cipher_method(std::string_view name) {
     }
 
     if (canonical == "aes-128-gcm") {
-        return CipherMethod{CipherKind::aead, EVP_aead_aes_128_gcm(), nullptr, 16, 16, 12,
-                            kAeadTagSize, 0, false, "aes-128-gcm"};
+        return CipherMethod{
+            CipherKind::aead, EVP_aead_aes_128_gcm(), nullptr, 16, 16, 12, kAeadTagSize, 0, false,
+            "aes-128-gcm"};
     }
     if (canonical == "aes-192-gcm") {
-        return CipherMethod{CipherKind::aead, EVP_aead_aes_192_gcm(), nullptr, 24, 24, 12,
-                            kAeadTagSize, 0, false, "aes-192-gcm"};
+        return CipherMethod{
+            CipherKind::aead, EVP_aead_aes_192_gcm(), nullptr, 24, 24, 12, kAeadTagSize, 0, false,
+            "aes-192-gcm"};
     }
     if (canonical == "aes-256-gcm") {
-        return CipherMethod{CipherKind::aead, EVP_aead_aes_256_gcm(), nullptr, 32, 32, 12,
-                            kAeadTagSize, 0, false, "aes-256-gcm"};
+        return CipherMethod{
+            CipherKind::aead, EVP_aead_aes_256_gcm(), nullptr, 32, 32, 12, kAeadTagSize, 0, false,
+            "aes-256-gcm"};
     }
     if (canonical == "chacha20-ietf-poly1305") {
-        return CipherMethod{CipherKind::aead, EVP_aead_chacha20_poly1305(), nullptr, 32, 32, 12,
-                            kAeadTagSize, 0, false, "chacha20-ietf-poly1305"};
+        return CipherMethod{CipherKind::aead,
+                            EVP_aead_chacha20_poly1305(),
+                            nullptr,
+                            32,
+                            32,
+                            12,
+                            kAeadTagSize,
+                            0,
+                            false,
+                            "chacha20-ietf-poly1305"};
     }
     if (canonical == "xchacha20-ietf-poly1305") {
-        return CipherMethod{CipherKind::aead, EVP_aead_xchacha20_poly1305(), nullptr, 32, 32, 24,
-                            kAeadTagSize, 0, false, "xchacha20-ietf-poly1305"};
+        return CipherMethod{CipherKind::aead,
+                            EVP_aead_xchacha20_poly1305(),
+                            nullptr,
+                            32,
+                            32,
+                            24,
+                            kAeadTagSize,
+                            0,
+                            false,
+                            "xchacha20-ietf-poly1305"};
     }
     if (canonical == "chacha8-ietf-poly1305") {
-        return CipherMethod{CipherKind::aead, nullptr, nullptr, 32, 32, 12, kAeadTagSize, 0,
-                            false, "chacha8-ietf-poly1305"};
+        return CipherMethod{
+            CipherKind::aead,       nullptr, nullptr, 32, 32, 12, kAeadTagSize, 0, false,
+            "chacha8-ietf-poly1305"};
     }
     if (canonical == "xchacha8-ietf-poly1305") {
-        return CipherMethod{CipherKind::aead, nullptr, nullptr, 32, 32, 24, kAeadTagSize, 0,
-                            false, "xchacha8-ietf-poly1305"};
+        return CipherMethod{
+            CipherKind::aead,        nullptr, nullptr, 32, 32, 24, kAeadTagSize, 0, false,
+            "xchacha8-ietf-poly1305"};
     }
     if (canonical == "aes-128-ccm") {
-        return CipherMethod{CipherKind::aead, nullptr, nullptr, 16, 16, 12, kAeadTagSize, 0,
-                            false, "aes-128-ccm"};
+        return CipherMethod{CipherKind::aead, nullptr, nullptr, 16,           16, 12,
+                            kAeadTagSize,     0,       false,   "aes-128-ccm"};
     }
     if (canonical == "aes-192-ccm") {
-        return CipherMethod{CipherKind::aead, nullptr, nullptr, 24, 24, 12, kAeadTagSize, 0,
-                            false, "aes-192-ccm"};
+        return CipherMethod{CipherKind::aead, nullptr, nullptr, 24,           24, 12,
+                            kAeadTagSize,     0,       false,   "aes-192-ccm"};
     }
     if (canonical == "aes-256-ccm") {
-        return CipherMethod{CipherKind::aead, nullptr, nullptr, 32, 32, 12, kAeadTagSize, 0,
-                            false, "aes-256-ccm"};
+        return CipherMethod{CipherKind::aead, nullptr, nullptr, 32,           32, 12,
+                            kAeadTagSize,     0,       false,   "aes-256-ccm"};
     }
 
     if (canonical == "2022-blake3-aes-128-gcm") {
-        return CipherMethod{CipherKind::aead, EVP_aead_aes_128_gcm(), nullptr, 16, 16, 12,
-                            kAeadTagSize, 0, true, "2022-blake3-aes-128-gcm"};
+        return CipherMethod{CipherKind::aead,
+                            EVP_aead_aes_128_gcm(),
+                            nullptr,
+                            16,
+                            16,
+                            12,
+                            kAeadTagSize,
+                            0,
+                            true,
+                            "2022-blake3-aes-128-gcm"};
     }
     if (canonical == "2022-blake3-aes-256-gcm") {
-        return CipherMethod{CipherKind::aead, EVP_aead_aes_256_gcm(), nullptr, 32, 32, 12,
-                            kAeadTagSize, 0, true, "2022-blake3-aes-256-gcm"};
+        return CipherMethod{CipherKind::aead,
+                            EVP_aead_aes_256_gcm(),
+                            nullptr,
+                            32,
+                            32,
+                            12,
+                            kAeadTagSize,
+                            0,
+                            true,
+                            "2022-blake3-aes-256-gcm"};
     }
     if (canonical == "2022-blake3-chacha20-poly1305") {
-        return CipherMethod{CipherKind::aead, EVP_aead_chacha20_poly1305(), nullptr, 32, 32, 12,
-                            kAeadTagSize, 0, true, "2022-blake3-chacha20-poly1305"};
+        return CipherMethod{CipherKind::aead,
+                            EVP_aead_chacha20_poly1305(),
+                            nullptr,
+                            32,
+                            32,
+                            12,
+                            kAeadTagSize,
+                            0,
+                            true,
+                            "2022-blake3-chacha20-poly1305"};
     }
 
     if (canonical == "chacha20") {
@@ -451,22 +499,23 @@ core::Result<CipherMethod> cipher_method(std::string_view name) {
     const auto stream = legacy_cipher(canonical);
     if (stream != nullptr) {
         const auto key_size = configured_legacy_key_size(canonical);
-        return CipherMethod{CipherKind::stream, nullptr, stream, key_size, 0, 0, 0,
-                            kAesBlockSize, false, canonical};
+        return CipherMethod{CipherKind::stream, nullptr, stream,   key_size, 0, 0, 0,
+                            kAesBlockSize,      false,   canonical};
     }
 
     return core::fail({core::ErrorCode::configuration,
                        "unsupported Shadowsocks cipher method: " + std::string(name)});
 }
 
-core::Result<std::vector<std::uint8_t>> derive_aead_subkey(
-    std::string_view method, std::string_view password, std::span<const std::uint8_t> salt) {
+core::Result<std::vector<std::uint8_t>> derive_aead_subkey(std::string_view method,
+                                                           std::string_view password,
+                                                           std::span<const std::uint8_t> salt) {
     const auto method_result = cipher_method(method);
     if (!method_result || method_result.value().kind != CipherKind::aead ||
         method_result.value().shadowsocks_2022) {
         return core::fail(method_result ? core::Error{core::ErrorCode::configuration,
-                                                       "Shadowsocks method is not AEAD"}
-                                         : method_result.error());
+                                                      "Shadowsocks method is not AEAD"}
+                                        : method_result.error());
     }
     if (password.empty() || salt.size() != method_result.value().salt_size) {
         return core::fail(
@@ -479,25 +528,26 @@ core::Result<std::vector<std::uint8_t>> derive_aead_subkey(
     return hkdf_sha1(master_key.value(), salt, "ss-subkey", method_result.value().key_size);
 }
 
-core::Result<std::vector<std::uint8_t>> derive_shadowsocks_2022_session_key(
-    std::string_view method, std::string_view password, std::span<const std::uint8_t> salt) {
+core::Result<std::vector<std::uint8_t>>
+derive_shadowsocks_2022_session_key(std::string_view method, std::string_view password,
+                                    std::span<const std::uint8_t> salt) {
     const auto method_result = cipher_method(method);
     if (!method_result || !method_result.value().shadowsocks_2022 ||
         salt.size() != method_result.value().salt_size) {
         return core::fail(method_result ? core::Error{core::ErrorCode::configuration,
-                                                       "invalid Shadowsocks 2022 session salt"}
-                                         : method_result.error());
+                                                      "invalid Shadowsocks 2022 session salt"}
+                                        : method_result.error());
     }
     return derive_shadowsocks_2022_subkey(method, password, salt);
 }
 
-core::Result<std::vector<std::uint8_t>> decode_shadowsocks_2022_psk(
-    std::string_view method, std::string_view password) {
+core::Result<std::vector<std::uint8_t>> decode_shadowsocks_2022_psk(std::string_view method,
+                                                                    std::string_view password) {
     const auto method_result = cipher_method(method);
     if (!method_result || !method_result.value().shadowsocks_2022) {
         return core::fail(method_result ? core::Error{core::ErrorCode::configuration,
-                                                       "Shadowsocks method is not Shadowsocks 2022"}
-                                         : method_result.error());
+                                                      "Shadowsocks method is not Shadowsocks 2022"}
+                                        : method_result.error());
     }
     const auto decoded = core::base64_decode(password);
     if (!decoded || decoded->size() != method_result.value().key_size) {
@@ -507,13 +557,14 @@ core::Result<std::vector<std::uint8_t>> decode_shadowsocks_2022_psk(
     return std::vector<std::uint8_t>(decoded.value().begin(), decoded.value().end());
 }
 
-core::Result<std::vector<std::uint8_t>> derive_shadowsocks_2022_subkey(
-    std::string_view method, std::string_view password, std::span<const std::uint8_t> salt) {
+core::Result<std::vector<std::uint8_t>>
+derive_shadowsocks_2022_subkey(std::string_view method, std::string_view password,
+                               std::span<const std::uint8_t> salt) {
     const auto method_result = cipher_method(method);
     if (!method_result || !method_result.value().shadowsocks_2022) {
         return core::fail(method_result ? core::Error{core::ErrorCode::configuration,
-                                                       "Shadowsocks method is not Shadowsocks 2022"}
-                                         : method_result.error());
+                                                      "Shadowsocks method is not Shadowsocks 2022"}
+                                        : method_result.error());
     }
     auto decoded = decode_shadowsocks_2022_psk(method, password);
     if (!decoded) {
@@ -539,8 +590,8 @@ core::Result<std::vector<std::uint8_t>> derive_legacy_key(std::string_view metho
     const auto method_result = cipher_method(method);
     if (!method_result || method_result.value().kind != CipherKind::stream) {
         return core::fail(method_result ? core::Error{core::ErrorCode::configuration,
-                                                       "Shadowsocks method is not a stream cipher"}
-                                         : method_result.error());
+                                                      "Shadowsocks method is not a stream cipher"}
+                                        : method_result.error());
     }
     if (password.empty() || iv.size() != method_result.value().iv_size) {
         return core::fail(
@@ -560,11 +611,12 @@ core::Result<std::vector<std::uint8_t>> aead_encrypt(std::string_view method,
     const auto method_result = cipher_method(method);
     if (!method_result || method_result.value().kind != CipherKind::aead) {
         return core::fail(method_result ? core::Error{core::ErrorCode::configuration,
-                                                       "Shadowsocks method is not AEAD"}
-                                         : method_result.error());
+                                                      "Shadowsocks method is not AEAD"}
+                                        : method_result.error());
     }
     const auto &spec = method_result.value();
-    if (key.size() != spec.key_size || nonce.size() != spec.nonce_size || plaintext.size() > INT_MAX) {
+    if (key.size() != spec.key_size || nonce.size() != spec.nonce_size ||
+        plaintext.size() > INT_MAX) {
         return core::fail(
             {core::ErrorCode::configuration, "Shadowsocks key, nonce, or plaintext is invalid"});
     }
@@ -574,9 +626,9 @@ core::Result<std::vector<std::uint8_t>> aead_encrypt(std::string_view method,
     if (is_aes_ccm_method(spec.name)) {
         return aes_ccm_crypt(key, nonce, plaintext, true);
     }
-    AeadContext context(EVP_AEAD_CTX_new(spec.aead, key.data(), key.size(),
-                                         EVP_AEAD_DEFAULT_TAG_LENGTH),
-                        EVP_AEAD_CTX_free);
+    AeadContext context(
+        EVP_AEAD_CTX_new(spec.aead, key.data(), key.size(), EVP_AEAD_DEFAULT_TAG_LENGTH),
+        EVP_AEAD_CTX_free);
     if (!context) {
         return core::fail(crypto_error("failed to initialize Shadowsocks encryption"));
     }
@@ -597,14 +649,14 @@ core::Result<std::vector<std::uint8_t>> aead_decrypt(std::string_view method,
     const auto method_result = cipher_method(method);
     if (!method_result || method_result.value().kind != CipherKind::aead) {
         return core::fail(method_result ? core::Error{core::ErrorCode::configuration,
-                                                       "Shadowsocks method is not AEAD"}
-                                         : method_result.error());
+                                                      "Shadowsocks method is not AEAD"}
+                                        : method_result.error());
     }
     const auto &spec = method_result.value();
     if (key.size() != spec.key_size || nonce.size() != spec.nonce_size ||
         ciphertext.size() < spec.overhead || ciphertext.size() - spec.overhead > INT_MAX) {
-        return core::fail(
-            {core::ErrorCode::protocol_framing, "Shadowsocks key, nonce, or ciphertext is invalid"});
+        return core::fail({core::ErrorCode::protocol_framing,
+                           "Shadowsocks key, nonce, or ciphertext is invalid"});
     }
     if (is_chacha8_method(spec.name)) {
         return chacha8_poly1305_crypt(key, nonce, ciphertext, false, 8);
@@ -612,9 +664,9 @@ core::Result<std::vector<std::uint8_t>> aead_decrypt(std::string_view method,
     if (is_aes_ccm_method(spec.name)) {
         return aes_ccm_crypt(key, nonce, ciphertext, false);
     }
-    AeadContext context(EVP_AEAD_CTX_new(spec.aead, key.data(), key.size(),
-                                         EVP_AEAD_DEFAULT_TAG_LENGTH),
-                        EVP_AEAD_CTX_free);
+    AeadContext context(
+        EVP_AEAD_CTX_new(spec.aead, key.data(), key.size(), EVP_AEAD_DEFAULT_TAG_LENGTH),
+        EVP_AEAD_CTX_free);
     if (!context) {
         return core::fail(crypto_error("failed to initialize Shadowsocks decryption"));
     }
@@ -628,14 +680,14 @@ core::Result<std::vector<std::uint8_t>> aead_decrypt(std::string_view method,
     return output;
 }
 
-core::Result<std::vector<std::uint8_t>> xchacha20_poly1305_encrypt(
-    std::span<const std::uint8_t> key, std::span<const std::uint8_t> nonce,
-    std::span<const std::uint8_t> plaintext) {
+core::Result<std::vector<std::uint8_t>>
+xchacha20_poly1305_encrypt(std::span<const std::uint8_t> key, std::span<const std::uint8_t> nonce,
+                           std::span<const std::uint8_t> plaintext) {
     constexpr std::size_t kNonceSize = 24;
     constexpr std::size_t kKeySize = 32;
     if (key.size() != kKeySize || nonce.size() != kNonceSize || plaintext.size() > INT_MAX) {
-        return core::fail({core::ErrorCode::configuration,
-                           "invalid XChaCha20-Poly1305 parameters"});
+        return core::fail(
+            {core::ErrorCode::configuration, "invalid XChaCha20-Poly1305 parameters"});
     }
     AeadContext context(EVP_AEAD_CTX_new(EVP_aead_xchacha20_poly1305(), key.data(), key.size(),
                                          EVP_AEAD_DEFAULT_TAG_LENGTH),
@@ -653,15 +705,15 @@ core::Result<std::vector<std::uint8_t>> xchacha20_poly1305_encrypt(
     return output;
 }
 
-core::Result<std::vector<std::uint8_t>> xchacha20_poly1305_decrypt(
-    std::span<const std::uint8_t> key, std::span<const std::uint8_t> nonce,
-    std::span<const std::uint8_t> ciphertext) {
+core::Result<std::vector<std::uint8_t>>
+xchacha20_poly1305_decrypt(std::span<const std::uint8_t> key, std::span<const std::uint8_t> nonce,
+                           std::span<const std::uint8_t> ciphertext) {
     constexpr std::size_t kNonceSize = 24;
     constexpr std::size_t kKeySize = 32;
     if (key.size() != kKeySize || nonce.size() != kNonceSize || ciphertext.size() < kAeadTagSize ||
         ciphertext.size() - kAeadTagSize > INT_MAX) {
-        return core::fail({core::ErrorCode::protocol_framing,
-                           "invalid XChaCha20-Poly1305 parameters"});
+        return core::fail(
+            {core::ErrorCode::protocol_framing, "invalid XChaCha20-Poly1305 parameters"});
     }
     AeadContext context(EVP_AEAD_CTX_new(EVP_aead_xchacha20_poly1305(), key.data(), key.size(),
                                          EVP_AEAD_DEFAULT_TAG_LENGTH),
@@ -705,9 +757,9 @@ LegacyStreamCipher &LegacyStreamCipher::operator=(LegacyStreamCipher &&other) no
 LegacyStreamCipher::~LegacyStreamCipher() = default;
 
 core::Result<LegacyStreamCipher> LegacyStreamCipher::create(std::string_view method,
-                                                             std::span<const std::uint8_t> key,
-                                                             std::span<const std::uint8_t> iv,
-                                                             bool encrypt) {
+                                                            std::span<const std::uint8_t> key,
+                                                            std::span<const std::uint8_t> iv,
+                                                            bool encrypt) {
     const auto spec = cipher_method(method);
     if (!spec) {
         return core::fail(spec.error());
@@ -732,8 +784,8 @@ core::Result<LegacyStreamCipher> LegacyStreamCipher::create(std::string_view met
                 return core::fail(crypto_error("Botan ChaCha is unavailable"));
             }
         } catch (const std::exception &error) {
-            return core::fail(crypto_error(std::string("failed to initialize ChaCha: ") +
-                                           error.what()));
+            return core::fail(
+                crypto_error(std::string("failed to initialize ChaCha: ") + error.what()));
         }
         return LegacyStreamCipher(std::move(impl));
     }
@@ -779,8 +831,8 @@ core::Status LegacyStreamCipher::update(std::span<std::uint8_t> data) noexcept {
         try {
             impl_->chacha_cipher->cipher1(data);
         } catch (const std::exception &error) {
-            return core::fail(crypto_error(std::string("failed to process ChaCha data: ") +
-                                           error.what()));
+            return core::fail(
+                crypto_error(std::string("failed to process ChaCha data: ") + error.what()));
         }
         return {};
     }
@@ -790,7 +842,8 @@ core::Status LegacyStreamCipher::update(std::span<std::uint8_t> data) noexcept {
                 int written = 0;
                 std::array<std::uint8_t, kAesBlockSize> encrypted{};
                 if (EVP_EncryptUpdate(impl_->block_context.get(), encrypted.data(), &written,
-                                      impl_->feedback.data(), static_cast<int>(kAesBlockSize)) != 1 ||
+                                      impl_->feedback.data(),
+                                      static_cast<int>(kAesBlockSize)) != 1 ||
                     written != static_cast<int>(kAesBlockSize)) {
                     return core::fail(crypto_error("failed to process Shadowsocks CFB data"));
                 }
@@ -799,8 +852,7 @@ core::Status LegacyStreamCipher::update(std::span<std::uint8_t> data) noexcept {
             const auto encrypted = impl_->keystream[impl_->feedback_offset];
             const auto input = byte;
             byte = static_cast<std::uint8_t>(input ^ encrypted);
-            impl_->feedback[impl_->feedback_offset] =
-                impl_->encrypt ? byte : input;
+            impl_->feedback[impl_->feedback_offset] = impl_->encrypt ? byte : input;
             impl_->feedback_offset = (impl_->feedback_offset + 1) % kAesBlockSize;
         }
         return {};

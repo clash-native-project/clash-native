@@ -9,8 +9,8 @@
 #include <string_view>
 #include <utility>
 
-#include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
 
 namespace {
 

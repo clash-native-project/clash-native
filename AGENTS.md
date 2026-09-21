@@ -16,6 +16,9 @@ Use English for all project content, including source code comments, documentati
 - Avoid adding dependencies without documenting the reason and evaluating their maintenance and licensing impact.
 - Do not treat experimental code as production-ready without explicit validation.
 - After every implementation change, append a concise entry dated `YYYY-MM-DD` to `docs/implementation-log.md` describing what was done. Keep this implementation log separate from `docs/architecture.md`.
+- Before every commit, run `clang-format` on the repository's C++ sources and
+  headers and run `gofmt` on the repository's Go sources. Do not format generated
+  build trees, vendored dependencies, or other third-party sources.
 
 ## Platform documentation
 

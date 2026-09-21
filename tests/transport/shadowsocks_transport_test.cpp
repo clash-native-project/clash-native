@@ -1,6 +1,6 @@
 #include <clash_native/core/base64.hpp>
-#include <clash_native/transport/shadowsocks/jls.hpp>
 #include <clash_native/transport/shadowsocks/crypto.hpp>
+#include <clash_native/transport/shadowsocks/jls.hpp>
 #include <clash_native/transport/shadowsocks/legacy_packet.hpp>
 #include <clash_native/transport/shadowsocks/restls.hpp>
 #include <clash_native/transport/shadowsocks/ss2022_packet.hpp>
@@ -375,13 +375,13 @@ TEST(ShadowsocksTransportTest, RoundTripsResTlsApplicationRecord) {
                                                                           false);
     EXPECT_FALSE(rejector.decode(tampered));
 
-    clash_native::transport::shadowsocks::RestlsApplicationCodec gcm_encoder(
-        secret, server_random, false, true);
+    clash_native::transport::shadowsocks::RestlsApplicationCodec gcm_encoder(secret, server_random,
+                                                                             false, true);
     const auto gcm_wire = gcm_encoder.encode(data, data.size(), 17, command);
     ASSERT_TRUE(gcm_wire);
     ASSERT_EQ(gcm_wire.value().size(), wire.value().size() + 8U);
-    clash_native::transport::shadowsocks::RestlsApplicationCodec gcm_decoder(
-        secret, server_random, false, true);
+    clash_native::transport::shadowsocks::RestlsApplicationCodec gcm_decoder(secret, server_random,
+                                                                             false, true);
     const auto gcm_decoded = gcm_decoder.decode(gcm_wire.value());
     ASSERT_TRUE(gcm_decoded);
     EXPECT_EQ(gcm_decoded.value().data, data);
