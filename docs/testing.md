@@ -41,6 +41,21 @@ primitive; it is not a packet relay bus between I/O workers.
   not prove deferred 32-bit x86, Linux, Zig, musl, TUN, routing, or router
   hardware behavior.
 
+## Go executable reuse on Windows
+
+Network tests must run a previously built Go executable. Do not use `go run`
+for a network test: it creates a new temporary executable path on each run,
+which can trigger another Windows network-access approval. Build a helper or
+server once with `go build -o <stable-path> ...`, keep that path fixed, and
+reuse the executable for subsequent test runs. Rebuild it only after changing
+the Go source or when intentionally refreshing the binary.
+
+For a Go test package, compile the test binary once with `go test -c -o
+<stable-path> .` and invoke that file for focused runs. The same rule applies
+to the Mihomo helper and every independent Go service used by the interop
+tests. The executable paths should normally be under the existing Windows
+build directory so the C++ host and Go harness refer to stable files.
+
 `TestHTTPForwardProxyUpgradeIndependentEndpoint` runs the built native test
 host as an HTTP proxy and an independent Go TCP origin. It verifies the
 HTTP/1.1 Upgrade handshake, forwarded headers, data coalesced with the

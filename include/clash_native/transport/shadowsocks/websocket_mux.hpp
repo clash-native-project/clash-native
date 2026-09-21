@@ -10,6 +10,8 @@
 #include <functional>
 #include <memory>
 
+// Shadowsocks WebSocket plugin multiplexing for v2ray mux and gost SMUX.
+
 namespace clash_native::transport::shadowsocks {
 
 enum class WebSocketMuxProtocol : std::uint8_t {

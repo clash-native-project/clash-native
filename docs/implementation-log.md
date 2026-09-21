@@ -1493,3 +1493,36 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   WS with a 50 KiB bidirectional payload. The existing Windows/Mihomo
   half-close EOF condition is documented separately and can be skipped with
   `CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE=1`.
+
+### 2026-09-21 — Document Go test reuse and transport directory boundaries
+
+- Documented the Windows rule to build Go helpers and test binaries once and
+  reuse stable executable paths instead of invoking `go run` for network tests.
+- Added transport layout rules separating reusable base transports,
+  cross-protocol proxy carriers, and protocol-specific implementations.
+- Defined `src/transport/proxy` as the shared home for carriers such as
+  ShadowTLS, ResTLS, and JLS, while keeping Shadowsocks-only framing under
+  `src/transport/shadowsocks`.
+
+### 2026-09-21 — Generalize the design guidelines document name
+
+- Renamed the transport-specific design document to
+  `docs/design-guidelines.md` so it can hold future project-wide design rules.
+
+### 2026-09-21 — Move shared WebSocket multiplexing into the proxy transport layer
+
+- Moved the reusable v2ray mux and SMUX framing/session implementation from
+  `src/transport/shadowsocks` to `src/transport/proxy`.
+- Kept Shadowsocks WebSocket plugin configuration and carrier pooling in the
+  Shadowsocks module while consuming the shared proxy mux API.
+- Updated CMake and outbound wiring so WS/WSS plugin multiplexing uses the
+  shared transport boundary.
+
+### 2026-09-21 — Keep WebSocket plugin muxing Shadowsocks-specific
+
+- Restored the v2ray mux and gost SMUX implementation under
+  `src/transport/shadowsocks` because no other proxy protocol currently uses
+  the same wire framing.
+- Kept the generic HTTP/1.1 WebSocket and optional TLS carrier in
+  `src/transport`; the mux remains eligible for extraction after a second
+  independent consumer appears.
