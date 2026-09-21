@@ -1,5 +1,7 @@
 #include <clash_native/transport/websocket_client.hpp>
 
+#include <clash_native/transport/tls_client.hpp>
+
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/error.hpp>
@@ -544,6 +546,48 @@ class WebSocketClientHandshakeOperation final
             });
         }
 
+        if (options_.tls) {
+            start_tls();
+            return;
+        }
+        start_websocket();
+    }
+
+    void start_tls() {
+        TlsClientOptions tls_options;
+        tls_options.server_name =
+            options_.tls_server_name.empty() ? options_.host : options_.tls_server_name;
+        tls_options.verify_peer = options_.tls_verify_peer;
+        tls_options.trusted_ca_pem = options_.tls_trusted_ca_pem;
+        tls_options.alpn_protocols = options_.tls_alpn_protocols;
+        if (tls_options.alpn_protocols.empty()) {
+            tls_options.alpn_protocols = {"http/1.1"};
+        }
+        tls_options.deadline = options_.deadline;
+        const auto self = shared_from_this();
+        tls_ = async_tls_client_handshake(std::move(stream_), std::move(tls_options),
+                                          [self](core::Result<TlsClientConnection> result) mutable {
+                                              self->tls_.reset();
+                                              if (self->completed_) {
+                                                  if (result && result->stream) {
+                                                      result->stream->close();
+                                                  }
+                                                  return;
+                                              }
+                                              if (!result) {
+                                                  self->finish(core::fail(result.error()));
+                                                  return;
+                                              }
+                                              self->stream_ = std::move(result.value().stream);
+                                              self->start_websocket();
+                                          });
+    }
+
+    void start_websocket() {
+        if (completed_ || !stream_) {
+            return;
+        }
+
         websocket_ = std::make_shared<BeastWebSocket>(WebSocketStreamAdapter(std::move(stream_)));
         websocket_->set_option(
             websocket::stream_base::timeout::suggested(boost::beast::role_type::client));
@@ -592,6 +636,10 @@ class WebSocketClientHandshakeOperation final
         completed_ = true;
         (void)timer_.cancel();
         if (!result) {
+            if (tls_) {
+                tls_->cancel();
+                tls_.reset();
+            }
             if (websocket_) {
                 websocket_->next_layer().close();
             }
@@ -613,6 +661,7 @@ class WebSocketClientHandshakeOperation final
     std::unique_ptr<core::StreamHandle> stream_;
     WebSocketClientOptions options_;
     WebSocketClientHandler handler_;
+    std::shared_ptr<TlsClientHandshake> tls_;
     std::shared_ptr<BeastWebSocket> websocket_;
     boost::asio::steady_timer timer_;
     bool completed_ = false;

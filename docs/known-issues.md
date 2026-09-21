@@ -83,6 +83,21 @@ interoperate when the client keeps the write side open. The current JLS
 interop case uses that mode and records this peer-specific limitation rather
 than treating it as a cryptographic or framing failure.
 
+## Mihomo Trojan relay exposes a Windows half-close EOF
+
+- **Status:** Deferred; the failure boundary is not isolated.
+- **Scope:** Trojan TCP/TLS, WebSocket, and WebSocket-over-TLS relay checks on
+  the Windows x64 profile.
+
+The Trojan authentication and bidirectional data paths pass against Mihomo
+when the client keeps the local write side open. With a client FIN, the tested
+Mihomo relay path can close the complete tunnel before the reverse echo is
+read, so the C++ test host observes EOF before the expected payload is
+complete. The same behavior was observed for direct TLS, plain WebSocket,
+and WSS carriers. The current interop cases therefore accept
+`CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE=1` for this peer-specific relay check;
+this does not indicate a Trojan or WebSocket handshake failure.
+
 ## Large UDP DNS bursts can lose datagrams on Windows
 
 - **Status:** Deferred; root cause is not isolated.

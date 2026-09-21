@@ -3,10 +3,12 @@
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/dns/resolver_service.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
+#include <clash_native/transport/websocket_client.hpp>
 
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace clash_native::outbound {
 
@@ -18,6 +20,13 @@ struct TrojanOutboundConfig {
     std::string server_name;
     std::string trusted_ca_pem;
     bool verify_peer = true;
+    // Supported values are tcp, ws, and wss. The ws mode can be paired with
+    // TLS by setting websocket_tls to true; wss always enables TLS.
+    std::string network = "tcp";
+    std::string websocket_host;
+    std::string websocket_path = "/";
+    std::vector<transport::ExchangeField> websocket_headers;
+    bool websocket_tls = false;
 };
 
 class TrojanOutbound final : public core::Outbound {

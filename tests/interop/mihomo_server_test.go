@@ -199,6 +199,16 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	trojanWSSAddress := reserveMihomoTCPAddress(t)
+	_, trojanWSSPort, err := net.SplitHostPort(trojanWSSAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trojanWSAddress := reserveMihomoTCPAddress(t)
+	_, trojanWSPort, err := net.SplitHostPort(trojanWSAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	home := t.TempDir()
 	caPath := filepath.Join(home, "test-ca.pem")
@@ -231,13 +241,35 @@ listeners:%s
         password: '%s'
     certificate: '%s'
     private-key: '%s'
+  - name: test-trojan-wss
+    type: trojan
+    listen: 127.0.0.1
+    port: %s
+    ws-path: /ws
+    users:
+      - username: test
+        password: '%s'
+    certificate: '%s'
+    private-key: '%s'
+  - name: test-trojan-ws
+    type: trojan
+    listen: 127.0.0.1
+    port: %s
+    ws-path: /ws
+    allow-insecure: true
+    users:
+      - username: test
+        password: '%s'
 `, listenerConfig.String(), trojanPort, mihomoTestPassword,
-		filepath.ToSlash(certificatePath), filepath.ToSlash(privateKeyPath))
+		filepath.ToSlash(certificatePath), filepath.ToSlash(privateKeyPath), trojanWSSPort,
+		mihomoTestPassword, filepath.ToSlash(certificatePath), filepath.ToSlash(privateKeyPath),
+		trojanWSPort, mihomoTestPassword)
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	listenerAddresses := []string{trojanAddress, obfsAddress, tlsObfsAddress}
+	listenerAddresses := []string{trojanAddress, trojanWSSAddress, trojanWSAddress, obfsAddress,
+		tlsObfsAddress}
 	listenerAddresses = append(listenerAddresses, mapValues(shadowsocksAddresses)...)
 	for _, address := range shadowTlsAddresses {
 		listenerAddresses = append(listenerAddresses, address)
@@ -494,13 +526,102 @@ listeners:%s
 		defer client.Close()
 		payload := []byte(strings.Repeat("cpp-to-mihomo-trojan-tls-", 2048))
 		writeBytes(t, client, payload)
-		if err := client.(*net.TCPConn).CloseWrite(); err != nil {
-			t.Fatalf("half-close C++ to Mihomo Trojan stream: %v", err)
+		if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("half-close C++ to Mihomo Trojan stream: %v", err)
+			}
 		}
 		echoed := make([]byte, len(payload))
 		readBytes(t, client, echoed)
 		if string(echoed) != string(payload) {
 			t.Fatal("Mihomo Trojan returned different bytes")
+		}
+	})
+
+	t.Run("Trojan/WSS", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":                "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":         trojanWSSAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":       mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":    "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":        caPath,
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_NETWORK": "wss",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_PATH": "/ws",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_TLS":  "1",
+		})
+		defer stopProxy()
+
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-trojan-wss-", 2048))
+		writeBytes(t, client, payload)
+		if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("half-close C++ to Mihomo Trojan WSS stream: %v", err)
+			}
+		}
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo Trojan WSS returned different bytes")
+		}
+	})
+
+	t.Run("Trojan/WS", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":                "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":         trojanWSAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":       mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":    "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_NETWORK": "ws",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_PATH": "/ws",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_TLS":  "0",
+		})
+		defer stopProxy()
+
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-trojan-ws-", 2048))
+		writeBytes(t, client, payload)
+		if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("half-close C++ to Mihomo Trojan WS stream: %v", err)
+			}
+		}
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo Trojan WS returned different bytes")
+		}
+	})
+
+	t.Run("Trojan/WSS-reject-untrusted-certificate", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":                "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":         trojanWSSAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":       mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":    "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_NETWORK": "wss",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_PATH": "/ws",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_TLS":  "1",
+		})
+		defer stopProxy()
+
+		control, err := net.DialTimeout("tcp", proxyAddress, 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer control.Close()
+		_ = control.SetDeadline(time.Now().Add(5 * time.Second))
+		writeBytes(t, control, []byte{5, 1, 0})
+		method := make([]byte, 2)
+		readBytes(t, control, method)
+		if string(method) != string([]byte{5, 0}) {
+			t.Fatalf("unexpected SOCKS5 method response: %v", method)
+		}
+		writeSocksConnectRequest(t, control, tcpEcho.Addr())
+		if code := readSocks5ReplyCode(t, control); code == 0 {
+			t.Fatal("C++ Trojan WSS outbound accepted Mihomo's untrusted certificate")
 		}
 	})
 

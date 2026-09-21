@@ -255,12 +255,24 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
             ca_pem.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
         }
         const auto server_name = environment_value("CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME");
+        auto trojan_config =
+            clash_native::outbound::TrojanOutboundConfig{"test-proxy",
+                                                         server.host,
+                                                         server.port,
+                                                         password,
+                                                         server_name.value_or(server.host),
+                                                         std::move(ca_pem),
+                                                         true};
+        trojan_config.network =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_NETWORK").value_or("tcp");
+        trojan_config.websocket_host =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_HOST").value_or("");
+        trojan_config.websocket_path =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_PATH").value_or("/");
+        trojan_config.websocket_tls =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_TLS").value_or("0") != "0";
         auto outbound = std::make_shared<clash_native::outbound::TrojanOutbound>(
-            runtime,
-            clash_native::outbound::TrojanOutboundConfig{
-                "test-proxy", server.host, server.port, password, server_name.value_or(server.host),
-                std::move(ca_pem), true},
-            std::move(resolver));
+            runtime, std::move(trojan_config), std::move(resolver));
         if (const auto result = outbound->validate(); !result) {
             throw std::runtime_error(result.error().context);
         }

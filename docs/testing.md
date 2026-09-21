@@ -121,6 +121,16 @@ closes its complete TLS tunnel when the JLS connection does not expose
 `CloseWrite`; this is a server-side half-close limitation, not a JLS
 handshake or data-path failure.
 
+`TestMihomoActualServerInteroperability/Trojan/TLS` validates the existing
+Trojan TCP/TLS outbound against a real Mihomo listener. The same test also
+covers `Trojan/WSS` and plain `Trojan/WS`: both use the shared HTTP/1.1
+WebSocket carrier, while WSS performs the TLS handshake before the Upgrade.
+The cases send a 50 KiB bidirectional payload and verify the configured
+certificate and `/ws` path. Mihomo's Windows relay can close the full tunnel
+after a peer FIN for all three carriers; set
+`CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE=1` when running these wire and carrier
+checks without that deferred half-close condition.
+
 `TestMihomoActualServerShadowsocksKcpTun` validates the Shadowsocks `kcptun`
 carrier against a real Mihomo listener. It covers TCP relay and UDP-over-TCP
 relay through KCP, SMUX, packet encryption, FEC framing, and the Snappy stream
@@ -191,6 +201,10 @@ $env:CLASH_NATIVE_TEST_HOST = 'D:\Project\cpp\clash-native\build\windows-clang-c
 
 # Run the Shadowsocks ResTLS TLS 1.2 and TLS 1.3 cases.
 & $interop '-test.count=1' '-test.run=^TestMihomoActualServerInteroperability$/Shadowsocks/restls-tls(12|13)$' '-test.v=true'
+
+# Run Trojan TCP/TLS, WSS, and plain WS carrier cases.
+$env:CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE = '1'
+& $interop '-test.count=1' '-test.run=^TestMihomoActualServerInteroperability$/Trojan/' '-test.v=true'
 
 # Run the Shadowsocks JLS TLS 1.3 case.
 & $interop '-test.count=1' '-test.run=^TestMihomoActualServerInteroperability$/Shadowsocks/jls$' '-test.v=true'

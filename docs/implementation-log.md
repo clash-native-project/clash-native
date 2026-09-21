@@ -1480,3 +1480,16 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   the remaining uncertainty about the shared framing or loopback test path,
   and the standalone wire verification required before resuming the work.
 - Intentionally skipped implementation changes for SOCKS4a.
+
+### 2026-09-21 — Add Trojan WebSocket and WSS carriers
+
+- Extended the shared HTTP/1.1 WebSocket client carrier with an optional TLS
+  handshake, certificate verification, custom trust roots, SNI, and ALPN.
+- Reused that carrier for Trojan `ws` and `wss` outbound modes and moved the
+  Shadowsocks WebSocket plugin TLS path onto the same implementation.
+- Added Trojan carrier configuration for the WebSocket host, path, headers,
+  and plain-versus-TLS WebSocket selection.
+- Added Mihomo interoperability coverage for Trojan TCP/TLS, WSS, and plain
+  WS with a 50 KiB bidirectional payload. The existing Windows/Mihomo
+  half-close EOF condition is documented separately and can be skipped with
+  `CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE=1`.

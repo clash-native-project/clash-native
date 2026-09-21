@@ -69,12 +69,19 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                  "Trojan outbound ID, server, port, and password are required"}));
             return;
         }
+        if (config_.network != "" && config_.network != "tcp" && config_.network != "ws" &&
+            config_.network != "wss") {
+            finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::configuration,
+                 "Trojan outbound network must be tcp, ws, or wss"}));
+            return;
+        }
         deadline_ = std::chrono::steady_clock::now() + kConnectTimeout;
         timer_.expires_at(deadline_);
         timer_.async_wait([self = shared_from_this()](const boost::system::error_code &error) {
             if (!error) {
                 self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::timeout, "timed out opening Trojan TLS stream"}));
+                    {core::ErrorCode::timeout, "timed out opening Trojan stream"}));
             }
         });
         detail::resolve_host(runtime_, resolver_, config_.server_host,
@@ -108,8 +115,16 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                          to_std_error(error)}));
                     return;
                 }
-                self->start_tls();
+                self->start_transport();
             });
+    }
+
+    void start_transport() {
+        if (config_.network == "ws" || config_.network == "wss") {
+            start_websocket();
+            return;
+        }
+        start_tls();
     }
 
     void start_tls() {
@@ -137,7 +152,49 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                     self->finish(core::StreamOpenResult::failed(result.error()));
                     return;
                 }
-                self->tls_stream_ = std::move(result->stream);
+                self->transport_stream_ = std::move(result->stream);
+                self->write_request_header();
+            });
+    }
+
+    void start_websocket() {
+        if (completed_ || !socket_) {
+            return;
+        }
+        const auto server_name =
+            config_.server_name.empty() ? config_.server_host : config_.server_name;
+        transport::WebSocketClientOptions options;
+        options.host =
+            config_.websocket_host.empty()
+                ? (config_.server_name.empty() ? config_.server_host : config_.server_name)
+                : config_.websocket_host;
+        options.target = config_.websocket_path;
+        options.headers = config_.websocket_headers;
+        options.tls = config_.network == "wss" || config_.websocket_tls;
+        options.tls_server_name = server_name;
+        options.tls_verify_peer = config_.verify_peer;
+        options.tls_trusted_ca_pem = config_.trusted_ca_pem;
+        options.tls_alpn_protocols = {"http/1.1"};
+        options.deadline = deadline_;
+
+        auto plain_stream = std::make_unique<net::TcpStream>(std::move(*socket_));
+        socket_.reset();
+        auto self = shared_from_this();
+        websocket_handshake_ = transport::async_websocket_client_handshake(
+            std::move(plain_stream), std::move(options),
+            [self](core::Result<std::unique_ptr<core::StreamHandle>> result) mutable {
+                self->websocket_handshake_.reset();
+                if (self->completed_) {
+                    if (result && result.value()) {
+                        result.value()->close();
+                    }
+                    return;
+                }
+                if (!result) {
+                    self->finish(core::StreamOpenResult::failed(result.error()));
+                    return;
+                }
+                self->transport_stream_ = std::move(result.value());
                 self->write_request_header();
             });
     }
@@ -161,19 +218,19 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         wire->push_back('\n');
 
         auto self = shared_from_this();
-        tls_stream_->async_write(
+        transport_stream_->async_write(
             boost::asio::buffer(*wire),
             [self, wire](const boost::system::error_code &error, std::size_t) {
                 if (error) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::transport_io, "failed to write Trojan TCP request",
-                         to_std_error(error)}));
+                    self->finish(core::StreamOpenResult::failed({core::ErrorCode::transport_io,
+                                                                 "failed to write Trojan request",
+                                                                 to_std_error(error)}));
                     return;
                 }
                 self->completed_ = true;
                 self->cancel_timer();
                 auto handler = std::move(self->handler_);
-                handler(core::StreamOpenResult::opened(std::move(self->tls_stream_)));
+                handler(core::StreamOpenResult::opened(std::move(self->transport_stream_)));
             });
     }
 
@@ -190,12 +247,15 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
             if (tls_handshake_) {
                 tls_handshake_->cancel();
             }
+            if (websocket_handshake_) {
+                websocket_handshake_->cancel();
+            }
             if (socket_) {
                 socket_->cancel(ignored);
                 socket_->close(ignored);
             }
-            if (tls_stream_) {
-                tls_stream_->close();
+            if (transport_stream_) {
+                transport_stream_->close();
             }
         }
         auto handler = std::move(handler_);
@@ -208,7 +268,8 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     core::StreamRequest request_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
     std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
-    std::unique_ptr<core::StreamHandle> tls_stream_;
+    std::shared_ptr<transport::WebSocketClientHandshake> websocket_handshake_;
+    std::unique_ptr<core::StreamHandle> transport_stream_;
     boost::asio::steady_timer timer_;
     core::StreamOpenHandler handler_;
     std::chrono::steady_clock::time_point deadline_{};
@@ -227,6 +288,15 @@ core::Status TrojanOutbound::validate() const {
         config_.password.empty()) {
         return core::fail({core::ErrorCode::configuration,
                            "Trojan outbound ID, server, port, and password are required"});
+    }
+    if (config_.network != "" && config_.network != "tcp" && config_.network != "ws" &&
+        config_.network != "wss") {
+        return core::fail(
+            {core::ErrorCode::configuration, "Trojan outbound network must be tcp, ws, or wss"});
+    }
+    if ((config_.network == "ws" || config_.network == "wss") && config_.websocket_path.empty()) {
+        return core::fail(
+            {core::ErrorCode::configuration, "Trojan WebSocket path must not be empty"});
     }
     return {};
 }

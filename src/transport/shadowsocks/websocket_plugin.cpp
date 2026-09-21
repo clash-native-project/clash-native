@@ -1,7 +1,6 @@
 #include <clash_native/transport/shadowsocks/websocket_plugin.hpp>
 
 #include <clash_native/net/tcp_stream.hpp>
-#include <clash_native/transport/tls_client.hpp>
 
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
@@ -42,9 +41,6 @@ class WebSocketPluginOperation final
                 if (self->completed_) {
                     return;
                 }
-                if (self->tls_) {
-                    self->tls_->cancel();
-                }
                 if (self->websocket_) {
                     self->websocket_->cancel();
                 }
@@ -73,24 +69,6 @@ class WebSocketPluginOperation final
         if (options_.path.empty()) {
             options_.path = "/";
         }
-        if (options_.tls) {
-            TlsClientOptions tls_options;
-            tls_options.server_name = options_.host;
-            tls_options.verify_peer = !options_.skip_cert_verify;
-            auto self = shared_from_this();
-            tls_ = async_tls_client_handshake(
-                std::move(stream_), std::move(tls_options),
-                [self](core::Result<TlsClientConnection> result) mutable {
-                    self->tls_.reset();
-                    if (!result) {
-                        self->finish(core::fail(result.error()));
-                        return;
-                    }
-                    self->stream_ = std::move(result.value().stream);
-                    self->start_websocket();
-                });
-            return;
-        }
         start_websocket();
     }
 
@@ -101,6 +79,10 @@ class WebSocketPluginOperation final
         WebSocketClientOptions websocket_options;
         websocket_options.host = options_.host;
         websocket_options.target = options_.path;
+        websocket_options.tls = options_.tls;
+        websocket_options.tls_server_name = options_.host;
+        websocket_options.tls_verify_peer = !options_.skip_cert_verify;
+        websocket_options.tls_alpn_protocols = {"http/1.1"};
         auto self = shared_from_this();
         websocket_ = async_websocket_client_handshake(
             std::move(stream_), std::move(websocket_options),
@@ -133,7 +115,6 @@ class WebSocketPluginOperation final
     std::unique_ptr<core::StreamHandle> stream_;
     WebSocketPluginOptions options_;
     WebSocketPluginHandler handler_;
-    std::shared_ptr<clash_native::transport::TlsClientHandshake> tls_;
     std::shared_ptr<clash_native::transport::WebSocketClientHandshake> websocket_;
     bool completed_ = false;
 };
@@ -158,9 +139,6 @@ class WebSocketPluginMuxOperation final
             boost::asio::post(executor_, [self] {
                 if (self->completed_) {
                     return;
-                }
-                if (self->tls_) {
-                    self->tls_->cancel();
                 }
                 if (self->websocket_) {
                     self->websocket_->cancel();
@@ -197,26 +175,6 @@ class WebSocketPluginMuxOperation final
         if (options_.path.empty()) {
             options_.path = "/";
         }
-        if (options_.tls) {
-            TlsClientOptions tls_options;
-            tls_options.server_name = options_.host;
-            tls_options.verify_peer = !options_.skip_cert_verify;
-            auto self = shared_from_this();
-            tls_ = async_tls_client_handshake(
-                std::move(stream_), std::move(tls_options),
-                [self](core::Result<TlsClientConnection> result) mutable {
-                    self->tls_.reset();
-                    if (!result) {
-                        self->finish(core::Result<
-                                     std::shared_ptr<clash_native::transport::MultiplexedSession>>(
-                            core::fail(result.error())));
-                        return;
-                    }
-                    self->stream_ = std::move(result.value().stream);
-                    self->start_websocket();
-                });
-            return;
-        }
         start_websocket();
     }
 
@@ -227,6 +185,10 @@ class WebSocketPluginMuxOperation final
         WebSocketClientOptions websocket_options;
         websocket_options.host = options_.host;
         websocket_options.target = options_.path;
+        websocket_options.tls = options_.tls;
+        websocket_options.tls_server_name = options_.host;
+        websocket_options.tls_verify_peer = !options_.skip_cert_verify;
+        websocket_options.tls_alpn_protocols = {"http/1.1"};
         auto self = shared_from_this();
         websocket_ = async_websocket_client_handshake(
             std::move(stream_), std::move(websocket_options),
@@ -271,7 +233,6 @@ class WebSocketPluginMuxOperation final
     std::unique_ptr<core::StreamHandle> stream_;
     WebSocketPluginOptions options_;
     WebSocketPluginMuxHandler handler_;
-    std::shared_ptr<clash_native::transport::TlsClientHandshake> tls_;
     std::shared_ptr<clash_native::transport::WebSocketClientHandshake> websocket_;
     std::shared_ptr<WebSocketMuxHandshake> mux_;
     bool completed_ = false;
