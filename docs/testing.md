@@ -83,10 +83,12 @@ downstream read, matching Mihomo's simple-obfs server timing.
 server backed by the test Shadowsocks peer. It covers both `v2ray-plugin` and
 `gost-plugin` in WebSocket mode, including a TLS-wrapped WebSocket case. The
 `TestShadowsocksWebSocketPluginMux` covers the optional multiplexed mode for
-both plugins: v2ray-plugin's native mux framing and gost-plugin's smux v1
-framing. Each subtest opens two Shadowsocks streams and checks that they share
-one WebSocket carrier. Native Shadowsocks UDP remains direct and is not wrapped
-by the WebSocket plugin.
+both plugins: v2ray-plugin's native mux framing and gost-plugin's smux v1 and
+v2 framing. The smux v2 case sends a payload larger than the initial peer
+window, exercising `UPD` window updates and write backpressure. Each subtest
+opens two Shadowsocks streams and checks that they share one WebSocket carrier.
+Native Shadowsocks UDP remains direct and is not wrapped by the WebSocket
+plugin.
 
 `TestMihomoActualServerShadowsocksUoT` validates Shadowsocks UDP-over-TCP
 version 1 and version 2 against a real Mihomo Shadowsocks listener. The test
@@ -175,7 +177,7 @@ go test -c -o $interop .
 $env:CLASH_NATIVE_TEST_HOST = 'D:\Project\cpp\clash-native\build\windows-clang-cl-x64\clash-native-test-host.exe'
 & $interop '-test.count=1' '-test.run=^TestShadowsocksWebSocketPlugins$' '-test.v=true'
 
-# Run WebSocket plugin mux reuse (v2ray mux and gost SMUX v1).
+# Run WebSocket plugin mux reuse (v2ray mux and gost SMUX v1/v2).
 & $interop '-test.count=1' '-test.run=^TestShadowsocksWebSocketPluginMux$' '-test.v=true'
 
 # Run Shadowsocks UDP-over-TCP versions 1 and 2.

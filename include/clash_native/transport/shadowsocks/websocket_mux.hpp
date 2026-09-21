@@ -19,7 +19,9 @@ enum class WebSocketMuxProtocol : std::uint8_t {
 
 struct WebSocketMuxOptions {
     WebSocketMuxProtocol protocol = WebSocketMuxProtocol::v2ray;
+    std::uint8_t smux_version = 1;
     std::size_t max_frame_size = 32 * 1024;
+    std::size_t smux_stream_buffer = 2 * 1024 * 1024;
     std::size_t max_concurrent_streams = 1024;
 };
 

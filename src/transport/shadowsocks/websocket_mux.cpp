@@ -34,10 +34,12 @@ constexpr std::uint8_t kSmuxSyn = 0;
 constexpr std::uint8_t kSmuxFin = 1;
 constexpr std::uint8_t kSmuxPush = 2;
 constexpr std::uint8_t kSmuxNop = 3;
+constexpr std::uint8_t kSmuxUpdate = 4;
 constexpr std::size_t kSmuxHeaderSize = 8;
 constexpr std::size_t kV2rayMaximumMetadataSize = 512;
 constexpr std::size_t kV2rayMaximumStreamId = 0xffff;
 constexpr std::size_t kMaximumMuxFrameSize = 0xffff;
+constexpr std::uint32_t kSmuxInitialPeerWindow = 262144;
 
 boost::system::error_code protocol_error() {
     return boost::system::errc::make_error_code(boost::system::errc::protocol_error);
@@ -105,6 +107,7 @@ class WebSocketMuxStreamState final : public std::enable_shared_from_this<WebSoc
 
     void on_data(std::vector<std::uint8_t> data);
     void on_remote_end();
+    void on_update(const std::vector<std::uint8_t> &payload);
     void on_session_error(const boost::system::error_code &error);
     void on_open_error(const boost::system::error_code &error);
 
@@ -141,8 +144,14 @@ class WebSocketMuxStreamState final : public std::enable_shared_from_this<WebSoc
     std::shared_ptr<PendingWrite> pending_write_;
     bool local_closed_ = false;
     bool remote_closed_ = false;
+    bool end_requested_ = false;
     bool end_enqueued_ = false;
     bool closed_ = false;
+    std::uint32_t peer_consumed_ = 0;
+    std::uint32_t peer_window_ = kSmuxInitialPeerWindow;
+    std::uint32_t bytes_sent_ = 0;
+    std::uint32_t bytes_consumed_ = 0;
+    std::uint32_t consumed_since_update_ = 0;
 };
 
 class WebSocketMuxStream final : public core::StreamHandle {
@@ -203,9 +212,14 @@ class WebSocketMuxSession final : public transport::MultiplexedSession,
         return std::min<std::size_t>(options_.max_frame_size, kMaximumMuxFrameSize);
     }
     WebSocketMuxProtocol protocol() const noexcept { return options_.protocol; }
+    bool smux_v2() const noexcept {
+        return options_.protocol == WebSocketMuxProtocol::smux && options_.smux_version == 2;
+    }
+    std::size_t smux_stream_buffer() const noexcept { return options_.smux_stream_buffer; }
 
-    void stream_shutdown(const std::shared_ptr<WebSocketMuxStreamState> &stream);
     void stream_close(const std::shared_ptr<WebSocketMuxStreamState> &stream);
+    void stream_update(const std::shared_ptr<WebSocketMuxStreamState> &stream,
+                       std::uint32_t consumed, std::uint32_t window);
 
   private:
     friend class WebSocketMuxStreamState;
@@ -224,6 +238,8 @@ class WebSocketMuxSession final : public transport::MultiplexedSession,
     std::vector<std::uint8_t> make_data_frame(std::uint32_t wire_id, const std::uint8_t *data,
                                               std::size_t size) const;
     std::vector<std::uint8_t> make_close_frame(std::uint32_t wire_id) const;
+    std::vector<std::uint8_t> make_update_frame(std::uint32_t wire_id, std::uint32_t consumed,
+                                                std::uint32_t window) const;
     std::vector<std::uint8_t> make_nop_frame() const;
     void enqueue_frame(std::vector<std::uint8_t> frame,
                        std::function<void(const boost::system::error_code &)> completed = {});
@@ -313,9 +329,8 @@ void WebSocketMuxStreamState::shutdown_send(boost::system::error_code &error) no
         return;
     }
     local_closed_ = true;
-    if (session_) {
-        session_->stream_shutdown(shared_from_this());
-    }
+    end_requested_ = true;
+    pump_write();
     error.clear();
 }
 
@@ -350,6 +365,18 @@ void WebSocketMuxStreamState::on_remote_end() {
     deliver_read();
 }
 
+void WebSocketMuxStreamState::on_update(const std::vector<std::uint8_t> &payload) {
+    if (!session_ || !session_->smux_v2() || payload.size() != 8 || closed_) {
+        if (session_) {
+            session_->fail(protocol_error());
+        }
+        return;
+    }
+    peer_consumed_ = get_le32(payload.data());
+    peer_window_ = get_le32(payload.data() + 4);
+    pump_write();
+}
+
 void WebSocketMuxStreamState::on_session_error(const boost::system::error_code &error) {
     if (closed_) {
         return;
@@ -374,6 +401,7 @@ void WebSocketMuxStreamState::deliver_read() {
         }
         return;
     }
+    const auto first_read = session_ && session_->smux_v2() && bytes_consumed_ == 0;
     std::size_t copied = 0;
     while (copied < read_buffer_.size() && !incoming_.empty()) {
         auto &front = incoming_.front();
@@ -383,12 +411,23 @@ void WebSocketMuxStreamState::deliver_read() {
                     front->data() + incoming_offset_, count);
         copied += count;
         incoming_offset_ += count;
+        if (session_ && session_->smux_v2()) {
+            bytes_consumed_ += static_cast<std::uint32_t>(count);
+            consumed_since_update_ += static_cast<std::uint32_t>(count);
+        }
         if (incoming_offset_ == front->size()) {
             incoming_.pop_front();
             incoming_offset_ = 0;
         }
     }
     finish_read({}, copied);
+    if (session_ && session_->smux_v2() &&
+        (first_read || consumed_since_update_ >=
+                           static_cast<std::uint32_t>(session_->smux_stream_buffer() / 2))) {
+        consumed_since_update_ = 0;
+        session_->stream_update(shared_from_this(), bytes_consumed_,
+                                static_cast<std::uint32_t>(session_->smux_stream_buffer()));
+    }
 }
 
 void WebSocketMuxStreamState::finish_read(const boost::system::error_code &error,
@@ -428,17 +467,42 @@ void WebSocketMuxStreamState::post_write(core::StreamHandle::WriteHandler handle
 }
 
 void WebSocketMuxStreamState::pump_write() {
-    if (closed_ || !session_ || !pending_write_) {
+    if (closed_ || !session_) {
+        return;
+    }
+    if (!pending_write_) {
+        if (end_requested_ && !end_enqueued_) {
+            end_enqueued_ = true;
+            session_->enqueue_frame(session_->make_close_frame(wire_id_));
+        }
         return;
     }
     if (pending_write_->offset == pending_write_->data->size()) {
         finish_write({});
+        if (end_requested_ && !end_enqueued_) {
+            end_enqueued_ = true;
+            session_->enqueue_frame(session_->make_close_frame(wire_id_));
+        }
         return;
     }
-    const auto available = pending_write_->data->size() - pending_write_->offset;
+    auto available = pending_write_->data->size() - pending_write_->offset;
+    if (session_->smux_v2()) {
+        const auto in_flight = bytes_sent_ - peer_consumed_;
+        if (in_flight >= peer_window_) {
+            return;
+        }
+        available =
+            std::min<std::size_t>(available, static_cast<std::size_t>(peer_window_ - in_flight));
+    }
+    if (available == 0) {
+        return;
+    }
     const auto size = std::min(available, session_->frame_size());
     const auto offset = pending_write_->offset;
     pending_write_->offset += size;
+    if (session_->smux_v2()) {
+        bytes_sent_ += static_cast<std::uint32_t>(size);
+    }
     auto self = shared_from_this();
     session_->enqueue_frame(
         session_->make_data_frame(wire_id_, pending_write_->data->data() + offset, size),
@@ -497,7 +561,7 @@ std::vector<std::uint8_t> WebSocketMuxSession::make_open_frame(std::uint32_t wir
     }
 
     std::vector<std::uint8_t> frame(kSmuxHeaderSize);
-    frame[0] = 1;
+    frame[0] = options_.smux_version;
     frame[1] = kSmuxSyn;
     put_le16(frame.data() + 2, 0);
     put_le32(frame.data() + 4, wire_id);
@@ -521,7 +585,7 @@ std::vector<std::uint8_t> WebSocketMuxSession::make_data_frame(std::uint32_t wir
     }
 
     std::vector<std::uint8_t> frame(kSmuxHeaderSize + size);
-    frame[0] = 1;
+    frame[0] = options_.smux_version;
     frame[1] = kSmuxPush;
     put_le16(frame.data() + 2, static_cast<std::uint16_t>(size));
     put_le32(frame.data() + 4, wire_id);
@@ -541,10 +605,23 @@ std::vector<std::uint8_t> WebSocketMuxSession::make_close_frame(std::uint32_t wi
         return frame;
     }
     std::vector<std::uint8_t> frame(kSmuxHeaderSize);
-    frame[0] = 1;
+    frame[0] = options_.smux_version;
     frame[1] = kSmuxFin;
     put_le16(frame.data() + 2, 0);
     put_le32(frame.data() + 4, wire_id);
+    return frame;
+}
+
+std::vector<std::uint8_t> WebSocketMuxSession::make_update_frame(std::uint32_t wire_id,
+                                                                 std::uint32_t consumed,
+                                                                 std::uint32_t window) const {
+    std::vector<std::uint8_t> frame(kSmuxHeaderSize + 8);
+    frame[0] = options_.smux_version;
+    frame[1] = kSmuxUpdate;
+    put_le16(frame.data() + 2, 8);
+    put_le32(frame.data() + 4, wire_id);
+    put_le32(frame.data() + kSmuxHeaderSize, consumed);
+    put_le32(frame.data() + kSmuxHeaderSize + 4, window);
     return frame;
 }
 
@@ -558,7 +635,7 @@ std::vector<std::uint8_t> WebSocketMuxSession::make_nop_frame() const {
         return frame;
     }
     std::vector<std::uint8_t> frame(kSmuxHeaderSize);
-    frame[0] = 1;
+    frame[0] = options_.smux_version;
     frame[1] = kSmuxNop;
     put_le16(frame.data() + 2, 0);
     put_le32(frame.data() + 4, 0);
@@ -707,7 +784,7 @@ bool WebSocketMuxSession::parse_smux_frame() {
     if (input_.size() < kSmuxHeaderSize) {
         return false;
     }
-    if (input_[0] != 1) {
+    if (input_[0] != options_.smux_version) {
         fail(protocol_error());
         return false;
     }
@@ -736,6 +813,12 @@ bool WebSocketMuxSession::parse_smux_frame() {
     } else if (command == kSmuxFin) {
         if (stream) {
             stream->on_remote_end();
+        }
+    } else if (command == kSmuxUpdate) {
+        if (stream) {
+            stream->on_update(payload);
+        } else if (!smux_v2() || payload.size() != 8) {
+            fail(protocol_error());
         }
     } else if (command == kSmuxSyn) {
         // The outbound side only accepts streams that it opened itself.
@@ -832,12 +915,12 @@ void WebSocketMuxSession::cancel(StreamId stream_id) noexcept {
     }
 }
 
-void WebSocketMuxSession::stream_shutdown(const std::shared_ptr<WebSocketMuxStreamState> &stream) {
-    if (closed_ || stream->closed() || stream->end_enqueued()) {
+void WebSocketMuxSession::stream_update(const std::shared_ptr<WebSocketMuxStreamState> &stream,
+                                        std::uint32_t consumed, std::uint32_t window) {
+    if (closed_ || !smux_v2() || stream->closed()) {
         return;
     }
-    stream->mark_end_enqueued();
-    enqueue_frame(make_close_frame(stream->wire_id()));
+    enqueue_frame(make_update_frame(stream->wire_id(), consumed, window));
 }
 
 void WebSocketMuxSession::stream_close(const std::shared_ptr<WebSocketMuxStreamState> &stream) {
@@ -898,6 +981,11 @@ class WebSocketMuxHandshakeOperation final
         boost::asio::post(executor_, [self] {
             if (self->options_.max_frame_size == 0 ||
                 self->options_.max_frame_size > kMaximumMuxFrameSize ||
+                (self->options_.protocol == WebSocketMuxProtocol::smux &&
+                 (self->options_.smux_version < 1 || self->options_.smux_version > 2)) ||
+                (self->options_.protocol == WebSocketMuxProtocol::smux &&
+                 (self->options_.smux_stream_buffer == 0 ||
+                  self->options_.smux_stream_buffer > std::numeric_limits<std::uint32_t>::max())) ||
                 self->options_.max_concurrent_streams == 0) {
                 self->finish_failure(
                     {core::ErrorCode::configuration, "WebSocket mux options are invalid", {}});

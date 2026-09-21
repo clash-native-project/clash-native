@@ -1323,3 +1323,13 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   streams reuse one upgraded WebSocket connection.
 - Added independent Go interoperability coverage for two logical streams over
   one v2ray mux or smux v1 carrier. Native Shadowsocks UDP remains unwrapped.
+
+### 2026-09-21 — Add WebSocket plugin smux v2 flow control
+
+- Added smux v2 selection for the gost WebSocket plugin carrier, including
+  `UPD` window frames, per-stream send windows, receive-consumption accounting,
+  and backpressure while a peer window is exhausted.
+- Preserved smux v1 as the default and rejected smux v2 selection for the
+  v2ray-plugin mux format.
+- Added a large-payload Go interoperability case that exercises smux v2
+  window updates over one reused WebSocket carrier.

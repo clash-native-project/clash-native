@@ -602,6 +602,16 @@ class ShadowsocksConnectOperation final
                                "Shadowsocks plugin mux requires v2ray-plugin or gost-plugin",
                                {}});
         }
+        if (config_.plugin_mux && config_.plugin_smux_version != 1 &&
+            config_.plugin_smux_version != 2) {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks WebSocket smux version must be 1 or 2", {}});
+        }
+        if (config_.plugin == "v2ray-plugin" && config_.plugin_mux &&
+            config_.plugin_smux_version != 1) {
+            return core::fail({core::ErrorCode::unsupported,
+                               "v2ray-plugin does not use smux version selection", {}});
+        }
         if (config_.plugin == "jls") {
             if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() || config_.plugin_tls) {
                 return core::fail({core::ErrorCode::configuration,
@@ -663,6 +673,7 @@ class ShadowsocksConnectOperation final
         options.mux_protocol = config_.plugin == "gost-plugin"
                                    ? ss::WebSocketMuxProtocol::smux
                                    : ss::WebSocketMuxProtocol::v2ray;
+        options.smux_version = config_.plugin_smux_version;
         return options;
     }
 
@@ -1472,6 +1483,16 @@ core::Status ShadowsocksOutbound::validate() const {
         config_.plugin != "gost-plugin") {
         return core::fail({core::ErrorCode::unsupported,
                            "Shadowsocks plugin mux requires v2ray-plugin or gost-plugin", {}});
+    }
+    if (config_.plugin_mux && config_.plugin_smux_version != 1 &&
+        config_.plugin_smux_version != 2) {
+        return core::fail({core::ErrorCode::configuration,
+                           "Shadowsocks WebSocket smux version must be 1 or 2", {}});
+    }
+    if (config_.plugin == "v2ray-plugin" && config_.plugin_mux &&
+        config_.plugin_smux_version != 1) {
+        return core::fail({core::ErrorCode::unsupported,
+                           "v2ray-plugin does not use smux version selection", {}});
     }
     if (config_.plugin == "jls") {
         if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() || config_.plugin_tls) {

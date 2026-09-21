@@ -35,6 +35,7 @@ struct ShadowsocksOutboundConfig {
     // Reuse one WebSocket carrier for multiple logical Shadowsocks streams.
     // v2ray-plugin uses its native mux framing; gost-plugin uses smux.
     bool plugin_mux = false;
+    std::uint8_t plugin_smux_version = 1;
     std::optional<transport::shadowsocks::KcptunClientOptions> kcptun;
     // Use the Shadowsocks TCP stream with the standardized UDP-over-TCP
     // framing. Version 1 is the legacy per-packet framing; version 2 adds a

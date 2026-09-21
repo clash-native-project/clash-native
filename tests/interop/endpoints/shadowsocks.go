@@ -66,6 +66,26 @@ func StartShadowsocksServer(method, password string) (*ShadowsocksServer, error)
 	return server, nil
 }
 
+// StartShadowsocksTCPServer starts only the TCP half of the test peer. It is
+// used by stream-carrier tests that do not need to reserve a matching UDP port
+// on Windows.
+func StartShadowsocksTCPServer(method, password string) (*ShadowsocksServer, error) {
+	if _, err := makeAEAD(method, make([]byte, keySize(method))); err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	server := &ShadowsocksServer{
+		method: method, password: password, tcp: listener,
+		conns: make(map[net.Conn]struct{}),
+	}
+	server.wg.Add(1)
+	go server.acceptTCP()
+	return server, nil
+}
+
 func (s *ShadowsocksServer) Addr() string { return s.tcp.Addr().String() }
 
 // ServeTCPConn runs the Shadowsocks TCP protocol on an externally accepted
@@ -82,7 +102,9 @@ func (s *ShadowsocksServer) Close() error {
 	var closeErr error
 	s.once.Do(func() {
 		closeErr = s.tcp.Close()
-		_ = s.udp.Close()
+		if s.udp != nil {
+			_ = s.udp.Close()
+		}
 		s.mu.Lock()
 		for conn := range s.conns {
 			_ = conn.Close()

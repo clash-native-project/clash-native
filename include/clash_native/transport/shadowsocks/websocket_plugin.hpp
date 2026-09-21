@@ -23,6 +23,7 @@ struct WebSocketPluginOptions {
     bool skip_cert_verify = false;
     bool mux = false;
     WebSocketMuxProtocol mux_protocol = WebSocketMuxProtocol::v2ray;
+    std::uint8_t smux_version = 1;
 };
 
 using WebSocketPluginHandler =

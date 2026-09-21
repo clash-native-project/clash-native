@@ -85,7 +85,7 @@ func (c *websocketNetConn) SetWriteDeadline(deadline time.Time) error {
 
 func startShadowsocksWebSocketServer(t *testing.T, method, password string, tlsServer bool) (string, func()) {
 	t.Helper()
-	shadowsocks, err := endpoints.StartShadowsocksServer(method, password)
+	shadowsocks, err := endpoints.StartShadowsocksTCPServer(method, password)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,9 +257,9 @@ func (s *v2rayMuxServer) serve(shadowsocks func(net.Conn)) error {
 }
 
 func startShadowsocksWebSocketMuxServer(t *testing.T, method, password string, tlsServer bool,
-	plugin string) (string, func(), *int32) {
+	plugin string, smuxVersion int) (string, func(), *int32) {
 	t.Helper()
-	shadowsocks, err := endpoints.StartShadowsocksServer(method, password)
+	shadowsocks, err := endpoints.StartShadowsocksTCPServer(method, password)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,6 +279,7 @@ func startShadowsocksWebSocketMuxServer(t *testing.T, method, password string, t
 		if plugin == "gost-plugin" {
 			config := smux.DefaultConfig()
 			config.KeepAliveDisabled = true
+			config.Version = smuxVersion
 			session, err := smux.Server(wsConn, config)
 			if err != nil {
 				_ = wsConn.Close()
@@ -379,17 +380,24 @@ func TestShadowsocksWebSocketPluginMux(t *testing.T) {
 	defer tcpEcho.Close()
 
 	for _, test := range []struct {
-		plugin string
-		tls    bool
+		plugin      string
+		tls         bool
+		smuxVersion int
 	}{
 		{plugin: "v2ray-plugin"},
-		{plugin: "gost-plugin"},
+		{plugin: "gost-plugin", smuxVersion: 1},
+		{plugin: "gost-plugin", smuxVersion: 2},
 		{plugin: "v2ray-plugin", tls: true},
 	} {
 		test := test
-		t.Run(test.plugin+map[bool]string{false: "/http", true: "/tls"}[test.tls], func(t *testing.T) {
+		name := test.plugin + map[bool]string{false: "/http", true: "/tls"}[test.tls]
+		if test.plugin == "gost-plugin" {
+			name += fmt.Sprintf("/smux-v%d", test.smuxVersion)
+		}
+		t.Run(name, func(t *testing.T) {
 			address, cleanup, connectionCount := startShadowsocksWebSocketMuxServer(
-				t, "chacha20-ietf-poly1305", mihomoTestPassword, test.tls, test.plugin)
+				t, "chacha20-ietf-poly1305", mihomoTestPassword, test.tls, test.plugin,
+				test.smuxVersion)
 			defer cleanup()
 			env := map[string]string{
 				"CLASH_NATIVE_TEST_OUTBOUND":             "shadowsocks",
@@ -407,6 +415,9 @@ func TestShadowsocksWebSocketPluginMux(t *testing.T) {
 				env["CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_TLS"] = "1"
 				env["CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_SKIP_CERT_VERIFY"] = "1"
 			}
+			if test.plugin == "gost-plugin" && test.smuxVersion == 2 {
+				env["CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_SMUX_VERSION"] = "2"
+			}
 			proxyAddress, stopProxy := startOutboundTestHost(t, env)
 			defer stopProxy()
 
@@ -414,7 +425,11 @@ func TestShadowsocksWebSocketPluginMux(t *testing.T) {
 			second := socks5Connect(t, proxyAddress, tcpEcho.Addr())
 			defer first.Close()
 			defer second.Close()
-			payload := []byte(strings.Repeat("shadowsocks-websocket-mux-", 1024))
+			payloadRepeat := 1024
+			if test.smuxVersion == 2 {
+				payloadRepeat = 32 * 1024
+			}
+			payload := []byte(strings.Repeat("shadowsocks-websocket-mux-", payloadRepeat))
 			writeBytes(t, first, payload)
 			echoed := make([]byte, len(payload))
 			readBytes(t, first, echoed)

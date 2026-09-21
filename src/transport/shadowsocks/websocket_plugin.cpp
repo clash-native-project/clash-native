@@ -237,6 +237,7 @@ class WebSocketPluginMuxOperation final
                 }
                 WebSocketMuxOptions mux_options;
                 mux_options.protocol = self->options_.mux_protocol;
+                mux_options.smux_version = self->options_.smux_version;
                 self->mux_ = async_open_websocket_mux(
                     std::move(result.value()), mux_options,
                     [self](core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>

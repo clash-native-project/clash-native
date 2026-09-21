@@ -27,6 +27,7 @@
 #include <iostream>
 #include <istream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -117,6 +118,21 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
                     .value_or("") == "1";
             config.plugin_mux =
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_MUX").value_or("") == "1";
+            if (const auto smux_version =
+                    environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_SMUX_VERSION");
+                smux_version && !smux_version->empty()) {
+                unsigned int parsed_version = 0;
+                const auto parsed = std::from_chars(smux_version->data(),
+                                                    smux_version->data() + smux_version->size(),
+                                                    parsed_version);
+                if (parsed.ec != std::errc{} ||
+                    parsed.ptr != smux_version->data() + smux_version->size() ||
+                    parsed_version > std::numeric_limits<std::uint8_t>::max()) {
+                    throw std::runtime_error(
+                        "invalid CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_SMUX_VERSION");
+                }
+                config.plugin_smux_version = static_cast<std::uint8_t>(parsed_version);
+            }
             config.plugin_password =
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_PASSWORD").value_or("");
             config.plugin_username =
