@@ -214,6 +214,30 @@ bool collect_connection_options(const http::fields &fields,
     return true;
 }
 
+bool collect_upgrade_protocol(const http::fields &fields, std::string &protocol,
+                              bool &present) {
+    for (const auto &field : fields) {
+        if (!is_http_header(as_std_view(field.name_string()), "upgrade")) {
+            continue;
+        }
+        present = true;
+        auto value = as_std_view(field.value());
+        while (true) {
+            const auto comma = value.find(',');
+            const auto token = trim_http_whitespace(value.substr(0, comma));
+            if (!is_http_token(token) || !protocol.empty()) {
+                return false;
+            }
+            protocol.assign(token);
+            if (comma == std::string_view::npos) {
+                break;
+            }
+            value.remove_prefix(comma + 1);
+        }
+    }
+    return present && !protocol.empty();
+}
+
 bool is_hop_by_hop_or_proxy_header(std::string_view name,
                                    const std::unordered_set<std::string> &connection_options) {
     if (connection_options.contains(lowercase_ascii(name))) {
@@ -1077,6 +1101,58 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
             }
         }
 
+        std::string upgrade_protocol;
+        bool has_upgrade_header = false;
+        if (!collect_upgrade_protocol(request.base(), upgrade_protocol, has_upgrade_header)) {
+            if (has_upgrade_header || connection_options.contains("upgrade")) {
+                send_http_forward_response(400, "Bad Request");
+                return;
+            }
+        }
+        if (has_upgrade_header || connection_options.contains("upgrade")) {
+            if (!has_upgrade_header || !connection_options.contains("upgrade")) {
+                send_http_forward_response(400, "Bad Request");
+                return;
+            }
+            if (request.method() != http::verb::get || !http_request_parser_->is_done()) {
+                send_http_forward_response(501, "Not Implemented");
+                return;
+            }
+
+            http_forward_ = true;
+            http_upgrade_forward_ = true;
+            http_upgrade_request_ = {};
+            http_upgrade_request_.mode = transport::StreamUpgradeMode::upgrade;
+            http_upgrade_request_.scheme = "http";
+            http_upgrade_request_.authority = parsed_target->authority;
+            http_upgrade_request_.target = parsed_target->origin_target;
+            http_upgrade_request_.protocol = std::move(upgrade_protocol);
+            for (const auto &field : request.base()) {
+                const auto name = as_std_view(field.name_string());
+                if (is_http_header(name, "host") || is_http_header(name, "connection") ||
+                    is_http_header(name, "upgrade") || is_http_header(name, "proxy-connection") ||
+                    is_http_header(name, "proxy-authorization") ||
+                    is_http_header(name, "keep-alive") || is_http_header(name, "te") ||
+                    is_http_header(name, "trailer") ||
+                    is_http_header(name, "transfer-encoding") ||
+                    is_http_header(name, "content-length")) {
+                    continue;
+                }
+                http_upgrade_request_.headers.push_back(
+                    {std::string(name), copy_view(field.value())});
+            }
+
+            const auto buffered = http_buffer_.size();
+            http_initial_data_.resize(buffered);
+            if (buffered != 0) {
+                boost::asio::buffer_copy(boost::asio::buffer(http_initial_data_),
+                                         http_buffer_.data());
+                http_buffer_.consume(buffered);
+            }
+            open_target(parsed_target->destination);
+            return;
+        }
+
         std::unordered_set<std::string> declared_trailers;
         std::vector<std::string> trailer_names;
         if (!collect_declared_trailers(request.base(), connection_options, declared_trailers,
@@ -1095,18 +1171,6 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
                 }
                 expects_continue = true;
             }
-        }
-
-        bool has_upgrade = false;
-        for (const auto &field : request.base()) {
-            if (is_http_header(as_std_view(field.name_string()), "upgrade") &&
-                !field.value().empty()) {
-                has_upgrade = true;
-            }
-        }
-        if (has_upgrade || connection_options.contains("upgrade")) {
-            send_http_forward_response(501, "Not Implemented");
-            return;
         }
 
         http_forward_request_ = {};
@@ -1524,10 +1588,29 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         if (protocol_ == Protocol::socks5) {
             send_socks_reply(0x00, true);
         } else if (http_forward_) {
-            start_http_forward_exchange();
+            if (http_upgrade_forward_) {
+                start_http_upgrade_exchange();
+            } else {
+                start_http_forward_exchange();
+            }
         } else {
             send_http_response(200, "Connection Established", true);
         }
+    }
+
+    void start_http_upgrade_exchange() {
+        http_session_ = transport::make_http1_exchange_session(std::move(remote_));
+        if (!http_session_) {
+            send_http_forward_response(502, "Bad Gateway");
+            return;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+        auto self = shared_from_this();
+        http_exchange_id_ = http_session_->open_tunnel(
+            std::move(http_upgrade_request_), deadline,
+            [self](core::Result<transport::StreamUpgradeResponse> result) mutable {
+                self->handle_http_upgrade_response(std::move(result));
+            });
     }
 
     void start_http_forward_exchange() {
@@ -1542,6 +1625,48 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
             std::move(http_forward_request_), deadline,
             [self](core::Result<transport::StreamingExchangeResponse> result) mutable {
                 self->handle_http_forward_response(std::move(result));
+            });
+    }
+
+    void handle_http_upgrade_response(
+        core::Result<transport::StreamUpgradeResponse> result) {
+        if (closed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (!result) {
+            send_http_forward_response(502, "Bad Gateway");
+            return;
+        }
+
+        auto upgrade = std::move(result.value());
+        if (!upgrade.stream || upgrade.response.status != 101) {
+            const auto status = upgrade.response.status >= 400 && upgrade.response.status <= 599
+                                    ? static_cast<int>(upgrade.response.status)
+                                    : 502;
+            const auto reason = status == 502
+                                    ? std::string_view("Bad Gateway")
+                                    : as_std_view(http::obsolete_reason(
+                                          static_cast<http::status>(status)));
+            send_http_forward_response(status, reason);
+            return;
+        }
+
+        remote_ = std::move(upgrade.stream);
+        if (http_session_) {
+            http_session_->stop();
+            http_session_.reset();
+        }
+        http_response_ = build_http_upgrade_response_headers(upgrade.response);
+        auto self = shared_from_this();
+        boost::asio::async_write(
+            client_, boost::asio::buffer(http_response_),
+            [self](const boost::system::error_code &error, std::size_t size) {
+                if (error) {
+                    self->close();
+                    return;
+                }
+                self->http_forward_response_bytes_ += size;
+                self->start_relay();
             });
     }
 
@@ -1591,6 +1716,28 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
 
     bool http_forward_request_method_is(std::string_view method) const noexcept {
         return http_forward_request_method_ == method;
+    }
+
+    std::string build_http_upgrade_response_headers(
+        const transport::ExchangeResponse &response) const {
+        const auto reason = http::obsolete_reason(static_cast<http::status>(response.status));
+        std::string output = fmt::format("HTTP/1.1 {} {}\r\n", response.status,
+                                         copy_view(reason));
+        for (const auto &header : response.headers) {
+            if (is_http_header(header.name, "content-length") ||
+                is_http_header(header.name, "transfer-encoding") ||
+                is_http_header(header.name, "proxy-connection") ||
+                is_http_header(header.name, "proxy-authenticate") ||
+                is_http_header(header.name, "proxy-authorization")) {
+                continue;
+            }
+            output.append(header.name);
+            output.append(": ");
+            output.append(header.value);
+            output.append("\r\n");
+        }
+        output.append("Proxy-Agent: clash-native\r\n\r\n");
+        return output;
     }
 
     std::string build_http_forward_response_headers(const transport::ExchangeResponse &response,
@@ -1747,8 +1894,10 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
         }
 
         http_forward_ = false;
+        http_upgrade_forward_ = false;
         http_exchange_id_ = 0;
         http_forward_request_ = {};
+        http_upgrade_request_ = {};
         http_forward_response_ = {};
         http_request_parser_.reset();
         http_response_.clear();
@@ -1947,6 +2096,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     std::atomic_bool closed_{false};
     Protocol protocol_ = Protocol::socks5;
     bool http_forward_ = false;
+    bool http_upgrade_forward_ = false;
 
     std::array<std::uint8_t, 1> protocol_byte_{};
     std::array<std::uint8_t, 2> method_header_{};
@@ -1963,6 +2113,7 @@ class ProxyServer::Session : public std::enable_shared_from_this<Session> {
     std::string http_forward_request_method_;
     std::shared_ptr<transport::ExchangeSession> http_session_;
     transport::ExchangeSession::ExchangeId http_exchange_id_ = 0;
+    transport::StreamUpgradeRequest http_upgrade_request_;
     transport::StreamingExchangeResponse http_forward_response_;
     bool http_client_keep_alive_ = false;
     bool http_exchange_keep_alive_ = false;

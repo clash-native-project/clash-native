@@ -144,6 +144,12 @@ interoperability failure.
 
 For HTTPS destinations, the HTTP listener supports `CONNECT`; TLS then runs between the client and destination inside that tunnel. Configuring listener TLS additionally encrypts the client-to-proxy hop. The TLS and Basic authentication options on an upstream HTTP proxy outbound are separate capabilities from the local listener settings.
 
+The HTTP/1.1 listener also forwards a single-token `Upgrade` request from a
+`GET` request into a full-duplex upstream stream after a successful `101`
+response. This covers WebSocket-style and other single-protocol HTTP/1.1
+upgrades. Upgrade requests with a request body or multiple protocol tokens are
+not accepted. HTTP/2 and HTTP/3 proxy ingress remain outside this listener.
+
 The current API does not load certificate files or expose listener TLS through
 the CLI because CLI configuration is scheduled for a later milestone. Revisit
 file-based configuration and client certificate authentication when that

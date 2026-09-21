@@ -11,8 +11,9 @@ This document defines the intended boundaries of the project before the
 protocol surface becomes large. It is a blueprint, not a claim that every
 described component is already implemented or production-ready. The current
 implementation includes SOCKS5 and HTTP/1.1 inbound entry paths, including
-CONNECT, ordinary forwarding, optional Basic authentication, and HTTP/1.1
-keep-alive exchanges. It also includes stream/datagram outbound contracts,
+CONNECT, ordinary forwarding, HTTP/1.1 Upgrade forwarding, optional Basic
+authentication, and HTTP/1.1 keep-alive exchanges. It also includes
+stream/datagram outbound contracts,
 Direct, Reject, Shadowsocks, Trojan, and encrypted DNS transports. Current
 protocol code and tests remain the evidence for actual support; a planned
 boundary in this document is not implementation proof.

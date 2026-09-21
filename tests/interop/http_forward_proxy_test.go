@@ -159,6 +159,123 @@ func TestHTTPForwardProxyAbsoluteFormAndHopHeaders(t *testing.T) {
 	}
 }
 
+func TestHTTPForwardProxyUpgradeIndependentEndpoint(t *testing.T) {
+	proxyAddress := startHTTPForwardProxy(t)
+	origin, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for upgrade origin: %v", err)
+	}
+	defer origin.Close()
+
+	const initialPayload = "go-upgrade-initial"
+	const laterPayload = "go-upgrade-later"
+	serverDone := make(chan error, 1)
+	go func() {
+		connection, acceptErr := origin.Accept()
+		if acceptErr != nil {
+			serverDone <- acceptErr
+			return
+		}
+		defer connection.Close()
+
+		reader := bufio.NewReader(connection)
+		request, readErr := http.ReadRequest(reader)
+		if readErr != nil {
+			serverDone <- readErr
+			return
+		}
+		defer request.Body.Close()
+		if request.Method != http.MethodGet || request.URL.Path != "/upgrade" ||
+			!strings.EqualFold(request.Header.Get("Upgrade"), "test-protocol") ||
+			!strings.Contains(strings.ToLower(request.Header.Get("Connection")), "upgrade") ||
+			request.Header.Get("X-Upgrade-Test") != "forwarded" {
+			serverDone <- fmt.Errorf("unexpected upgrade request: %s %s headers=%v",
+				request.Method, request.URL, request.Header)
+			return
+		}
+
+		if _, writeErr := io.WriteString(connection,
+			"HTTP/1.1 101 Switching Protocols\r\n"+
+				"Connection: Upgrade\r\n"+
+				"Upgrade: test-protocol\r\n"+
+				"X-Upgrade-Ack: yes\r\n\r\n"); writeErr != nil {
+			serverDone <- writeErr
+			return
+		}
+		initial := make([]byte, len(initialPayload))
+		if _, readErr := io.ReadFull(reader, initial); readErr != nil {
+			serverDone <- readErr
+			return
+		}
+		if string(initial) != initialPayload {
+			serverDone <- fmt.Errorf("unexpected initial upgrade payload %q", initial)
+			return
+		}
+		if _, writeErr := connection.Write(initial); writeErr != nil {
+			serverDone <- writeErr
+			return
+		}
+		later := make([]byte, len(laterPayload))
+		if _, readErr := io.ReadFull(reader, later); readErr != nil {
+			serverDone <- readErr
+			return
+		}
+		if _, writeErr := connection.Write(later); writeErr != nil {
+			serverDone <- writeErr
+			return
+		}
+		serverDone <- nil
+	}()
+
+	client, err := net.DialTimeout("tcp", proxyAddress, 2*time.Second)
+	if err != nil {
+		t.Fatalf("connect to HTTP proxy: %v", err)
+	}
+	defer client.Close()
+	_ = client.SetDeadline(time.Now().Add(10 * time.Second))
+	request := fmt.Sprintf(
+		"GET http://%s/upgrade HTTP/1.1\r\nHost: wrong.invalid\r\n"+
+			"Connection: Upgrade\r\nUpgrade: test-protocol\r\n"+
+			"X-Upgrade-Test: forwarded\r\n\r\n%s",
+		origin.Addr(), initialPayload)
+	writeBytes(t, client, []byte(request))
+
+	reader := bufio.NewReader(client)
+	response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatalf("read Upgrade response: %v", err)
+	}
+	if response.StatusCode != http.StatusSwitchingProtocols ||
+		!strings.EqualFold(response.Header.Get("Upgrade"), "test-protocol") ||
+		response.Header.Get("X-Upgrade-Ack") != "yes" {
+		t.Fatalf("unexpected Upgrade response: status=%d headers=%v", response.StatusCode,
+			response.Header)
+	}
+	_ = response.Body.Close()
+
+	echoedInitial := make([]byte, len(initialPayload))
+	readBytes(t, reader, echoedInitial)
+	if string(echoedInitial) != initialPayload {
+		t.Fatalf("unexpected echoed initial payload %q", echoedInitial)
+	}
+	writeBytes(t, client, []byte(laterPayload))
+	echoedLater := make([]byte, len(laterPayload))
+	if _, err := io.ReadFull(reader, echoedLater); err != nil {
+		select {
+		case serverErr := <-serverDone:
+			t.Fatalf("read later payload: %v; upgrade origin: %v", err, serverErr)
+		default:
+			t.Fatalf("read later payload: %v", err)
+		}
+	}
+	if string(echoedLater) != laterPayload {
+		t.Fatalf("unexpected echoed later payload %q", echoedLater)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("upgrade origin: %v", err)
+	}
+}
+
 func TestHTTPForwardProxyNoBodyResponseLengthSemantics(t *testing.T) {
 	origin, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

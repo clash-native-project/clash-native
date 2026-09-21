@@ -1434,3 +1434,22 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   custom trusted root certificate in one PEM chain buffer.
 - Enabled client certificate verification against the custom root and verified
   the HTTP CONNECT relay after the chain handshake.
+
+### 2026-09-21 — Add HTTP/1.1 Upgrade forwarding to the local proxy
+
+- Added a dedicated HTTP/1.1 Upgrade path for the local HTTP proxy listener.
+  The proxy now forwards the handshake through the existing upstream exchange
+  session, returns the upstream `101 Switching Protocols` response, and then
+  relays the upgraded byte stream in both directions.
+- Preserved client bytes read together with the request headers and forwarded
+  selected end-to-end handshake headers while keeping proxy hop-by-hop and
+  authentication headers local.
+- Added Windows x64 coverage for a custom Upgrade protocol, forwarded headers,
+  early data, and subsequent bidirectional stream data.
+
+### 2026-09-21 — Add process-level HTTP Upgrade interoperability coverage
+
+- Added a Go black-box test that runs the built native test host as an HTTP
+  proxy and an independent Go TCP service as the Upgrade origin.
+- The test verifies the forwarded handshake headers, the `101` response, data
+  already coalesced with the client request, and later bidirectional payloads.

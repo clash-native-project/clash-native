@@ -75,6 +75,12 @@ header, sends a ping control frame, and checks a 256 KiB binary echo. The
 carrier is limited to HTTP/1.1 Upgrade; HTTP/2 and HTTP/3 Extended CONNECT are
 not covered.
 
+The local HTTP proxy Upgrade path is validated separately with
+`TestHTTPForwardProxyUpgradeIndependentEndpoint`. The test runs the built
+native test host as the proxy and an independent Go TCP service as the
+Upgrade origin, checking the `101` handshake, forwarded headers, coalesced
+initial data, and later bidirectional stream data.
+
 The Shadowsocks `simple-obfs` HTTP and TLS carriers are validated on Windows
 x64 with a real Mihomo listener. The checks cover classic AEAD and Shadowsocks
 2022 TCP; native Shadowsocks UDP is intentionally unwrapped by these plugins.

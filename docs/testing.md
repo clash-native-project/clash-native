@@ -41,6 +41,11 @@ primitive; it is not a packet relay bus between I/O workers.
   not prove deferred 32-bit x86, Linux, Zig, musl, TUN, routing, or router
   hardware behavior.
 
+`TestHTTPForwardProxyUpgradeIndependentEndpoint` runs the built native test
+host as an HTTP proxy and an independent Go TCP origin. It verifies the
+HTTP/1.1 Upgrade handshake, forwarded headers, data coalesced with the
+request headers, and bidirectional data after the `101` response.
+
 ## Mihomo server interoperability
 
 `TestMihomoActualServerInteroperability` starts a real Mihomo process using a

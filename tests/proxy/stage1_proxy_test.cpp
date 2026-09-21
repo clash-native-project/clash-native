@@ -271,6 +271,129 @@ class HttpTarget {
     }
 };
 
+class HttpUpgradeTargetSession final
+    : public std::enable_shared_from_this<HttpUpgradeTargetSession> {
+  public:
+    HttpUpgradeTargetSession(boost::asio::ip::tcp::socket socket, std::atomic_bool &valid_request)
+        : socket_(std::move(socket)), valid_request_(valid_request) {}
+
+    void start() { read_request(); }
+
+  private:
+    void read_request() {
+        auto self = shared_from_this();
+        boost::asio::async_read_until(
+            socket_, request_buffer_, "\r\n\r\n",
+            [self](const boost::system::error_code &error, std::size_t header_size) {
+                if (error) {
+                    return;
+                }
+
+                const std::string request(
+                    boost::asio::buffers_begin(self->request_buffer_.data()),
+                    boost::asio::buffers_end(self->request_buffer_.data()));
+                self->valid_request_ = request.find("GET /upgrade HTTP/1.1\r\n") != std::string::npos &&
+                                       request.find("Upgrade: test-protocol\r\n") !=
+                                           std::string::npos &&
+                                       request.find("X-Upgrade-Test: forwarded\r\n") !=
+                                           std::string::npos;
+
+                self->request_buffer_.consume(header_size);
+                self->initial_data_.assign(
+                    boost::asio::buffers_begin(self->request_buffer_.data()),
+                    boost::asio::buffers_end(self->request_buffer_.data()));
+                self->request_buffer_.consume(self->request_buffer_.size());
+                self->write_response();
+            });
+    }
+
+    void write_response() {
+        response_ = "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Upgrade: test-protocol\r\n"
+                    "X-Upgrade-Ack: yes\r\n\r\n";
+        auto self = shared_from_this();
+        boost::asio::async_write(
+            socket_, boost::asio::buffer(response_),
+            [self](const boost::system::error_code &error, std::size_t) {
+                if (error) {
+                    return;
+                }
+                self->write_initial_data();
+            });
+    }
+
+    void write_initial_data() {
+        if (initial_data_.empty()) {
+            read_data();
+            return;
+        }
+        auto self = shared_from_this();
+        boost::asio::async_write(
+            socket_, boost::asio::buffer(initial_data_),
+            [self](const boost::system::error_code &error, std::size_t) {
+                if (!error) {
+                    self->initial_data_.clear();
+                    self->read_data();
+                }
+            });
+    }
+
+    void read_data() {
+        auto self = shared_from_this();
+        socket_.async_read_some(
+            boost::asio::buffer(data_),
+            [self](const boost::system::error_code &error, std::size_t size) {
+                if (error) {
+                    return;
+                }
+                boost::asio::async_write(
+                    self->socket_, boost::asio::buffer(self->data_, size),
+                    [self](const boost::system::error_code &write_error, std::size_t) {
+                        if (!write_error) {
+                            self->read_data();
+                        }
+                    });
+            });
+    }
+
+    boost::asio::ip::tcp::socket socket_;
+    boost::asio::streambuf request_buffer_;
+    std::vector<std::uint8_t> initial_data_;
+    std::string response_;
+    std::array<std::uint8_t, 4096> data_{};
+    std::atomic_bool &valid_request_;
+};
+
+class HttpUpgradeTarget {
+  public:
+    explicit HttpUpgradeTarget(clash_native::runtime::AsioRuntime &runtime)
+        : acceptor(runtime.context(), {boost::asio::ip::address_v4::loopback(), 0}),
+          endpoint(acceptor.local_endpoint()) {
+        accept();
+    }
+
+    void stop() {
+        boost::system::error_code ignored;
+        acceptor.close(ignored);
+    }
+
+    boost::asio::ip::tcp::acceptor acceptor;
+    boost::asio::ip::tcp::endpoint endpoint;
+    std::atomic_bool valid_request{false};
+
+  private:
+    void accept() {
+        auto socket = std::make_shared<boost::asio::ip::tcp::socket>(acceptor.get_executor());
+        acceptor.async_accept(*socket, [this, socket](const boost::system::error_code &error) {
+            if (!error) {
+                std::make_shared<HttpUpgradeTargetSession>(std::move(*socket), valid_request)
+                    ->start();
+            }
+        });
+    }
+};
+
 } // namespace
 
 TEST(Stage1ProxyTest, AcceptsHttpConnectAndRelaysBufferedData) {
@@ -612,6 +735,57 @@ TEST(HttpProxyTest, KeepsHttp11ClientConnectionForMultipleRequests) {
     }
 
     EXPECT_EQ(target.request_count.load(), 2);
+    boost::system::error_code ignored;
+    client.close(ignored);
+    proxy.stop();
+    target.stop();
+    runtime.stop();
+}
+
+TEST(HttpProxyTest, ForwardsHttp11UpgradeAndRelaysTheUpgradedStream) {
+    clash_native::runtime::AsioRuntime runtime;
+    HttpUpgradeTarget target(runtime);
+    clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
+    proxy.set_inbound_mode(clash_native::proxy::ProxyInboundMode::http);
+    ASSERT_TRUE(proxy.start());
+    runtime.start();
+
+    boost::asio::ip::tcp::socket client(runtime.context());
+    client.connect(proxy.endpoint());
+    const auto authority = "127.0.0.1:" + std::to_string(target.endpoint.port());
+    const std::string initial_data = "upgrade-initial-data";
+    const std::string request =
+        "GET http://" + authority + "/upgrade HTTP/1.1\r\nHost: " + authority +
+        "\r\nConnection: Upgrade\r\nUpgrade: test-protocol\r\n"
+        "X-Upgrade-Test: forwarded\r\n\r\n" + initial_data;
+    boost::asio::write(client, boost::asio::buffer(request));
+
+    boost::asio::streambuf response;
+    boost::asio::read_until(client, response, "\r\n\r\n");
+    std::string response_bytes(boost::asio::buffers_begin(response.data()),
+                               boost::asio::buffers_end(response.data()));
+    const auto header_end = response_bytes.find("\r\n\r\n");
+    ASSERT_NE(header_end, std::string::npos);
+    EXPECT_EQ(response_bytes.substr(0, response_bytes.find("\r\n")),
+              "HTTP/1.1 101 Switching Protocols");
+    EXPECT_NE(response_bytes.find("Upgrade: test-protocol\r\n"), std::string::npos);
+    EXPECT_NE(response_bytes.find("X-Upgrade-Ack: yes\r\n"), std::string::npos);
+
+    std::string echoed = response_bytes.substr(header_end + 4);
+    while (echoed.size() < initial_data.size()) {
+        std::array<char, 1024> buffer{};
+        const auto size = client.read_some(boost::asio::buffer(buffer));
+        echoed.append(buffer.data(), size);
+    }
+    EXPECT_EQ(echoed.substr(0, initial_data.size()), initial_data);
+
+    const std::string later_data = "upgrade-later-data";
+    boost::asio::write(client, boost::asio::buffer(later_data));
+    std::string later_echo(later_data.size(), '\0');
+    boost::asio::read(client, boost::asio::buffer(later_echo));
+    EXPECT_EQ(later_echo, later_data);
+    EXPECT_TRUE(target.valid_request.load());
+
     boost::system::error_code ignored;
     client.close(ignored);
     proxy.stop();
