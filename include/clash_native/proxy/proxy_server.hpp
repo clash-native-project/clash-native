@@ -28,6 +28,8 @@
 
 namespace clash_native::proxy {
 
+class ProxySession;
+
 enum class ProxyInboundMode {
     mixed,
     http,
@@ -66,8 +68,8 @@ class ProxyServer {
     boost::asio::ip::tcp::endpoint endpoint() const noexcept;
 
   private:
-    class Session;
-    using SessionPtr = std::shared_ptr<Session>;
+    friend class ProxySession;
+    using SessionPtr = std::shared_ptr<ProxySession>;
     using DatagramRouteHandler =
         std::function<void(core::DatagramOpenResult, boost::asio::ip::udp::endpoint)>;
 

@@ -172,6 +172,11 @@ add_library(clash-native-core STATIC
     src/observability/connection_registry.cpp
     src/platform/platform_adapter.cpp
     src/proxy/proxy_server.cpp
+    src/proxy/http_proxy_utils.cpp
+    src/proxy/proxy_session.cpp
+    src/proxy/proxy_session_http.cpp
+    src/proxy/proxy_session_socks.cpp
+    src/proxy/proxy_stream.cpp
     src/proxy/tcp_relay.cpp
     src/router/traffic_router.cpp
     src/runtime/asio_runtime.cpp

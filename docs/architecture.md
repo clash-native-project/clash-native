@@ -18,9 +18,11 @@ Direct, Reject, Shadowsocks, Trojan, and encrypted DNS transports. Current
 protocol code and tests remain the evidence for actual support; a planned
 boundary in this document is not implementation proof.
 
-The current `ProxyServer::Session` integration path is transitional. It must
-not become the base class or control-flow template for future inbound,
-outbound, carrier, or relay code.
+The current `ProxySession` integration path is transitional. Its server
+lifecycle, shared session state, HTTP handling, SOCKS5 handling, and local
+stream adapter are kept in separate implementation units. It must not become
+the base class or control-flow template for future inbound, outbound, carrier,
+or relay code.
 
 ## 2. Goals
 

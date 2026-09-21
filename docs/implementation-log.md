@@ -1453,3 +1453,9 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   proxy and an independent Go TCP service as the Upgrade origin.
 - The test verifies the forwarded handshake headers, the `101` response, data
   already coalesced with the client request, and later bidirectional payloads.
+### 2026-09-21 — Split local proxy implementation by responsibility
+
+- Split the local proxy implementation into server lifecycle, shared session,
+  HTTP, SOCKS5, stream adapter, and HTTP parsing utility modules. Existing HTTP,
+  CONNECT, Upgrade, SOCKS5 TCP, and SOCKS5 UDP behavior remains on the same
+  runtime path.
