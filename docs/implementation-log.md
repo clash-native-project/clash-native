@@ -1333,3 +1333,37 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   v2ray-plugin mux format.
 - Added a large-payload Go interoperability case that exercises smux v2
   window updates over one reused WebSocket carrier.
+
+### 2026-09-21 — Implement Shadowsocks Shadow-TLS v3
+
+- Added a Botan TLS 1.3 Shadow-TLS v3 client with the password-authenticated
+  32-byte ClientHello session ID required by the v3 wire protocol.
+- Implemented the v3 bridge-record HMAC/XOR transformation and post-handshake
+  authenticated application records as a dedicated carrier stream.
+- Extended Shadowsocks configuration validation and Mihomo interoperability
+  coverage to Shadow-TLS v3 alongside v1 and v2.
+
+### 2026-09-21 — Tighten Shadow-TLS v3 certificate handling
+
+- Removed the obsolete disabled v3 path from the v1/v2 carrier module so v3
+  has one active implementation.
+- Shadow-TLS v3 now uses the embedded CA bundle for Botan certificate
+  verification when `skip_cert_verify` is disabled; the explicit skip path
+  remains available for camouflage endpoints.
+
+### 2026-09-21 — Keep the Go interop test executable stable
+
+- Documented the fixed `go test -c` output directory in the ignore rules so
+  repeated Windows interop runs use one executable path instead of a temporary
+  test binary.
+
+### 2026-09-21 — Finalize Shadow-TLS v3 carrier cleanup
+
+- Kept the v3 frame reader self-contained and removed an unused per-stream
+  header buffer from the carrier implementation.
+
+### 2026-09-21 — Add the Shadow-TLS v3 embedded trust store
+
+- Loaded the existing embedded CA bundle into Botan's in-memory certificate
+  store so v3 can perform normal certificate and hostname verification.
+- Kept the skip-verification path free of an empty trust-store object.

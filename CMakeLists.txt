@@ -148,6 +148,7 @@ add_library(clash-native-core STATIC
     src/transport/shadowsocks/ss2022_stream.cpp
     src/transport/shadowsocks/simple_obfs.cpp
     src/transport/shadowsocks/shadow_tls.cpp
+    src/transport/shadowsocks/shadow_tls_v3.cpp
     src/transport/shadowsocks/restls.cpp
     src/transport/shadowsocks/restls_client.cpp
     src/transport/shadowsocks/jls.cpp

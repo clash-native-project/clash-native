@@ -566,13 +566,13 @@ class ShadowsocksConnectOperation final
                                    "Shadowsocks Shadow-TLS does not use WebSocket plugin options",
                                    {}});
             }
-            if (config_.plugin_version < 1 || config_.plugin_version > 2) {
+            if (config_.plugin_version < 1 || config_.plugin_version > 3) {
                 return core::fail({core::ErrorCode::configuration,
-                                   "Shadowsocks Shadow-TLS version must be 1 or 2", {}});
+                                   "Shadowsocks Shadow-TLS version must be 1, 2, or 3", {}});
             }
-            if (config_.plugin_version == 2 && config_.plugin_password.empty()) {
+            if (config_.plugin_version >= 2 && config_.plugin_password.empty()) {
                 return core::fail({core::ErrorCode::configuration,
-                                   "Shadowsocks Shadow-TLS v2 requires a plugin password",
+                                   "Shadowsocks Shadow-TLS v2 and v3 require a plugin password",
                                    {}});
             }
             if (config_.plugin_host.empty()) {
@@ -1450,13 +1450,13 @@ core::Status ShadowsocksOutbound::validate() const {
                                "Shadowsocks Shadow-TLS does not use WebSocket plugin options",
                                {}});
         }
-        if (config_.plugin_version < 1 || config_.plugin_version > 2) {
+        if (config_.plugin_version < 1 || config_.plugin_version > 3) {
             return core::fail({core::ErrorCode::configuration,
-                               "Shadowsocks Shadow-TLS version must be 1 or 2", {}});
+                               "Shadowsocks Shadow-TLS version must be 1, 2, or 3", {}});
         }
-        if (config_.plugin_version == 2 && config_.plugin_password.empty()) {
+        if (config_.plugin_version >= 2 && config_.plugin_password.empty()) {
             return core::fail({core::ErrorCode::configuration,
-                               "Shadowsocks Shadow-TLS v2 requires a plugin password", {}});
+                               "Shadowsocks Shadow-TLS v2 and v3 require a plugin password", {}});
         }
         if (config_.plugin_host.empty()) {
             return core::fail({core::ErrorCode::configuration,

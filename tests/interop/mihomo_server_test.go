@@ -108,8 +108,8 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
       mode: tls
 `, udpHost, tlsObfsPort, mihomoTestPassword)
 	const shadowTlsPassword = "clash-native-shadow-tls-password"
-	shadowTlsAddresses := make(map[int]string, 2)
-	for _, version := range []int{1, 2} {
+	shadowTlsAddresses := make(map[int]string, 3)
+	for _, version := range []int{1, 2, 3} {
 		address := reserveMihomoShadowsocksAddressOnHost(t, udpHost)
 		shadowTlsAddresses[version] = address
 		_, port, err := net.SplitHostPort(address)
@@ -136,6 +136,16 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
       enable: true
       version: 2
       password: '%s'
+      handshake:
+        dest: itunes.apple.com:443
+`, shadowTlsPassword)
+		} else {
+			fmt.Fprintf(&listenerConfig, `    shadow-tls:
+      enable: true
+      version: 3
+      users:
+        - name: test
+          password: '%s'
       handshake:
         dest: itunes.apple.com:443
 `, shadowTlsPassword)
@@ -336,7 +346,7 @@ listeners:%s
 		}
 	})
 
-	for _, version := range []int{1, 2} {
+	for _, version := range []int{1, 2, 3} {
 		version := version
 		t.Run(fmt.Sprintf("Shadowsocks/shadow-tls-v%d", version), func(t *testing.T) {
 			environment := map[string]string{
@@ -353,7 +363,7 @@ listeners:%s
 			if version >= 2 {
 				environment["CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_PASSWORD"] = shadowTlsPassword
 			}
-			if version == 2 {
+			if version >= 2 {
 				environment["CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_ALPN"] = "http/1.1"
 			}
 			proxyAddress, stopProxy := startOutboundTestHost(t, environment)
