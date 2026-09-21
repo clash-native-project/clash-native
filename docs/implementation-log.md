@@ -1,5 +1,17 @@
 # Implementation Log
 
+### 2026-09-21 — Complete ResTLS TLS 1.3 outbound validation
+
+- Added the native Botan TLS 1.3 ResTLS handshaker. Its ClientHello callback
+  parses the emitted key-share and PSK identity extensions, derives the
+  BLAKE3 authentication prefix, and preserves the required 32-byte
+  compatibility Session ID.
+- Added the TLS 1.3 Mihomo interoperability case using the fixed Go test
+  executable workflow. The test covers the TLS handshake and the plain ResTLS
+  application-record exchange through a TCP echo.
+- Updated the Windows testing documentation to include both ResTLS TLS 1.2
+  and TLS 1.3 validation.
+
 ### 2026-09-21 — Record Shadowsocks Windows and UDP known limitations
 
 - Added the classic Shadowsocks TCP half-close/Windows relay EOF behavior to

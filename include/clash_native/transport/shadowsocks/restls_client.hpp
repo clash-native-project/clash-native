@@ -15,8 +15,8 @@ struct RestlsClientOptions {
     std::string password;
     std::string restls_script;
     bool skip_cert_verify = false;
-    // The native implementation currently uses Botan's TLS 1.2 handshaker.
-    // TLS 1.3 remains rejected until its ClientHello Session ID hook is wired.
+    // The version hint selects a fixed Botan TLS handshaker and the matching
+    // ResTLS ClientHello authentication layout.
     std::string version_hint = "tls12";
 };
 

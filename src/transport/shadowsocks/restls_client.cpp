@@ -14,8 +14,10 @@
 #include <botan/tls_exceptn.h>
 #include <botan/tls_policy.h>
 #include <botan/tls_server_info.h>
+#include <botan/tls_messages.h>
 #include <botan/tls_session.h>
 #include <botan/tls_session_manager.h>
+#include <botan/tls_session_manager_noop.h>
 #include <botan/x509cert.h>
 #include <botan/x25519.h>
 
@@ -46,6 +48,8 @@ namespace {
 
 constexpr std::size_t kTlsRecordHeaderLength = 5;
 constexpr std::size_t kMaxTlsRecordPayload = 16384;
+constexpr std::size_t kTlsRandomLength = 32;
+constexpr std::size_t kTls13SessionIdLength = 32;
 constexpr auto kHandshakeTimeout = std::chrono::seconds(10);
 
 core::Error restls_error(core::ErrorCode code, std::string message) {
@@ -65,6 +69,119 @@ core::Error restls_exception(std::string context, const std::exception& exceptio
 
 std::vector<std::uint8_t> to_bytes(std::span<const std::uint8_t> data) {
     return {data.begin(), data.end()};
+}
+
+struct RestlsTls13ClientHelloMaterials {
+    std::vector<std::pair<std::uint16_t, std::vector<std::uint8_t>>> key_shares;
+    std::vector<std::vector<std::uint8_t>> psk_labels;
+};
+
+std::optional<RestlsTls13ClientHelloMaterials>
+parse_restls_tls13_client_hello(std::span<const std::uint8_t> body) {
+    auto read_u8 = [&](std::size_t &offset, std::uint8_t &value) {
+        if (offset >= body.size()) {
+            return false;
+        }
+        value = body[offset++];
+        return true;
+    };
+    auto read_u16 = [&](std::size_t &offset, std::uint16_t &value) {
+        if (offset + 2 > body.size()) {
+            return false;
+        }
+        value = (static_cast<std::uint16_t>(body[offset]) << 8) | body[offset + 1];
+        offset += 2;
+        return true;
+    };
+
+    if (body.size() < 2 + kTlsRandomLength + 1) {
+        return std::nullopt;
+    }
+    std::size_t offset = 2 + kTlsRandomLength;
+    std::uint8_t session_id_length = 0;
+    if (!read_u8(offset, session_id_length) || offset + session_id_length > body.size()) {
+        return std::nullopt;
+    }
+    offset += session_id_length;
+
+    std::uint16_t cipher_suites_length = 0;
+    if (!read_u16(offset, cipher_suites_length) ||
+        offset + cipher_suites_length > body.size()) {
+        return std::nullopt;
+    }
+    offset += cipher_suites_length;
+    std::uint8_t compression_methods_length = 0;
+    if (!read_u8(offset, compression_methods_length) ||
+        offset + compression_methods_length > body.size()) {
+        return std::nullopt;
+    }
+    offset += compression_methods_length;
+
+    std::uint16_t extensions_length = 0;
+    if (!read_u16(offset, extensions_length) || offset + extensions_length > body.size()) {
+        return std::nullopt;
+    }
+    const auto extensions_end = offset + extensions_length;
+    RestlsTls13ClientHelloMaterials result;
+    while (offset < extensions_end) {
+        std::uint16_t extension_type = 0;
+        std::uint16_t extension_length = 0;
+        if (!read_u16(offset, extension_type) || !read_u16(offset, extension_length) ||
+            offset + extension_length > extensions_end) {
+            return std::nullopt;
+        }
+        const auto extension_end = offset + extension_length;
+        if (extension_type == 0x0033) { // key_share
+            std::uint16_t shares_length = 0;
+            if (!read_u16(offset, shares_length) || offset + shares_length > extension_end) {
+                return std::nullopt;
+            }
+            const auto shares_end = offset + shares_length;
+            while (offset < shares_end) {
+                std::uint16_t group = 0;
+                std::uint16_t share_length = 0;
+                if (!read_u16(offset, group) || !read_u16(offset, share_length) ||
+                    offset + share_length > shares_end) {
+                    return std::nullopt;
+                }
+                result.key_shares.emplace_back(
+                    group, std::vector<std::uint8_t>(body.begin() + offset,
+                                                     body.begin() + offset + share_length));
+                offset += share_length;
+            }
+            if (offset != shares_end) {
+                return std::nullopt;
+            }
+        } else if (extension_type == 0x0029) { // pre_shared_key
+            std::uint16_t identities_length = 0;
+            if (!read_u16(offset, identities_length) || offset + identities_length > extension_end) {
+                return std::nullopt;
+            }
+            const auto identities_end = offset + identities_length;
+            while (offset < identities_end) {
+                std::uint16_t identity_length = 0;
+                if (!read_u16(offset, identity_length) || offset + identity_length + 4 > identities_end) {
+                    return std::nullopt;
+                }
+                result.psk_labels.emplace_back(body.begin() + offset,
+                                               body.begin() + offset + identity_length);
+                offset += identity_length + 4; // identity plus obfuscated_ticket_age
+            }
+            if (offset != identities_end) {
+                return std::nullopt;
+            }
+            std::uint16_t binders_length = 0;
+            if (!read_u16(offset, binders_length) || offset + binders_length != extension_end) {
+                return std::nullopt;
+            }
+            offset += binders_length;
+        }
+        offset = extension_end;
+    }
+    if (offset != extensions_end || result.key_shares.empty()) {
+        return std::nullopt;
+    }
+    return result;
 }
 
 class RestlsPolicy final : public Botan::TLS::Text_Policy {
@@ -198,12 +315,15 @@ class RestlsCallbacks final : public Botan::TLS::Callbacks {
     using EmitHandler = std::function<void(std::span<const std::uint8_t>)>;
     using RecordHandler = std::function<void(std::span<const std::uint8_t>)>;
 
-    RestlsCallbacks(std::shared_ptr<Botan::RandomNumberGenerator> rng, EmitHandler emit,
-                    RecordHandler record, bool skip_cert_verify)
+    RestlsCallbacks(std::shared_ptr<Botan::RandomNumberGenerator> rng,
+                    std::array<std::uint8_t, 32> secret, EmitHandler emit,
+                    RecordHandler record, bool skip_cert_verify, bool tls13)
         : rng_(std::move(rng)),
+          secret_(secret),
           emit_(std::move(emit)),
           record_(std::move(record)),
-          skip_cert_verify_(skip_cert_verify) {
+          skip_cert_verify_(skip_cert_verify),
+          tls13_(tls13) {
         x25519_key_ = std::make_unique<RestlsX25519Key>(*rng_);
         p256_key_ = std::make_unique<Botan::ECDH_PrivateKey>(
             *rng_, Botan::EC_Group::from_name("secp256r1"));
@@ -235,6 +355,39 @@ class RestlsCallbacks final : public Botan::TLS::Callbacks {
 
     void tls_alert(Botan::TLS::Alert alert) override {
         last_alert_ = alert.type_string();
+    }
+
+    void tls_modify_client_hello_random(std::vector<std::uint8_t> &random,
+                                        const Botan::TLS::Client_Hello &hello) override {
+        if (!tls13_) {
+            return;
+        }
+        if (random.size() != kTlsRandomLength) {
+            throw Botan::TLS::TLS_Exception(
+                Botan::TLS::Alert::IllegalParameter,
+                "ResTLS TLS 1.3 ClientHello random has an invalid length");
+        }
+        auto &session_id = const_cast<Botan::TLS::Session_ID &>(hello.session_id()).get();
+        if (session_id.size() != kTls13SessionIdLength) {
+            throw Botan::TLS::TLS_Exception(
+                Botan::TLS::Alert::IllegalParameter,
+                "ResTLS TLS 1.3 requires a 32-byte session ID");
+        }
+        const auto materials = parse_restls_tls13_client_hello(hello.serialize());
+        if (!materials) {
+            throw Botan::TLS::TLS_Exception(
+                Botan::TLS::Alert::DecodeError,
+                "ResTLS TLS 1.3 ClientHello is missing key-share materials");
+        }
+        const auto session_id_prefix = derive_restls_tls13_session_id(
+            secret_, materials->key_shares, materials->psk_labels);
+        if (!session_id_prefix) {
+            throw Botan::TLS::TLS_Exception(
+                Botan::TLS::Alert::InternalError,
+                "ResTLS TLS 1.3 ClientHello authentication derivation failed");
+        }
+        std::copy(session_id_prefix.value().begin(), session_id_prefix.value().end(),
+                  session_id.begin());
     }
 
     void tls_verify_cert_chain(
@@ -321,9 +474,11 @@ class RestlsCallbacks final : public Botan::TLS::Callbacks {
 
   private:
     std::shared_ptr<Botan::RandomNumberGenerator> rng_;
+    std::array<std::uint8_t, 32> secret_{};
     EmitHandler emit_;
     RecordHandler record_;
     bool skip_cert_verify_ = false;
+    bool tls13_ = false;
     std::unique_ptr<RestlsX25519Key> x25519_key_;
     std::unique_ptr<Botan::ECDH_PrivateKey> p256_key_;
     std::unique_ptr<Botan::ECDH_PrivateKey> p384_key_;
@@ -340,9 +495,9 @@ class RestlsStream final : public core::StreamHandle,
                  std::array<std::uint8_t, 32> secret, std::vector<std::uint8_t> server_random,
                  std::shared_ptr<Botan::RandomNumberGenerator> rng,
                  std::vector<RestlsScriptLine> script, std::vector<std::uint8_t> initial_wire,
-                 bool tls12_gcm)
+                 bool tls12_gcm, std::vector<std::uint8_t> initial_auth_extra)
         : lower_(std::move(lower)),
-          encoder_(secret, server_random, false, tls12_gcm),
+          encoder_(secret, server_random, false, tls12_gcm, std::move(initial_auth_extra)),
           decoder_(secret, std::move(server_random), true, tls12_gcm),
           rng_(std::move(rng)),
           script_(std::move(script)),
@@ -724,12 +879,14 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
                                            "ResTLS server name and password are required")));
             return;
         }
-        if (options_.version_hint != "tls12") {
+        if (options_.version_hint != "tls12" && options_.version_hint != "tls13") {
             finish(core::fail(restls_error(
                 core::ErrorCode::unsupported,
-                "native ResTLS currently supports only the tls12 version hint")));
+                "native ResTLS supports only the tls12 and tls13 version hints")));
             return;
         }
+        const bool tls13 = options_.version_hint == "tls13";
+        tls13_ = tls13;
         auto script = parse_restls_script(options_.restls_script.empty()
                                               ? "250?100<1,350~100<1,600~100,300~200,300~100"
                                               : options_.restls_script);
@@ -748,37 +905,42 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
         });
         try {
             rng_ = std::make_shared<Botan::AutoSeeded_RNG>();
-            callbacks_ = std::make_shared<RestlsCallbacks>(
-                rng_, [self](std::span<const std::uint8_t> data) { self->emit_tls(data); },
-                [self](std::span<const std::uint8_t> data) { self->record_received(data); },
-                options_.skip_cert_verify);
             const auto secret = derive_restls_secret(options_.password);
             if (!secret) {
                 finish(core::fail(secret.error()));
                 return;
             }
             secret_ = secret.value();
-            const auto public_keys = callbacks_->public_keys();
-            const auto session_id = derive_restls_tls12_session_id(secret_, public_keys);
-            if (!session_id) {
-                finish(core::fail(session_id.error()));
-                return;
-            }
-            Botan::secure_vector<std::uint8_t> master_secret(48, 0);
+            callbacks_ = std::make_shared<RestlsCallbacks>(
+                rng_, secret_, [self](std::span<const std::uint8_t> data) { self->emit_tls(data); },
+                [self](std::span<const std::uint8_t> data) { self->record_received(data); },
+                options_.skip_cert_verify, tls13);
             Botan::TLS::Server_Information info(options_.server_name);
-            Botan::TLS::Session session(master_secret, Botan::TLS::Protocol_Version::TLS_V12,
-                                        0xC02F, Botan::TLS::Connection_Side::Client, true, false,
-                                        {}, info, 0, std::chrono::system_clock::now());
-            Botan::TLS::Session_Handle handle(
-                Botan::TLS::Session_ID(std::vector<std::uint8_t>(session_id.value().begin(),
-                                                                  session_id.value().end())));
-            session_manager_ = std::make_shared<RestlsSessionManager>(rng_, std::move(session),
-                                                                        std::move(handle));
-            policy_ = std::make_shared<RestlsPolicy>(false);
+            const auto protocol_version = tls13 ? Botan::TLS::Protocol_Version::TLS_V13
+                                                : Botan::TLS::Protocol_Version::TLS_V12;
+            if (tls13) {
+                session_manager_ = std::make_shared<Botan::TLS::Session_Manager_Noop>();
+            } else {
+                const auto public_keys = callbacks_->public_keys();
+                const auto session_id = derive_restls_tls12_session_id(secret_, public_keys);
+                if (!session_id) {
+                    finish(core::fail(session_id.error()));
+                    return;
+                }
+                Botan::secure_vector<std::uint8_t> master_secret(48, 0);
+                Botan::TLS::Session session(master_secret, protocol_version, 0xC02F,
+                                            Botan::TLS::Connection_Side::Client, true, false, {},
+                                            info, 0, std::chrono::system_clock::now());
+                Botan::TLS::Session_Handle handle(Botan::TLS::Session_ID(
+                    std::vector<std::uint8_t>(session_id.value().begin(), session_id.value().end())));
+                session_manager_ = std::make_shared<RestlsSessionManager>(
+                    rng_, std::move(session), std::move(handle));
+            }
+            policy_ = std::make_shared<RestlsPolicy>(tls13);
             credentials_ = std::make_shared<RestlsCredentials>();
             tls_client_ = std::make_unique<Botan::TLS::Client>(
                 callbacks_, session_manager_, credentials_, policy_, rng_, info,
-                Botan::TLS::Protocol_Version::TLS_V12, std::vector<std::string>{});
+                protocol_version, std::vector<std::string>{});
             read_tls_records();
         } catch (const std::exception& exception) {
             finish(core::fail(restls_exception("failed to initialize native ResTLS", exception)));
@@ -882,8 +1044,10 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
             tls_input_.erase(tls_input_.begin(),
                              tls_input_.begin() + static_cast<std::ptrdiff_t>(record.size()));
             remember_server_random(record);
-            if (server_ccs_seen_ && record[0] == 22) {
-                unmask_server_finished(record);
+            if (server_ccs_seen_ && !server_auth_unmasked_ &&
+                (record[0] == 22 || record[0] == 23)) {
+                unmask_server_auth(record);
+                server_auth_unmasked_ = true;
             }
             if (record[0] == 20) {
                 server_ccs_seen_ = true;
@@ -930,9 +1094,8 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
                cipher_suite == 0xC02C;
     }
 
-    void unmask_server_finished(std::vector<std::uint8_t>& record) {
-        if (!server_tls12_gcm_ || server_random_.size() != 32 ||
-            record.size() <= kTlsRecordHeaderLength) {
+    void unmask_server_auth(std::vector<std::uint8_t>& record) {
+        if (server_random_.size() != 32 || record.size() <= kTlsRecordHeaderLength) {
             return;
         }
         const auto mask = restls_hmac(
@@ -941,7 +1104,7 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
             return;
         }
         std::size_t offset = kTlsRecordHeaderLength;
-        if (record.size() >= kTlsRecordHeaderLength + 8) {
+        if (server_tls12_gcm_ && record.size() >= kTlsRecordHeaderLength + 8) {
             std::uint64_t explicit_nonce = 0;
             for (std::size_t index = 0; index < 8; ++index) {
                 explicit_nonce = (explicit_nonce << 8) | record[kTlsRecordHeaderLength + index];
@@ -966,7 +1129,8 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
         (void)timer_.cancel();
         auto adapter = std::make_shared<RestlsStream>(
             std::move(stream_), secret_, std::move(server_random_), rng_, std::move(script_),
-            std::move(tls_input_), server_tls12_gcm_);
+            std::move(tls_input_), server_tls12_gcm_,
+            tls13_ ? std::move(last_client_finished_) : std::vector<std::uint8_t>{});
         finish(core::Result<std::unique_ptr<core::StreamHandle>>(
             std::make_unique<RestlsStreamHandle>(std::move(adapter))));
     }
@@ -997,7 +1161,7 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
     boost::asio::steady_timer timer_;
     std::shared_ptr<Botan::RandomNumberGenerator> rng_;
     std::shared_ptr<RestlsCallbacks> callbacks_;
-    std::shared_ptr<RestlsSessionManager> session_manager_;
+    std::shared_ptr<Botan::TLS::Session_Manager> session_manager_;
     std::shared_ptr<RestlsPolicy> policy_;
     std::shared_ptr<RestlsCredentials> credentials_;
     std::unique_ptr<Botan::TLS::Client> tls_client_;
@@ -1006,6 +1170,8 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
     std::vector<std::uint8_t> server_random_;
     bool server_tls12_gcm_ = false;
     bool server_ccs_seen_ = false;
+    bool server_auth_unmasked_ = false;
+    bool tls13_ = false;
     std::vector<std::uint8_t> last_client_finished_;
     std::vector<std::uint8_t> tls_input_;
     std::vector<std::uint8_t> read_temp_ = std::vector<std::uint8_t>(16 * 1024);

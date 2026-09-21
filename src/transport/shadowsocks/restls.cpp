@@ -226,11 +226,13 @@ core::Result<std::array<std::uint8_t, 16>> derive_restls_tls13_session_id(
 
 RestlsApplicationCodec::RestlsApplicationCodec(std::array<std::uint8_t, 32> secret,
                                                std::vector<std::uint8_t> server_random,
-                                               bool to_client, bool tls12_gcm) noexcept
+                                               bool to_client, bool tls12_gcm,
+                                               std::vector<std::uint8_t> initial_auth_extra) noexcept
     : secret_(secret),
       server_random_(std::move(server_random)),
       to_client_(to_client),
-      tls12_gcm_(tls12_gcm) {}
+      tls12_gcm_(tls12_gcm),
+      initial_auth_extra_(std::move(initial_auth_extra)) {}
 
 core::Result<std::vector<std::uint8_t>>
 RestlsApplicationCodec::encode(std::span<const std::uint8_t> data, std::size_t data_length,
@@ -274,16 +276,18 @@ RestlsApplicationCodec::encode(std::span<const std::uint8_t> data, std::size_t d
               payload.begin() + static_cast<std::ptrdiff_t>(kRestlsApplicationMacLength));
     const auto header = std::span<const std::uint8_t>(record).first(payload_offset);
     std::vector<std::uint8_t> auth_input;
-    auth_input.reserve(header.size() + payload.size() - kRestlsApplicationMacLength);
-    // A full TLS 1.2 handshake uses the record header and application payload
-    // here; the Mihomo ResTLS server does not include the encrypted Finished
-    // record in the first application-record authentication input.
+    auth_input.reserve(initial_auth_extra_.size() + header.size() + payload.size() -
+                       kRestlsApplicationMacLength);
+    if (!initial_auth_extra_.empty() && counter_ == 0) {
+        auth_input.insert(auth_input.end(), initial_auth_extra_.begin(), initial_auth_extra_.end());
+    }
     auth_input.insert(auth_input.end(), header.begin(), header.end());
     auth_input.insert(auth_input.end(), payload.begin() + kRestlsApplicationMacLength,
                       payload.end());
     const auto auth = auth_hash(secret_, server_random_, to_client_, counter_, auth_input);
     std::copy_n(auth.begin(), kRestlsApplicationMacLength, payload.begin());
     ++counter_;
+    initial_auth_extra_.clear();
     return record;
 }
 

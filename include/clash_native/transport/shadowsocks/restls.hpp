@@ -57,12 +57,15 @@ struct RestlsDecodedRecord {
 
 // The post-handshake ResTLS application record format. This deliberately keeps
 // padding generation outside the codec so callers can provide a cryptographic
-// random source and tests can use deterministic padding.
+// random source and tests can use deterministic padding. `initial_auth_extra`
+// carries the TLS 1.3 client Finished record required by the first
+// client-to-server ResTLS application record.
 class RestlsApplicationCodec final {
   public:
     RestlsApplicationCodec(std::array<std::uint8_t, 32> secret,
                            std::vector<std::uint8_t> server_random, bool to_client,
-                           bool tls12_gcm = false) noexcept;
+                           bool tls12_gcm = false,
+                           std::vector<std::uint8_t> initial_auth_extra = {}) noexcept;
 
     core::Result<std::vector<std::uint8_t>> encode(std::span<const std::uint8_t> data,
                                                    std::size_t data_length,
@@ -78,6 +81,7 @@ class RestlsApplicationCodec final {
     std::vector<std::uint8_t> server_random_;
     bool to_client_ = false;
     bool tls12_gcm_ = false;
+    std::vector<std::uint8_t> initial_auth_extra_;
     std::uint64_t counter_ = 0;
 };
 

@@ -99,12 +99,13 @@ address encoding for each packet frame. `DatagramHandle` preserves either an IP
 address or a domain name returned by the protocol. Native UDP socket adapters
 still require an IP address when sending to the operating system.
 
-`TestMihomoActualServerInteroperability/Shadowsocks/restls-tls12` validates
-the Shadowsocks ResTLS outbound path against a real Mihomo listener. It uses a
-separately built Go test executable, the TLS 1.2 version hint, the configured
-Mihomo ResTLS script, and a TCP echo exchange. TLS 1.3 ResTLS remains outside
-the validated scope until the native TLS client has matching session-ID and
-record hooks.
+`TestMihomoActualServerInteroperability/Shadowsocks/restls-tls12` and
+`.../restls-tls13` validate the Shadowsocks ResTLS outbound path against a real
+Mihomo listener. They use a separately built Go test executable, fixed TLS 1.2
+or TLS 1.3 version hints, the configured Mihomo ResTLS script, and a TCP echo
+exchange. The TLS 1.3 case covers the custom 32-byte compatibility Session ID
+with its BLAKE3 authentication prefix and the plain ResTLS application-record
+format used after the TLS handshake.
 
 `TestMihomoActualServerInteroperability/Shadowsocks/jls` validates the
 Shadowsocks JLS outbound path against a real Mihomo listener. It uses a
@@ -183,8 +184,8 @@ $env:CLASH_NATIVE_TEST_HOST = 'D:\Project\cpp\clash-native\build\windows-clang-c
 # Run Shadowsocks UDP-over-TCP versions 1 and 2.
 & $interop '-test.count=1' '-test.run=^TestMihomoActualServerShadowsocksUoT$' '-test.v=true'
 
-# Run the Shadowsocks ResTLS TLS 1.2 case.
-& $interop '-test.count=1' '-test.run=^TestMihomoActualServerInteroperability$/Shadowsocks/restls-tls12$' '-test.v=true'
+# Run the Shadowsocks ResTLS TLS 1.2 and TLS 1.3 cases.
+& $interop '-test.count=1' '-test.run=^TestMihomoActualServerInteroperability$/Shadowsocks/restls-tls(12|13)$' '-test.v=true'
 
 # Run the Shadowsocks JLS TLS 1.3 case.
 & $interop '-test.count=1' '-test.run=^TestMihomoActualServerInteroperability$/Shadowsocks/jls$' '-test.v=true'

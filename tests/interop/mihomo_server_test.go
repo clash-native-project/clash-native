@@ -418,6 +418,38 @@ listeners:%s
 		}
 	})
 
+	t.Run("Shadowsocks/restls-tls13", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":                         "shadowsocks",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":                  restlsAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":                mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_METHOD":                  "chacha20-ietf-poly1305",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN":                  "restls",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_HOST":             "www.google.com",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_PASSWORD":         restlsPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_VERSION_HINT":     "tls13",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_RESTLS_SCRIPT":    "1000?100<1,500~100,350~100,600~100,400~200",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_SKIP_CERT_VERIFY": "1",
+			"CLASH_NATIVE_TEST_PROXY_HOST":                       udpHost,
+		})
+		defer stopProxy()
+
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-restls-tls13-", 2048))
+		writeBytes(t, client, payload)
+		if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("half-close C++ to Mihomo ResTLS TLS 1.3 stream: %v", err)
+			}
+		}
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo ResTLS TLS 1.3 returned different bytes")
+		}
+	})
+
 	t.Run("Shadowsocks/jls", func(t *testing.T) {
 		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
 			"CLASH_NATIVE_TEST_OUTBOUND":                         "shadowsocks",
