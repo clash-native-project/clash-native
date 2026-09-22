@@ -1,5 +1,97 @@
 # Implementation Log
 
+### 2026-09-22 — Add broadcast and watch channels (tokio parity: four kinds)
+
+- Added `include/clash_native/async/broadcast.hpp`: MPMC broadcast with
+  per-receiver sequence cursors, a bounded evicting buffer, and lag
+  reporting. `send()` never blocks; slow receivers get `broadcast_lagged`
+  (with the skipped count) as `set_error` while the stream stays alive, so a
+  lag-tolerant loop can catch it around `co_await` and continue from the
+  oldest buffered value. Includes `Sender::subscribe()` for late joiners
+  (new subscribers observe only later values), receiver counting (send fails
+  with no receivers), and the usual stop/destroy cancellation.
+- Added `include/clash_native/async/watch.hpp`: single-slot latest-value
+  channel with a version counter. `Receiver::next()` waits for a version
+  newer than the seen one and yields a copy; `borrow()` snapshots
+  synchronously, `mark_changed()` re-observes the current value, and close
+  drains the last update before ending. Sender is move-only, receivers are
+  copyable (tokio parity). Both new receivers natively satisfy
+  `async_stream`, so all operators compose over them.
+- Fixed a critical bug found by the watch tests: four waiter wake-up loops
+  (new in broadcast/watch) missed the `node = next` list advance and spun
+  forever growing the woken list (one test consumed ~20GB before bad_alloc).
+  All list traversals across the async headers were re-audited; mpsc was
+  already correct.
+- Added `tests/core/broadcast_test.cpp` (11 cases) and
+  `tests/core/watch_test.cpp` (10 cases) covering fan-out, late subscribe,
+  lag counting and lag-tolerant loops, coalescing, independent receivers,
+  close draining, cancellation, threaded producers, and operator composition.
+- Validated with the Windows x64 Release clang-cl/MSVC build: 72 async cases
+  pass in ~0.5s total; `pixi run format-check` and `git diff --check` pass.
+
+### 2026-09-22 — Replace the blocking async channels with sender-native streams
+
+- Rewrote `include/clash_native/async/oneshot.hpp` as a P2300 sender: the
+  receiver connects directly to a caller receiver, completes with
+  `set_value(optional<T>)` / `set_error` / `set_stopped`, and supports
+  cancellation both by stop token and by destroying the parked operation.
+  The state machine keeps the previous fine-grained locking (the mutex is
+  never held across a completion) plus a detached flag so late sends fail.
+- Rewrote `include/clash_native/async/mpsc_channel.hpp` on the same model:
+  unbounded, bounded (backpressure), and rendezvous (`bounded(0)`) channels
+  with synchronous `try_send` fast paths, direct hand-off to a parked
+  receiver, intrusive parked-sender wait lists, stop-token cancellation that
+  withdraws parked values, and single-consumer violation reporting. The
+  previous `rigtorp/MPMCQueue` reference dependency was replaced with a
+  mutex-guarded deque so no new third-party dependency was needed.
+- Added `include/clash_native/async/async_stream.hpp`: an `async_stream`
+  concept (`next()` returns a sender of `optional<T>`), factories
+  (`empty`/`once`/`from_vector`/`interval_on`), statically composed pipeable
+  operators (`async_map`, `async_filter`, `async_take`, `async_take_while`,
+  `async_skip`, `async_skip_while`, `async_scan`, `async_flat_map`,
+  `async_zip`, sequential `merge`, concurrent `async_merge`), sender
+  consumers (`async_for_each`, `async_fold`, `collect`, `count`, `first`),
+  and an `AnyAsyncStream` type-erased escape hatch. Repeat pulls use a
+  trampoline so synchronous sources iterate instead of recursing; stop
+  tokens propagate through every stage.
+- Added `stdexec` (0.10.0) to `vcpkg.json` and linked `STDEXEC::stdexec` to
+  `clash-native-core`.
+- Rewrote `tests/core/channel_test.cpp` for the new API and added
+  `tests/core/async_stream_test.cpp` plus `tests/core/async_test_helpers.hpp`
+  (51 cases total, including cancellation, error propagation, move-only
+  payloads, a 100k-item non-recursion case, early-drop driver cancellation,
+  task-consumer composition with `when_all`/`then`/`starts_on`, a complex
+  multi-stage pipeline, push-style `subscribe`, and a tokio-style
+  `StreamMap`: readiness-based fan-in over named heterogeneous streams with
+  first-wins pulls, per-source end accounting, and a heap
+  self-deleting child protocol with a mutex abandon handshake so destroying a
+  parked pull is safe. Supporting fixes: `AnyAsyncStream` pulls are erased to
+  `exec::any_sender` (with the stop-token query declared so cancellation
+  passes through the erasure instead of degrading to `never_stop_token`),
+  and operator inner receivers use unqualified completions plus an eager
+  stop-token snapshot env because erased machinery invokes receivers as
+  lvalues and cannot copy immovable envs).
+- Concurrent `async_merge` uses structured concurrency instead of threads:
+  each source is pulled by an `exec::task` driver spawned into an
+  `exec::async_scope` in the shared state, so parked drivers suspend without
+  consuming any thread (verified: the merge tests create no library threads).
+  Dropping the merged stream calls `scope.request_stop()`, which wakes parked
+  drivers; each driver converts a stopped pull into end-of-stream via
+  `let_stopped` and still delivers exactly one sentinel, so destruction
+  completes synchronously. A source that ignores stop tokens and never ends
+  still pins its driver until it does.
+- Deleted the unreferenced reference copies at `include/channel.hpp`,
+  `include/stream.hpp`, `include/stream_base.hpp`, and `include/runtime.hpp`
+  (they pointed at a non-existent `dart_cpp_bridge` include prefix and were
+  included by nothing).
+- Validated with the Windows x64 Release clang-cl/MSVC build: the 38 new
+  cases pass (threaded cases repeated 15 times), `pixi run format-check`
+  and `git diff --check` pass. The full binary still reports 4 failing
+  `ResolverService` UDP cases; they fail identically on the pristine tree
+  (verified via `git stash` plus rebuild), so they are pre-existing
+  environment failures unrelated to this change. Go interop was not rerun;
+  no Go sources were modified.
+
 ### 2026-09-21 — Keep logging configuration at the process boundary
 
 - Removed the project-specific logging configuration API and kept library code

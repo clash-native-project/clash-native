@@ -22,6 +22,7 @@ find_package(nghttp3 CONFIG REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(Snappy CONFIG REQUIRED)
+find_package(STDEXEC CONFIG REQUIRED)
 find_package(tl-expected CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
@@ -197,6 +198,7 @@ target_link_libraries(clash-native-core
     PUBLIC
         Boost::asio
         Threads::Threads
+        STDEXEC::stdexec
         protobuf::libprotobuf
         tl::expected
     PRIVATE
@@ -308,8 +310,11 @@ if(BUILD_TESTING)
     )
 
     add_executable(clash-native-tests
+        tests/core/async_stream_test.cpp
         tests/core/base64_test.cpp
+        tests/core/broadcast_test.cpp
         tests/core/channel_test.cpp
+        tests/core/watch_test.cpp
         tests/core/error_test.cpp
         tests/core/outbound_contract_test.cpp
         tests/core/version_test.cpp
