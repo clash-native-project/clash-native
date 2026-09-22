@@ -1526,3 +1526,48 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Kept the generic HTTP/1.1 WebSocket and optional TLS carrier in
   `src/transport`; the mux remains eligible for extraction after a second
   independent consumer appears.
+
+### 2026-09-21 — Consolidate the Asio runtime into a shared worker pool
+
+- Replaced the multiple independent `AsioRuntime` instances and `RuntimeSet`
+  container with one process-wide runtime singleton.
+- The singleton owns one shared `io_context`, work guard, and configurable
+  runner-thread pool; callers must use session serialization when mutable state
+  can be reached by different runner threads.
+- Updated runtime tests and architecture/testing documentation for the shared
+  multi-thread scheduler model.
+
+### 2026-09-21 — Serialize shared-runtime service state
+
+- Added a shared Asio strand to the singleton scheduler and associated the
+  runtime-owned DNS, proxy, outbound, and bootstrap I/O objects with it.
+- Marshalled DNS query, upstream, and completion state transitions through the
+  serialized executor so multiple runner threads do not concurrently mutate a
+  service's owner state.
+- Updated the DNS completion test and runtime documentation for interchangeable
+  worker threads and explicit scheduler affinity.
+
+### 2026-09-22 — Finish singleton runtime migration on Windows
+
+- Kept the DNS server's UDP and TCP listeners on the shared serialized executor
+  so listener state and query bookkeeping remain single-owner with multiple
+  runtime workers.
+- Updated the architecture and stdexec usage notes to describe the process-wide
+  runtime lifetime and runner-thread model accurately.
+- Added bounded waits to the Windows DNS UDP listener tests so environments that
+  do not deliver loopback UDP report a skip instead of hanging the CTest run.
+- Kept the TCP test fixture's accepted socket alive until teardown so the
+  multi-worker runtime test does not depend on a response timing race.
+- Reused the Windows test address probe for direct UDP outbound coverage so
+  the test does not require loopback UDP delivery.
+- Moved the remaining Shadowsocks and KCP datagram sockets and pool timers to
+  the shared serialized executor as well.
+
+### 2026-09-22 — Match the Asio concurrency hint to the runner count
+
+- Rebuilt the stopped singleton runtime's `io_context`, serialized executor,
+  and work guard when the configured worker count changes.
+- Constructed `io_context` with the runner count so single-worker mode can use
+  Asio's lower-overhead single-thread scheduling path.
+- Added a runtime test covering context replacement during worker-count
+  reconfiguration and documented the executor lifetime requirement.

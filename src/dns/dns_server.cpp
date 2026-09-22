@@ -75,17 +75,16 @@ DnsServer::DnsServer(runtime::AsioRuntime &runtime, ResolverService &resolver,
 DnsServer::DnsServer(runtime::AsioRuntime &runtime, DnsQueryService &query_service,
                      boost::asio::ip::udp::endpoint udp_endpoint,
                      boost::asio::ip::tcp::endpoint tcp_endpoint)
-    : runtime_(runtime), query_service_(&query_service),
-      udp_socket_(runtime.context().get_executor()), tcp_acceptor_(runtime.context()),
-      udp_endpoint_(udp_endpoint), tcp_endpoint_(tcp_endpoint),
-      callback_gate_(std::make_shared<std::atomic_bool>(false)) {}
+    : runtime_(runtime), query_service_(&query_service), udp_socket_(runtime.serialized_executor()),
+      tcp_acceptor_(runtime.serialized_executor()), udp_endpoint_(udp_endpoint),
+      tcp_endpoint_(tcp_endpoint), callback_gate_(std::make_shared<std::atomic_bool>(false)) {}
 
 DnsServer::DnsServer(runtime::AsioRuntime &runtime,
                      std::shared_ptr<runtime::RuntimeSnapshotStore> snapshot_store,
                      boost::asio::ip::udp::endpoint udp_endpoint,
                      boost::asio::ip::tcp::endpoint tcp_endpoint)
     : runtime_(runtime), snapshot_store_(std::move(snapshot_store)),
-      udp_socket_(runtime.context().get_executor()), tcp_acceptor_(runtime.context()),
+      udp_socket_(runtime.serialized_executor()), tcp_acceptor_(runtime.serialized_executor()),
       udp_endpoint_(udp_endpoint), tcp_endpoint_(tcp_endpoint),
       callback_gate_(std::make_shared<std::atomic_bool>(false)) {
     if (!snapshot_store_) {
@@ -164,7 +163,7 @@ void DnsServer::stop() noexcept {
     }
 
     std::binary_semaphore completed(0);
-    boost::asio::dispatch(runtime_.context(), [this, &completed] {
+    boost::asio::dispatch(runtime_.serialized_executor(), [this, &completed] {
         stop_on_owner();
         completed.release();
     });
@@ -244,7 +243,7 @@ void DnsServer::accept_tcp() {
         return;
     }
     const auto gate = callback_gate_;
-    auto socket = std::make_shared<boost::asio::ip::tcp::socket>(runtime_.context());
+    auto socket = std::make_shared<boost::asio::ip::tcp::socket>(runtime_.serialized_executor());
     tcp_acceptor_.async_accept(*socket,
                                [this, gate, socket](const boost::system::error_code &error) {
                                    if (!gate->load(std::memory_order_acquire)) {

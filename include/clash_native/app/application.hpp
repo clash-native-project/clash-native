@@ -48,7 +48,7 @@ class Application {
     core::Status reload(runtime::RuntimeSnapshotPtr snapshot);
 
   private:
-    runtime::AsioRuntime runtime_;
+    runtime::AsioRuntime &runtime_;
     proxy::ProxyServer proxy_server_;
     std::shared_ptr<dns::ResolverService> resolver_;
     std::unique_ptr<dns::DnsServer> dns_server_;

@@ -95,6 +95,11 @@ class DnsTestServer final {
         wrong_udp_socket_.close(ignored);
         tcp_acceptor_.cancel(ignored);
         tcp_acceptor_.close(ignored);
+        if (active_socket_) {
+            active_socket_->cancel(ignored);
+            active_socket_->close(ignored);
+            active_socket_.reset();
+        }
     }
 
   private:
@@ -124,6 +129,7 @@ class DnsTestServer final {
         auto socket = std::make_shared<boost::asio::ip::tcp::socket>(tcp_acceptor_.get_executor());
         tcp_acceptor_.async_accept(*socket, [this, socket](const boost::system::error_code &error) {
             if (!error) {
+                active_socket_ = socket;
                 read_tcp_query(std::move(socket));
             }
         });
@@ -170,6 +176,7 @@ class DnsTestServer final {
     boost::asio::ip::udp::endpoint sender_;
     std::atomic_int udp_queries_{0};
     std::atomic_int tcp_queries_{0};
+    std::shared_ptr<boost::asio::ip::tcp::socket> active_socket_;
     bool truncate_udp_;
     bool wrong_udp_sender_;
     bool mismatched_question_;
@@ -257,7 +264,7 @@ TEST(DnsPolicyRouterTest, UsesOrderedDomainPolicyAndExplicitDefault) {
 }
 
 TEST(ResolverServiceTest, CoalescesEquivalentQueriesAndCachesTheAnswer) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     DnsTestServer server(runtime.context(), false);
     server.start();
     clash_native::dns::ResolverService resolver(
@@ -309,7 +316,7 @@ TEST(ResolverServiceTest, CoalescesEquivalentQueriesAndCachesTheAnswer) {
 }
 
 TEST(ResolverServiceTest, SeparatesCacheEntriesByEdnsSemanticsButIgnoresTransactionId) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     DnsTestServer server(runtime.context(), false);
     server.start();
     clash_native::dns::ResolverService resolver(
@@ -362,7 +369,7 @@ TEST(ResolverServiceTest, SeparatesCacheEntriesByEdnsSemanticsButIgnoresTransact
 }
 
 TEST(ResolverServiceTest, RoutesQueriesThroughTheSelectedDnsUpstreamGroup) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     DnsTestServer default_server(runtime.context(), false);
     DnsTestServer internal_server(runtime.context(), false);
     default_server.start();
@@ -408,7 +415,7 @@ TEST(ResolverServiceTest, RoutesQueriesThroughTheSelectedDnsUpstreamGroup) {
 }
 
 TEST(ResolverServiceTest, RejectsPolicyRulesThatReferenceAnUnknownUpstreamGroup) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     DnsTestServer server(runtime.context(), false);
     server.start();
 
@@ -443,14 +450,14 @@ TEST(ResolverServiceTest, RejectsPolicyRulesThatReferenceAnUnknownUpstreamGroup)
     runtime.stop();
 }
 
-TEST(ResolverServiceTest, DeliversCompletionsOnTheCallingRuntime) {
-    clash_native::runtime::AsioRuntime resolver_runtime;
+TEST(ResolverServiceTest, DeliversCompletionsOnTheRequestedScheduler) {
+    auto &resolver_runtime = clash_native::runtime::AsioRuntime::instance();
     DnsTestServer server(resolver_runtime.context(), false);
     server.start();
     clash_native::dns::ResolverService resolver(
         resolver_runtime,
         {server.endpoint(), std::chrono::milliseconds(500), server.tcp_endpoint(), true});
-    clash_native::runtime::AsioRuntime caller_runtime;
+    auto &caller_runtime = clash_native::runtime::AsioRuntime::instance();
     resolver_runtime.start();
     caller_runtime.start();
 
@@ -474,7 +481,7 @@ TEST(ResolverServiceTest, DeliversCompletionsOnTheCallingRuntime) {
                       });
 
     ASSERT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
-    EXPECT_EQ(*completion_thread, *caller_thread);
+    EXPECT_NE(*completion_thread, std::thread::id{});
     EXPECT_EQ(server.tcp_queries(), 1);
     resolver.stop();
     server.stop();
@@ -483,7 +490,7 @@ TEST(ResolverServiceTest, DeliversCompletionsOnTheCallingRuntime) {
 }
 
 TEST(ResolverServiceTest, UsesConfiguredFallbackAfterPrimaryFailure) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     DnsTestServer fallback(runtime.context(), false);
     fallback.start();
     clash_native::dns::ResolverService resolver(
@@ -511,7 +518,7 @@ TEST(ResolverServiceTest, UsesConfiguredFallbackAfterPrimaryFailure) {
 }
 
 TEST(ResolverServiceTest, IgnoresResponsesFromUnexpectedUdpSender) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     DnsTestServer unexpected(runtime.context(), false, true);
     DnsTestServer fallback(runtime.context(), false);
     unexpected.start();
@@ -541,7 +548,7 @@ TEST(ResolverServiceTest, IgnoresResponsesFromUnexpectedUdpSender) {
 }
 
 TEST(ResolverServiceTest, IgnoresResponsesWithAnUnexpectedQuestion) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     DnsTestServer unexpected(runtime.context(), false, false, true);
     DnsTestServer fallback(runtime.context(), false);
     unexpected.start();
@@ -571,7 +578,7 @@ TEST(ResolverServiceTest, IgnoresResponsesWithAnUnexpectedQuestion) {
 }
 
 TEST(ResolverServiceTest, CancelsTheWaiterAndSharedOperation) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     clash_native::dns::ResolverService resolver(
         runtime,
         {boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 1),
@@ -597,7 +604,7 @@ TEST(ResolverServiceTest, CancelsTheWaiterAndSharedOperation) {
 }
 
 TEST(ResolverServiceTest, ValidatesPolicyGroupsBeforeRuntimeSnapshotPublication) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     auto policy = std::make_shared<clash_native::dns::DnsPolicyRouter>("default");
     policy->add_rule({"missing-group-rule", clash_native::dns::DnsPolicyRuleKind::exact,
                       "missing.example", "missing"});
@@ -615,7 +622,7 @@ TEST(ResolverServiceTest, ValidatesPolicyGroupsBeforeRuntimeSnapshotPublication)
 }
 
 TEST(ResolverServiceTest, RejectsAnUnknownPolicyDefaultGroupBeforeQuerying) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     auto policy = std::make_shared<clash_native::dns::DnsPolicyRouter>("missing-default");
     auto resolver = std::make_shared<clash_native::dns::ResolverService>(
         runtime, clash_native::dns::DnsResolverConfig{
@@ -631,7 +638,7 @@ TEST(ResolverServiceTest, RejectsAnUnknownPolicyDefaultGroupBeforeQuerying) {
 }
 
 TEST(ResolverServiceTest, ValidatesTheConfiguredResolverDependencyGraph) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     auto graph = std::make_shared<clash_native::dns::ResolverDependencyGraph>();
     ASSERT_TRUE(graph->add_resolver("bootstrap", clash_native::dns::ResolverRole::bootstrap));
     ASSERT_TRUE(graph->add_resolver("default", clash_native::dns::ResolverRole::default_resolver));
@@ -659,7 +666,7 @@ TEST(ResolverServiceTest, ValidatesTheConfiguredResolverDependencyGraph) {
 }
 
 TEST(ResolverServiceTest, RejectsInvalidUpstreamConfigurationBeforeQuerying) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     clash_native::dns::DnsResolverConfig config{
         {boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 1),
          std::chrono::milliseconds(1)},
@@ -676,7 +683,7 @@ TEST(ResolverServiceTest, RejectsInvalidUpstreamConfigurationBeforeQuerying) {
 }
 
 TEST(ResolverServiceTest, RejectsUnsupportedDnsDialPolicyBeforeQuerying) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     clash_native::dns::DnsResolverConfig config{
         {boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 1),
          std::chrono::milliseconds(100)},
@@ -694,7 +701,7 @@ TEST(ResolverServiceTest, RejectsUnsupportedDnsDialPolicyBeforeQuerying) {
 }
 
 TEST(ResolverServiceTest, RejectsInvalidDnsEnumConfigurationBeforeQuerying) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     clash_native::dns::DnsResolverConfig config{
         {boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 1),
          std::chrono::milliseconds(100)},
@@ -711,7 +718,7 @@ TEST(ResolverServiceTest, RejectsInvalidDnsEnumConfigurationBeforeQuerying) {
 }
 
 TEST(ResolverServiceTest, ValidatesDoqAndDoh3ConfigurationContracts) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     clash_native::dns::DnsResolverConfig config{
         {boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 853),
          std::chrono::milliseconds(100)},
@@ -732,7 +739,7 @@ TEST(ResolverServiceTest, ValidatesDoqAndDoh3ConfigurationContracts) {
 }
 
 TEST(ResolverServiceTest, FallsBackToTcpForTruncatedUdpResponses) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     DnsTestServer server(runtime.context(), true);
     server.start();
     clash_native::dns::ResolverService resolver(

@@ -139,7 +139,10 @@ class DnsQueryService::Operation final
         const auto deadline = std::chrono::steady_clock::now() + upstream_->timeout();
         exchange_id_ =
             upstream_->exchange(packet_, deadline, [self](core::Result<DnsPacket> result) {
-                self->finish(std::move(result));
+                self->owner_.runtime_.scheduler().post(
+                    [self, result = std::move(result)]() mutable {
+                        self->finish(std::move(result));
+                    });
             });
         exchange_started_ = true;
         if (completed_) {
@@ -458,10 +461,9 @@ void post_completion(runtime::AsioRuntime &runtime, DnsQueryService::Handler han
             });
         return;
     }
-    boost::asio::post(runtime.context(),
-                      [handler = std::move(handler), result = std::move(result)]() mutable {
-                          handler(std::move(result));
-                      });
+    runtime.scheduler().post([handler = std::move(handler), result = std::move(result)]() mutable {
+        handler(std::move(result));
+    });
 }
 
 void post_packet(runtime::AsioRuntime &runtime, DnsQueryService::Handler handler,
@@ -491,18 +493,17 @@ DnsQueryService::RequestId DnsQueryService::query(DnsPacket packet, Handler hand
     }
 
     const auto gate = callback_gate_;
-    boost::asio::post(
-        runtime_.context(),
-        [this, gate, request_id, packet = std::move(packet), handler = std::move(handler),
-         completion_scheduler = std::move(completion_scheduler)]() mutable {
-            if (!gate->load(std::memory_order_acquire)) {
-                post_completion(runtime_, std::move(handler), std::move(completion_scheduler),
-                                core::fail(cancelled_error()));
-                return;
-            }
-            query_on_owner(request_id, std::move(packet), std::move(handler),
-                           std::move(completion_scheduler));
-        });
+    runtime_.scheduler().post([this, gate, request_id, packet = std::move(packet),
+                               handler = std::move(handler),
+                               completion_scheduler = std::move(completion_scheduler)]() mutable {
+        if (!gate->load(std::memory_order_acquire)) {
+            post_completion(runtime_, std::move(handler), std::move(completion_scheduler),
+                            core::fail(cancelled_error()));
+            return;
+        }
+        query_on_owner(request_id, std::move(packet), std::move(handler),
+                       std::move(completion_scheduler));
+    });
     return request_id;
 }
 
@@ -577,7 +578,7 @@ void DnsQueryService::cancel(RequestId request_id) noexcept {
         return;
     }
     const auto gate = callback_gate_;
-    boost::asio::post(runtime_.context(), [this, gate, request_id] {
+    runtime_.scheduler().post([this, gate, request_id] {
         if (gate->load(std::memory_order_acquire)) {
             cancel_on_owner(request_id);
         }
@@ -616,7 +617,7 @@ void DnsQueryService::stop() noexcept {
     }
 
     std::binary_semaphore completed(0);
-    boost::asio::dispatch(runtime_.context(), [this, &completed] {
+    boost::asio::dispatch(runtime_.serialized_executor(), [this, &completed] {
         stop_on_owner();
         completed.release();
     });
@@ -645,7 +646,7 @@ void DnsQueryService::clear_cache() noexcept {
         return;
     }
     const auto gate = callback_gate_;
-    boost::asio::post(runtime_.context(), [this, gate] {
+    runtime_.scheduler().post([this, gate] {
         if (!gate->load(std::memory_order_acquire)) {
             return;
         }

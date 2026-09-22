@@ -35,20 +35,20 @@ class SystemBootstrapResolver final : public BootstrapResolver,
                                       public std::enable_shared_from_this<SystemBootstrapResolver> {
   public:
     explicit SystemBootstrapResolver(runtime::AsioRuntime &runtime)
-        : runtime_(runtime), resolver_(runtime.context()) {}
+        : runtime_(runtime), resolver_(runtime.serialized_executor()) {}
 
     RequestId resolve(std::string hostname, std::chrono::steady_clock::time_point deadline,
                       Handler handler) override {
         const auto request_id = next_request_id_++;
         if (stopped_) {
-            boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
+            runtime_.scheduler().post([handler = std::move(handler)]() mutable {
                 if (handler) {
                     handler(core::fail(cancelled_error()));
                 }
             });
             return request_id;
         }
-        auto request = std::make_shared<Request>(runtime_.context());
+        auto request = std::make_shared<Request>(runtime_.serialized_executor());
         request->hostname = std::move(hostname);
         request->handler = std::move(handler);
         request->timer.expires_at(deadline);
@@ -115,7 +115,7 @@ class SystemBootstrapResolver final : public BootstrapResolver,
 
   private:
     struct Request {
-        explicit Request(boost::asio::io_context &context) : timer(context) {}
+        explicit Request(boost::asio::any_io_executor executor) : timer(std::move(executor)) {}
 
         std::string hostname;
         Handler handler;
@@ -132,10 +132,10 @@ class SystemBootstrapResolver final : public BootstrapResolver,
         request->timer.cancel();
         if (request->handler) {
             auto handler = std::move(request->handler);
-            boost::asio::post(runtime_.context(),
-                              [handler = std::move(handler), result = std::move(result)]() mutable {
-                                  handler(std::move(result));
-                              });
+            runtime_.scheduler().post(
+                [handler = std::move(handler), result = std::move(result)]() mutable {
+                    handler(std::move(result));
+                });
         }
     }
 
@@ -185,14 +185,14 @@ class DnsBootstrapResolver final : public BootstrapResolver,
                       Handler handler) override {
         const auto request_id = next_request_id_++;
         if (stopped_) {
-            boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
+            runtime_.scheduler().post([handler = std::move(handler)]() mutable {
                 if (handler) {
                     handler(core::fail(cancelled_error()));
                 }
             });
             return request_id;
         }
-        auto request = std::make_shared<Request>(runtime_.context());
+        auto request = std::make_shared<Request>(runtime_.serialized_executor());
         request->hostname = std::move(hostname);
         request->deadline = deadline;
         request->handler = std::move(handler);
@@ -216,7 +216,7 @@ class DnsBootstrapResolver final : public BootstrapResolver,
         close_socket(*request);
         if (request->handler) {
             auto handler = std::move(request->handler);
-            boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
+            runtime_.scheduler().post([handler = std::move(handler)]() mutable {
                 handler(core::fail(cancelled_error()));
             });
         }
@@ -241,7 +241,7 @@ class DnsBootstrapResolver final : public BootstrapResolver,
 
   private:
     struct Request {
-        explicit Request(boost::asio::io_context &context) : timer(context) {}
+        explicit Request(boost::asio::any_io_executor executor) : timer(std::move(executor)) {}
 
         std::string hostname;
         std::chrono::steady_clock::time_point deadline;
@@ -283,7 +283,8 @@ class DnsBootstrapResolver final : public BootstrapResolver,
             return;
         }
 
-        request->socket = std::make_shared<boost::asio::ip::udp::socket>(runtime_.context());
+        request->socket =
+            std::make_shared<boost::asio::ip::udp::socket>(runtime_.serialized_executor());
         boost::system::error_code error;
         const auto endpoint = request->servers[request->server_index];
         request->socket->open(endpoint.protocol(), error);
@@ -489,10 +490,10 @@ class DnsBootstrapResolver final : public BootstrapResolver,
         close_socket(*request);
         if (request->handler) {
             auto handler = std::move(request->handler);
-            boost::asio::post(runtime_.context(),
-                              [handler = std::move(handler), result = std::move(result)]() mutable {
-                                  handler(std::move(result));
-                              });
+            runtime_.scheduler().post(
+                [handler = std::move(handler), result = std::move(result)]() mutable {
+                    handler(std::move(result));
+                });
         }
     }
 

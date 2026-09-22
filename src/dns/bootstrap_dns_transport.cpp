@@ -163,10 +163,10 @@ class BootstrapDnsTransport final : public DnsTransport,
         pending_.erase(found);
         if (pending->handler) {
             auto handler = std::move(pending->handler);
-            boost::asio::post(runtime_.context(),
-                              [handler = std::move(handler), result = std::move(result)]() mutable {
-                                  handler(std::move(result));
-                              });
+            runtime_.scheduler().post(
+                [handler = std::move(handler), result = std::move(result)]() mutable {
+                    handler(std::move(result));
+                });
         }
     }
 

@@ -96,12 +96,12 @@ class HttpProxyConnectOperation final
                               core::StreamOpenHandler handler)
         : runtime_(runtime), resolver_(std::move(resolver)), config_(std::move(config)),
           request_(std::move(request)),
-          socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.context())),
-          timer_(runtime.context()), handler_(std::move(handler)) {}
+          socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.serialized_executor())),
+          timer_(runtime.serialized_executor()), handler_(std::move(handler)) {}
 
     void start() {
         const auto self = shared_from_this();
-        boost::asio::dispatch(runtime_.context(), [self] { self->start_on_owner(); });
+        boost::asio::dispatch(runtime_.serialized_executor(), [self] { self->start_on_owner(); });
     }
 
   private:
@@ -130,7 +130,7 @@ class HttpProxyConnectOperation final
         detail::resolve_host(runtime_, resolver_, config_.server_host,
                              [self](core::Result<detail::AddressList> result) mutable {
                                  boost::asio::dispatch(
-                                     self->runtime_.context(),
+                                     self->runtime_.serialized_executor(),
                                      [self, result = std::move(result)]() mutable {
                                          self->resolved(std::move(result));
                                      });
@@ -364,7 +364,7 @@ void HttpProxyOutbound::connect_stream(core::StreamRequest request,
 }
 
 void HttpProxyOutbound::open_datagram(core::DatagramRequest, core::DatagramOpenHandler handler) {
-    boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
+    runtime_.scheduler().post([handler = std::move(handler)]() mutable {
         handler(core::DatagramOpenResult::unsupported());
     });
 }

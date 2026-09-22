@@ -127,9 +127,9 @@ TEST(OutboundRegistryTest, SelectsASharedSnapshotConcurrently) {
 }
 
 TEST(DirectOutboundTest, OpensAnIpDatagramForDnsEgress) {
-    clash_native::runtime::AsioRuntime runtime;
-    boost::asio::ip::udp::socket receiver(runtime.context(),
-                                          {boost::asio::ip::address_v4::loopback(), 0});
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    const auto test_address = udp_test_address(runtime.context());
+    boost::asio::ip::udp::socket receiver(runtime.context(), {test_address, 0});
     const auto endpoint = receiver.local_endpoint();
     clash_native::outbound::DirectOutbound outbound(runtime);
 
@@ -180,7 +180,7 @@ TEST(ShadowsocksOutboundTest, RejectsEncryptedUdpDatagramsLargerThan1500Bytes) {
     constexpr std::size_t aead_tag_size = 16;
     constexpr std::size_t ipv4_proxy_address_size = 1 + 4 + 2;
 
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     runtime.start();
     const auto test_address = udp_test_address(runtime.context());
 

@@ -160,7 +160,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
             return;
         }
 
-        auto pending = std::make_shared<Pending>(runtime_.context());
+        auto pending = std::make_shared<Pending>(runtime_.serialized_executor());
         pending->request = std::move(request);
         pending->handler = std::move(handler);
         pending->timer.expires_at(deadline);
@@ -202,7 +202,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
 
   private:
     struct Pending {
-        explicit Pending(boost::asio::io_context &context) : timer(context) {}
+        explicit Pending(boost::asio::any_io_executor executor) : timer(std::move(executor)) {}
 
         transport::ExchangeRequest request;
         Handler handler;
@@ -212,12 +212,12 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     };
 
     void complete_immediately(Handler handler, core::Error error) {
-        boost::asio::post(runtime_.context(),
-                          [handler = std::move(handler), error = std::move(error)]() mutable {
-                              if (handler) {
-                                  handler(core::fail(std::move(error)));
-                              }
-                          });
+        runtime_.scheduler().post(
+            [handler = std::move(handler), error = std::move(error)]() mutable {
+                if (handler) {
+                    handler(core::fail(std::move(error)));
+                }
+            });
     }
 
     void connect_if_needed() {

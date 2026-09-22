@@ -112,7 +112,7 @@ TEST(EndpointDialerTest, RejectsRuntimeOutboundCyclesBeforeOpeningAHandle) {
 }
 
 TEST(EndpointDialerTest, ResolvesDnsTrafficRulesBeforeOpeningDatagramCarrier) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     auto outbound = std::make_shared<RecordingOutbound>("resolver-proxy");
     clash_native::outbound::OutboundRegistry registry;
     ASSERT_TRUE(registry.add_outbound("resolver-proxy", outbound));

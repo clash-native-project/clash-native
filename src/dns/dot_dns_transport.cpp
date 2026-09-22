@@ -99,7 +99,7 @@ class DotDnsTransport::Session final
             return;
         }
 
-        auto pending = std::make_shared<Pending>(runtime_.context());
+        auto pending = std::make_shared<Pending>(runtime_.serialized_executor());
         pending->frame.reserve(2 + query.size());
         pending->frame.push_back(static_cast<std::uint8_t>(query.size() >> 8));
         pending->frame.push_back(static_cast<std::uint8_t>(query.size() & 0xff));
@@ -134,7 +134,7 @@ class DotDnsTransport::Session final
 
   private:
     struct Pending {
-        explicit Pending(boost::asio::io_context &context) : timer(context) {}
+        explicit Pending(boost::asio::any_io_executor executor) : timer(std::move(executor)) {}
 
         std::vector<std::uint8_t> frame;
         Handler handler;
@@ -145,12 +145,12 @@ class DotDnsTransport::Session final
     using ReadCompletion = std::function<void(const boost::system::error_code &)>;
 
     void complete_immediately(Handler handler, core::Error error) {
-        boost::asio::post(runtime_.context(),
-                          [handler = std::move(handler), error = std::move(error)]() mutable {
-                              if (handler) {
-                                  handler(core::fail(std::move(error)));
-                              }
-                          });
+        runtime_.scheduler().post(
+            [handler = std::move(handler), error = std::move(error)]() mutable {
+                if (handler) {
+                    handler(core::fail(std::move(error)));
+                }
+            });
     }
 
     void connect_if_needed() {

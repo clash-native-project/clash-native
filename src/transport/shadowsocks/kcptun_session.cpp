@@ -703,13 +703,13 @@ struct KcptunClientPool::Impl final : public std::enable_shared_from_this<Kcptun
     };
 
     Impl(runtime::AsioRuntime &runtime, KcptunClientOptions options)
-        : runtime(runtime), options(std::move(options)), scavenger(runtime.context()) {
+        : runtime(runtime), options(std::move(options)), scavenger(runtime.serialized_executor()) {
         slots.resize(static_cast<std::size_t>(this->options.connection_count));
     }
 
     void open_stream(boost::asio::ip::udp::endpoint endpoint, core::StreamOpenHandler handler) {
         if (closed) {
-            boost::asio::post(runtime.context(), [handler = std::move(handler)]() mutable {
+            runtime.scheduler().post([handler = std::move(handler)]() mutable {
                 handler(core::StreamOpenResult::failed(
                     {core::ErrorCode::transport_io, "kcptun client pool is closed", {}}));
             });

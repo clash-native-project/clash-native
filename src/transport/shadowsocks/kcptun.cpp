@@ -600,7 +600,7 @@ make_kcptun_carrier(runtime::AsioRuntime &runtime, boost::asio::ip::udp::endpoin
         return core::fail(packet_codec.error());
     }
 
-    auto socket = std::make_unique<net::UdpStream>(runtime.context().get_executor());
+    auto socket = std::make_unique<net::UdpStream>(runtime.serialized_executor());
     boost::system::error_code error;
     socket->open(remote_endpoint.protocol(), error);
     if (!error) {

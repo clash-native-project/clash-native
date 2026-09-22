@@ -105,7 +105,7 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     Operation(Doh1DnsTransport &owner, ExchangeId exchange_id, DnsExchangeRequest request,
               Handler handler)
         : owner_(owner), exchange_id_(exchange_id), request_(std::move(request)),
-          handler_(std::move(handler)), timer_(owner.runtime_.context()) {}
+          handler_(std::move(handler)), timer_(owner.runtime_.serialized_executor()) {}
 
     void start() {
         if (std::chrono::steady_clock::now() >= request_.deadline) {

@@ -68,7 +68,7 @@ class EchoSession : public std::enable_shared_from_this<EchoSession> {
 } // namespace
 
 TEST(Socks5ProxyTest, ConnectsAndRelaysTcpData) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     boost::asio::ip::tcp::acceptor target(runtime.context(),
                                           {boost::asio::ip::address_v4::loopback(), 0});
     const auto target_endpoint = target.local_endpoint();
@@ -129,7 +129,7 @@ TEST(Socks5ProxyTest, ConnectsAndRelaysTcpData) {
 }
 
 TEST(Socks5ProxyTest, ConnectsAndRelaysSocks4TcpData) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     boost::asio::ip::tcp::acceptor target(runtime.context(),
                                           {boost::asio::ip::address_v4::loopback(), 0});
     const auto target_endpoint = target.local_endpoint();
@@ -190,7 +190,7 @@ TEST(Socks5ProxyTest, ConnectsAndRelaysSocks4TcpData) {
 }
 
 TEST(Socks5ProxyTest, ParsesSocks4aDomainRequests) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
     proxy.set_default_action(clash_native::router::RouteAction::reject());
     ASSERT_TRUE(proxy.start());
@@ -219,7 +219,7 @@ TEST(Socks5ProxyTest, ParsesSocks4aDomainRequests) {
 }
 
 TEST(Socks5ProxyTest, SupportsMihomoStyleUsernamePasswordAuthentication) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     boost::asio::ip::tcp::acceptor target(runtime.context(),
                                           {boost::asio::ip::address_v4::loopback(), 0});
     const auto target_endpoint = target.local_endpoint();
@@ -286,7 +286,7 @@ TEST(Socks5ProxyTest, SupportsMihomoStyleUsernamePasswordAuthentication) {
 }
 
 TEST(Socks5ProxyTest, RelaysStandaloneUdpListenerPackets) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     const auto udp_address = udp_test_address(runtime.context());
     if (udp_address.is_loopback()) {
         GTEST_SKIP() << "non-loopback UDP is unavailable in this Windows environment";

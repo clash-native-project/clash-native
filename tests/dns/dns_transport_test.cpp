@@ -107,12 +107,12 @@ cname_response(const clash_native::dns::DnsPacket &query, std::string_view targe
 class FakeDnsTransport final : public clash_native::dns::DnsTransport,
                                public std::enable_shared_from_this<FakeDnsTransport> {
   public:
-    FakeDnsTransport(boost::asio::io_context &context, boost::asio::ip::address answer_address,
+    FakeDnsTransport(boost::asio::any_io_executor executor, boost::asio::ip::address answer_address,
                      std::shared_ptr<FakeTransportStats> stats, bool respond, bool fail = false,
                      std::uint8_t response_code = 0, bool return_query = false,
                      FakeResponseFactory response_factory = {})
-        : context_(context), answer_address_(std::move(answer_address)), stats_(std::move(stats)),
-          respond_(respond), fail_(fail), response_code_(response_code),
+        : executor_(std::move(executor)), answer_address_(std::move(answer_address)),
+          stats_(std::move(stats)), respond_(respond), fail_(fail), response_code_(response_code),
           return_query_(return_query), response_factory_(std::move(response_factory)) {}
 
     ExchangeId exchange(clash_native::dns::DnsExchangeRequest request, Handler handler) override {
@@ -128,7 +128,7 @@ class FakeDnsTransport final : public clash_native::dns::DnsTransport,
         started_ = true;
         if (respond_) {
             auto self = shared_from_this();
-            boost::asio::post(context_, [self] {
+            boost::asio::post(executor_, [self] {
                 if (self->completed_) {
                     return;
                 }
@@ -197,7 +197,7 @@ class FakeDnsTransport final : public clash_native::dns::DnsTransport,
     }
 
   private:
-    boost::asio::io_context &context_;
+    boost::asio::any_io_executor executor_;
     boost::asio::ip::address answer_address_;
     std::shared_ptr<FakeTransportStats> stats_;
     Handler handler_;
@@ -214,9 +214,9 @@ class FakeDnsTransport final : public clash_native::dns::DnsTransport,
 
 class ProbeDnsStream final : public clash_native::core::StreamHandle {
   public:
-    explicit ProbeDnsStream(boost::asio::io_context &context,
+    explicit ProbeDnsStream(boost::asio::any_io_executor executor,
                             std::shared_ptr<std::atomic_bool> closed)
-        : executor_(context.get_executor()), closed_(std::move(closed)) {}
+        : executor_(std::move(executor)), closed_(std::move(closed)) {}
 
     void async_read_some(boost::asio::mutable_buffer, ReadHandler handler) override {
         handler(boost::asio::error::eof, 0);
@@ -245,20 +245,20 @@ class ProbeDnsStream final : public clash_native::core::StreamHandle {
 
 class ProbeDnsDialer final : public clash_native::dns::DnsUpstreamDialer {
   public:
-    ProbeDnsDialer(boost::asio::io_context &context, std::shared_ptr<std::atomic_int> calls,
+    ProbeDnsDialer(boost::asio::any_io_executor executor, std::shared_ptr<std::atomic_int> calls,
                    std::shared_ptr<std::atomic_bool> closed)
-        : context_(context), calls_(std::move(calls)), closed_(std::move(closed)) {}
+        : executor_(std::move(executor)), calls_(std::move(calls)), closed_(std::move(closed)) {}
 
     void connect_stream(clash_native::core::StreamRequest, Handler handler) override {
         ++*calls_;
-        boost::asio::post(context_, [this, handler = std::move(handler)]() mutable {
+        boost::asio::post(executor_, [this, handler = std::move(handler)]() mutable {
             handler(clash_native::core::StreamOpenResult::opened(
-                std::make_unique<ProbeDnsStream>(context_, closed_)));
+                std::make_unique<ProbeDnsStream>(executor_, closed_)));
         });
     }
 
   private:
-    boost::asio::io_context &context_;
+    boost::asio::any_io_executor executor_;
     std::shared_ptr<std::atomic_int> calls_;
     std::shared_ptr<std::atomic_bool> closed_;
 };
@@ -286,8 +286,8 @@ class CountingDnsDialer final : public clash_native::dns::DnsUpstreamDialer {
 
 class PersistentTcpDnsServer final {
   public:
-    explicit PersistentTcpDnsServer(boost::asio::io_context &context)
-        : acceptor_(context), gate_(std::make_shared<std::atomic_bool>(false)) {
+    explicit PersistentTcpDnsServer(boost::asio::any_io_executor executor)
+        : acceptor_(executor), gate_(std::make_shared<std::atomic_bool>(false)) {
         boost::system::error_code error;
         acceptor_.open(boost::asio::ip::tcp::v4(), error);
         if (!error) {
@@ -432,8 +432,8 @@ class PersistentTcpDnsServer final {
 
 class PersistentUdpDnsServer final {
   public:
-    explicit PersistentUdpDnsServer(boost::asio::io_context &context)
-        : socket_(context, {boost::asio::ip::address_v4::loopback(), 0}),
+    explicit PersistentUdpDnsServer(boost::asio::any_io_executor executor)
+        : socket_(executor, {boost::asio::ip::address_v4::loopback(), 0}),
           gate_(std::make_shared<std::atomic_bool>(false)) {}
 
     boost::asio::ip::udp::endpoint endpoint() const noexcept { return socket_.local_endpoint(); }
@@ -555,13 +555,13 @@ std::optional<TestCertificate> make_test_certificate() {
 
 class DotDnsTestServer final {
   public:
-    static std::unique_ptr<DotDnsTestServer> create(boost::asio::io_context &context) {
+    static std::unique_ptr<DotDnsTestServer> create(boost::asio::any_io_executor executor) {
         const auto certificate = make_test_certificate();
         if (!certificate) {
             return nullptr;
         }
         return std::unique_ptr<DotDnsTestServer>(
-            new DotDnsTestServer(context, certificate->certificate, certificate->private_key));
+            new DotDnsTestServer(executor, certificate->certificate, certificate->private_key));
     }
 
     boost::asio::ip::tcp::endpoint endpoint() const noexcept { return acceptor_.local_endpoint(); }
@@ -583,10 +583,10 @@ class DotDnsTestServer final {
   private:
     using Stream = boost::asio::ssl::stream<boost::asio::ip::tcp::socket>;
 
-    DotDnsTestServer(boost::asio::io_context &context, std::string certificate,
+    DotDnsTestServer(boost::asio::any_io_executor executor, std::string certificate,
                      std::string private_key)
         : certificate_(std::move(certificate)), private_key_(std::move(private_key)),
-          ssl_context_(boost::asio::ssl::context::tls_server), acceptor_(context),
+          ssl_context_(boost::asio::ssl::context::tls_server), acceptor_(executor),
           gate_(std::make_shared<std::atomic_bool>(false)) {
         boost::system::error_code error;
         ssl_context_.use_certificate_chain(boost::asio::buffer(certificate_), error);
@@ -702,14 +702,15 @@ class DotDnsTestServer final {
 class Doh1DnsTestServer final {
   public:
     static std::unique_ptr<Doh1DnsTestServer>
-    create(boost::asio::io_context &context, std::string content_type = "application/dns-message",
-           int status_code = 200, bool chunked = false) {
+    create(boost::asio::any_io_executor executor,
+           std::string content_type = "application/dns-message", int status_code = 200,
+           bool chunked = false) {
         const auto certificate = make_test_certificate();
         if (!certificate) {
             return nullptr;
         }
         return std::unique_ptr<Doh1DnsTestServer>(
-            new Doh1DnsTestServer(context, certificate->certificate, certificate->private_key,
+            new Doh1DnsTestServer(executor, certificate->certificate, certificate->private_key,
                                   std::move(content_type), status_code, chunked));
     }
 
@@ -733,12 +734,12 @@ class Doh1DnsTestServer final {
   private:
     using Stream = boost::asio::ssl::stream<boost::asio::ip::tcp::socket>;
 
-    Doh1DnsTestServer(boost::asio::io_context &context, std::string certificate,
+    Doh1DnsTestServer(boost::asio::any_io_executor executor, std::string certificate,
                       std::string private_key, std::string content_type, int status_code,
                       bool chunked)
         : certificate_(std::move(certificate)), private_key_(std::move(private_key)),
           content_type_(std::move(content_type)), status_code_(status_code), chunked_(chunked),
-          ssl_context_(boost::asio::ssl::context::tls_server), acceptor_(context),
+          ssl_context_(boost::asio::ssl::context::tls_server), acceptor_(executor),
           gate_(std::make_shared<std::atomic_bool>(false)) {
         boost::system::error_code error;
         ssl_context_.use_certificate_chain(boost::asio::buffer(certificate_), error);
@@ -923,13 +924,13 @@ class Doh1DnsTestServer final {
 
 class Doh2DnsTestServer final {
   public:
-    static std::unique_ptr<Doh2DnsTestServer> create(boost::asio::io_context &context) {
+    static std::unique_ptr<Doh2DnsTestServer> create(boost::asio::any_io_executor executor) {
         const auto certificate = make_test_certificate();
         if (!certificate) {
             return nullptr;
         }
         return std::unique_ptr<Doh2DnsTestServer>(
-            new Doh2DnsTestServer(context, certificate->certificate, certificate->private_key));
+            new Doh2DnsTestServer(executor, certificate->certificate, certificate->private_key));
     }
 
     boost::asio::ip::tcp::endpoint endpoint() const noexcept { return acceptor_.local_endpoint(); }
@@ -1177,10 +1178,10 @@ class Doh2DnsTestServer final {
         }
     };
 
-    Doh2DnsTestServer(boost::asio::io_context &context, std::string certificate,
+    Doh2DnsTestServer(boost::asio::any_io_executor executor, std::string certificate,
                       std::string private_key)
         : certificate_(std::move(certificate)), private_key_(std::move(private_key)),
-          ssl_context_(boost::asio::ssl::context::tls_server), acceptor_(context),
+          ssl_context_(boost::asio::ssl::context::tls_server), acceptor_(executor),
           gate_(std::make_shared<std::atomic_bool>(false)) {
         boost::system::error_code error;
         ssl_context_.use_certificate_chain(boost::asio::buffer(certificate_), error);
@@ -1269,7 +1270,7 @@ fake_config(std::shared_ptr<FakeTransportStats> default_stats,
                              clash_native::dns::DnsUpstreamConfig config) {
         const bool internal = config.endpoint == internal_endpoint;
         return std::make_shared<FakeDnsTransport>(
-            runtime.context(),
+            runtime.serialized_executor(),
             internal ? boost::asio::ip::make_address("198.51.100.2")
                      : boost::asio::ip::make_address("192.0.2.2"),
             internal ? internal_stats : default_stats, respond);
@@ -1284,7 +1285,7 @@ fake_config(std::shared_ptr<FakeTransportStats> default_stats,
 } // namespace
 
 TEST(ResolverServiceTransportTest, UsesInjectedTransportForPolicySelectedGroups) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     auto default_stats = std::make_shared<FakeTransportStats>();
     auto internal_stats = std::make_shared<FakeTransportStats>();
     clash_native::dns::DnsTransportFactory factory;
@@ -1296,7 +1297,7 @@ TEST(ResolverServiceTransportTest, UsesInjectedTransportForPolicySelectedGroups)
     auto failures = std::make_shared<std::atomic_int>(0);
     auto done = std::make_shared<std::promise<void>>();
     auto future = done->get_future();
-    boost::asio::post(runtime.context(), [&resolver, completed, failures, done] {
+    boost::asio::post(runtime.serialized_executor(), [&resolver, completed, failures, done] {
         const auto handler = [completed, failures, done](
                                  clash_native::core::Result<clash_native::dns::DnsAnswer> result) {
             if (!result) {
@@ -1322,8 +1323,8 @@ TEST(ResolverServiceTransportTest, UsesInjectedTransportForPolicySelectedGroups)
 }
 
 TEST(ResolverServiceTransportTest, UsesNamedOutboundForPlainUdpEgress) {
-    clash_native::runtime::AsioRuntime runtime;
-    PersistentUdpDnsServer upstream(runtime.context());
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    PersistentUdpDnsServer upstream(runtime.serialized_executor());
     upstream.start();
 
     auto registry = std::make_shared<clash_native::outbound::OutboundRegistry>();
@@ -1369,7 +1370,7 @@ TEST(ResolverServiceTransportTest, UsesNamedOutboundForPlainUdpEgress) {
 }
 
 TEST(ResolverServiceTransportTest, FollowsCnameInASeparateDnsResponse) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     runtime.start();
     auto stats = std::make_shared<FakeTransportStats>();
     const auto endpoint =
@@ -1397,8 +1398,8 @@ TEST(ResolverServiceTransportTest, FollowsCnameInASeparateDnsResponse) {
                 return clash_native::dns::DnsMessageCodec::decode_packet(encoded.value(), query.id);
             };
             return std::make_shared<FakeDnsTransport>(
-                owner_runtime.context(), boost::asio::ip::make_address("192.0.2.44"), stats, true,
-                false, 0, false, response_factory);
+                owner_runtime.serialized_executor(), boost::asio::ip::make_address("192.0.2.44"),
+                stats, true, false, 0, false, response_factory);
         };
     clash_native::dns::ResolverService resolver(
         runtime, clash_native::dns::DnsResolverConfig{
@@ -1426,7 +1427,7 @@ TEST(ResolverServiceTransportTest, FollowsCnameInASeparateDnsResponse) {
 }
 
 TEST(ResolverServiceTransportTest, DoesNotCallTransportForUnknownPolicyGroup) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     auto stats = std::make_shared<FakeTransportStats>();
     clash_native::dns::DnsTransportFactory factory;
     auto config = fake_config(stats, stats, false, &factory);
@@ -1439,7 +1440,7 @@ TEST(ResolverServiceTransportTest, DoesNotCallTransportForUnknownPolicyGroup) {
 
     auto done = std::make_shared<std::promise<void>>();
     auto future = done->get_future();
-    boost::asio::post(runtime.context(), [&resolver, done] {
+    boost::asio::post(runtime.serialized_executor(), [&resolver, done] {
         resolver.resolve({"missing.example", clash_native::dns::DnsRecordType::a, 1},
                          [done](clash_native::core::Result<clash_native::dns::DnsAnswer> result) {
                              ASSERT_FALSE(result);
@@ -1458,7 +1459,7 @@ TEST(ResolverServiceTransportTest, DoesNotCallTransportForUnknownPolicyGroup) {
 }
 
 TEST(ResolverServiceTransportTest, CancelsInjectedTransportExchangeOnce) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     auto stats = std::make_shared<FakeTransportStats>();
     clash_native::dns::DnsTransportFactory factory;
     auto config = fake_config(stats, stats, false, &factory);
@@ -1467,7 +1468,7 @@ TEST(ResolverServiceTransportTest, CancelsInjectedTransportExchangeOnce) {
 
     auto done = std::make_shared<std::promise<void>>();
     auto future = done->get_future();
-    boost::asio::post(runtime.context(), [&resolver, done] {
+    boost::asio::post(runtime.serialized_executor(), [&resolver, done] {
         const auto request_id = resolver.resolve(
             {"cancel.example", clash_native::dns::DnsRecordType::a, 1},
             [done](clash_native::core::Result<clash_native::dns::DnsAnswer> result) {
@@ -1487,7 +1488,7 @@ TEST(ResolverServiceTransportTest, CancelsInjectedTransportExchangeOnce) {
 }
 
 TEST(ResolverServiceTransportTest, StopsPendingInjectedTransportAndCompletesWaiterOnce) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     auto stats = std::make_shared<FakeTransportStats>();
     stats->exchange_started = std::make_shared<std::promise<void>>();
     auto exchange_started = stats->exchange_started->get_future();
@@ -1499,7 +1500,7 @@ TEST(ResolverServiceTransportTest, StopsPendingInjectedTransportAndCompletesWait
     auto callback_count = std::make_shared<std::atomic_int>(0);
     auto done = std::make_shared<std::promise<void>>();
     auto future = done->get_future();
-    boost::asio::post(runtime.context(), [&resolver, callback_count, done] {
+    boost::asio::post(runtime.serialized_executor(), [&resolver, callback_count, done] {
         resolver.resolve({"shutdown.example", clash_native::dns::DnsRecordType::a, 1},
                          [callback_count,
                           done](clash_native::core::Result<clash_native::dns::DnsAnswer> result) {
@@ -1522,7 +1523,7 @@ TEST(ResolverServiceTransportTest, StopsPendingInjectedTransportAndCompletesWait
 }
 
 TEST(ResolverServiceTransportTest, SkipsUnhealthyUpstreamMembersUntilTheyRecover) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     const auto first_endpoint =
         boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 5302);
     const auto second_endpoint =
@@ -1535,7 +1536,7 @@ TEST(ResolverServiceTransportTest, SkipsUnhealthyUpstreamMembersUntilTheyRecover
                        clash_native::dns::DnsUpstreamConfig config) {
             const bool first = config.endpoint == first_endpoint;
             return std::make_shared<FakeDnsTransport>(
-                owner_runtime.context(), boost::asio::ip::make_address("192.0.2.20"),
+                owner_runtime.serialized_executor(), boost::asio::ip::make_address("192.0.2.20"),
                 first ? first_stats : second_stats, true, first);
         };
 
@@ -1582,7 +1583,7 @@ TEST(ResolverServiceTransportTest, SkipsUnhealthyUpstreamMembersUntilTheyRecover
 }
 
 TEST(ResolverServiceTransportTest, TriesGroupMembersWithinOneDeadline) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     const auto first_endpoint =
         boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 5310);
     const auto second_endpoint =
@@ -1593,7 +1594,7 @@ TEST(ResolverServiceTransportTest, TriesGroupMembersWithinOneDeadline) {
                     second_stats](clash_native::runtime::AsioRuntime &owner_runtime,
                                   clash_native::dns::DnsUpstreamConfig config) {
         const bool first = config.endpoint == first_endpoint;
-        return std::make_shared<FakeDnsTransport>(owner_runtime.context(),
+        return std::make_shared<FakeDnsTransport>(owner_runtime.serialized_executor(),
                                                   first
                                                       ? boost::asio::ip::make_address("192.0.2.10")
                                                       : boost::asio::ip::make_address("192.0.2.11"),
@@ -1617,7 +1618,7 @@ TEST(ResolverServiceTransportTest, TriesGroupMembersWithinOneDeadline) {
 
     auto done = std::make_shared<std::promise<void>>();
     auto future = done->get_future();
-    boost::asio::post(runtime.context(), [&resolver, done] {
+    boost::asio::post(runtime.serialized_executor(), [&resolver, done] {
         resolver.resolve({"group.example", clash_native::dns::DnsRecordType::a, 1},
                          [done](clash_native::core::Result<clash_native::dns::DnsAnswer> result) {
                              ASSERT_TRUE(result) << (result ? "" : result.error().context);
@@ -1635,7 +1636,7 @@ TEST(ResolverServiceTransportTest, TriesGroupMembersWithinOneDeadline) {
 }
 
 TEST(ResolverServiceTransportTest, FallsBackAfterRetryableDnsResponse) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     const auto first_endpoint =
         boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 5324);
     const auto second_endpoint =
@@ -1647,7 +1648,7 @@ TEST(ResolverServiceTransportTest, FallsBackAfterRetryableDnsResponse) {
                                   clash_native::dns::DnsUpstreamConfig config) {
         const bool first = config.endpoint == first_endpoint;
         return std::make_shared<FakeDnsTransport>(
-            owner_runtime.context(), boost::asio::ip::make_address("192.0.2.12"),
+            owner_runtime.serialized_executor(), boost::asio::ip::make_address("192.0.2.12"),
             first ? first_stats : second_stats, true, false, first ? 2 : 0);
     };
 
@@ -1687,7 +1688,7 @@ TEST(ResolverServiceTransportTest, FallsBackAfterRetryableDnsResponse) {
 }
 
 TEST(DnsQueryServiceTest, ReturnsTheCompletePacketThroughAnInjectedTransport) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     auto stats = std::make_shared<FakeTransportStats>();
     clash_native::dns::DnsTransportFactory factory;
     auto config = fake_config(stats, stats, true, &factory);
@@ -1720,7 +1721,7 @@ TEST(DnsQueryServiceTest, ReturnsTheCompletePacketThroughAnInjectedTransport) {
 }
 
 TEST(DnsQueryServiceTest, RejectsAQueryWithoutWireDataBeforeTransportCreation) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     auto stats = std::make_shared<FakeTransportStats>();
     clash_native::dns::DnsTransportFactory factory;
     auto config = fake_config(stats, stats, true, &factory);
@@ -1744,7 +1745,7 @@ TEST(DnsQueryServiceTest, RejectsAQueryWithoutWireDataBeforeTransportCreation) {
 }
 
 TEST(DnsQueryServiceTest, CachesNxDomainButDoesNotCacheServfail) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     runtime.start();
 
     const auto endpoint =
@@ -1752,7 +1753,7 @@ TEST(DnsQueryServiceTest, CachesNxDomainButDoesNotCacheServfail) {
     auto nxdomain_stats = std::make_shared<FakeTransportStats>();
     auto nxdomain_factory = [endpoint, nxdomain_stats](clash_native::runtime::AsioRuntime &owner,
                                                        clash_native::dns::DnsUpstreamConfig) {
-        return std::make_shared<FakeDnsTransport>(owner.context(),
+        return std::make_shared<FakeDnsTransport>(owner.serialized_executor(),
                                                   boost::asio::ip::make_address("192.0.2.20"),
                                                   nxdomain_stats, true, false, 3);
     };
@@ -1791,7 +1792,7 @@ TEST(DnsQueryServiceTest, CachesNxDomainButDoesNotCacheServfail) {
     auto servfail_stats = std::make_shared<FakeTransportStats>();
     auto servfail_factory = [endpoint, servfail_stats](clash_native::runtime::AsioRuntime &owner,
                                                        clash_native::dns::DnsUpstreamConfig) {
-        return std::make_shared<FakeDnsTransport>(owner.context(),
+        return std::make_shared<FakeDnsTransport>(owner.serialized_executor(),
                                                   boost::asio::ip::make_address("192.0.2.21"),
                                                   servfail_stats, true, false, 2);
     };
@@ -1820,7 +1821,7 @@ TEST(DnsQueryServiceTest, CachesNxDomainButDoesNotCacheServfail) {
 }
 
 TEST(DnsQueryServiceTest, EvictsLeastRecentlyUsedEntriesAtTheConfiguredCapacity) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     auto stats = std::make_shared<FakeTransportStats>();
     clash_native::dns::DnsTransportFactory factory;
     auto config = fake_config(stats, stats, true, &factory);
@@ -1940,8 +1941,8 @@ TEST(ExchangeSessionTest, ReusesHttp11ConnectionForQueuedExchanges) {
 }
 
 TEST(DnsTransportTest, ReusesTcpSessionAndDispatchesOutOfOrderResponses) {
-    clash_native::runtime::AsioRuntime runtime;
-    PersistentTcpDnsServer server(runtime.context());
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    PersistentTcpDnsServer server(runtime.serialized_executor());
     server.start();
     runtime.start();
 
@@ -1969,8 +1970,8 @@ TEST(DnsTransportTest, ReusesTcpSessionAndDispatchesOutOfOrderResponses) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     const auto first_query = make_query("first.example", 0x1111);
     const auto second_query = make_query("second.example", 0x2222);
-    boost::asio::post(runtime.context(), [transport, first_query, second_query, deadline,
-                                          first_done, second_done] {
+    boost::asio::post(runtime.serialized_executor(), [transport, first_query, second_query,
+                                                      deadline, first_done, second_done] {
         transport->exchange(
             {first_query, deadline},
             [first_done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
@@ -2014,8 +2015,8 @@ TEST(DnsTransportTest, ReusesTcpSessionAndDispatchesOutOfOrderResponses) {
 }
 
 TEST(DnsTransportTest, TimesOutWhenAnUpstreamReturnsAQueryInsteadOfAResponse) {
-    clash_native::runtime::AsioRuntime runtime;
-    boost::asio::ip::udp::socket server(runtime.context(),
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    boost::asio::ip::udp::socket server(runtime.serialized_executor(),
                                         {boost::asio::ip::address_v4::loopback(), 0});
     const auto endpoint = server.local_endpoint();
     auto request_buffer = std::make_shared<std::array<std::uint8_t, 65535>>();
@@ -2065,11 +2066,11 @@ TEST(DnsTransportTest, TimesOutWhenAnUpstreamReturnsAQueryInsteadOfAResponse) {
 }
 
 TEST(DnsTransportTest, UsesTheConfiguredDialerForPlainTcp) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     runtime.start();
     auto calls = std::make_shared<std::atomic_int>(0);
     auto closed = std::make_shared<std::atomic_bool>(false);
-    auto dialer = std::make_shared<ProbeDnsDialer>(runtime.context(), calls, closed);
+    auto dialer = std::make_shared<ProbeDnsDialer>(runtime.serialized_executor(), calls, closed);
 
     clash_native::dns::DnsUpstreamConfig config;
     config.endpoint = {boost::asio::ip::address_v4::loopback(), 1};
@@ -2102,8 +2103,8 @@ TEST(DnsTransportTest, UsesTheConfiguredDialerForPlainTcp) {
 }
 
 TEST(DnsTransportTest, ExchangesOverDotWithTlsAndTcpFraming) {
-    clash_native::runtime::AsioRuntime runtime;
-    auto server = DotDnsTestServer::create(runtime.context());
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    auto server = DotDnsTestServer::create(runtime.serialized_executor());
     ASSERT_NE(server, nullptr);
     server->start();
     runtime.start();
@@ -2147,8 +2148,8 @@ TEST(DnsTransportTest, ExchangesOverDotWithTlsAndTcpFraming) {
 }
 
 TEST(DnsTransportTest, RejectsUntrustedDotCertificate) {
-    clash_native::runtime::AsioRuntime runtime;
-    auto server = DotDnsTestServer::create(runtime.context());
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    auto server = DotDnsTestServer::create(runtime.serialized_executor());
     ASSERT_NE(server, nullptr);
     server->start();
     runtime.start();
@@ -2187,8 +2188,8 @@ TEST(DnsTransportTest, RejectsUntrustedDotCertificate) {
 }
 
 TEST(DnsTransportTest, ReusesDotTlsSessionForMultipleExchanges) {
-    clash_native::runtime::AsioRuntime runtime;
-    auto server = DotDnsTestServer::create(runtime.context());
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    auto server = DotDnsTestServer::create(runtime.serialized_executor());
     ASSERT_NE(server, nullptr);
     server->start();
     runtime.start();
@@ -2218,8 +2219,8 @@ TEST(DnsTransportTest, ReusesDotTlsSessionForMultipleExchanges) {
     auto first_future = first_done->get_future();
     auto second_future = second_done->get_future();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    boost::asio::post(runtime.context(), [transport, first_query, second_query, deadline,
-                                          first_done, second_done] {
+    boost::asio::post(runtime.serialized_executor(), [transport, first_query, second_query,
+                                                      deadline, first_done, second_done] {
         transport->exchange(
             {first_query, deadline},
             [first_done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
@@ -2252,9 +2253,9 @@ TEST(DnsTransportTest, ReusesDotTlsSessionForMultipleExchanges) {
 
 TEST(DnsTransportTest, ExchangesOverDoh1WithContentLengthAndChunkedResponses) {
     for (const bool chunked : {false, true}) {
-        clash_native::runtime::AsioRuntime runtime;
-        auto server =
-            Doh1DnsTestServer::create(runtime.context(), "application/dns-message", 200, chunked);
+        auto &runtime = clash_native::runtime::AsioRuntime::instance();
+        auto server = Doh1DnsTestServer::create(runtime.serialized_executor(),
+                                                "application/dns-message", 200, chunked);
         ASSERT_NE(server, nullptr);
         server->start();
         runtime.start();
@@ -2301,8 +2302,9 @@ TEST(DnsTransportTest, RejectsInvalidDoh1StatusAndContentType) {
     const std::array<std::pair<std::string, int>, 2> invalid_responses = {
         std::pair{"application/dns-message", 502}, std::pair{"text/plain", 200}};
     for (const auto &[content_type, status_code] : invalid_responses) {
-        clash_native::runtime::AsioRuntime runtime;
-        auto server = Doh1DnsTestServer::create(runtime.context(), content_type, status_code);
+        auto &runtime = clash_native::runtime::AsioRuntime::instance();
+        auto server =
+            Doh1DnsTestServer::create(runtime.serialized_executor(), content_type, status_code);
         ASSERT_NE(server, nullptr);
         server->start();
         runtime.start();
@@ -2341,8 +2343,8 @@ TEST(DnsTransportTest, RejectsInvalidDoh1StatusAndContentType) {
 }
 
 TEST(DnsTransportTest, RejectsUntrustedDoh1Certificate) {
-    clash_native::runtime::AsioRuntime runtime;
-    auto server = Doh1DnsTestServer::create(runtime.context());
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    auto server = Doh1DnsTestServer::create(runtime.serialized_executor());
     ASSERT_NE(server, nullptr);
     server->start();
     runtime.start();
@@ -2379,8 +2381,8 @@ TEST(DnsTransportTest, RejectsUntrustedDoh1Certificate) {
 }
 
 TEST(DnsTransportTest, ExchangesOverDoh2WithHttp2AndDnsMediaType) {
-    clash_native::runtime::AsioRuntime runtime;
-    auto server = Doh2DnsTestServer::create(runtime.context());
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    auto server = Doh2DnsTestServer::create(runtime.serialized_executor());
     ASSERT_NE(server, nullptr);
     server->start();
     runtime.start();
@@ -2425,8 +2427,8 @@ TEST(DnsTransportTest, ExchangesOverDoh2WithHttp2AndDnsMediaType) {
 }
 
 TEST(DnsTransportTest, RejectsUntrustedDoh2Certificate) {
-    clash_native::runtime::AsioRuntime runtime;
-    auto server = Doh2DnsTestServer::create(runtime.context());
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    auto server = Doh2DnsTestServer::create(runtime.serialized_executor());
     ASSERT_NE(server, nullptr);
     server->start();
     runtime.start();
@@ -2466,8 +2468,8 @@ TEST(DnsTransportTest, RejectsUntrustedDoh2Certificate) {
 }
 
 TEST(DnsTransportTest, MultiplexesDoh2ExchangesOnOneHttp2Session) {
-    clash_native::runtime::AsioRuntime runtime;
-    auto server = Doh2DnsTestServer::create(runtime.context());
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    auto server = Doh2DnsTestServer::create(runtime.serialized_executor());
     ASSERT_NE(server, nullptr);
     server->start();
     runtime.start();
@@ -2498,8 +2500,8 @@ TEST(DnsTransportTest, MultiplexesDoh2ExchangesOnOneHttp2Session) {
     auto first_future = first_done->get_future();
     auto second_future = second_done->get_future();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    boost::asio::post(runtime.context(), [transport, first_query, second_query, deadline,
-                                          first_done, second_done] {
+    boost::asio::post(runtime.serialized_executor(), [transport, first_query, second_query,
+                                                      deadline, first_done, second_done] {
         transport->exchange(
             {first_query, deadline},
             [first_done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
@@ -2527,7 +2529,7 @@ TEST(DnsTransportTest, MultiplexesDoh2ExchangesOnOneHttp2Session) {
 }
 
 TEST(DnsTransportTest, FailsWhenQuicDnsUpstreamIsUnavailable) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     runtime.start();
 
     clash_native::dns::DnsUpstreamConfig config;

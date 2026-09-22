@@ -52,7 +52,7 @@ class PlannedDnsUpstreamDialer final : public DnsUpstreamDialer {
             return;
         }
         endpoint_dialer_ = std::make_shared<transport::EndpointDialer>(
-            runtime_.context().get_executor(), std::move(plan).value());
+            runtime_.serialized_executor(), std::move(plan).value());
     }
 
     void connect_stream(core::StreamRequest request, Handler handler) override {
@@ -62,7 +62,7 @@ class PlannedDnsUpstreamDialer final : public DnsUpstreamDialer {
         }
         const auto error = plan_error_.value_or(
             core::Error{core::ErrorCode::configuration, "DNS endpoint dial plan is missing"});
-        boost::asio::post(runtime_.context(), [handler = std::move(handler), error]() mutable {
+        runtime_.scheduler().post([handler = std::move(handler), error]() mutable {
             handler(core::StreamOpenResult::failed(error));
         });
     }
@@ -74,7 +74,7 @@ class PlannedDnsUpstreamDialer final : public DnsUpstreamDialer {
         }
         const auto error = plan_error_.value_or(
             core::Error{core::ErrorCode::configuration, "DNS endpoint dial plan is missing"});
-        boost::asio::post(runtime_.context(), [handler = std::move(handler), error]() mutable {
+        runtime_.scheduler().post([handler = std::move(handler), error]() mutable {
             handler(core::DatagramOpenResult::failed(error));
         });
     }
@@ -102,7 +102,7 @@ class TrafficRulesDnsUpstreamDialer final : public DnsUpstreamDialer {
             post_stream_error(std::move(handler), plan.error());
             return;
         }
-        transport::EndpointDialer dialer(runtime_.context().get_executor(), plan.value());
+        transport::EndpointDialer dialer(runtime_.serialized_executor(), plan.value());
         dialer.connect_stream(std::move(request), std::move(handler));
     }
 
@@ -118,23 +118,23 @@ class TrafficRulesDnsUpstreamDialer final : public DnsUpstreamDialer {
             post_datagram_error(std::move(handler), plan.error());
             return;
         }
-        transport::EndpointDialer dialer(runtime_.context().get_executor(), plan.value());
+        transport::EndpointDialer dialer(runtime_.serialized_executor(), plan.value());
         dialer.open_datagram(std::move(request), std::move(handler));
     }
 
   private:
     void post_stream_error(Handler handler, core::Error error) const {
-        boost::asio::post(runtime_.context(),
-                          [handler = std::move(handler), error = std::move(error)]() mutable {
-                              handler(core::StreamOpenResult::failed(std::move(error)));
-                          });
+        runtime_.scheduler().post(
+            [handler = std::move(handler), error = std::move(error)]() mutable {
+                handler(core::StreamOpenResult::failed(std::move(error)));
+            });
     }
 
     void post_datagram_error(core::DatagramOpenHandler handler, core::Error error) const {
-        boost::asio::post(runtime_.context(),
-                          [handler = std::move(handler), error = std::move(error)]() mutable {
-                              handler(core::DatagramOpenResult::failed(std::move(error)));
-                          });
+        runtime_.scheduler().post(
+            [handler = std::move(handler), error = std::move(error)]() mutable {
+                handler(core::DatagramOpenResult::failed(std::move(error)));
+            });
     }
 
     core::Result<transport::EndpointDialPlan>
@@ -204,14 +204,14 @@ OutboundDnsUpstreamDialer::OutboundDnsUpstreamDialer(
         plan_error_ = plan.error();
         return;
     }
-    endpoint_dialer_ = std::make_shared<transport::EndpointDialer>(
-        runtime_.context().get_executor(), plan.value());
+    endpoint_dialer_ =
+        std::make_shared<transport::EndpointDialer>(runtime_.serialized_executor(), plan.value());
 }
 
 void OutboundDnsUpstreamDialer::connect_stream(core::StreamRequest request, Handler handler) {
     if (plan_error_) {
         const auto error = *plan_error_;
-        boost::asio::post(runtime_.context(), [handler = std::move(handler), error]() mutable {
+        runtime_.scheduler().post([handler = std::move(handler), error]() mutable {
             handler(core::StreamOpenResult::failed(error));
         });
         return;
@@ -223,7 +223,7 @@ void OutboundDnsUpstreamDialer::open_datagram(core::DatagramRequest request,
                                               core::DatagramOpenHandler handler) {
     if (plan_error_) {
         const auto error = *plan_error_;
-        boost::asio::post(runtime_.context(), [handler = std::move(handler), error]() mutable {
+        runtime_.scheduler().post([handler = std::move(handler), error]() mutable {
             handler(core::DatagramOpenResult::failed(error));
         });
         return;
@@ -292,7 +292,7 @@ class AsioDnsTransport::TcpSession final
             return;
         }
 
-        auto pending = std::make_shared<Pending>(runtime_.context());
+        auto pending = std::make_shared<Pending>(runtime_.serialized_executor());
         pending->frame.reserve(2 + query.size());
         pending->frame.push_back(static_cast<std::uint8_t>(query.size() >> 8));
         pending->frame.push_back(static_cast<std::uint8_t>(query.size() & 0xff));
@@ -324,7 +324,7 @@ class AsioDnsTransport::TcpSession final
 
   private:
     struct Pending {
-        explicit Pending(boost::asio::io_context &context) : timer(context) {}
+        explicit Pending(boost::asio::any_io_executor executor) : timer(std::move(executor)) {}
 
         std::vector<std::uint8_t> frame;
         Handler handler;
@@ -335,12 +335,12 @@ class AsioDnsTransport::TcpSession final
     using ReadCompletion = std::function<void(const boost::system::error_code &)>;
 
     void complete_immediately(Handler handler, core::Error error) {
-        boost::asio::post(runtime_.context(),
-                          [handler = std::move(handler), error = std::move(error)]() mutable {
-                              if (handler) {
-                                  handler(core::fail(std::move(error)));
-                              }
-                          });
+        runtime_.scheduler().post(
+            [handler = std::move(handler), error = std::move(error)]() mutable {
+                if (handler) {
+                    handler(core::fail(std::move(error)));
+                }
+            });
     }
 
     void connect_if_needed() {
@@ -593,7 +593,7 @@ class AsioDnsTransport::Operation final
     Operation(AsioDnsTransport &owner, ExchangeId exchange_id, DnsExchangeRequest request,
               Handler handler)
         : owner_(owner), exchange_id_(exchange_id), request_(std::move(request)),
-          handler_(std::move(handler)), timeout_timer_(owner.runtime_.context()),
+          handler_(std::move(handler)), timeout_timer_(owner.runtime_.serialized_executor()),
           udp_endpoint_(owner.config_.endpoint) {}
 
     void start() {

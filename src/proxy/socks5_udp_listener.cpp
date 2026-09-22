@@ -27,7 +27,7 @@ Socks5UdpListener::Socks5UdpListener(ProxyServer &owner) : owner_(owner) {}
 
 core::Status Socks5UdpListener::start(boost::asio::ip::udp::endpoint endpoint) {
     stop();
-    socket_ = std::make_shared<net::UdpStream>(owner_.runtime_.context().get_executor());
+    socket_ = std::make_shared<net::UdpStream>(owner_.runtime_.serialized_executor());
     boost::system::error_code error;
     socket_->open(endpoint.protocol(), error);
     if (!error) {

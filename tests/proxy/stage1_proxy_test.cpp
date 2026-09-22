@@ -389,7 +389,7 @@ class HttpUpgradeTarget {
 } // namespace
 
 TEST(Stage1ProxyTest, AcceptsHttpConnectAndRelaysBufferedData) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     EchoTarget target(runtime);
     clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
     ASSERT_TRUE(proxy.start());
@@ -431,7 +431,7 @@ TEST(Stage1ProxyTest, AcceptsHttpConnectAndRelaysBufferedData) {
 }
 
 TEST(HttpProxyTest, AcceptsHttpsProxyConnectionsWithConfiguredServerCredentials) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     EchoTarget target(runtime);
     clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
     proxy.set_inbound_mode(clash_native::proxy::ProxyInboundMode::http);
@@ -482,7 +482,7 @@ TEST(HttpProxyTest, AcceptsHttpsProxyConnectionsWithConfiguredServerCredentials)
 }
 
 TEST(HttpProxyTest, SendsConfiguredCertificateChainToVerifiedHttpsClient) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     EchoTarget target(runtime);
     clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
     proxy.set_inbound_mode(clash_native::proxy::ProxyInboundMode::http);
@@ -544,7 +544,7 @@ TEST(HttpProxyTest, SendsConfiguredCertificateChainToVerifiedHttpsClient) {
 }
 
 TEST(Stage1ProxyTest, RejectOutboundReturnsSocks5Rejection) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
     proxy.set_default_action(clash_native::router::RouteAction::reject());
     ASSERT_TRUE(proxy.start());
@@ -573,7 +573,7 @@ TEST(Stage1ProxyTest, RejectOutboundReturnsSocks5Rejection) {
 }
 
 TEST(Stage1ProxyTest, TracksAProxyConnectionUntilTheClientCloses) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     EchoTarget target(runtime);
     auto registry = std::make_shared<clash_native::observability::ConnectionRegistry>();
     clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
@@ -624,7 +624,7 @@ TEST(Stage1ProxyTest, TracksAProxyConnectionUntilTheClientCloses) {
 }
 
 TEST(HttpProxyTest, HttpOnlyModeRequiresBasicAuthentication) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     EchoTarget target(runtime);
     clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
     proxy.set_inbound_mode(clash_native::proxy::ProxyInboundMode::http);
@@ -691,7 +691,7 @@ TEST(HttpProxyTest, HttpOnlyModeRequiresBasicAuthentication) {
 }
 
 TEST(HttpProxyTest, KeepsHttp11ClientConnectionForMultipleRequests) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     HttpTarget target(runtime);
     clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
     proxy.set_inbound_mode(clash_native::proxy::ProxyInboundMode::http);
@@ -728,7 +728,7 @@ TEST(HttpProxyTest, KeepsHttp11ClientConnectionForMultipleRequests) {
 }
 
 TEST(HttpProxyTest, ForwardsHttp11UpgradeAndRelaysTheUpgradedStream) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     HttpUpgradeTarget target(runtime);
     clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
     proxy.set_inbound_mode(clash_native::proxy::ProxyInboundMode::http);

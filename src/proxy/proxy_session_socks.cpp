@@ -312,7 +312,7 @@ void ProxySession::open_socks_udp_association() {
                            : boost::asio::ip::address(boost::asio::ip::address_v6::any());
     }
 
-    udp_relay_socket_ = std::make_shared<net::UdpStream>(owner_.runtime_.context().get_executor());
+    udp_relay_socket_ = std::make_shared<net::UdpStream>(owner_.runtime_.serialized_executor());
     udp_relay_socket_->open(
         bind_address.is_v4() ? boost::asio::ip::udp::v4() : boost::asio::ip::udp::v6(), error);
     if (!error) {

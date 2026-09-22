@@ -492,8 +492,8 @@ class ShadowsocksConnectOperation final
         : runtime_(runtime), resolver_(std::move(resolver)), config_(std::move(config)),
           kcptun_pool_(std::move(kcptun_pool)), websocket_mux_pool_(std::move(websocket_mux_pool)),
           request_(std::move(request)),
-          socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.context())),
-          timer_(runtime.context()), handler_(std::move(handler)) {}
+          socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.serialized_executor())),
+          timer_(runtime.serialized_executor()), handler_(std::move(handler)) {}
 
     void start() {
         const auto validation = validate_config();
@@ -1415,7 +1415,7 @@ ShadowsocksOutbound::ShadowsocksOutbound(runtime::AsioRuntime &runtime,
     if (config_.plugin_mux &&
         (config_.plugin == "v2ray-plugin" || config_.plugin == "gost-plugin")) {
         websocket_mux_pool_ = std::make_shared<transport::shadowsocks::WebSocketPluginMuxPool>(
-            runtime_.context().get_executor());
+            runtime_.serialized_executor());
     }
 }
 
@@ -1564,10 +1564,10 @@ void ShadowsocksOutbound::connect_stream(core::StreamRequest request,
 void ShadowsocksOutbound::open_datagram(core::DatagramRequest request,
                                         core::DatagramOpenHandler handler) {
     if (const auto validation = validate(); !validation) {
-        boost::asio::post(runtime_.context(),
-                          [handler = std::move(handler), error = validation.error()]() mutable {
-                              handler(core::DatagramOpenResult::failed(std::move(error)));
-                          });
+        runtime_.scheduler().post(
+            [handler = std::move(handler), error = validation.error()]() mutable {
+                handler(core::DatagramOpenResult::failed(std::move(error)));
+            });
         return;
     }
 
@@ -1580,10 +1580,10 @@ void ShadowsocksOutbound::open_datagram(core::DatagramRequest request,
             runtime_, resolver_, kcptun_pool_, websocket_mux_pool_, config_,
             std::move(stream_request),
             [handler = std::move(handler), initial_destination = request.initial_destination,
-             version, context = &runtime_.context()](core::StreamOpenResult result) mutable {
-                boost::asio::post(context->get_executor(), [handler = std::move(handler),
-                                                            initial_destination, version,
-                                                            result = std::move(result)]() mutable {
+             version,
+             executor = runtime_.serialized_executor()](core::StreamOpenResult result) mutable {
+                boost::asio::post(executor, [handler = std::move(handler), initial_destination,
+                                             version, result = std::move(result)]() mutable {
                     if (!result.succeeded()) {
                         handler(core::DatagramOpenResult::failed(result.error.value_or(
                             core::Error{core::ErrorCode::transport_io,
@@ -1621,7 +1621,7 @@ void ShadowsocksOutbound::open_datagram(core::DatagramRequest request,
             }
             const auto server =
                 boost::asio::ip::udp::endpoint(result.value().front(), config.server_port);
-            auto socket = std::make_shared<net::UdpStream>(runtime->context().get_executor());
+            auto socket = std::make_shared<net::UdpStream>(runtime->serialized_executor());
             boost::system::error_code error;
             socket->open(server.protocol(), error);
             if (!error) {

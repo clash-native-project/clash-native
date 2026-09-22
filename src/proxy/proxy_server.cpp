@@ -57,7 +57,7 @@ core::Error listener_error(std::string_view operation, const boost::system::erro
 } // namespace
 
 ProxyServer::ProxyServer(runtime::AsioRuntime &runtime, boost::asio::ip::tcp::endpoint endpoint)
-    : runtime_(runtime), acceptor_(runtime.context()), endpoint_(endpoint), router_(),
+    : runtime_(runtime), acceptor_(runtime.serialized_executor()), endpoint_(endpoint), router_(),
       direct_outbound_(std::make_shared<outbound::DirectOutbound>(runtime)),
       reject_outbound_(std::make_shared<outbound::RejectOutbound>(runtime)),
       outbound_registry_(std::make_shared<outbound::OutboundRegistry>()),
@@ -334,7 +334,7 @@ void ProxyServer::stop() noexcept {
     }
 
     std::binary_semaphore completed(0);
-    boost::asio::dispatch(runtime_.context(), [this, &completed] {
+    boost::asio::dispatch(runtime_.serialized_executor(), [this, &completed] {
         stop_on_owner();
         completed.release();
     });
@@ -424,7 +424,7 @@ void ProxyServer::accept() {
         return;
     }
 
-    auto client = std::make_shared<boost::asio::ip::tcp::socket>(runtime_.context());
+    auto client = std::make_shared<boost::asio::ip::tcp::socket>(runtime_.serialized_executor());
     const auto gate = callback_gate_;
     acceptor_.async_accept(*client, [this, gate, client](const boost::system::error_code &error) {
         if (!gate->load(std::memory_order_acquire)) {

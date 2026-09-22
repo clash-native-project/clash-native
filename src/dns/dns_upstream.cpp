@@ -38,12 +38,19 @@ DnsTransport::ExchangeId DnsUpstream::exchange(DnsPacket query,
                                                std::chrono::steady_clock::time_point deadline,
                                                DnsTransport::Handler handler) {
     if (!transport_) {
-        boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
+        runtime_.scheduler().post([handler = std::move(handler)]() mutable {
             handler(core::fail(configuration_error()));
         });
         return 0;
     }
-    return transport_->exchange({std::move(query), deadline}, std::move(handler));
+    return transport_->exchange(
+        {std::move(query), deadline}, [runtime = &runtime_, handler = std::move(handler)](
+                                          core::Result<DnsPacket> result) mutable {
+            runtime->scheduler().post(
+                [handler = std::move(handler), result = std::move(result)]() mutable {
+                    handler(std::move(result));
+                });
+        });
 }
 
 void DnsUpstream::cancel(DnsTransport::ExchangeId exchange_id) noexcept {

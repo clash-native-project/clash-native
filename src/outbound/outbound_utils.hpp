@@ -34,15 +34,14 @@ class HostResolveOperation final : public std::enable_shared_from_this<HostResol
                          std::shared_ptr<dns::ResolverService> resolver, std::string host,
                          ResolveHandler handler)
         : runtime_(runtime), resolver_(std::move(resolver)), host_(std::move(host)),
-          timer_(runtime.context()), handler_(std::move(handler)) {}
+          timer_(runtime.serialized_executor()), handler_(std::move(handler)) {}
 
     void start() {
         boost::system::error_code address_error;
         const auto address = boost::asio::ip::make_address(host_, address_error);
         if (!address_error) {
-            boost::asio::post(runtime_.context(), [self = shared_from_this(), address] {
-                self->finish(AddressList{address});
-            });
+            runtime_.scheduler().post(
+                [self = shared_from_this(), address] { self->finish(AddressList{address}); });
             return;
         }
         if (!resolver_) {

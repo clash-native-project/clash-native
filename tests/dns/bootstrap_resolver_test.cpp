@@ -54,7 +54,7 @@ TEST(BootstrapResolverTest, BuiltInServersKeepTheConfiguredOrder) {
 }
 
 TEST(BootstrapResolverTest, FallsBackToTheSystemAdapterAfterBootstrapCandidates) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     auto system = std::make_shared<FixedBootstrapResolver>(
         runtime, boost::asio::ip::make_address("192.0.2.99"));
     const auto resolver = clash_native::dns::make_bootstrap_resolver(runtime, {}, system);
@@ -78,7 +78,7 @@ TEST(BootstrapResolverTest, FallsBackToTheSystemAdapterAfterBootstrapCandidates)
 }
 
 TEST(BootstrapResolverTest, ResolvesLocalhostThroughTheSystemAdapter) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     const auto resolver = clash_native::dns::make_system_bootstrap_resolver(runtime);
     std::promise<AddressResult> result_promise;
     auto result_future = result_promise.get_future();
@@ -97,7 +97,7 @@ TEST(BootstrapResolverTest, ResolvesLocalhostThroughTheSystemAdapter) {
 }
 
 TEST(BootstrapResolverTest, CancellationCompletesExactlyOnce) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     const auto resolver = clash_native::dns::make_system_bootstrap_resolver(runtime);
     std::promise<AddressResult> result_promise;
     auto result_future = result_promise.get_future();

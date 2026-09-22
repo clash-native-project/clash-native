@@ -78,14 +78,14 @@ std::string authority(const DnsUpstreamConfig &config, std::string host, std::ui
 } // namespace
 
 QuicDnsTransport::QuicDnsTransport(runtime::AsioRuntime &runtime, DnsUpstreamConfig config)
-    : runtime_(runtime), config_(std::move(config)), strand_(runtime.context().get_executor()) {
+    : runtime_(runtime), config_(std::move(config)), strand_(runtime.serialized_executor()) {
     if (!config_.dialer) {
         config_.dialer = make_direct_dns_upstream_dialer(runtime_);
     }
 }
 
 QuicDnsTransport::Operation::Operation(QuicDnsTransport &owner)
-    : owner_(owner), idle_timer_(owner.runtime_.context()), mode_(owner.config_.mode),
+    : owner_(owner), idle_timer_(owner.runtime_.serialized_executor()), mode_(owner.config_.mode),
       host_(remote_name(owner.config_)), port_(remote_port(owner.config_)),
       remote_endpoint_(owner.config_.endpoint.address(), port_),
       authority_(authority(owner.config_, host_, port_)),
@@ -126,7 +126,8 @@ void QuicDnsTransport::Operation::add_exchange(ExchangeId id, DnsExchangeRequest
     }
     idle_timer_.cancel();
     idle_ = false;
-    auto exchange = std::make_shared<Exchange>(id, std::move(request), owner_.runtime_.context());
+    auto exchange =
+        std::make_shared<Exchange>(id, std::move(request), owner_.runtime_.serialized_executor());
     exchanges_.emplace(id, exchange);
     const auto &wire = exchange->request.query.wire;
     if (wire.size() < 12 || wire.size() > 0xffff) {

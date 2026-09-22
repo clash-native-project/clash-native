@@ -58,8 +58,8 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                            core::StreamOpenHandler handler)
         : runtime_(runtime), resolver_(std::move(resolver)), config_(std::move(config)),
           request_(std::move(request)),
-          socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.context())),
-          timer_(runtime.context()), handler_(std::move(handler)) {}
+          socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.serialized_executor())),
+          timer_(runtime.serialized_executor()), handler_(std::move(handler)) {}
 
     void start() {
         if (config_.id.empty() || config_.server_host.empty() || config_.server_port == 0 ||
@@ -312,7 +312,7 @@ void TrojanOutbound::connect_stream(core::StreamRequest request, core::StreamOpe
 }
 
 void TrojanOutbound::open_datagram(core::DatagramRequest, core::DatagramOpenHandler handler) {
-    boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
+    runtime_.scheduler().post([handler = std::move(handler)]() mutable {
         handler(core::DatagramOpenResult::unsupported());
     });
 }

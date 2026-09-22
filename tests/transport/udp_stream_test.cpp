@@ -41,7 +41,7 @@ boost::asio::ip::address_v4 udp_test_address(boost::asio::io_context &context) {
 } // namespace
 
 TEST(UdpStreamTest, SendsAndReceivesDatagramsWithPeerEndpoints) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     const auto test_address = udp_test_address(runtime.context());
     clash_native::net::UdpStream stream(runtime.context().get_executor());
     boost::system::error_code error;

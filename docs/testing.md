@@ -9,10 +9,16 @@ claiming that the complete proxy engine exists.
   implementation code.
 - `clash-native` is a process composition root and must not become a home for
   routing, protocol, DNS, or relay logic.
-- `AsioRuntime` and `RuntimeSet` own their worker threads and work guards.
-- A runtime is started at most once and stopped explicitly or by its owner.
-  Stop is idempotent, and owned asynchronous work must be drained before the
-  worker thread is joined.
+- The process-wide `AsioRuntime` singleton owns one shared `io_context`, its
+  work guard, and the configured runner-thread pool.
+- The runner count is passed to `io_context` as its concurrency hint. Tests
+  that change the count must do so while the runtime is stopped and before
+  retaining runtime-owned executors across the reconfiguration.
+- Runtime-owned service state is exercised through the shared serialized
+  executor; tests that provide their own I/O objects should use that executor
+  when the object has mutable callback state.
+- The runtime has at most one active start. Start and stop are idempotent;
+  stop drains owned asynchronous work before all runner threads are joined.
 - Test processes own every child process, socket, and temporary resource they
   create. Cleanup is required on success, failure, cancellation, and timeout.
 

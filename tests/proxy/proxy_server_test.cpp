@@ -11,7 +11,7 @@
 #include <future>
 
 TEST(ProxyServerTest, TracksLifecycle) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     clash_native::proxy::ProxyServer proxy_server(runtime, {boost::asio::ip::tcp::v4(), 0});
 
     EXPECT_FALSE(proxy_server.running());
@@ -28,7 +28,7 @@ TEST(ProxyServerTest, TracksLifecycle) {
 }
 
 TEST(ProxyServerTest, DirectOutboundDoesNotUseTheSystemResolver) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     clash_native::outbound::DirectOutbound direct(runtime);
     runtime.start();
 
@@ -49,7 +49,7 @@ TEST(ProxyServerTest, DirectOutboundDoesNotUseTheSystemResolver) {
 }
 
 TEST(ProxyServerTest, ReloadsTheRuntimeSnapshotForNewConnections) {
-    clash_native::runtime::AsioRuntime runtime;
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
     clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
     ASSERT_TRUE(proxy.start());
     runtime.start();

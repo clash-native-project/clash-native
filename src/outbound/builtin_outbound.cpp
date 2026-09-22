@@ -36,11 +36,12 @@ core::Error connection_error(core::ErrorCode code, std::string context,
 
 class DirectConnectOperation final : public std::enable_shared_from_this<DirectConnectOperation> {
   public:
-    DirectConnectOperation(boost::asio::io_context &context, core::StreamRequest request,
+    DirectConnectOperation(boost::asio::any_io_executor executor, core::StreamRequest request,
                            std::shared_ptr<dns::ResolverService> resolver,
                            core::StreamOpenHandler handler)
-        : request_(std::move(request)), resolver_(std::move(resolver)), socket_(context),
-          connect_timer_(context), handler_(std::move(handler)) {}
+        : request_(std::move(request)), resolver_(std::move(resolver)),
+          socket_(std::move(executor)), connect_timer_(socket_.get_executor()),
+          handler_(std::move(handler)) {}
 
     void start() {
         connect_timer_.expires_after(std::chrono::seconds(10));
@@ -186,14 +187,14 @@ core::OutboundCapabilities DirectOutbound::capabilities() const noexcept { retur
 
 void DirectOutbound::connect_stream(core::StreamRequest request, core::StreamOpenHandler handler) {
     auto operation = std::make_shared<DirectConnectOperation>(
-        runtime_.context(), std::move(request), resolver_, std::move(handler));
+        runtime_.serialized_executor(), std::move(request), resolver_, std::move(handler));
     operation->start();
 }
 
 void DirectOutbound::open_datagram(core::DatagramRequest request,
                                    core::DatagramOpenHandler handler) {
     if (!request.initial_destination || !request.initial_destination->is_address()) {
-        boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
+        runtime_.scheduler().post([handler = std::move(handler)]() mutable {
             handler(core::DatagramOpenResult::failed(
                 {core::ErrorCode::configuration,
                  "direct outbound datagram dialing requires an IP address"}));
@@ -202,7 +203,7 @@ void DirectOutbound::open_datagram(core::DatagramRequest request,
     }
 
     const auto address = request.initial_destination->address();
-    auto socket = std::make_unique<net::UdpStream>(runtime_.context().get_executor());
+    auto socket = std::make_unique<net::UdpStream>(runtime_.serialized_executor());
     boost::system::error_code error;
     socket->open(address.is_v4() ? boost::asio::ip::udp::v4() : boost::asio::ip::udp::v6(), error);
     if (!error) {
@@ -212,7 +213,7 @@ void DirectOutbound::open_datagram(core::DatagramRequest request,
         socket->bind({local_address, 0}, error);
     }
     if (error) {
-        boost::asio::post(runtime_.context(), [handler = std::move(handler), error]() mutable {
+        runtime_.scheduler().post([handler = std::move(handler), error]() mutable {
             handler(core::DatagramOpenResult::failed(
                 {core::ErrorCode::transport_io, "failed to open direct outbound datagram", error}));
         });
@@ -230,12 +231,12 @@ const core::OutboundDescriptor &RejectOutbound::descriptor() const noexcept { re
 core::OutboundCapabilities RejectOutbound::capabilities() const noexcept { return capabilities_; }
 
 void RejectOutbound::connect_stream(core::StreamRequest, core::StreamOpenHandler handler) {
-    boost::asio::post(runtime_.context(),
-                      [handler = std::move(handler)]() mutable { handler(rejected_stream()); });
+    runtime_.scheduler().post(
+        [handler = std::move(handler)]() mutable { handler(rejected_stream()); });
 }
 
 void RejectOutbound::open_datagram(core::DatagramRequest, core::DatagramOpenHandler handler) {
-    boost::asio::post(runtime_.context(), [handler = std::move(handler)]() mutable {
+    runtime_.scheduler().post([handler = std::move(handler)]() mutable {
         handler(core::DatagramOpenResult::unsupported());
     });
 }

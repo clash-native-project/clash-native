@@ -13,7 +13,7 @@
 
 namespace clash_native::app {
 
-Application::Application() : runtime_(), proxy_server_(runtime_) {}
+Application::Application() : runtime_(runtime::AsioRuntime::instance()), proxy_server_(runtime_) {}
 
 int Application::run(const ApplicationOptions &options) {
     if (!options.listen_endpoint) {
@@ -59,7 +59,7 @@ int Application::run(const ApplicationOptions &options) {
                 boost::asio::ip::tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0)));
     }
 
-    boost::asio::signal_set signals(runtime_.context(), SIGINT, SIGTERM);
+    boost::asio::signal_set signals(runtime_.serialized_executor(), SIGINT, SIGTERM);
     std::promise<void> stopped;
     auto stopped_future = stopped.get_future();
     signals.async_wait([this, &stopped](const boost::system::error_code &, int) {

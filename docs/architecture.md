@@ -37,8 +37,8 @@ or relay code.
   implementing native platform traffic-capture and route-management features.
 - Use explicit ownership, cancellation, and shutdown rules for every
   asynchronous resource.
-- Scale network work across multiple Asio runtimes without sharing mutable
-  connection state between them.
+- Scale network work across runner threads in one shared Asio runtime while
+  serializing mutable connection state on an owning strand.
 - Prefer dependencies available through vcpkg when their ports, build options,
   licenses, and supported targets are suitable.
 - Use Zig's C and C++ compiler drivers as the Linux release and
@@ -604,37 +604,46 @@ CLI configuration remain separate work.
 
 ## 8. Runtime model
 
-### 8.1 Runtime set
+### 8.1 Runtime singleton
 
-The core uses multiple independent Asio runtimes. The worker count is
-configurable and defaults to four.
+The core uses one process-wide Asio runtime. It owns one shared
+`boost::asio::io_context`, one scheduler adapter, one work guard, and a
+configurable runner-thread pool that defaults to four threads.
 
-Each worker owns:
+The runtime constructs `io_context` with the configured runner count as its
+Asio concurrency hint. Changing the count while the runtime is stopped
+rebuilds the context, strand, and work guard so a single-worker configuration
+can use Asio's lower-overhead single-thread path. Worker-count configuration
+must therefore happen before handing runtime-owned executors to long-lived
+services.
 
-- one `boost::asio::io_context`;
-- one scheduler adapter for stdexec;
-- one work guard;
-- one worker thread;
-- a structured-concurrency scope for its long-lived child operations;
-- the sessions and protocol objects assigned to that worker.
+All sessions, protocol objects, listeners, timers, and resolver operations use
+the shared context. The runner threads are interchangeable event-loop workers;
+the runtime does not create one independent `io_context` per worker.
 
-The runtime count is a configured count, not automatically identical to the
-number of logical CPUs. A later configuration layer may offer an `auto` mode.
+The runner count is a configured count, not automatically identical to the
+number of logical CPUs. It may only be changed while the singleton is stopped.
+The runtime can be started and stopped again during controlled lifecycle tests,
+but only one active start may exist in a process.
+
+The runtime's serialized executor is the common strand for runtime-owned
+service state. Components that expose their own session or protocol state may
+use a child strand, but they must not mutate that state directly from an
+unassociated handler.
 
 ### 8.2 Affinity
 
-A connection is assigned to one worker and remains there for its lifetime.
-Its sockets, timers, resolver operations, ngtcp2/nghttp3 connection objects, and
-mutable protocol state must not migrate between workers.
+A connection uses the shared scheduler and may resume on different runner
+threads over its lifetime. Sockets, timers, resolver operations,
+ngtcp2/nghttp3 connection objects, and mutable protocol state must therefore
+be serialized with an Asio strand or an equivalent session scheduler whenever
+their implementation is not safe for concurrent handler execution.
 
-Load balancing happens when a new session is accepted. Listener distribution
-is a platform/runtime strategy: implementations may use a shared acceptor,
-per-worker acceptors where supported, or another adapter. Protocol code must
-not depend on the selected accept strategy.
-
-Cross-worker communication carries commands, immutable snapshots, ownership
-transfers made before a session starts, and aggregated events. The hot data
-path should not bounce packet buffers between workers.
+Listener distribution is a platform/runtime strategy: implementations may use
+a shared acceptor or another adapter. Protocol code must not depend on a
+particular runner thread. Cross-thread handoff carries commands, immutable
+snapshots, ownership transfers made before a session starts, and aggregated
+events; the hot data path should avoid unnecessary packet-buffer bouncing.
 
 ### 8.3 Blocking work
 
@@ -1516,24 +1525,26 @@ optional persistence, reload transfer, and clear failure behavior when a
 mapping is missing. FakeIP filters may reuse domain/rule matchers, but they are
 not the same decision as DNS upstream selection.
 
-### 14.9 Multi-runtime ownership
+### 14.9 Runtime ownership
 
-The initial implementation assigns one logical `DnsQueryService` owner to a
-selected I/O runtime. It owns the cache, in-flight-query table, upstream
-registry, and DNS configuration generation. Each `DnsUpstream` owns its
-transport sessions on that same runtime. This does not require an additional
-thread.
+The implementation assigns one logical `DnsQueryService` owner to the shared
+I/O runtime. It owns the cache, in-flight-query table, upstream registry, and
+DNS configuration generation. Each `DnsUpstream` owns its transport sessions
+on that same runtime. This does not create an additional `io_context`.
 
 ```text
-caller worker
+caller task
   -> bounded MPSC query request
-  -> DnsQueryService owner runtime
+  -> DnsQueryService on the shared runtime
   -> upstream exchange
   -> oneshot result
   -> caller's owning scheduler
 ```
 
-The caller must resume on its own scheduler before touching connection state.
+The caller must resume on the required session scheduler before touching
+connection state. A strand or equivalent serialized scheduler is used when a
+service or session has mutable state that can be reached by multiple runner
+threads.
 Shutdown stops new requests, closes the request channel, cancels upstream
 operations, completes or stops pending replies, and drains the DNS scope
 before its runtime work guard is released.
@@ -1544,9 +1555,9 @@ use the new snapshot. Old pools stop only after their snapshot is no longer
 referenced, so a reload does not mutate transport configuration underneath an
 in-flight query.
 
-If measurement later shows the single owner is a bottleneck, transports and
-cache shards may be distributed per worker without changing the public
-resolver or policy interfaces.
+If measurement later shows the shared owner is a bottleneck, transports and
+cache shards may be distributed behind the same scheduler and resolver
+interfaces without restoring multiple independent runtime objects.
 
 ### 14.10 Implementation milestones
 

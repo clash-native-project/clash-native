@@ -182,7 +182,6 @@ add_library(clash-native-core STATIC
     src/proxy/tcp_relay.cpp
     src/router/traffic_router.cpp
     src/runtime/asio_runtime.cpp
-    src/runtime/runtime_set.cpp
 )
 
 target_include_directories(clash-native-core
@@ -329,7 +328,6 @@ if(BUILD_TESTING)
         tests/router/traffic_router_test.cpp
         tests/runtime/asio_runtime_test.cpp
         tests/runtime/runtime_snapshot_test.cpp
-        tests/runtime/runtime_set_test.cpp
         tests/transport/endpoint_dialer_test.cpp
         tests/transport/kcp_client_test.cpp
         tests/transport/websocket_client_test.cpp

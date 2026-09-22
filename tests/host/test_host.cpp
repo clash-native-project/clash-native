@@ -604,7 +604,7 @@ int main(int argc, char **) {
             raw_udp && *raw_udp == "1") {
             return run_raw_shadowsocks2022_udp_test();
         }
-        clash_native::runtime::AsioRuntime runtime;
+        auto &runtime = clash_native::runtime::AsioRuntime::instance();
         std::shared_ptr<clash_native::dns::ResolverService> resolver;
         std::shared_ptr<clash_native::dns::ResolverService> reload_resolver;
         std::unique_ptr<clash_native::dns::DnsServer> dns_server;

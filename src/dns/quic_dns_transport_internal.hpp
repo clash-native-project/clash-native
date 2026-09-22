@@ -73,8 +73,9 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
   public:
     struct Exchange {
         Exchange(ExchangeId exchange_id, DnsExchangeRequest exchange_request,
-                 boost::asio::io_context &context)
-            : id(exchange_id), request(std::move(exchange_request)), deadline_timer(context) {}
+                 boost::asio::any_io_executor executor)
+            : id(exchange_id), request(std::move(exchange_request)),
+              deadline_timer(std::move(executor)) {}
 
         ExchangeId id;
         DnsExchangeRequest request;
