@@ -2,6 +2,7 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/dns/resolver_service.hpp>
+#include <clash_native/io/sender.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 
 #include <string>
@@ -17,7 +18,7 @@ class DirectOutbound final : public core::Outbound {
 
     const core::OutboundDescriptor &descriptor() const noexcept override;
     core::OutboundCapabilities capabilities() const noexcept override;
-    void connect_stream(core::StreamRequest request, core::StreamOpenHandler handler) override;
+    io::AnySender<core::StreamOpenResult> connect_stream(core::StreamRequest request) override;
     void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) override;
 
   private:
@@ -35,7 +36,7 @@ class RejectOutbound final : public core::Outbound {
 
     const core::OutboundDescriptor &descriptor() const noexcept override;
     core::OutboundCapabilities capabilities() const noexcept override;
-    void connect_stream(core::StreamRequest request, core::StreamOpenHandler handler) override;
+    io::AnySender<core::StreamOpenResult> connect_stream(core::StreamRequest request) override;
     void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) override;
 
   private:

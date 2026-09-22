@@ -1,5 +1,6 @@
 #include <clash_native/transport/shadowsocks/websocket_plugin.hpp>
 
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 
 #include <boost/asio/connect.hpp>
@@ -24,7 +25,7 @@ class WebSocketPluginOperation final
     : public clash_native::transport::WebSocketClientHandshake,
       public std::enable_shared_from_this<WebSocketPluginOperation> {
   public:
-    WebSocketPluginOperation(std::unique_ptr<core::StreamHandle> stream,
+    WebSocketPluginOperation(std::unique_ptr<io::StreamHandle> stream,
                              WebSocketPluginOptions options, WebSocketPluginHandler handler)
         : executor_(stream->executor()), stream_(std::move(stream)), options_(std::move(options)),
           handler_(std::move(handler)) {}
@@ -86,7 +87,7 @@ class WebSocketPluginOperation final
         auto self = shared_from_this();
         websocket_ = async_websocket_client_handshake(
             std::move(stream_), std::move(websocket_options),
-            [self](core::Result<std::unique_ptr<core::StreamHandle>> result) mutable {
+            [self](core::Result<std::unique_ptr<io::StreamHandle>> result) mutable {
                 self->websocket_.reset();
                 if (!result) {
                     self->finish(core::fail(result.error()));
@@ -96,7 +97,7 @@ class WebSocketPluginOperation final
             });
     }
 
-    void finish(core::Result<std::unique_ptr<core::StreamHandle>> result) {
+    void finish(core::Result<std::unique_ptr<io::StreamHandle>> result) {
         if (completed_) {
             return;
         }
@@ -112,7 +113,7 @@ class WebSocketPluginOperation final
     }
 
     boost::asio::any_io_executor executor_;
-    std::unique_ptr<core::StreamHandle> stream_;
+    std::unique_ptr<io::StreamHandle> stream_;
     WebSocketPluginOptions options_;
     WebSocketPluginHandler handler_;
     std::shared_ptr<clash_native::transport::WebSocketClientHandshake> websocket_;
@@ -123,7 +124,7 @@ class WebSocketPluginMuxOperation final
     : public WebSocketMuxHandshake,
       public std::enable_shared_from_this<WebSocketPluginMuxOperation> {
   public:
-    WebSocketPluginMuxOperation(std::unique_ptr<core::StreamHandle> stream,
+    WebSocketPluginMuxOperation(std::unique_ptr<io::StreamHandle> stream,
                                 WebSocketPluginOptions options, WebSocketPluginMuxHandler handler)
         : executor_(stream->executor()), stream_(std::move(stream)), options_(std::move(options)),
           handler_(std::move(handler)) {}
@@ -192,7 +193,7 @@ class WebSocketPluginMuxOperation final
         auto self = shared_from_this();
         websocket_ = async_websocket_client_handshake(
             std::move(stream_), std::move(websocket_options),
-            [self](core::Result<std::unique_ptr<core::StreamHandle>> result) mutable {
+            [self](core::Result<std::unique_ptr<io::StreamHandle>> result) mutable {
                 self->websocket_.reset();
                 if (!result) {
                     self->finish(
@@ -203,8 +204,9 @@ class WebSocketPluginMuxOperation final
                 WebSocketMuxOptions mux_options;
                 mux_options.protocol = self->options_.mux_protocol;
                 mux_options.smux_version = self->options_.smux_version;
+                // Sessions-plane debt: the mux plane still speaks core::.
                 self->mux_ = async_open_websocket_mux(
-                    std::move(result.value()), mux_options,
+                    net::adapt_io_to_core(std::move(result.value())), mux_options,
                     [self](
                         core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>
                             mux_result) mutable {
@@ -230,7 +232,7 @@ class WebSocketPluginMuxOperation final
     }
 
     boost::asio::any_io_executor executor_;
-    std::unique_ptr<core::StreamHandle> stream_;
+    std::unique_ptr<io::StreamHandle> stream_;
     WebSocketPluginOptions options_;
     WebSocketPluginMuxHandler handler_;
     std::shared_ptr<clash_native::transport::WebSocketClientHandshake> websocket_;
@@ -241,7 +243,7 @@ class WebSocketPluginMuxOperation final
 } // namespace
 
 std::shared_ptr<clash_native::transport::WebSocketClientHandshake>
-async_open_websocket_plugin(std::unique_ptr<core::StreamHandle> stream,
+async_open_websocket_plugin(std::unique_ptr<io::StreamHandle> stream,
                             WebSocketPluginOptions options, WebSocketPluginHandler handler) {
     if (!stream || !handler) {
         if (stream) {
@@ -260,7 +262,7 @@ async_open_websocket_plugin(std::unique_ptr<core::StreamHandle> stream,
 }
 
 std::shared_ptr<WebSocketMuxHandshake>
-async_open_websocket_plugin_mux(std::unique_ptr<core::StreamHandle> stream,
+async_open_websocket_plugin_mux(std::unique_ptr<io::StreamHandle> stream,
                                 WebSocketPluginOptions options, WebSocketPluginMuxHandler handler) {
     if (!stream || !handler) {
         if (stream) {
@@ -342,7 +344,7 @@ void WebSocketPluginMuxPool::start_carrier() {
         });
 }
 
-void WebSocketPluginMuxPool::async_open_carrier(std::unique_ptr<core::StreamHandle> stream,
+void WebSocketPluginMuxPool::async_open_carrier(std::unique_ptr<io::StreamHandle> stream,
                                                 WebSocketPluginOptions options) {
     auto self = shared_from_this();
     async_open_websocket_plugin_mux(

@@ -1,5 +1,7 @@
 #include <clash_native/transport/websocket_client.hpp>
 
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include <boost/asio/buffer.hpp>
@@ -15,7 +17,9 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -31,14 +35,17 @@ class WebSocketStreamAdapter {
     using executor_type = boost::asio::any_io_executor;
     using lowest_layer_type = WebSocketStreamAdapter;
 
-    explicit WebSocketStreamAdapter(std::unique_ptr<core::StreamHandle> handle)
-        : handle_(std::shared_ptr<core::StreamHandle>(std::move(handle))) {}
+    explicit WebSocketStreamAdapter(std::unique_ptr<io::StreamHandle> handle)
+        : handle_(std::shared_ptr<io::StreamHandle>(std::move(handle))) {}
 
     executor_type get_executor() const noexcept { return handle_->executor(); }
 
     lowest_layer_type &lowest_layer() noexcept { return *this; }
     const lowest_layer_type &lowest_layer() const noexcept { return *this; }
 
+    // Drives the sender-based handle to completion on the heap and translates
+    // the terminal signal back into the Asio handler call. Unqualified
+    // completions: the erased sender invokes the receiver as an lvalue.
     template <typename MutableBufferSequence, typename CompletionToken>
     auto async_read_some(const MutableBufferSequence &buffers, CompletionToken &&token) {
         auto first = boost::asio::buffer_sequence_begin(buffers);
@@ -55,12 +62,24 @@ class WebSocketStreamAdapter {
                                            void(boost::system::error_code, std::size_t)>(
             [handle = std::move(handle), buffer](auto completion_handler) mutable {
                 using Handler = std::decay_t<decltype(completion_handler)>;
-                auto shared_handler = std::make_shared<Handler>(std::move(completion_handler));
-                handle->async_read_some(
-                    buffer, [shared_handler = std::move(shared_handler)](
-                                const boost::system::error_code &error, std::size_t size) mutable {
-                        (*shared_handler)(error, size);
-                    });
+                struct Receiver {
+                    Handler handler;
+                    void set_value(std::optional<std::size_t> count) noexcept {
+                        if (count) {
+                            std::move(handler)(boost::system::error_code{}, *count);
+                        } else {
+                            std::move(handler)(boost::asio::error::eof, std::size_t{0});
+                        }
+                    }
+                    void set_error(std::exception_ptr error) noexcept {
+                        std::move(handler)(unpack_error(std::move(error)), std::size_t{0});
+                    }
+                    void set_stopped() noexcept {
+                        std::move(handler)(boost::asio::error::operation_aborted, std::size_t{0});
+                    }
+                };
+                async::start_with_receiver(handle->async_read_some(buffer),
+                                           Receiver{std::move(completion_handler)});
             },
             token);
     }
@@ -75,15 +94,26 @@ class WebSocketStreamAdapter {
             [handle = std::move(handle),
              bytes = std::move(bytes)](auto completion_handler) mutable {
                 using Handler = std::decay_t<decltype(completion_handler)>;
-                auto shared_handler = std::make_shared<Handler>(std::move(completion_handler));
-                auto lifetime = bytes;
-                handle->async_write(
-                    boost::asio::buffer(*bytes),
-                    [lifetime = std::move(lifetime), shared_handler = std::move(shared_handler)](
-                        const boost::system::error_code &error, std::size_t size) mutable {
-                        (void)lifetime;
-                        (*shared_handler)(error, size);
-                    });
+                struct Receiver {
+                    Handler handler;
+                    std::shared_ptr<std::vector<std::uint8_t>> lifetime;
+                    void set_value(std::size_t count) noexcept {
+                        std::move(handler)(boost::system::error_code{}, count);
+                    }
+                    void set_error(std::exception_ptr error) noexcept {
+                        std::move(handler)(unpack_error(std::move(error)), std::size_t{0});
+                    }
+                    void set_stopped() noexcept {
+                        std::move(handler)(boost::asio::error::operation_aborted, std::size_t{0});
+                    }
+                };
+                // Split sender creation from the move below: function argument
+                // evaluation order is unspecified, so dereferencing bytes for
+                // the sender while moving it into the receiver in one call
+                // risks use-after-move.
+                auto sender = handle->async_write(boost::asio::buffer(*bytes));
+                async::start_with_receiver(
+                    std::move(sender), Receiver{std::move(completion_handler), std::move(bytes)});
             },
             token);
     }
@@ -101,7 +131,20 @@ class WebSocketStreamAdapter {
     }
 
   private:
-    std::shared_ptr<core::StreamHandle> handle_;
+    static boost::system::error_code unpack_error(std::exception_ptr error) noexcept {
+        try {
+            std::rethrow_exception(std::move(error));
+        } catch (const core::Error &failure) {
+            if (failure.cause) {
+                return {failure.cause.value(), boost::system::system_category()};
+            }
+            return boost::asio::error::fault;
+        } catch (...) {
+            return boost::asio::error::fault;
+        }
+    }
+
+    std::shared_ptr<io::StreamHandle> handle_;
 };
 
 inline void beast_close_socket(WebSocketStreamAdapter &stream) { stream.close(); }
@@ -466,17 +509,66 @@ class WebSocketStreamState final : public std::enable_shared_from_this<WebSocket
     bool closed_ = false;
 };
 
-class WebSocketStream final : public core::StreamHandle {
+class WebSocketStream final : public io::StreamHandle {
   public:
+    using ReadSignatures =
+        stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
+    using WriteSignatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                           stdexec::set_error_t(std::exception_ptr),
+                                                           stdexec::set_stopped_t()>;
+
     explicit WebSocketStream(std::shared_ptr<WebSocketStreamState> state)
         : state_(std::move(state)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        state_->async_read_some(buffer, std::move(handler));
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        auto state = state_;
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
+            [state, buffer](auto terminal) mutable {
+                state->async_read_some(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t count) mutable {
+                        terminal(error, count);
+                    });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                if (!error) {
+                    stdexec::set_value(std::move(receiver), std::optional<std::size_t>(count));
+                } else if (error == boost::asio::error::eof) {
+                    stdexec::set_value(std::move(receiver), std::optional<std::size_t>());
+                } else {
+                    stdexec::set_error(
+                        std::move(receiver),
+                        std::make_exception_ptr(
+                            core::Error{core::ErrorCode::transport_io, "websocket read",
+                                        std::error_code(error.value(), std::system_category())}));
+                }
+            })};
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
-        state_->async_write(buffer, std::move(handler));
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        auto state = state_;
+        return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
+            [state, buffer](auto terminal) mutable {
+                state->async_write(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t count) mutable {
+                        terminal(error, count);
+                    });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                if (!error) {
+                    stdexec::set_value(std::move(receiver), count);
+                } else {
+                    stdexec::set_error(
+                        std::move(receiver),
+                        std::make_exception_ptr(
+                            core::Error{core::ErrorCode::transport_io, "websocket write",
+                                        std::error_code(error.value(), std::system_category())}));
+                }
+            })};
     }
 
     boost::asio::any_io_executor executor() noexcept override { return state_->executor(); }
@@ -500,7 +592,7 @@ class WebSocketClientHandshakeOperation final
     : public WebSocketClientHandshake,
       public std::enable_shared_from_this<WebSocketClientHandshakeOperation> {
   public:
-    WebSocketClientHandshakeOperation(std::unique_ptr<core::StreamHandle> stream,
+    WebSocketClientHandshakeOperation(std::unique_ptr<io::StreamHandle> stream,
                                       WebSocketClientOptions options,
                                       WebSocketClientHandler handler)
         : executor_(stream->executor()), stream_(std::move(stream)), options_(std::move(options)),
@@ -626,10 +718,10 @@ class WebSocketClientHandshakeOperation final
         auto state = std::make_shared<WebSocketStreamState>(websocket_, options_.max_message_size);
         websocket_.reset();
         auto stream = std::make_unique<WebSocketStream>(std::move(state));
-        finish(std::unique_ptr<core::StreamHandle>(std::move(stream)));
+        finish(std::unique_ptr<io::StreamHandle>(std::move(stream)));
     }
 
-    void finish(core::Result<std::unique_ptr<core::StreamHandle>> result) {
+    void finish(core::Result<std::unique_ptr<io::StreamHandle>> result) {
         if (completed_) {
             return;
         }
@@ -658,7 +750,7 @@ class WebSocketClientHandshakeOperation final
     }
 
     boost::asio::any_io_executor executor_;
-    std::unique_ptr<core::StreamHandle> stream_;
+    std::unique_ptr<io::StreamHandle> stream_;
     WebSocketClientOptions options_;
     WebSocketClientHandler handler_;
     std::shared_ptr<TlsClientHandshake> tls_;
@@ -670,7 +762,7 @@ class WebSocketClientHandshakeOperation final
 } // namespace
 
 std::shared_ptr<WebSocketClientHandshake>
-async_websocket_client_handshake(std::unique_ptr<core::StreamHandle> stream,
+async_websocket_client_handshake(std::unique_ptr<io::StreamHandle> stream,
                                  WebSocketClientOptions options, WebSocketClientHandler handler) {
     if (!stream || !handler) {
         if (stream) {

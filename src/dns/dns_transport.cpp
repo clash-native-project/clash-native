@@ -1,5 +1,7 @@
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
 
 #include <boost/asio/post.hpp>
@@ -55,16 +57,14 @@ class PlannedDnsUpstreamDialer final : public DnsUpstreamDialer {
             runtime_.serialized_executor(), std::move(plan).value());
     }
 
-    void connect_stream(core::StreamRequest request, Handler handler) override {
+    io::AnySender<core::StreamOpenResult> connect_stream(core::StreamRequest request) override {
         if (endpoint_dialer_) {
-            endpoint_dialer_->connect_stream(std::move(request), std::move(handler));
-            return;
+            return endpoint_dialer_->connect_stream(std::move(request));
         }
         const auto error = plan_error_.value_or(
             core::Error{core::ErrorCode::configuration, "DNS endpoint dial plan is missing"});
-        runtime_.scheduler().post([handler = std::move(handler), error]() mutable {
-            handler(core::StreamOpenResult::failed(error));
-        });
+        return io::AnySender<core::StreamOpenResult>{
+            stdexec::just(core::StreamOpenResult::failed(error))};
     }
 
     void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) override {
@@ -95,15 +95,15 @@ class TrafficRulesDnsUpstreamDialer final : public DnsUpstreamDialer {
           traffic_router_(std::move(traffic_router)), egress_hostname_(std::move(egress_hostname)),
           direct_outbound_(std::make_shared<outbound::DirectOutbound>(runtime_)) {}
 
-    void connect_stream(core::StreamRequest request, Handler handler) override {
+    io::AnySender<core::StreamOpenResult> connect_stream(core::StreamRequest request) override {
         const auto plan =
             make_plan(request.destination, core::Network::tcp, request.resolved_address);
         if (!plan) {
-            post_stream_error(std::move(handler), plan.error());
-            return;
+            return io::AnySender<core::StreamOpenResult>{
+                stdexec::just(core::StreamOpenResult::failed(plan.error()))};
         }
         transport::EndpointDialer dialer(runtime_.serialized_executor(), plan.value());
-        dialer.connect_stream(std::move(request), std::move(handler));
+        return dialer.connect_stream(std::move(request));
     }
 
     void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) override {
@@ -123,13 +123,6 @@ class TrafficRulesDnsUpstreamDialer final : public DnsUpstreamDialer {
     }
 
   private:
-    void post_stream_error(Handler handler, core::Error error) const {
-        runtime_.scheduler().post(
-            [handler = std::move(handler), error = std::move(error)]() mutable {
-                handler(core::StreamOpenResult::failed(std::move(error)));
-            });
-    }
-
     void post_datagram_error(core::DatagramOpenHandler handler, core::Error error) const {
         runtime_.scheduler().post(
             [handler = std::move(handler), error = std::move(error)]() mutable {
@@ -208,15 +201,14 @@ OutboundDnsUpstreamDialer::OutboundDnsUpstreamDialer(
         std::make_shared<transport::EndpointDialer>(runtime_.serialized_executor(), plan.value());
 }
 
-void OutboundDnsUpstreamDialer::connect_stream(core::StreamRequest request, Handler handler) {
+io::AnySender<core::StreamOpenResult>
+OutboundDnsUpstreamDialer::connect_stream(core::StreamRequest request) {
     if (plan_error_) {
         const auto error = *plan_error_;
-        runtime_.scheduler().post([handler = std::move(handler), error]() mutable {
-            handler(core::StreamOpenResult::failed(error));
-        });
-        return;
+        return io::AnySender<core::StreamOpenResult>{
+            stdexec::just(core::StreamOpenResult::failed(error))};
     }
-    endpoint_dialer_->connect_stream(std::move(request), std::move(handler));
+    return endpoint_dialer_->connect_stream(std::move(request));
 }
 
 void OutboundDnsUpstreamDialer::open_datagram(core::DatagramRequest request,
@@ -357,9 +349,11 @@ class AsioDnsTransport::TcpSession final
             return;
         }
         auto self = shared_from_this();
-        dialer_->connect_stream(
-            {core::Destination::address(endpoint_.address(), endpoint_.port()), std::nullopt},
-            [self, generation](core::StreamOpenResult result) mutable {
+        struct ConnectReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<TcpSession> self;
+            std::uint64_t generation;
+            void set_value(core::StreamOpenResult result) && noexcept {
                 if (generation != self->connection_generation_ || self->stopped_) {
                     if (result.handle) {
                         result.handle->close();
@@ -375,7 +369,27 @@ class AsioDnsTransport::TcpSession final
                 }
                 self->stream_ = std::move(result.handle);
                 self->on_connected(generation);
-            });
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                if (generation != self->connection_generation_ || self->stopped_) {
+                    return;
+                }
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    self->connection_failed(failure, generation);
+                } catch (...) {
+                    self->connection_failed(core::Error{core::ErrorCode::endpoint_connection,
+                                                        "DNS upstream dialer failed"},
+                                            generation);
+                }
+            }
+            void set_stopped() && noexcept {}
+        };
+        async::start_with_receiver(
+            dialer_->connect_stream(
+                {core::Destination::address(endpoint_.address(), endpoint_.port()), std::nullopt}),
+            ConnectReceiver{self, generation});
     }
 
     void on_connected(std::uint64_t generation) {
@@ -422,7 +436,8 @@ class AsioDnsTransport::TcpSession final
             }
             self->flush_writes(generation);
         };
-        stream_->async_write(boost::asio::buffer(pending->frame), on_write);
+        net::start_write_for_handler(stream_->async_write(boost::asio::buffer(pending->frame)),
+                                     std::move(on_write));
     }
 
     void read_frame(std::uint64_t generation) {
@@ -496,8 +511,9 @@ class AsioDnsTransport::TcpSession final
             }
             self->read_exact(buffer, next_offset, generation, std::move(handler));
         };
-        stream_->async_read_some(
-            boost::asio::buffer(buffer->data() + offset, buffer->size() - offset), on_read);
+        net::start_read_for_handler(stream_->async_read_some(boost::asio::buffer(
+                                        buffer->data() + offset, buffer->size() - offset)),
+                                    std::move(on_read));
     }
 
     void dispatch_response(std::vector<std::uint8_t> response, std::uint64_t generation) {
@@ -576,7 +592,7 @@ class AsioDnsTransport::TcpSession final
     runtime::AsioRuntime &runtime_;
     boost::asio::ip::tcp::endpoint endpoint_;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
-    std::unique_ptr<core::StreamHandle> stream_;
+    std::unique_ptr<io::StreamHandle> stream_;
     std::unordered_map<std::uint16_t, PendingPtr> pending_;
     std::deque<std::uint16_t> write_queue_;
     std::uint64_t connection_generation_ = 0;

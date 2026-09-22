@@ -114,33 +114,23 @@ EndpointDialer::extend_trace(const std::shared_ptr<const core::EndpointDialTrace
     return std::make_shared<const core::EndpointDialTrace>(std::move(next));
 }
 
-void EndpointDialer::connect_stream(core::StreamRequest request,
-                                    core::StreamOpenHandler handler) const {
+io::AnySender<core::StreamOpenResult>
+EndpointDialer::connect_stream(core::StreamRequest request) const {
+    using ResultSender = io::AnySender<core::StreamOpenResult>;
     const auto selected = plan_.select_outbound();
     if (!selected) {
-        boost::asio::post(executor_,
-                          [handler = std::move(handler), error = selected.error()]() mutable {
-                              handler(core::StreamOpenResult::failed(error));
-                          });
-        return;
+        return ResultSender{stdexec::just(core::StreamOpenResult::failed(selected.error()))};
     }
     const auto outbound = selected.value();
     if (!outbound->capabilities().stream) {
-        boost::asio::post(executor_, [handler = std::move(handler)]() mutable {
-            handler(core::StreamOpenResult::unsupported());
-        });
-        return;
+        return ResultSender{stdexec::just(core::StreamOpenResult::unsupported())};
     }
     const auto trace = extend_trace(request.dial_trace, outbound->descriptor().id);
     if (!trace) {
-        boost::asio::post(executor_,
-                          [handler = std::move(handler), error = trace.error()]() mutable {
-                              handler(core::StreamOpenResult::failed(error));
-                          });
-        return;
+        return ResultSender{stdexec::just(core::StreamOpenResult::failed(trace.error()))};
     }
     request.dial_trace = trace.value();
-    outbound->connect_stream(std::move(request), std::move(handler));
+    return outbound->connect_stream(std::move(request));
 }
 
 void EndpointDialer::open_datagram(core::DatagramRequest request,

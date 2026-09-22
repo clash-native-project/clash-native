@@ -53,7 +53,7 @@ class TlsClientHandshakeOperationImpl final
     : public TlsClientHandshake,
       public std::enable_shared_from_this<TlsClientHandshakeOperationImpl> {
   public:
-    TlsClientHandshakeOperationImpl(std::unique_ptr<core::StreamHandle> stream,
+    TlsClientHandshakeOperationImpl(std::unique_ptr<io::StreamHandle> stream,
                                     TlsClientOptions options, TlsClientHandler handler)
         : executor_(stream->executor()), options_(std::move(options)), handler_(std::move(handler)),
           context_(
@@ -194,7 +194,7 @@ class TlsClientHandshakeOperationImpl final
                     negotiated_alpn.assign(reinterpret_cast<const char *>(protocol),
                                            protocol_length);
                 }
-                std::unique_ptr<core::StreamHandle> stream;
+                std::unique_ptr<io::StreamHandle> stream;
                 if (self->options_.handoff_raw_transport) {
                     stream = self->stream_->take_transport();
                 } else {
@@ -239,7 +239,7 @@ class TlsClientHandshakeOperationImpl final
 } // namespace detail
 
 std::shared_ptr<TlsClientHandshake>
-async_tls_client_handshake(std::unique_ptr<core::StreamHandle> stream, TlsClientOptions options,
+async_tls_client_handshake(std::unique_ptr<io::StreamHandle> stream, TlsClientOptions options,
                            TlsClientHandler handler) {
     if (!stream || !handler) {
         if (stream) {

@@ -1,6 +1,9 @@
+#include <clash_native/io/sender.hpp>
 #include <clash_native/runtime/runtime_snapshot.hpp>
 
 #include <gtest/gtest.h>
+
+#include <stdexec/execution.hpp>
 
 #include <memory>
 #include <string>
@@ -20,9 +23,10 @@ class StubOutbound final : public clash_native::core::Outbound {
         return {false, clash_native::core::DatagramSemantics::unsupported};
     }
 
-    void connect_stream(clash_native::core::StreamRequest,
-                        clash_native::core::StreamOpenHandler handler) override {
-        handler(clash_native::core::StreamOpenResult::unsupported());
+    clash_native::io::AnySender<clash_native::core::StreamOpenResult>
+    connect_stream(clash_native::core::StreamRequest) override {
+        return clash_native::io::AnySender<clash_native::core::StreamOpenResult>{
+            stdexec::just(clash_native::core::StreamOpenResult::unsupported())};
     }
 
     void open_datagram(clash_native::core::DatagramRequest,

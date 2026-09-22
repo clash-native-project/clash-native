@@ -3,12 +3,15 @@
 
 #include <gtest/gtest.h>
 
+#include <stdexec/execution.hpp>
+
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 
 #include <array>
 #include <future>
+#include <tuple>
 
 TEST(ProxyServerTest, TracksLifecycle) {
     auto &runtime = clash_native::runtime::AsioRuntime::instance();
@@ -32,16 +35,11 @@ TEST(ProxyServerTest, DirectOutboundDoesNotUseTheSystemResolver) {
     clash_native::outbound::DirectOutbound direct(runtime);
     runtime.start();
 
-    auto done = std::make_shared<std::promise<clash_native::core::StreamOpenResult>>();
-    auto future = done->get_future();
-    direct.connect_stream(
-        {clash_native::core::Destination::domain("example.invalid", 443), std::nullopt},
-        [done](clash_native::core::StreamOpenResult result) {
-            done->set_value(std::move(result));
-        });
+    auto wait = stdexec::sync_wait(direct.connect_stream(
+        {clash_native::core::Destination::domain("example.invalid", 443), std::nullopt}));
 
-    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
-    const auto result = future.get();
+    ASSERT_TRUE(wait.has_value());
+    auto result = std::move(std::get<0>(*wait));
     EXPECT_EQ(result.status, clash_native::core::OpenStatus::failed);
     ASSERT_TRUE(result.error);
     EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::configuration);

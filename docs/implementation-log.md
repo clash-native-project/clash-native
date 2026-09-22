@@ -1,5 +1,29 @@
 # Implementation Log
 
+### 2026-09-22 — Add sender-based io handle abstractions (migration targets)
+
+- Added `include/clash_native/io/` with sender-based counterparts of the four
+  handle/session abstractions, using the same class names under the `io`
+  namespace so old and new can coexist during migration: `sender.hpp`
+  (`AnySender<T>` type-erased sender), `address.hpp` (`Destination`,
+  `DatagramAddress`), `stream_handle.hpp`, `datagram_handle.hpp` (plus a
+  `DatagramPacket` result), `multiplexed_session.hpp`, and
+  `exchange_session.hpp` (request/response vocabulary plus body and tunnel
+  streams/sessions).
+- Conventions: async ops return senders completing exactly once;
+  `set_value(optional<size_t>)` with disengaged meaning clean EOF on reads
+  (maps to relay shutdown), `set_error` carrying `core::Error`,
+  `set_stopped()` on cancellation (never `operation_aborted` as an error);
+  handler-era `cancel(id)` is retained alongside stop-token cancellation;
+  deadlines stay as parameters; at most one outstanding read/write per
+  handle. Old `core::`/`transport::` abstractions are untouched.
+- Added `tests/io/io_handles_test.cpp` (5 cases) with in-memory fakes
+  proving the contracts: stream read/write/EOF, error surfacing, datagram
+  echo, exchange round-trips (buffered/streaming/tunnel), and multiplexed
+  open yielding a usable stream.
+- Validated with the Windows x64 Release clang-cl/MSVC build: 77 async/io
+  cases pass; `pixi run format-check` and `git diff --check` pass.
+
 ### 2026-09-22 — Add broadcast and watch channels (tokio parity: four kinds)
 
 - Added `include/clash_native/async/broadcast.hpp`: MPMC broadcast with
@@ -1663,3 +1687,10 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   Asio's lower-overhead single-thread scheduling path.
 - Added a runtime test covering context replacement during worker-count
   reconfiguration and documented the executor lifetime requirement.
+
+### 2026-09-22 — Finish proxy-plane sender migration and fix test-plane debt
+
+- Migrated the remaining test doubles to the sender narrow waist: `EventReceiver` drops `&&` (erased `AnySender` invokes the receiver as an lvalue), `StreamOpenResult` is moved out of `sync_wait` tuples (it holds a `unique_ptr`), stub outbounds return `just(unsupported)`, DNS probe dialers adapt `core::` streams at the edge, and host probes take `io::` inputs (`websocket_client` adapts the handshake output back to `core::` for its callback-style echo checks).
+- Fixed `Loopback` in `io_handles_test` with an `executor_work_guard` (the worker's `run()` previously returned with no work, hanging all `use_sender` pulls) and bound it to loopback instead of `0.0.0.0`.
+- Fixed a use-after-move segfault in `http1_client`/`websocket_client` write adapters: `start_with_receiver(handle->async_write(buffer(*bytes)), Receiver{..., move(bytes)})` evaluates arguments in unspecified order, so the receiver move could null `bytes` before dereference. Sender creation is now split from the move with a comment.
+- Validated with the Windows x64 Release clang-cl/MSVC build: zero build errors; `clash-native-tests` reports 224 passed, 3 skipped, 4 failed (the known DNS UDP environment baseline); `pixi run format`, `format-check`, and `git diff --check` pass.

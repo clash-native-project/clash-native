@@ -26,14 +26,13 @@ struct WebSocketPluginOptions {
     std::uint8_t smux_version = 1;
 };
 
-using WebSocketPluginHandler =
-    std::function<void(core::Result<std::unique_ptr<core::StreamHandle>>)>;
+using WebSocketPluginHandler = std::function<void(core::Result<std::unique_ptr<io::StreamHandle>>)>;
 
 // Establishes an optional TLS layer followed by an HTTP/1.1 WebSocket
 // upgrade. The returned stream carries raw Shadowsocks bytes as binary
 // WebSocket messages.
 std::shared_ptr<clash_native::transport::WebSocketClientHandshake>
-async_open_websocket_plugin(std::unique_ptr<core::StreamHandle> stream,
+async_open_websocket_plugin(std::unique_ptr<io::StreamHandle> stream,
                             WebSocketPluginOptions options, WebSocketPluginHandler handler);
 
 using WebSocketPluginMuxHandler =
@@ -43,7 +42,7 @@ using WebSocketPluginMuxHandler =
 // common MultiplexedSession. The caller owns the returned handshake operation
 // until the callback completes or it is cancelled.
 std::shared_ptr<WebSocketMuxHandshake>
-async_open_websocket_plugin_mux(std::unique_ptr<core::StreamHandle> stream,
+async_open_websocket_plugin_mux(std::unique_ptr<io::StreamHandle> stream,
                                 WebSocketPluginOptions options, WebSocketPluginMuxHandler handler);
 
 // Reuses one WebSocket carrier for multiple logical plugin streams. A pool is
@@ -51,7 +50,10 @@ async_open_websocket_plugin_mux(std::unique_ptr<core::StreamHandle> stream,
 // protocols. If the carrier retires, the next request establishes a new one.
 class WebSocketPluginMuxPool final : public std::enable_shared_from_this<WebSocketPluginMuxPool> {
   public:
-    using StreamHandler = WebSocketPluginHandler;
+    // The pool still deals core::StreamHandle: MultiplexedSession (QUIC/H2/H3
+    // included) is the sessions plane and flips separately. The carrier side
+    // below already runs on io:: (TcpStream is dual).
+    using StreamHandler = std::function<void(core::Result<std::unique_ptr<core::StreamHandle>>)>;
 
     explicit WebSocketPluginMuxPool(boost::asio::any_io_executor executor)
         : executor_(std::move(executor)) {}
@@ -69,7 +71,7 @@ class WebSocketPluginMuxPool final : public std::enable_shared_from_this<WebSock
     };
 
     void start_carrier();
-    void async_open_carrier(std::unique_ptr<core::StreamHandle> stream,
+    void async_open_carrier(std::unique_ptr<io::StreamHandle> stream,
                             WebSocketPluginOptions options);
     void drain_pending();
     void fail_pending(core::Error error);

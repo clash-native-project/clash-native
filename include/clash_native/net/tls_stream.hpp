@@ -1,6 +1,7 @@
 #pragma once
 
 #include <clash_native/core/outbound.hpp>
+#include <clash_native/io/stream_handle.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 
 #include <boost/asio/ssl/context.hpp>
@@ -14,15 +15,16 @@ class TlsClientHandshakeOperationImpl;
 
 namespace clash_native::net {
 
-class TlsStream final : public core::StreamHandle {
+class TlsStream final : public io::StreamHandle {
   public:
-    using SslStream = boost::asio::ssl::stream<StreamHandleAdapter>;
+    using SslStream = boost::asio::ssl::stream<StreamHandleAdapter<io::StreamHandle>>;
 
     TlsStream(std::shared_ptr<boost::asio::ssl::context> context,
-              std::unique_ptr<core::StreamHandle> stream);
+              std::unique_ptr<io::StreamHandle> stream);
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override;
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override;
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override;
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override;
     boost::asio::any_io_executor executor() noexcept override;
     boost::asio::ip::tcp::endpoint
     local_endpoint(boost::system::error_code &error) const noexcept override;
@@ -31,7 +33,7 @@ class TlsStream final : public core::StreamHandle {
 
     // Detaches the underlying project stream after a completed handshake.
     // The SSL layer must not be used after this call.
-    std::unique_ptr<core::StreamHandle> take_transport() noexcept;
+    std::unique_ptr<io::StreamHandle> take_transport() noexcept;
 
   private:
     std::shared_ptr<boost::asio::ssl::context> context_;

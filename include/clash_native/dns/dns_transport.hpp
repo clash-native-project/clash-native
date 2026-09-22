@@ -3,6 +3,7 @@
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
 #include <clash_native/dns/dns_types.hpp>
+#include <clash_native/io/sender.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
 #include <clash_native/router/traffic_router.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
@@ -36,9 +37,7 @@ struct DnsDialPolicy {
 
 class DnsUpstreamDialer {
   public:
-    using Handler = core::StreamOpenHandler;
-
-    virtual void connect_stream(core::StreamRequest request, Handler handler) = 0;
+    virtual io::AnySender<core::StreamOpenResult> connect_stream(core::StreamRequest request) = 0;
     virtual void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) {
         handler(core::DatagramOpenResult::unsupported());
     }
@@ -52,7 +51,7 @@ class OutboundDnsUpstreamDialer final : public DnsUpstreamDialer {
                               std::string outbound_id,
                               transport::EndpointDialRequirements requirements = {});
 
-    void connect_stream(core::StreamRequest request, Handler handler) override;
+    io::AnySender<core::StreamOpenResult> connect_stream(core::StreamRequest request) override;
     void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) override;
 
   private:

@@ -1,5 +1,7 @@
 #include <clash_native/transport/shadowsocks/restls_client.hpp>
 
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/shadowsocks/restls.hpp>
 
 #include <botan/asn1_obj.h>
@@ -478,10 +480,22 @@ class RestlsCallbacks final : public Botan::TLS::Callbacks {
     std::string last_alert_;
 };
 
-class RestlsStream final : public core::StreamHandle,
+class RestlsStream final : public io::StreamHandle,
                            public std::enable_shared_from_this<RestlsStream> {
   public:
-    RestlsStream(std::unique_ptr<core::StreamHandle> lower, std::array<std::uint8_t, 32> secret,
+    using ReadSignatures =
+        stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
+    using WriteSignatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                           stdexec::set_error_t(std::exception_ptr),
+                                                           stdexec::set_stopped_t()>;
+    // Internal machinery stays handler-style; only the public overrides below
+    // speak senders.
+    using ReadHandler = core::StreamHandle::ReadHandler;
+    using WriteHandler = core::StreamHandle::WriteHandler;
+
+    RestlsStream(std::unique_ptr<io::StreamHandle> lower, std::array<std::uint8_t, 32> secret,
                  std::vector<std::uint8_t> server_random,
                  std::shared_ptr<Botan::RandomNumberGenerator> rng,
                  std::vector<RestlsScriptLine> script, std::vector<std::uint8_t> initial_wire,
@@ -493,7 +507,34 @@ class RestlsStream final : public core::StreamHandle,
 
     ~RestlsStream() override = default;
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
+            [this, buffer](auto terminal) mutable {
+                this->read_impl(buffer, [terminal = std::move(terminal)](
+                                            const boost::system::error_code &error,
+                                            std::size_t count) mutable { terminal(error, count); });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_read(std::move(receiver), error, count, "restls read");
+            })};
+    }
+
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
+            [this, buffer](auto terminal) mutable {
+                this->write_impl(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t count) mutable {
+                        terminal(error, count);
+                    });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_write(std::move(receiver), error, count, "restls write");
+            })};
+    }
+
+    void read_impl(boost::asio::mutable_buffer buffer, ReadHandler handler) {
         if (read_handler_) {
             post_read(std::move(handler), boost::asio::error::already_started, 0);
             return;
@@ -510,7 +551,7 @@ class RestlsStream final : public core::StreamHandle,
         pump_read();
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
+    void write_impl(boost::asio::const_buffer buffer, WriteHandler handler) {
         if (write_handler_) {
             post_write(std::move(handler), boost::asio::error::already_started, 0);
             return;
@@ -594,23 +635,23 @@ class RestlsStream final : public core::StreamHandle,
         }
         lower_read_pending_ = true;
         auto self = shared_from_this();
-        lower_->async_read_some(boost::asio::buffer(read_temp_),
-                                [self](const boost::system::error_code &error, std::size_t size) {
-                                    self->lower_read_pending_ = false;
-                                    if (error) {
-                                        self->finish_read(error, 0);
-                                        return;
-                                    }
-                                    if (size == 0) {
-                                        self->finish_read(boost::asio::error::eof, 0);
-                                        return;
-                                    }
-                                    self->read_wire_.insert(self->read_wire_.end(),
-                                                            self->read_temp_.begin(),
-                                                            self->read_temp_.begin() +
-                                                                static_cast<std::ptrdiff_t>(size));
-                                    self->pump_read();
-                                });
+        net::start_read_for_handler(
+            lower_->async_read_some(boost::asio::buffer(read_temp_)),
+            [self](const boost::system::error_code &error, std::size_t size) {
+                self->lower_read_pending_ = false;
+                if (error) {
+                    self->finish_read(error, 0);
+                    return;
+                }
+                if (size == 0) {
+                    self->finish_read(boost::asio::error::eof, 0);
+                    return;
+                }
+                self->read_wire_.insert(self->read_wire_.end(), self->read_temp_.begin(),
+                                        self->read_temp_.begin() +
+                                            static_cast<std::ptrdiff_t>(size));
+                self->pump_read();
+            });
     }
 
     bool process_wire() {
@@ -698,22 +739,22 @@ class RestlsStream final : public core::StreamHandle,
         write_wire_ = std::move(wire.value());
         write_in_progress_ = true;
         auto self = shared_from_this();
-        lower_->async_write(boost::asio::buffer(write_wire_),
-                            [self, chunk, needs_response = line.command.needs_peer_response()](
-                                const boost::system::error_code &error, std::size_t) {
-                                self->write_in_progress_ = false;
-                                if (error) {
-                                    self->finish_write(error, 0);
-                                    return;
-                                }
-                                self->pending_write_offset_ += chunk;
-                                ++self->script_index_;
-                                if (needs_response &&
-                                    self->pending_write_offset_ < self->pending_write_.size()) {
-                                    self->write_waiting_response_ = true;
-                                }
-                                self->pump_write();
-                            });
+        net::start_write_for_handler(
+            lower_->async_write(boost::asio::buffer(write_wire_)),
+            [self, chunk, needs_response = line.command.needs_peer_response()](
+                const boost::system::error_code &error, std::size_t) {
+                self->write_in_progress_ = false;
+                if (error) {
+                    self->finish_write(error, 0);
+                    return;
+                }
+                self->pending_write_offset_ += chunk;
+                ++self->script_index_;
+                if (needs_response && self->pending_write_offset_ < self->pending_write_.size()) {
+                    self->write_waiting_response_ = true;
+                }
+                self->pump_write();
+            });
     }
 
     void pump_control_write() {
@@ -736,19 +777,19 @@ class RestlsStream final : public core::StreamHandle,
         write_wire_ = std::move(wire.value());
         write_in_progress_ = true;
         auto self = shared_from_this();
-        lower_->async_write(boost::asio::buffer(write_wire_),
-                            [self](const boost::system::error_code &error, std::size_t) {
-                                self->write_in_progress_ = false;
-                                if (error) {
-                                    self->finish_read(error, 0);
-                                    self->finish_write(error, 0);
-                                    return;
-                                }
-                                --self->pending_control_responses_;
-                                ++self->script_index_;
-                                self->pump_control_write();
-                                self->pump_write();
-                            });
+        net::start_write_for_handler(lower_->async_write(boost::asio::buffer(write_wire_)),
+                                     [self](const boost::system::error_code &error, std::size_t) {
+                                         self->write_in_progress_ = false;
+                                         if (error) {
+                                             self->finish_read(error, 0);
+                                             self->finish_write(error, 0);
+                                             return;
+                                         }
+                                         --self->pending_control_responses_;
+                                         ++self->script_index_;
+                                         self->pump_control_write();
+                                         self->pump_write();
+                                     });
     }
 
     void ensure_control_read() {
@@ -757,23 +798,23 @@ class RestlsStream final : public core::StreamHandle,
         }
         lower_read_pending_ = true;
         auto self = shared_from_this();
-        lower_->async_read_some(boost::asio::buffer(read_temp_),
-                                [self](const boost::system::error_code &error, std::size_t size) {
-                                    self->lower_read_pending_ = false;
-                                    if (error) {
-                                        self->finish_write(error, 0);
-                                        self->finish_read(error, 0);
-                                        return;
-                                    }
-                                    self->read_wire_.insert(self->read_wire_.end(),
-                                                            self->read_temp_.begin(),
-                                                            self->read_temp_.begin() +
-                                                                static_cast<std::ptrdiff_t>(size));
-                                    (void)self->process_wire();
-                                    if (self->write_waiting_response_) {
-                                        self->ensure_control_read();
-                                    }
-                                });
+        net::start_read_for_handler(
+            lower_->async_read_some(boost::asio::buffer(read_temp_)),
+            [self](const boost::system::error_code &error, std::size_t size) {
+                self->lower_read_pending_ = false;
+                if (error) {
+                    self->finish_write(error, 0);
+                    self->finish_read(error, 0);
+                    return;
+                }
+                self->read_wire_.insert(self->read_wire_.end(), self->read_temp_.begin(),
+                                        self->read_temp_.begin() +
+                                            static_cast<std::ptrdiff_t>(size));
+                (void)self->process_wire();
+                if (self->write_waiting_response_) {
+                    self->ensure_control_read();
+                }
+            });
     }
 
     void finish_read(boost::system::error_code error, std::size_t size) {
@@ -793,7 +834,7 @@ class RestlsStream final : public core::StreamHandle,
         pending_write_size_ = 0;
     }
 
-    std::unique_ptr<core::StreamHandle> lower_;
+    std::unique_ptr<io::StreamHandle> lower_;
     RestlsApplicationCodec encoder_;
     RestlsApplicationCodec decoder_;
     std::shared_ptr<Botan::RandomNumberGenerator> rng_;
@@ -816,19 +857,50 @@ class RestlsStream final : public core::StreamHandle,
     std::size_t pending_control_responses_ = 0;
 };
 
-class RestlsStreamHandle final : public core::StreamHandle {
+class RestlsStreamHandle final : public io::StreamHandle {
   public:
+    using ReadSignatures =
+        stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
+    using WriteSignatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                           stdexec::set_error_t(std::exception_ptr),
+                                                           stdexec::set_stopped_t()>;
+
     explicit RestlsStreamHandle(std::shared_ptr<RestlsStream> stream)
         : stream_(std::move(stream)) {}
 
     ~RestlsStreamHandle() override { close(); }
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        stream_->async_read_some(buffer, std::move(handler));
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        auto stream = stream_;
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
+            [stream, buffer](auto terminal) mutable {
+                stream->read_impl(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t count) mutable {
+                        terminal(error, count);
+                    });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_read(std::move(receiver), error, count, "restls read");
+            })};
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
-        stream_->async_write(buffer, std::move(handler));
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        auto stream = stream_;
+        return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
+            [stream, buffer](auto terminal) mutable {
+                stream->write_impl(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t count) mutable {
+                        terminal(error, count);
+                    });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_write(std::move(receiver), error, count, "restls write");
+            })};
     }
 
     boost::asio::any_io_executor executor() noexcept override { return stream_->executor(); }
@@ -855,7 +927,7 @@ class RestlsStreamHandle final : public core::StreamHandle {
 
 class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpenOperation> {
   public:
-    RestlsOpenOperation(std::unique_ptr<core::StreamHandle> stream, RestlsClientOptions options,
+    RestlsOpenOperation(std::unique_ptr<io::StreamHandle> stream, RestlsClientOptions options,
                         RestlsOpenHandler handler)
         : stream_(std::move(stream)), options_(std::move(options)), handler_(std::move(handler)),
           timer_(stream_->executor()) {}
@@ -974,16 +1046,16 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
         tls_write_current_ = std::move(tls_write_queue_.front());
         tls_write_queue_.erase(tls_write_queue_.begin());
         auto self = shared_from_this();
-        stream_->async_write(boost::asio::buffer(tls_write_current_),
-                             [self](const boost::system::error_code &error, std::size_t) {
-                                 self->tls_write_in_progress_ = false;
-                                 if (error) {
-                                     self->finish(core::fail(restls_io_error(
-                                         "failed to write ResTLS TLS handshake", error)));
-                                     return;
-                                 }
-                                 self->start_tls_write();
-                             });
+        net::start_write_for_handler(stream_->async_write(boost::asio::buffer(tls_write_current_)),
+                                     [self](const boost::system::error_code &error, std::size_t) {
+                                         self->tls_write_in_progress_ = false;
+                                         if (error) {
+                                             self->finish(core::fail(restls_io_error(
+                                                 "failed to write ResTLS TLS handshake", error)));
+                                             return;
+                                         }
+                                         self->start_tls_write();
+                                     });
     }
 
     void read_tls_records() {
@@ -992,8 +1064,8 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
         }
         read_in_progress_ = true;
         auto self = shared_from_this();
-        stream_->async_read_some(
-            boost::asio::buffer(read_temp_),
+        net::start_read_for_handler(
+            stream_->async_read_some(boost::asio::buffer(read_temp_)),
             [self](const boost::system::error_code &error, std::size_t size) {
                 self->read_in_progress_ = false;
                 if (error) {
@@ -1121,11 +1193,11 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
             std::move(stream_), secret_, std::move(server_random_), rng_, std::move(script_),
             std::move(tls_input_), server_tls12_gcm_,
             tls13_ ? std::move(last_client_finished_) : std::vector<std::uint8_t>{});
-        finish(core::Result<std::unique_ptr<core::StreamHandle>>(
+        finish(core::Result<std::unique_ptr<io::StreamHandle>>(
             std::make_unique<RestlsStreamHandle>(std::move(adapter))));
     }
 
-    void finish(core::Result<std::unique_ptr<core::StreamHandle>> result) {
+    void finish(core::Result<std::unique_ptr<io::StreamHandle>> result) {
         if (completed_) {
             return;
         }
@@ -1141,11 +1213,11 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
         }
     }
 
-    void finish(std::unique_ptr<core::StreamHandle> stream) {
-        finish(core::Result<std::unique_ptr<core::StreamHandle>>(std::move(stream)));
+    void finish(std::unique_ptr<io::StreamHandle> stream) {
+        finish(core::Result<std::unique_ptr<io::StreamHandle>>(std::move(stream)));
     }
 
-    std::unique_ptr<core::StreamHandle> stream_;
+    std::unique_ptr<io::StreamHandle> stream_;
     RestlsClientOptions options_;
     RestlsOpenHandler handler_;
     boost::asio::steady_timer timer_;
@@ -1174,7 +1246,7 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
 
 } // namespace
 
-void async_open_restls(std::unique_ptr<core::StreamHandle> stream, RestlsClientOptions options,
+void async_open_restls(std::unique_ptr<io::StreamHandle> stream, RestlsClientOptions options,
                        RestlsOpenHandler handler) {
     if (!stream || !handler) {
         if (stream) {

@@ -2,6 +2,7 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
+#include <clash_native/io/sender.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
 
 #include <boost/asio/any_io_executor.hpp>
@@ -52,7 +53,7 @@ class EndpointDialer final {
   public:
     EndpointDialer(boost::asio::any_io_executor executor, EndpointDialPlan plan);
 
-    void connect_stream(core::StreamRequest request, core::StreamOpenHandler handler) const;
+    io::AnySender<core::StreamOpenResult> connect_stream(core::StreamRequest request) const;
     void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) const;
 
     std::string_view egress_identity() const noexcept { return plan_.egress_identity(); }

@@ -18,9 +18,9 @@ struct JlsClientOptions {
     bool skip_cert_verify = false;
 };
 
-using JlsOpenHandler = std::function<void(core::Result<std::unique_ptr<core::StreamHandle>>)>;
+using JlsOpenHandler = std::function<void(core::Result<std::unique_ptr<io::StreamHandle>>)>;
 
-void async_open_jls(std::unique_ptr<core::StreamHandle> stream, JlsClientOptions options,
+void async_open_jls(std::unique_ptr<io::StreamHandle> stream, JlsClientOptions options,
                     JlsOpenHandler handler);
 
 } // namespace clash_native::transport::shadowsocks

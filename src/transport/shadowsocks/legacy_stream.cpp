@@ -1,5 +1,7 @@
 #include <clash_native/transport/shadowsocks/legacy_stream.hpp>
 
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/shadowsocks/crypto.hpp>
 #include <clash_native/transport/shadowsocks/simple_obfs.hpp>
 
@@ -13,6 +15,7 @@
 #include <climits>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <optional>
 #include <span>
@@ -334,16 +337,43 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
     bool write_in_progress_ = false;
 };
 
-class LegacyStreamHandle final : public core::StreamHandle {
+class LegacyStreamHandle final : public io::StreamHandle {
   public:
+    using ReadSignatures =
+        stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
+    using WriteSignatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                           stdexec::set_error_t(std::exception_ptr),
+                                                           stdexec::set_stopped_t()>;
+
     explicit LegacyStreamHandle(std::shared_ptr<LegacyStreamState> state)
         : state_(std::move(state)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        state_->read(buffer, std::move(handler));
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        auto state = state_;
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
+            [state, buffer](auto terminal) mutable {
+                state->read(buffer, [terminal = std::move(terminal)](
+                                        const boost::system::error_code &error,
+                                        std::size_t count) mutable { terminal(error, count); });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_read(std::move(receiver), error, count, "legacy read");
+            })};
     }
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
-        state_->write(buffer, std::move(handler));
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        auto state = state_;
+        return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
+            [state, buffer](auto terminal) mutable {
+                state->write(buffer, [terminal = std::move(terminal)](
+                                         const boost::system::error_code &error,
+                                         std::size_t count) mutable { terminal(error, count); });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_write(std::move(receiver), error, count, "legacy write");
+            })};
     }
     boost::asio::any_io_executor executor() noexcept override { return state_->executor(); }
     boost::asio::ip::tcp::endpoint
@@ -361,18 +391,18 @@ class LegacyStreamHandle final : public core::StreamHandle {
 
 } // namespace
 
-core::Result<std::unique_ptr<core::StreamHandle>>
+core::Result<std::unique_ptr<io::StreamHandle>>
 make_legacy_stream_handle(std::shared_ptr<boost::asio::ip::tcp::socket> socket, std::string method,
                           std::string password, LegacyStreamCipher write_cipher,
                           std::vector<std::uint8_t> initial_wire, ObfsMode obfs_mode) {
     auto state = std::make_shared<LegacyStreamState>(std::move(socket), std::move(method),
                                                      std::move(password), std::move(write_cipher),
                                                      std::move(initial_wire), obfs_mode);
-    return std::unique_ptr<core::StreamHandle>(
+    return std::unique_ptr<io::StreamHandle>(
         std::make_unique<LegacyStreamHandle>(std::move(state)));
 }
 
-core::Result<std::unique_ptr<core::StreamHandle>>
+core::Result<std::unique_ptr<io::StreamHandle>>
 make_legacy_stream_handle(std::shared_ptr<StreamCarrier> carrier, std::string method,
                           std::string password, LegacyStreamCipher write_cipher,
                           std::vector<std::uint8_t> initial_wire) {
@@ -383,7 +413,7 @@ make_legacy_stream_handle(std::shared_ptr<StreamCarrier> carrier, std::string me
     auto state = std::make_shared<LegacyStreamState>(std::move(carrier), std::move(method),
                                                      std::move(password), std::move(write_cipher),
                                                      std::move(initial_wire));
-    return std::unique_ptr<core::StreamHandle>(
+    return std::unique_ptr<io::StreamHandle>(
         std::make_unique<LegacyStreamHandle>(std::move(state)));
 }
 

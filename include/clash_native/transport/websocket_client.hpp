@@ -2,6 +2,7 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
+#include <clash_native/io/stream_handle.hpp>
 #include <clash_native/transport/exchange_session.hpp>
 
 #include <chrono>
@@ -38,8 +39,7 @@ class WebSocketClientHandshake {
     virtual ~WebSocketClientHandshake() = default;
 };
 
-using WebSocketClientHandler =
-    std::function<void(core::Result<std::unique_ptr<core::StreamHandle>>)>;
+using WebSocketClientHandler = std::function<void(core::Result<std::unique_ptr<io::StreamHandle>>)>;
 
 // Completes an optional TLS handshake followed by an HTTP/1.1 WebSocket
 // Upgrade over an already established stream. The returned stream maps each
@@ -47,7 +47,7 @@ using WebSocketClientHandler =
 // message payloads as a byte stream. Ping, pong, close, masking, and
 // fragmentation are handled by the WebSocket implementation.
 std::shared_ptr<WebSocketClientHandshake>
-async_websocket_client_handshake(std::unique_ptr<core::StreamHandle> stream,
+async_websocket_client_handshake(std::unique_ptr<io::StreamHandle> stream,
                                  WebSocketClientOptions options, WebSocketClientHandler handler);
 
 } // namespace clash_native::transport

@@ -37,7 +37,7 @@ class TrojanOutbound final : public core::Outbound {
     core::Status validate() const;
     const core::OutboundDescriptor &descriptor() const noexcept override;
     core::OutboundCapabilities capabilities() const noexcept override;
-    void connect_stream(core::StreamRequest request, core::StreamOpenHandler handler) override;
+    io::AnySender<core::StreamOpenResult> connect_stream(core::StreamRequest request) override;
     void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) override;
 
   private:

@@ -1,3 +1,5 @@
+#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/trojan_outbound.hpp>
 #include <clash_native/transport/tls_client.hpp>
@@ -16,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <exception>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -182,7 +185,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         auto self = shared_from_this();
         websocket_handshake_ = transport::async_websocket_client_handshake(
             std::move(plain_stream), std::move(options),
-            [self](core::Result<std::unique_ptr<core::StreamHandle>> result) mutable {
+            [self](core::Result<std::unique_ptr<io::StreamHandle>> result) mutable {
                 self->websocket_handshake_.reset();
                 if (self->completed_) {
                     if (result && result.value()) {
@@ -218,24 +221,71 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         wire->push_back('\n');
 
         auto self = shared_from_this();
-        transport_stream_->async_write(
-            boost::asio::buffer(*wire),
-            [self, wire](const boost::system::error_code &error, std::size_t) {
-                if (error) {
-                    self->finish(core::StreamOpenResult::failed({core::ErrorCode::transport_io,
-                                                                 "failed to write Trojan request",
-                                                                 to_std_error(error)}));
-                    return;
-                }
+        struct WriteForwarder {
+            std::shared_ptr<TrojanConnectOperation> self;
+            std::shared_ptr<std::vector<std::uint8_t>> wire;
+            void set_value(std::size_t) noexcept {
                 self->completed_ = true;
                 self->cancel_timer();
                 auto handler = std::move(self->handler_);
                 handler(core::StreamOpenResult::opened(std::move(self->transport_stream_)));
-            });
+            }
+            void set_error(std::exception_ptr error) noexcept {
+                core::Error failure{
+                    core::ErrorCode::transport_io, "failed to write Trojan request", {}};
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &named) {
+                    failure = named;
+                } catch (...) {
+                }
+                self->finish(core::StreamOpenResult::failed(std::move(failure)));
+            }
+            void set_stopped() noexcept {
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "Trojan request write cancelled"}));
+            }
+        };
+        async::start_with_receiver(transport_stream_->async_write(boost::asio::buffer(*wire)),
+                                   WriteForwarder{self, wire});
     }
 
     void cancel_timer() noexcept { timer_.cancel(); }
 
+  public:
+    // Abort for sender-driven cancellation: runs on any thread, mirrors the
+    // failure cleanup in finish() without completing (the bridge drops the
+    // late terminal through its settled flag).
+    void abort() noexcept {
+        auto self = shared_from_this();
+        try {
+            // Runtime outlives every operation; socket_ may already be moved
+            // into the stream chain, so never touch it here.
+            boost::asio::post(runtime_.serialized_executor(), [self]() {
+                if (self->completed_) {
+                    return;
+                }
+                boost::system::error_code ignored;
+                self->cancel_timer();
+                if (self->tls_handshake_) {
+                    self->tls_handshake_->cancel();
+                }
+                if (self->websocket_handshake_) {
+                    self->websocket_handshake_->cancel();
+                }
+                if (self->socket_) {
+                    self->socket_->cancel(ignored);
+                    self->socket_->close(ignored);
+                }
+                if (self->transport_stream_) {
+                    self->transport_stream_->close();
+                }
+            });
+        } catch (...) {
+        }
+    }
+
+  private:
     void finish(core::StreamOpenResult result) {
         if (completed_) {
             return;
@@ -269,7 +319,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
     std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
     std::shared_ptr<transport::WebSocketClientHandshake> websocket_handshake_;
-    std::unique_ptr<core::StreamHandle> transport_stream_;
+    std::unique_ptr<io::StreamHandle> transport_stream_;
     boost::asio::steady_timer timer_;
     core::StreamOpenHandler handler_;
     std::chrono::steady_clock::time_point deadline_{};
@@ -305,10 +355,20 @@ const core::OutboundDescriptor &TrojanOutbound::descriptor() const noexcept { re
 
 core::OutboundCapabilities TrojanOutbound::capabilities() const noexcept { return capabilities_; }
 
-void TrojanOutbound::connect_stream(core::StreamRequest request, core::StreamOpenHandler handler) {
-    auto operation = std::make_shared<TrojanConnectOperation>(
-        runtime_, resolver_, config_, std::move(request), std::move(handler));
-    operation->start();
+io::AnySender<core::StreamOpenResult> TrojanOutbound::connect_stream(core::StreamRequest request) {
+    auto &runtime = runtime_;
+    auto resolver = resolver_;
+    auto config = config_;
+    return async::bridge_sender<core::StreamOpenResult>(
+        [&runtime, resolver = std::move(resolver), config = std::move(config),
+         request = std::move(request)](
+            async::BridgeSender<core::StreamOpenResult>::Handler terminal) mutable {
+            auto operation = std::make_shared<TrojanConnectOperation>(
+                runtime, std::move(resolver), std::move(config), std::move(request),
+                std::move(terminal));
+            operation->start();
+            return [operation] { operation->abort(); };
+        });
 }
 
 void TrojanOutbound::open_datagram(core::DatagramRequest, core::DatagramOpenHandler handler) {

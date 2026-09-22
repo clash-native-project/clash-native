@@ -1,4 +1,7 @@
+#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/core/base64.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/http_proxy_outbound.hpp>
 #include <clash_native/transport/exchange_session.hpp>
@@ -44,18 +47,50 @@ std::string destination_authority(const core::Destination &destination) {
     return authority;
 }
 
-class HttpProxyTunnelStream final : public core::StreamHandle {
+class HttpProxyTunnelStream final : public io::StreamHandle {
   public:
+    using ReadSignatures =
+        stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
+    using WriteSignatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                           stdexec::set_error_t(std::exception_ptr),
+                                                           stdexec::set_stopped_t()>;
+
     HttpProxyTunnelStream(std::unique_ptr<core::StreamHandle> stream,
                           std::shared_ptr<transport::ExchangeSession> session)
         : stream_(std::move(stream)), session_(std::move(session)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        stream_->async_read_some(buffer, std::move(handler));
+    // Bridges the legacy inner handle: drives one pull per call and
+    // translates the terminal into the io contract. The handle outlives its
+    // pulls by contract, so capturing this is sound.
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
+            [this, buffer](auto terminal) mutable {
+                stream_->async_read_some(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t count) mutable {
+                        terminal(error, count);
+                    });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_read(std::move(receiver), error, count, "http-proxy read");
+            })};
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
-        stream_->async_write(buffer, std::move(handler));
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
+            [this, buffer](auto terminal) mutable {
+                stream_->async_write(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t count) mutable {
+                        terminal(error, count);
+                    });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_write(std::move(receiver), error, count, "http-proxy write");
+            })};
     }
 
     boost::asio::any_io_executor executor() noexcept override { return stream_->executor(); }
@@ -228,7 +263,7 @@ class HttpProxyConnectOperation final
             });
     }
 
-    void begin_http(std::unique_ptr<core::StreamHandle> stream, std::string_view alpn) {
+    void begin_http(std::unique_ptr<io::StreamHandle> stream, std::string_view alpn) {
         if (completed_) {
             if (stream) {
                 stream->close();
@@ -280,6 +315,33 @@ class HttpProxyConnectOperation final
             });
     }
 
+  public:
+    // Abort for sender-driven cancellation: posted to the strand so it stays
+    // ordered with finish(). The bridge drops the late terminal.
+    void abort() noexcept {
+        auto self = shared_from_this();
+        try {
+            // Runtime outlives every operation; socket_ may already be moved
+            // into the stream chain, so never touch it here.
+            boost::asio::post(runtime_.serialized_executor(), [self]() {
+                if (self->completed_) {
+                    return;
+                }
+                boost::system::error_code ignored;
+                (void)self->timer_.cancel();
+                if (self->tls_handshake_) {
+                    self->tls_handshake_->cancel();
+                }
+                if (self->socket_) {
+                    self->socket_->cancel(ignored);
+                    self->socket_->close(ignored);
+                }
+            });
+        } catch (...) {
+        }
+    }
+
+  private:
     void finish(core::StreamOpenResult result) {
         if (completed_) {
             if (result.handle) {
@@ -356,11 +418,21 @@ core::OutboundCapabilities HttpProxyOutbound::capabilities() const noexcept {
     return capabilities_;
 }
 
-void HttpProxyOutbound::connect_stream(core::StreamRequest request,
-                                       core::StreamOpenHandler handler) {
-    auto operation = std::make_shared<HttpProxyConnectOperation>(
-        runtime_, resolver_, config_, std::move(request), std::move(handler));
-    operation->start();
+io::AnySender<core::StreamOpenResult>
+HttpProxyOutbound::connect_stream(core::StreamRequest request) {
+    auto &runtime = runtime_;
+    auto resolver = resolver_;
+    auto config = config_;
+    return async::bridge_sender<core::StreamOpenResult>(
+        [&runtime, resolver = std::move(resolver), config = std::move(config),
+         request = std::move(request)](
+            async::BridgeSender<core::StreamOpenResult>::Handler terminal) mutable {
+            auto operation = std::make_shared<HttpProxyConnectOperation>(
+                runtime, std::move(resolver), std::move(config), std::move(request),
+                std::move(terminal));
+            operation->start();
+            return [operation] { operation->abort(); };
+        });
 }
 
 void HttpProxyOutbound::open_datagram(core::DatagramRequest, core::DatagramOpenHandler handler) {

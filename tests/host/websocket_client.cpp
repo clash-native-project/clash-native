@@ -1,3 +1,5 @@
+#include <clash_native/io/stream_handle.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/transport/websocket_client.hpp>
 
@@ -101,12 +103,14 @@ class WebSocketProbe final : public std::enable_shared_from_this<WebSocketProbe>
         options.deadline = std::chrono::steady_clock::now() + 10s;
         (void)clash_native::transport::async_websocket_client_handshake(
             std::move(stream), std::move(options),
-            [self](clash_native::core::Result<std::unique_ptr<StreamHandle>> result) {
+            [self](clash_native::core::Result<std::unique_ptr<clash_native::io::StreamHandle>>
+                       result) {
                 if (!result) {
                     self->fail("WebSocket handshake failed: " + result.error().context);
                     return;
                 }
-                self->stream_ = std::move(result.value());
+                // Probe debt: the echo checks still speak callback-style core::.
+                self->stream_ = clash_native::net::adapt_io_to_core(std::move(result.value()));
                 self->write_payload();
             });
     }

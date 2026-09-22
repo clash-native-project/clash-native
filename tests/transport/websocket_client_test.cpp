@@ -1,3 +1,4 @@
+#include <clash_native/io/sender.hpp>
 #include <clash_native/transport/websocket_client.hpp>
 
 #include <gtest/gtest.h>
@@ -5,25 +6,27 @@
 #include <boost/asio/error.hpp>
 #include <boost/asio/io_context.hpp>
 
+#include <stdexec/execution.hpp>
+
 #include <future>
 #include <memory>
+#include <optional>
 
 namespace {
 
-class TestStream final : public clash_native::core::StreamHandle {
+class TestStream final : public clash_native::io::StreamHandle {
   public:
     explicit TestStream(boost::asio::any_io_executor executor) : executor_(std::move(executor)) {}
 
-    void async_read_some(boost::asio::mutable_buffer, ReadHandler handler) override {
-        boost::asio::post(executor_, [handler = std::move(handler)]() mutable {
-            handler(boost::asio::error::operation_aborted, 0);
-        });
+    clash_native::io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer) override {
+        return clash_native::io::AnySender<std::optional<std::size_t>>{
+            stdexec::just(std::optional<std::size_t>())};
     }
 
-    void async_write(boost::asio::const_buffer, WriteHandler handler) override {
-        boost::asio::post(executor_, [handler = std::move(handler)]() mutable {
-            handler(boost::asio::error::operation_aborted, 0);
-        });
+    clash_native::io::AnySender<std::size_t>
+    async_write(boost::asio::const_buffer buffer) override {
+        return clash_native::io::AnySender<std::size_t>{stdexec::just(buffer.size())};
     }
 
     boost::asio::any_io_executor executor() noexcept override { return executor_; }
@@ -50,7 +53,7 @@ class TestStream final : public clash_native::core::StreamHandle {
 } // namespace
 
 TEST(WebSocketClientTest, RejectsMissingStream) {
-    std::promise<clash_native::core::Result<std::unique_ptr<clash_native::core::StreamHandle>>>
+    std::promise<clash_native::core::Result<std::unique_ptr<clash_native::io::StreamHandle>>>
         completion;
     auto future = completion.get_future();
     const auto operation = clash_native::transport::async_websocket_client_handshake(
@@ -70,7 +73,7 @@ TEST(WebSocketClientTest, RejectsInvalidOptionsBeforeOpeningHandshake) {
     options.host = "localhost";
     options.target = "relative-target";
 
-    std::promise<clash_native::core::Result<std::unique_ptr<clash_native::core::StreamHandle>>>
+    std::promise<clash_native::core::Result<std::unique_ptr<clash_native::io::StreamHandle>>>
         completion;
     auto future = completion.get_future();
     const auto operation = clash_native::transport::async_websocket_client_handshake(

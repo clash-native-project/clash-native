@@ -1,5 +1,7 @@
 #include <clash_native/transport/shadowsocks/shadow_tls_v3.hpp>
 
+#include <clash_native/net/stream_handle_adapter.hpp>
+
 #include "transport/builtin_ca_bundle.hpp"
 
 #include <botan/auto_rng.h>
@@ -778,8 +780,10 @@ class ShadowTlsV3OpenOperation final
                                                 std::move(pending_plain_), std::move(input_));
         auto handler = std::move(handler_);
         if (handler) {
-            handler(core::Result<std::unique_ptr<core::StreamHandle>>(
-                std::make_unique<SharedStreamAdapter<ShadowTlsV3Stream>>(std::move(stream))));
+            // Shadow-TLS v3 debt: the v3 framing state machine still speaks
+            // core::; adapt at the edge until it flips to io:: like v1/v2.
+            handler(core::Result<std::unique_ptr<io::StreamHandle>>(net::adapt_core_to_io(
+                std::make_unique<SharedStreamAdapter<ShadowTlsV3Stream>>(std::move(stream)))));
         }
     }
 
@@ -795,7 +799,11 @@ class ShadowTlsV3OpenOperation final
         }
         auto handler = std::move(handler_);
         if (handler) {
-            handler(std::move(result));
+            if (!result) {
+                handler(core::fail(result.error()));
+                return;
+            }
+            handler(net::adapt_core_to_io(std::move(result.value())));
         }
     }
 

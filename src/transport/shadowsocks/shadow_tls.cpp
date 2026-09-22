@@ -1,6 +1,9 @@
 #include <clash_native/transport/shadowsocks/shadow_tls.hpp>
 #include <clash_native/transport/shadowsocks/shadow_tls_v3.hpp>
 
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/shadowsocks/crypto.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
@@ -19,7 +22,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -59,9 +64,9 @@ std::vector<std::uint8_t> hmac_sha1(std::string_view key, std::span<const std::u
     return {output.begin(), output.begin() + output_size};
 }
 
-class HashingReadStream final : public core::StreamHandle {
+class HashingReadStream final : public io::StreamHandle {
   public:
-    HashingReadStream(std::unique_ptr<core::StreamHandle> stream, std::string password)
+    HashingReadStream(std::unique_ptr<io::StreamHandle> stream, std::string password)
         : stream_(std::move(stream)), password_(std::move(password)) {}
 
     std::vector<std::uint8_t> digest8() const {
@@ -72,20 +77,24 @@ class HashingReadStream final : public core::StreamHandle {
         return {digest.begin(), digest.begin() + 8};
     }
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        stream_->async_read_some(
-            buffer, [this, buffer, handler = std::move(handler)](
-                        const boost::system::error_code &error, std::size_t size) mutable {
-                if (!error && size != 0) {
+    // The inner handle is already sender-based: hash as a side effect in a
+    // then-stage. `this` stays alive through the pull by the single
+    // outstanding pull contract (same rule as channel state).
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        return io::AnySender<std::optional<std::size_t>>{
+            stream_->async_read_some(buffer) |
+            stdexec::then([this, buffer](std::optional<std::size_t> count) {
+                if (count && *count != 0) {
                     const auto *bytes = static_cast<const std::uint8_t *>(buffer.data());
-                    received_.insert(received_.end(), bytes, bytes + size);
+                    received_.insert(received_.end(), bytes, bytes + *count);
                 }
-                handler(error, size);
-            });
+                return count;
+            })};
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
-        stream_->async_write(buffer, std::move(handler));
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        return stream_->async_write(buffer);
     }
 
     boost::asio::any_io_executor executor() noexcept override { return stream_->executor(); }
@@ -102,14 +111,14 @@ class HashingReadStream final : public core::StreamHandle {
     void close() noexcept override { stream_->close(); }
 
   private:
-    std::unique_ptr<core::StreamHandle> stream_;
+    std::unique_ptr<io::StreamHandle> stream_;
     std::string password_;
     std::vector<std::uint8_t> received_;
 };
 
 class FramedStreamBase {
   protected:
-    explicit FramedStreamBase(std::unique_ptr<core::StreamHandle> stream)
+    explicit FramedStreamBase(std::unique_ptr<io::StreamHandle> stream)
         : stream_(std::move(stream)) {}
 
     using ExactHandler = std::function<void(const boost::system::error_code &)>;
@@ -126,9 +135,9 @@ class FramedStreamBase {
             return;
         }
         auto self = shared_from_this_base();
-        stream_->async_read_some(
-            boost::asio::mutable_buffer(static_cast<std::uint8_t *>(buffer.data()) + offset,
-                                        buffer.size() - offset),
+        net::start_read_for_handler(
+            stream_->async_read_some(boost::asio::mutable_buffer(
+                static_cast<std::uint8_t *>(buffer.data()) + offset, buffer.size() - offset)),
             [self, buffer, offset, handler = std::move(handler)](
                 const boost::system::error_code &error, std::size_t size) mutable {
                 if (error) {
@@ -147,17 +156,56 @@ class FramedStreamBase {
     // continuation alive without exposing its implementation type.
     virtual std::shared_ptr<FramedStreamBase> shared_from_this_base() = 0;
 
-    std::unique_ptr<core::StreamHandle> stream_;
+    std::unique_ptr<io::StreamHandle> stream_;
 };
 
-class ShadowTlsV2Stream final : public core::StreamHandle,
+class ShadowTlsV2Stream final : public io::StreamHandle,
                                 public FramedStreamBase,
                                 public std::enable_shared_from_this<ShadowTlsV2Stream> {
   public:
-    ShadowTlsV2Stream(std::unique_ptr<core::StreamHandle> stream, std::vector<std::uint8_t> hash)
+    // Internal machinery stays handler-style; only the public overrides below
+    // speak senders.
+    using ReadHandler = core::StreamHandle::ReadHandler;
+    using WriteHandler = core::StreamHandle::WriteHandler;
+    using ReadSignatures =
+        stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
+    using WriteSignatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                           stdexec::set_error_t(std::exception_ptr),
+                                                           stdexec::set_stopped_t()>;
+
+    ShadowTlsV2Stream(std::unique_ptr<io::StreamHandle> stream, std::vector<std::uint8_t> hash)
         : FramedStreamBase(std::move(stream)), hash_(std::move(hash)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
+            [this, buffer](auto terminal) mutable {
+                this->read_impl(buffer, [terminal = std::move(terminal)](
+                                            const boost::system::error_code &error,
+                                            std::size_t count) mutable { terminal(error, count); });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_read(std::move(receiver), error, count, "shadow-tls read");
+            })};
+    }
+
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
+            [this, buffer](auto terminal) mutable {
+                this->write_impl(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t count) mutable {
+                        terminal(error, count);
+                    });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_write(std::move(receiver), error, count, "shadow-tls write");
+            })};
+    }
+
+    void read_impl(boost::asio::mutable_buffer buffer, ReadHandler handler) {
         if (read_busy_) {
             boost::asio::post(executor(), [handler = std::move(handler)]() mutable {
                 handler(boost::asio::error::already_started, 0);
@@ -181,7 +229,7 @@ class ShadowTlsV2Stream final : public core::StreamHandle,
         read_header();
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
+    void write_impl(boost::asio::const_buffer buffer, WriteHandler handler) {
         if (write_busy_) {
             boost::asio::post(executor(), [handler = std::move(handler)]() mutable {
                 handler(boost::asio::error::already_started, 0);
@@ -247,10 +295,10 @@ class ShadowTlsV2Stream final : public core::StreamHandle,
 
     void write_frame() {
         auto self = shared_from_this();
-        stream_->async_write(boost::asio::buffer(write_wire_),
-                             [self](const boost::system::error_code &error, std::size_t) {
-                                 self->finish_write(error);
-                             });
+        net::start_write_for_handler(stream_->async_write(boost::asio::buffer(write_wire_)),
+                                     [self](const boost::system::error_code &error, std::size_t) {
+                                         self->finish_write(error);
+                                     });
     }
 
     void finish_write(const boost::system::error_code &error) {
@@ -339,16 +387,47 @@ class ShadowTlsV2Stream final : public core::StreamHandle,
     WriteHandler write_handler_;
 };
 
-template <typename T> class SharedStreamAdapter final : public core::StreamHandle {
+template <typename T> class SharedStreamAdapter final : public io::StreamHandle {
   public:
+    using ReadSignatures =
+        stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
+    using WriteSignatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                           stdexec::set_error_t(std::exception_ptr),
+                                                           stdexec::set_stopped_t()>;
+
     explicit SharedStreamAdapter(std::shared_ptr<T> stream) : stream_(std::move(stream)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        stream_->async_read_some(buffer, std::move(handler));
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        auto stream = stream_;
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
+            [stream, buffer](auto terminal) mutable {
+                stream->read_impl(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t count) mutable {
+                        terminal(error, count);
+                    });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_read(std::move(receiver), error, count, "shadow-tls read");
+            })};
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
-        stream_->async_write(buffer, std::move(handler));
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        auto stream = stream_;
+        return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
+            [stream, buffer](auto terminal) mutable {
+                stream->write_impl(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t count) mutable {
+                        terminal(error, count);
+                    });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_write(std::move(receiver), error, count, "shadow-tls write");
+            })};
     }
 
     boost::asio::any_io_executor executor() noexcept override { return stream_->executor(); }
@@ -370,8 +449,8 @@ template <typename T> class SharedStreamAdapter final : public core::StreamHandl
 
 class ShadowTlsOpenOperation final : public std::enable_shared_from_this<ShadowTlsOpenOperation> {
   public:
-    ShadowTlsOpenOperation(std::unique_ptr<core::StreamHandle> stream,
-                           ShadowTlsClientOptions options, ShadowTlsOpenHandler handler)
+    ShadowTlsOpenOperation(std::unique_ptr<io::StreamHandle> stream, ShadowTlsClientOptions options,
+                           ShadowTlsOpenHandler handler)
         : stream_(std::move(stream)), options_(std::move(options)), handler_(std::move(handler)),
           delay_timer_(stream_->executor()) {}
 
@@ -436,7 +515,7 @@ class ShadowTlsOpenOperation final : public std::enable_shared_from_this<ShadowT
             });
     }
 
-    void finish(core::Result<std::unique_ptr<core::StreamHandle>> result) {
+    void finish(core::Result<std::unique_ptr<io::StreamHandle>> result) {
         if (completed_) {
             return;
         }
@@ -448,23 +527,23 @@ class ShadowTlsOpenOperation final : public std::enable_shared_from_this<ShadowT
         }
     }
 
-    void finish(std::unique_ptr<core::StreamHandle> stream) {
-        finish(core::Result<std::unique_ptr<core::StreamHandle>>(std::move(stream)));
+    void finish(std::unique_ptr<io::StreamHandle> stream) {
+        finish(core::Result<std::unique_ptr<io::StreamHandle>>(std::move(stream)));
     }
 
-    std::unique_ptr<core::StreamHandle> stream_;
+    std::unique_ptr<io::StreamHandle> stream_;
     ShadowTlsClientOptions options_;
     ShadowTlsOpenHandler handler_;
     std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
     boost::asio::steady_timer delay_timer_;
-    std::unique_ptr<core::StreamHandle> delayed_stream_;
+    std::unique_ptr<io::StreamHandle> delayed_stream_;
     bool completed_ = false;
 };
 
 } // namespace
 
-void async_open_shadow_tls(std::unique_ptr<core::StreamHandle> stream,
-                           ShadowTlsClientOptions options, ShadowTlsOpenHandler handler) {
+void async_open_shadow_tls(std::unique_ptr<io::StreamHandle> stream, ShadowTlsClientOptions options,
+                           ShadowTlsOpenHandler handler) {
     if (!stream || !handler) {
         if (stream) {
             stream->close();
@@ -476,7 +555,9 @@ void async_open_shadow_tls(std::unique_ptr<core::StreamHandle> stream,
         return;
     }
     if (options.version == 3) {
-        async_open_shadow_tls_v3(std::move(stream), std::move(options), std::move(handler));
+        // Shadow-TLS v3 debt: the v3 plane still takes core:: carriers.
+        async_open_shadow_tls_v3(net::adapt_io_to_core(std::move(stream)), std::move(options),
+                                 std::move(handler));
         return;
     }
     std::make_shared<ShadowTlsOpenOperation>(std::move(stream), std::move(options),

@@ -1,5 +1,7 @@
 #include <clash_native/transport/shadowsocks/ss2022_stream.hpp>
 
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/shadowsocks/crypto.hpp>
 
 #include <boost/asio/buffer.hpp>
@@ -13,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -94,13 +97,22 @@ core::Result<std::vector<std::uint8_t>> encrypt_chunk(std::string_view method,
 
 class Shadowsocks2022StreamState;
 
-class Shadowsocks2022StreamHandle final : public core::StreamHandle {
+class Shadowsocks2022StreamHandle final : public io::StreamHandle {
   public:
+    using ReadSignatures =
+        stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
+    using WriteSignatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                           stdexec::set_error_t(std::exception_ptr),
+                                                           stdexec::set_stopped_t()>;
+
     explicit Shadowsocks2022StreamHandle(std::shared_ptr<Shadowsocks2022StreamState> state)
         : state_(std::move(state)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override;
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override;
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override;
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override;
     boost::asio::any_io_executor executor() noexcept override;
     boost::asio::ip::tcp::endpoint
     local_endpoint(boost::system::error_code &error) const noexcept override;
@@ -543,14 +555,32 @@ class Shadowsocks2022StreamState final
     core::StreamHandle::ReadHandler read_handler_;
 };
 
-void Shadowsocks2022StreamHandle::async_read_some(boost::asio::mutable_buffer buffer,
-                                                  ReadHandler handler) {
-    state_->read(buffer, std::move(handler));
+io::AnySender<std::optional<std::size_t>>
+Shadowsocks2022StreamHandle::async_read_some(boost::asio::mutable_buffer buffer) {
+    auto state = state_;
+    return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
+        [state, buffer](auto terminal) mutable {
+            state->read(buffer, [terminal = std::move(terminal)](
+                                    const boost::system::error_code &error,
+                                    std::size_t count) mutable { terminal(error, count); });
+        },
+        [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+            net::translate_read(std::move(receiver), error, count, "shadowsocks-2022 read");
+        })};
 }
 
-void Shadowsocks2022StreamHandle::async_write(boost::asio::const_buffer buffer,
-                                              WriteHandler handler) {
-    state_->write(buffer, std::move(handler));
+io::AnySender<std::size_t>
+Shadowsocks2022StreamHandle::async_write(boost::asio::const_buffer buffer) {
+    auto state = state_;
+    return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
+        [state, buffer](auto terminal) mutable {
+            state->write(buffer, [terminal = std::move(terminal)](
+                                     const boost::system::error_code &error,
+                                     std::size_t count) mutable { terminal(error, count); });
+        },
+        [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+            net::translate_write(std::move(receiver), error, count, "shadowsocks-2022 write");
+        })};
 }
 
 boost::asio::any_io_executor Shadowsocks2022StreamHandle::executor() noexcept {

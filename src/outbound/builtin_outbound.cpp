@@ -1,3 +1,4 @@
+#include <clash_native/async/bridge.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
@@ -9,6 +10,7 @@
 #include <fmt/format.h>
 
 #include <chrono>
+#include <exception>
 #include <memory>
 #include <system_error>
 #include <utility>
@@ -76,6 +78,28 @@ class DirectConnectOperation final : public std::enable_shared_from_this<DirectC
         }
 
         resolve_domain(dns::DnsRecordType::a);
+    }
+
+    // Abort for sender-driven cancellation: runs on the strand (fully
+    // ordered with complete()), best-effort and idempotent. The bridge drops
+    // the late terminal through its settled flag.
+    void abort() noexcept {
+        auto self = shared_from_this();
+        try {
+            boost::asio::post(socket_.get_executor(), [self]() {
+                if (self->completed_) {
+                    return;
+                }
+                self->connect_timer_.cancel();
+                if (self->resolver_ && self->resolver_request_id_) {
+                    self->resolver_->cancel(*self->resolver_request_id_);
+                    self->resolver_request_id_.reset();
+                }
+                boost::system::error_code ignored;
+                self->socket_.close(ignored);
+            });
+        } catch (...) {
+        }
     }
 
   private:
@@ -185,10 +209,17 @@ const core::OutboundDescriptor &DirectOutbound::descriptor() const noexcept { re
 
 core::OutboundCapabilities DirectOutbound::capabilities() const noexcept { return capabilities_; }
 
-void DirectOutbound::connect_stream(core::StreamRequest request, core::StreamOpenHandler handler) {
-    auto operation = std::make_shared<DirectConnectOperation>(
-        runtime_.serialized_executor(), std::move(request), resolver_, std::move(handler));
-    operation->start();
+io::AnySender<core::StreamOpenResult> DirectOutbound::connect_stream(core::StreamRequest request) {
+    auto executor = runtime_.serialized_executor();
+    auto resolver = resolver_;
+    return async::bridge_sender<core::StreamOpenResult>(
+        [executor, request = std::move(request), resolver = std::move(resolver)](
+            async::BridgeSender<core::StreamOpenResult>::Handler terminal) mutable {
+            auto operation = std::make_shared<DirectConnectOperation>(
+                executor, std::move(request), std::move(resolver), std::move(terminal));
+            operation->start();
+            return [operation] { operation->abort(); };
+        });
 }
 
 void DirectOutbound::open_datagram(core::DatagramRequest request,
@@ -230,9 +261,8 @@ const core::OutboundDescriptor &RejectOutbound::descriptor() const noexcept { re
 
 core::OutboundCapabilities RejectOutbound::capabilities() const noexcept { return capabilities_; }
 
-void RejectOutbound::connect_stream(core::StreamRequest, core::StreamOpenHandler handler) {
-    runtime_.scheduler().post(
-        [handler = std::move(handler)]() mutable { handler(rejected_stream()); });
+io::AnySender<core::StreamOpenResult> RejectOutbound::connect_stream(core::StreamRequest) {
+    return io::AnySender<core::StreamOpenResult>{stdexec::just(rejected_stream())};
 }
 
 void RejectOutbound::open_datagram(core::DatagramRequest, core::DatagramOpenHandler handler) {

@@ -1,5 +1,9 @@
 #include <clash_native/transport/shadowsocks/kcptun_session.hpp>
 
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/io/stream_handle.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
+
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
@@ -12,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -65,14 +70,23 @@ std::uint32_t get_u32(const std::uint8_t *input) {
 class KcptunMuxSession;
 class KcptunMuxStreamState;
 
-class KcptunMuxStream final : public core::StreamHandle {
+class KcptunMuxStream final : public io::StreamHandle {
   public:
+    using ReadSignatures =
+        stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
+    using WriteSignatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                           stdexec::set_error_t(std::exception_ptr),
+                                                           stdexec::set_stopped_t()>;
+
     explicit KcptunMuxStream(std::shared_ptr<KcptunMuxStreamState> state)
         : state_(std::move(state)) {}
     ~KcptunMuxStream() override;
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override;
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override;
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override;
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override;
     boost::asio::any_io_executor executor() noexcept override;
     boost::asio::ip::tcp::endpoint
     local_endpoint(boost::system::error_code &error) const noexcept override;
@@ -451,12 +465,33 @@ class KcptunMuxStreamState final : public std::enable_shared_from_this<KcptunMux
 
 KcptunMuxStream::~KcptunMuxStream() { close(); }
 
-void KcptunMuxStream::async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) {
-    state_->async_read_some(buffer, std::move(handler));
+io::AnySender<std::optional<std::size_t>>
+KcptunMuxStream::async_read_some(boost::asio::mutable_buffer buffer) {
+    auto state = state_;
+    return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
+        [state, buffer](auto terminal) mutable {
+            state->async_read_some(
+                buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                         std::size_t count) mutable {
+                    terminal(error, count);
+                });
+        },
+        [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+            net::translate_read(std::move(receiver), error, count, "kcptun read");
+        })};
 }
 
-void KcptunMuxStream::async_write(boost::asio::const_buffer buffer, WriteHandler handler) {
-    state_->async_write(buffer, std::move(handler));
+io::AnySender<std::size_t> KcptunMuxStream::async_write(boost::asio::const_buffer buffer) {
+    auto state = state_;
+    return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
+        [state, buffer](auto terminal) mutable {
+            state->async_write(buffer, [terminal = std::move(terminal)](
+                                           const boost::system::error_code &error,
+                                           std::size_t count) mutable { terminal(error, count); });
+        },
+        [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+            net::translate_write(std::move(receiver), error, count, "kcptun write");
+        })};
 }
 
 boost::asio::any_io_executor KcptunMuxStream::executor() noexcept { return state_->executor(); }
@@ -490,8 +525,7 @@ void KcptunMuxSession::async_open_stream(core::StreamOpenHandler handler) {
     auto stream = std::make_shared<KcptunMuxStreamState>(shared_from_this(), stream_id, options_);
     register_stream(stream_id, stream);
     enqueue_frame(kSyn, stream_id, {});
-    handler(core::StreamOpenResult::opened(
-        std::unique_ptr<core::StreamHandle>(std::make_unique<KcptunMuxStream>(stream))));
+    handler(core::StreamOpenResult::opened(std::make_unique<KcptunMuxStream>(stream)));
 }
 
 void KcptunMuxSession::enqueue_frame(

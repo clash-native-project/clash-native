@@ -1,3 +1,4 @@
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/transport/exchange_session.hpp>
@@ -227,9 +228,13 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         connecting_ = true;
         const auto generation = connection_generation_;
         const auto self = shared_from_this();
-        dialer_->connect_stream(
-            {core::Destination::address(endpoint_.address(), endpoint_.port()), std::nullopt},
-            [self, generation](core::StreamOpenResult result) mutable {
+        struct ConnectReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<Session> self;
+            std::uint64_t generation;
+            void set_value(core::StreamOpenResult result) && noexcept {
+                const auto self = this->self;
+                const auto generation = this->generation;
                 if (generation != self->connection_generation_ || self->stopped_) {
                     if (result.handle) {
                         result.handle->close();
@@ -277,7 +282,26 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
                         }
                         self->submit_waiting();
                     });
-            });
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                if (generation != self->connection_generation_ || self->stopped_) {
+                    return;
+                }
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    self->connection_failed(failure);
+                } catch (...) {
+                    self->connection_failed(
+                        core::Error{core::ErrorCode::endpoint_connection, "DoH2 dialer failed"});
+                }
+            }
+            void set_stopped() && noexcept {}
+        };
+        async::start_with_receiver(
+            dialer_->connect_stream(
+                {core::Destination::address(endpoint_.address(), endpoint_.port()), std::nullopt}),
+            ConnectReceiver{self, generation});
     }
 
     void submit_waiting() {

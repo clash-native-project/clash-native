@@ -3,6 +3,7 @@
 #include <clash_native/dns/dns_query_service.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/dns/resolver_service.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
@@ -249,12 +250,13 @@ class ProbeDnsDialer final : public clash_native::dns::DnsUpstreamDialer {
                    std::shared_ptr<std::atomic_bool> closed)
         : executor_(std::move(executor)), calls_(std::move(calls)), closed_(std::move(closed)) {}
 
-    void connect_stream(clash_native::core::StreamRequest, Handler handler) override {
+    clash_native::io::AnySender<clash_native::core::StreamOpenResult>
+    connect_stream(clash_native::core::StreamRequest) override {
         ++*calls_;
-        boost::asio::post(executor_, [this, handler = std::move(handler)]() mutable {
-            handler(clash_native::core::StreamOpenResult::opened(
-                std::make_unique<ProbeDnsStream>(executor_, closed_)));
-        });
+        // Test debt: the probe stream is still core::; adapt at the edge.
+        return clash_native::io::AnySender<clash_native::core::StreamOpenResult>{stdexec::just(
+            clash_native::core::StreamOpenResult::opened(clash_native::net::adapt_core_to_io(
+                std::make_unique<ProbeDnsStream>(executor_, closed_))))};
     }
 
   private:
@@ -269,9 +271,10 @@ class CountingDnsDialer final : public clash_native::dns::DnsUpstreamDialer {
                       std::shared_ptr<std::atomic_int> stream_calls)
         : delegate_(std::move(delegate)), stream_calls_(std::move(stream_calls)) {}
 
-    void connect_stream(clash_native::core::StreamRequest request, Handler handler) override {
+    clash_native::io::AnySender<clash_native::core::StreamOpenResult>
+    connect_stream(clash_native::core::StreamRequest request) override {
         ++*stream_calls_;
-        delegate_->connect_stream(std::move(request), std::move(handler));
+        return delegate_->connect_stream(std::move(request));
     }
 
     void open_datagram(clash_native::core::DatagramRequest request,

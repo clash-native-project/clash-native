@@ -1,3 +1,4 @@
+#include <clash_native/io/stream_handle.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/transport/exchange_session.hpp>
@@ -666,8 +667,8 @@ class RawQuicProbe final : public std::enable_shared_from_this<RawQuicProbe> {
     bool finished_ = false;
 };
 
-std::unique_ptr<StreamHandle> connect_tcp(boost::asio::io_context &context,
-                                          const ServerAddress &server) {
+std::unique_ptr<clash_native::io::StreamHandle> connect_tcp(boost::asio::io_context &context,
+                                                            const ServerAddress &server) {
     boost::asio::ip::tcp::socket socket(context);
     socket.connect({server.address, server.port});
     return std::make_unique<clash_native::net::TcpStream>(std::move(socket));

@@ -102,9 +102,10 @@ class Http2ClientSession final : public ExchangeSession,
                                  public MultiplexedSession,
                                  public std::enable_shared_from_this<Http2ClientSession> {
   public:
-    explicit Http2ClientSession(std::unique_ptr<core::StreamHandle> stream)
+    explicit Http2ClientSession(std::unique_ptr<io::StreamHandle> stream)
         : executor_(stream->executor()),
-          stream_(std::make_unique<net::StreamHandleAdapter>(std::move(stream))) {}
+          stream_(std::make_unique<net::StreamHandleAdapter<io::StreamHandle>>(std::move(stream))) {
+    }
 
     ~Http2ClientSession() { close_http2(); }
 
@@ -1528,7 +1529,7 @@ class Http2ClientSession final : public ExchangeSession,
     }
 
     boost::asio::any_io_executor executor_;
-    std::unique_ptr<net::StreamHandleAdapter> stream_;
+    std::unique_ptr<net::StreamHandleAdapter<io::StreamHandle>> stream_;
     nghttp2_session *http2_session_ = nullptr;
     std::optional<core::Error> initialization_error_;
     std::unordered_map<ExchangeId, PendingPtr> pending_;
@@ -1552,7 +1553,7 @@ class Http2ClientSession final : public ExchangeSession,
 } // namespace
 
 std::shared_ptr<ExchangeSession>
-make_http2_exchange_session(std::unique_ptr<core::StreamHandle> stream) {
+make_http2_exchange_session(std::unique_ptr<io::StreamHandle> stream) {
     if (!stream) {
         return {};
     }

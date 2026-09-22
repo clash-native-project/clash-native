@@ -1,3 +1,4 @@
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/transport/exchange_session.hpp>
@@ -169,9 +170,10 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
             owner_.config_.endpoint.address(),
             owner_.config_.endpoint.port() == 53 ? 443 : owner_.config_.endpoint.port()));
         const auto self = shared_from_this();
-        owner_.config_.dialer->connect_stream(
-            {core::Destination::address(endpoint.address(), endpoint.port()), std::nullopt},
-            [self](core::StreamOpenResult result) mutable {
+        struct ConnectReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<Operation> self;
+            void set_value(core::StreamOpenResult result) && noexcept {
                 if (self->completed_) {
                     if (result.handle) {
                         result.handle->close();
@@ -185,10 +187,26 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
                     return;
                 }
                 self->start_tls(std::move(result.handle));
-            });
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    self->finish(core::fail(failure));
+                } catch (...) {
+                    self->finish(core::fail(core::Error{core::ErrorCode::endpoint_connection,
+                                                        "DoH/HTTP/1.1 dialer failed"}));
+                }
+            }
+            void set_stopped() && noexcept {}
+        };
+        async::start_with_receiver(
+            owner_.config_.dialer->connect_stream(
+                {core::Destination::address(endpoint.address(), endpoint.port()), std::nullopt}),
+            ConnectReceiver{self});
     }
 
-    void start_tls(std::unique_ptr<core::StreamHandle> stream) {
+    void start_tls(std::unique_ptr<io::StreamHandle> stream) {
         const auto server_name = !owner_.config_.server_name.empty()
                                      ? owner_.config_.server_name
                                      : (!owner_.config_.hostname.empty()
@@ -223,7 +241,7 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
             });
     }
 
-    void start_http(std::unique_ptr<core::StreamHandle> stream) {
+    void start_http(std::unique_ptr<io::StreamHandle> stream) {
         http_session_ = transport::make_http1_exchange_session(std::move(stream));
         if (!http_session_) {
             finish(core::fail(

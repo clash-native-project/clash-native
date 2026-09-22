@@ -1,3 +1,4 @@
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/core/base64.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
@@ -52,6 +53,34 @@ namespace {
 core::Error listener_error(std::string_view operation, const boost::system::error_code &error) {
     return {core::ErrorCode::transport_io, fmt::format("failed to {} proxy listener", operation),
             std::error_code(error.value(), std::system_category())};
+}
+
+// Proxy-plane debt: drives a sender-based outbound open into a callback
+// handler. Delete when the proxy plane runs on senders.
+template <class Sender>
+void start_open_for_handler(Sender &&sender, core::StreamOpenHandler handler) {
+    struct Receiver {
+        using receiver_concept = stdexec::receiver_tag;
+        core::StreamOpenHandler handler;
+        void set_value(core::StreamOpenResult result) && noexcept {
+            std::move(handler)(std::move(result));
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const core::Error &failure) {
+                handler(core::StreamOpenResult::failed(failure));
+            } catch (...) {
+                handler(core::StreamOpenResult::failed(core::Error{
+                    core::ErrorCode::endpoint_connection, "proxy outbound open failed"}));
+            }
+        }
+        void set_stopped() && noexcept {
+            handler(core::StreamOpenResult::failed(
+                core::Error{core::ErrorCode::cancelled, "proxy outbound open was cancelled"}));
+        }
+    };
+    async::start_with_receiver(std::forward<Sender>(sender), Receiver{std::move(handler)});
 }
 
 } // namespace
@@ -578,20 +607,23 @@ void ProxyServer::route_stream(
                                    : result.error()));
                         return;
                     }
-                    direct_outbound_->connect_stream(
-                        {std::move(destination), result.value().front()}, std::move(handler));
+                    start_open_for_handler(direct_outbound_->connect_stream(
+                                               {std::move(destination), result.value().front()}),
+                                           std::move(handler));
                 });
             return;
         }
-        direct_outbound_->connect_stream(
-            {std::move(metadata.destination), context.destination_address}, std::move(handler));
+        start_open_for_handler(direct_outbound_->connect_stream(
+                                   {std::move(metadata.destination), context.destination_address}),
+                               std::move(handler));
         return;
     case router::RouteActionKind::reject:
         if (connection_id && connection_registry_) {
             connection_registry_->update_outbound(*connection_id, "reject");
         }
-        reject_outbound_->connect_stream(
-            {std::move(metadata.destination), context.destination_address}, std::move(handler));
+        start_open_for_handler(reject_outbound_->connect_stream(
+                                   {std::move(metadata.destination), context.destination_address}),
+                               std::move(handler));
         return;
     case router::RouteActionKind::named:
         if (!snapshot->outbounds) {
@@ -609,8 +641,10 @@ void ProxyServer::route_stream(
                 connection_registry_->update_outbound(*connection_id,
                                                       selected.value()->descriptor().id);
             }
-            selected.value()->connect_stream(
-                {std::move(metadata.destination), context.destination_address}, std::move(handler));
+            start_open_for_handler(
+                selected.value()->connect_stream(
+                    {std::move(metadata.destination), context.destination_address}),
+                std::move(handler));
         }
         return;
     }

@@ -1,5 +1,7 @@
 #include "http_body_stream.hpp"
 #include "http_tunnel_stream.hpp"
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/exchange_session.hpp>
 
 #include <boost/asio/any_io_executor.hpp>
@@ -41,8 +43,8 @@ class Http1StreamAdapter {
   public:
     using executor_type = boost::asio::any_io_executor;
 
-    explicit Http1StreamAdapter(std::unique_ptr<core::StreamHandle> handle)
-        : handle_(std::shared_ptr<core::StreamHandle>(std::move(handle))) {}
+    explicit Http1StreamAdapter(std::unique_ptr<io::StreamHandle> handle)
+        : handle_(std::shared_ptr<io::StreamHandle>(std::move(handle))) {}
 
     executor_type get_executor() const noexcept { return handle_->executor(); }
 
@@ -62,12 +64,24 @@ class Http1StreamAdapter {
                                            void(boost::system::error_code, std::size_t)>(
             [handle = std::move(handle), buffer](auto completion_handler) mutable {
                 using Handler = std::decay_t<decltype(completion_handler)>;
-                auto shared_handler = std::make_shared<Handler>(std::move(completion_handler));
-                handle->async_read_some(
-                    buffer, [shared_handler = std::move(shared_handler)](
-                                const boost::system::error_code &error, std::size_t size) mutable {
-                        (*shared_handler)(error, size);
-                    });
+                struct Receiver {
+                    Handler handler;
+                    void set_value(std::optional<std::size_t> count) noexcept {
+                        if (count) {
+                            std::move(handler)(boost::system::error_code{}, *count);
+                        } else {
+                            std::move(handler)(boost::asio::error::eof, std::size_t{0});
+                        }
+                    }
+                    void set_error(std::exception_ptr error) noexcept {
+                        std::move(handler)(net::unpack_error(std::move(error)), std::size_t{0});
+                    }
+                    void set_stopped() noexcept {
+                        std::move(handler)(boost::asio::error::operation_aborted, std::size_t{0});
+                    }
+                };
+                async::start_with_receiver(handle->async_read_some(buffer),
+                                           Receiver{std::move(completion_handler)});
             },
             token);
     }
@@ -82,15 +96,26 @@ class Http1StreamAdapter {
             [handle = std::move(handle),
              bytes = std::move(bytes)](auto completion_handler) mutable {
                 using Handler = std::decay_t<decltype(completion_handler)>;
-                auto shared_handler = std::make_shared<Handler>(std::move(completion_handler));
-                auto lifetime = bytes;
-                handle->async_write(
-                    boost::asio::buffer(*bytes),
-                    [lifetime = std::move(lifetime), shared_handler = std::move(shared_handler)](
-                        const boost::system::error_code &error, std::size_t size) mutable {
-                        (void)lifetime;
-                        (*shared_handler)(error, size);
-                    });
+                struct Receiver {
+                    Handler handler;
+                    std::shared_ptr<std::vector<std::uint8_t>> lifetime;
+                    void set_value(std::size_t count) noexcept {
+                        std::move(handler)(boost::system::error_code{}, count);
+                    }
+                    void set_error(std::exception_ptr error) noexcept {
+                        std::move(handler)(net::unpack_error(std::move(error)), std::size_t{0});
+                    }
+                    void set_stopped() noexcept {
+                        std::move(handler)(boost::asio::error::operation_aborted, std::size_t{0});
+                    }
+                };
+                // Split sender creation from the move below: function argument
+                // evaluation order is unspecified, so dereferencing bytes for
+                // the sender while moving it into the receiver in one call
+                // risks use-after-move.
+                auto sender = handle->async_write(boost::asio::buffer(*bytes));
+                async::start_with_receiver(
+                    std::move(sender), Receiver{std::move(completion_handler), std::move(bytes)});
             },
             token);
     }
@@ -101,17 +126,15 @@ class Http1StreamAdapter {
         }
     }
 
-    std::shared_ptr<core::StreamHandle> take_handle() noexcept {
-        return std::exchange(handle_, {});
-    }
+    std::shared_ptr<io::StreamHandle> take_handle() noexcept { return std::exchange(handle_, {}); }
 
   private:
-    std::shared_ptr<core::StreamHandle> handle_;
+    std::shared_ptr<io::StreamHandle> handle_;
 };
 
 class Http1TunnelState final : public std::enable_shared_from_this<Http1TunnelState> {
   public:
-    Http1TunnelState(std::shared_ptr<core::StreamHandle> stream, std::vector<std::uint8_t> buffered)
+    Http1TunnelState(std::shared_ptr<io::StreamHandle> stream, std::vector<std::uint8_t> buffered)
         : stream_(std::move(stream)), buffered_(std::move(buffered)) {}
 
     void async_read_some(boost::asio::mutable_buffer buffer,
@@ -138,9 +161,10 @@ class Http1TunnelState final : public std::enable_shared_from_this<Http1TunnelSt
             return;
         }
         read_in_progress_ = true;
-        stream_->async_read_some(
-            buffer, [self, handler = std::move(handler)](const boost::system::error_code &error,
-                                                         std::size_t size) mutable {
+        net::start_read_for_handler(
+            stream_->async_read_some(buffer),
+            [self, handler = std::move(handler)](const boost::system::error_code &error,
+                                                 std::size_t size) mutable {
                 self->read_in_progress_ = false;
                 if (handler) {
                     handler(error, size);
@@ -165,19 +189,20 @@ class Http1TunnelState final : public std::enable_shared_from_this<Http1TunnelSt
         auto bytes = std::make_shared<std::vector<std::uint8_t>>(buffer.size());
         boost::asio::buffer_copy(boost::asio::buffer(*bytes), buffer);
         write_in_progress_ = true;
-        stream_->async_write(boost::asio::buffer(*bytes),
-                             [self, bytes, handler = std::move(handler)](
-                                 const boost::system::error_code &error, std::size_t size) mutable {
-                                 (void)bytes;
-                                 self->write_in_progress_ = false;
-                                 self->post_write(std::move(handler), error, size);
-                                 if (self->shutdown_requested_ && !self->closed_) {
-                                     self->shutdown_requested_ = false;
-                                     self->local_closed_ = true;
-                                     boost::system::error_code ignored;
-                                     self->stream_->shutdown_send(ignored);
-                                 }
-                             });
+        net::start_write_for_handler(
+            stream_->async_write(boost::asio::buffer(*bytes)),
+            [self, bytes, handler = std::move(handler)](const boost::system::error_code &error,
+                                                        std::size_t size) mutable {
+                (void)bytes;
+                self->write_in_progress_ = false;
+                self->post_write(std::move(handler), error, size);
+                if (self->shutdown_requested_ && !self->closed_) {
+                    self->shutdown_requested_ = false;
+                    self->local_closed_ = true;
+                    boost::system::error_code ignored;
+                    self->stream_->shutdown_send(ignored);
+                }
+            });
     }
 
     boost::asio::any_io_executor executor() noexcept { return stream_->executor(); }
@@ -231,7 +256,7 @@ class Http1TunnelState final : public std::enable_shared_from_this<Http1TunnelSt
                           });
     }
 
-    std::shared_ptr<core::StreamHandle> stream_;
+    std::shared_ptr<io::StreamHandle> stream_;
     std::vector<std::uint8_t> buffered_;
     std::size_t buffered_offset_ = 0;
     bool read_in_progress_ = false;
@@ -561,7 +586,7 @@ bool is_http_framing_error(const boost::system::error_code &error) {
 class Http1ClientSession final : public ExchangeSession,
                                  public std::enable_shared_from_this<Http1ClientSession> {
   public:
-    explicit Http1ClientSession(std::unique_ptr<core::StreamHandle> stream)
+    explicit Http1ClientSession(std::unique_ptr<io::StreamHandle> stream)
         : executor_(stream->executor()),
           stream_(std::make_unique<Http1StreamAdapter>(std::move(stream))) {}
 
@@ -1335,7 +1360,7 @@ class Http1ClientSession final : public ExchangeSession,
             buffered.resize(copied);
             read_buffer_.consume(copied);
         }
-        std::shared_ptr<core::StreamHandle> raw_stream;
+        std::shared_ptr<io::StreamHandle> raw_stream;
         if (stream_) {
             raw_stream = stream_->take_handle();
             stream_.reset();
@@ -1528,7 +1553,7 @@ class Http1ClientSession final : public ExchangeSession,
 } // namespace
 
 std::shared_ptr<ExchangeSession>
-make_http1_exchange_session(std::unique_ptr<core::StreamHandle> stream) {
+make_http1_exchange_session(std::unique_ptr<io::StreamHandle> stream) {
     if (!stream) {
         return {};
     }

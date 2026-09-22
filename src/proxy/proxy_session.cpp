@@ -1,5 +1,7 @@
 #include "proxy_session.hpp"
 
+#include <clash_native/net/stream_handle_adapter.hpp>
+
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 #include <fmt/format.h>
@@ -151,7 +153,8 @@ void ProxySession::handle_open_result(core::StreamOpenResult result) {
         return;
     }
 
-    remote_ = std::move(result.handle);
+    // Proxy-plane debt: the relay plane still speaks core::.
+    remote_ = net::adapt_io_to_core(std::move(result.handle));
     if (protocol_ == Protocol::socks4) {
         send_socks4_reply(0x5a, true);
     } else if (protocol_ == Protocol::socks5) {

@@ -2,6 +2,8 @@
 
 #include "http_proxy_utils.hpp"
 
+#include <clash_native/net/stream_handle_adapter.hpp>
+
 #include <boost/asio/post.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/beast/http.hpp>
@@ -314,7 +316,10 @@ void ProxySession::open_http_forward_target(core::Destination destination) {
 }
 
 void ProxySession::start_http_upgrade_exchange() {
-    http_session_ = transport::make_http1_exchange_session(std::move(remote_));
+    // Proxy-plane debt: remote_ is still core:: until the proxy plane flips;
+    // the session already takes io:: carriers.
+    http_session_ =
+        transport::make_http1_exchange_session(net::adapt_core_to_io(std::move(remote_)));
     if (!http_session_) {
         send_http_forward_response(502, "Bad Gateway");
         return;
@@ -329,7 +334,9 @@ void ProxySession::start_http_upgrade_exchange() {
 }
 
 void ProxySession::start_http_forward_exchange() {
-    http_session_ = transport::make_http1_exchange_session(std::move(remote_));
+    // Proxy-plane debt: see start_http_upgrade_exchange.
+    http_session_ =
+        transport::make_http1_exchange_session(net::adapt_core_to_io(std::move(remote_)));
     if (!http_session_) {
         send_http_forward_response(502, "Bad Gateway");
         return;

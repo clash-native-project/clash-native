@@ -15,13 +15,13 @@
 
 namespace clash_native::transport::shadowsocks {
 
-core::Result<std::unique_ptr<core::StreamHandle>>
+core::Result<std::unique_ptr<io::StreamHandle>>
 make_legacy_stream_handle(std::shared_ptr<boost::asio::ip::tcp::socket> socket, std::string method,
                           std::string password, LegacyStreamCipher write_cipher,
                           std::vector<std::uint8_t> initial_wire = {},
                           ObfsMode obfs_mode = ObfsMode::none);
 
-core::Result<std::unique_ptr<core::StreamHandle>>
+core::Result<std::unique_ptr<io::StreamHandle>>
 make_legacy_stream_handle(std::shared_ptr<StreamCarrier> carrier, std::string method,
                           std::string password, LegacyStreamCipher write_cipher,
                           std::vector<std::uint8_t> initial_wire = {});

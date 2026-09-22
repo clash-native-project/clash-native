@@ -45,13 +45,13 @@ template <class V> struct EventReceiver {
 
     auto get_env() const noexcept -> const StopEnv & { return env; }
 
-    void set_value(V value) && noexcept {
+    void set_value(V value) noexcept {
         done->set_value(Event{Outcome::kValue, std::optional<V>(std::move(value))});
     }
-    void set_error(std::exception_ptr) && noexcept {
+    void set_error(std::exception_ptr) noexcept {
         done->set_value(Event{Outcome::kError, std::nullopt});
     }
-    void set_stopped() && noexcept { done->set_value(Event{Outcome::kStopped, std::nullopt}); }
+    void set_stopped() noexcept { done->set_value(Event{Outcome::kStopped, std::nullopt}); }
 };
 
 // Drives a sender with an empty (void) completion.

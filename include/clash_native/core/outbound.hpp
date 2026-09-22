@@ -1,6 +1,9 @@
 #pragma once
 
 #include <clash_native/core/error.hpp>
+#include <clash_native/io/datagram_handle.hpp>
+#include <clash_native/io/sender.hpp>
+#include <clash_native/io/stream_handle.hpp>
 
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/buffer.hpp>
@@ -173,11 +176,11 @@ class DatagramHandle {
 
 struct StreamOpenResult {
     OpenStatus status = OpenStatus::failed;
-    std::unique_ptr<StreamHandle> handle;
+    std::unique_ptr<io::StreamHandle> handle;
     bool application_data_committed = false;
     std::optional<Error> error;
 
-    static StreamOpenResult opened(std::unique_ptr<StreamHandle> value,
+    static StreamOpenResult opened(std::unique_ptr<io::StreamHandle> value,
                                    bool application_data_committed = false) {
         return {OpenStatus::opened, std::move(value), application_data_committed, std::nullopt};
     }
@@ -225,8 +228,9 @@ class Outbound {
     virtual const OutboundDescriptor &descriptor() const noexcept = 0;
     virtual OutboundCapabilities capabilities() const noexcept = 0;
 
-    // An open handler must be called exactly once, including for unsupported operations.
-    virtual void connect_stream(StreamRequest request, StreamOpenHandler handler) = 0;
+    // Open senders complete exactly once (value, error, or stopped),
+    // including for unsupported operations.
+    virtual io::AnySender<StreamOpenResult> connect_stream(StreamRequest request) = 0;
     virtual void open_datagram(DatagramRequest request, DatagramOpenHandler handler) = 0;
 
     virtual ~Outbound() = default;

@@ -23,7 +23,7 @@ struct TlsClientOptions {
 };
 
 struct TlsClientConnection {
-    std::unique_ptr<core::StreamHandle> stream;
+    std::unique_ptr<io::StreamHandle> stream;
     std::string negotiated_alpn;
 };
 
@@ -38,7 +38,7 @@ using TlsClientHandler = std::function<void(core::Result<TlsClientConnection>)>;
 // Completes a TLS client handshake over an already established project stream.
 // The completion runs on that stream's executor and is invoked exactly once.
 std::shared_ptr<TlsClientHandshake>
-async_tls_client_handshake(std::unique_ptr<core::StreamHandle> stream, TlsClientOptions options,
+async_tls_client_handshake(std::unique_ptr<io::StreamHandle> stream, TlsClientOptions options,
                            TlsClientHandler handler);
 
 } // namespace clash_native::transport

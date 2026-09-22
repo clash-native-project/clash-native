@@ -1,5 +1,7 @@
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include <boost/asio/buffer.hpp>
@@ -161,9 +163,13 @@ class DotDnsTransport::Session final
         connecting_ = true;
         const auto generation = connection_generation_;
         auto self = shared_from_this();
-        dialer_->connect_stream(
-            {core::Destination::address(endpoint_.address(), endpoint_.port()), std::nullopt},
-            [self, generation](core::StreamOpenResult result) mutable {
+        struct ConnectReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<Session> self;
+            std::uint64_t generation;
+            void set_value(core::StreamOpenResult result) && noexcept {
+                const auto self = this->self;
+                const auto generation = this->generation;
                 if (generation != self->connection_generation_ || self->stopped_) {
                     if (result.handle) {
                         result.handle->close();
@@ -200,7 +206,27 @@ class DotDnsTransport::Session final
                         self->read_frame(generation);
                         self->flush_writes(generation);
                     });
-            });
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                if (generation != self->connection_generation_ || self->stopped_) {
+                    return;
+                }
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    self->connection_failed(failure, generation);
+                } catch (...) {
+                    self->connection_failed(
+                        core::Error{core::ErrorCode::endpoint_connection, "DoT dialer failed"},
+                        generation);
+                }
+            }
+            void set_stopped() && noexcept {}
+        };
+        async::start_with_receiver(
+            dialer_->connect_stream(
+                {core::Destination::address(endpoint_.address(), endpoint_.port()), std::nullopt}),
+            ConnectReceiver{self, generation});
     }
 
     void flush_writes(std::uint64_t generation = 0) {
@@ -222,8 +248,8 @@ class DotDnsTransport::Session final
         const auto pending = pending_.at(query_id);
         write_in_progress_ = true;
         auto self = shared_from_this();
-        tls_stream_->async_write(
-            boost::asio::buffer(pending->frame),
+        net::start_write_for_handler(
+            tls_stream_->async_write(boost::asio::buffer(pending->frame)),
             [self, pending, query_id, generation](const boost::system::error_code &error,
                                                   std::size_t) {
                 if (generation != self->connection_generation_ || self->stopped_) {
@@ -293,8 +319,9 @@ class DotDnsTransport::Session final
             return;
         }
         auto self = shared_from_this();
-        tls_stream_->async_read_some(
-            boost::asio::buffer(buffer->data() + offset, buffer->size() - offset),
+        net::start_read_for_handler(
+            tls_stream_->async_read_some(
+                boost::asio::buffer(buffer->data() + offset, buffer->size() - offset)),
             [self, buffer, offset, generation, handler = std::move(handler)](
                 const boost::system::error_code &error, std::size_t size) mutable {
                 if (generation != self->connection_generation_ || self->stopped_) {
@@ -406,7 +433,7 @@ class DotDnsTransport::Session final
     bool verify_peer_;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
     std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
-    std::unique_ptr<core::StreamHandle> tls_stream_;
+    std::unique_ptr<io::StreamHandle> tls_stream_;
     std::unordered_map<std::uint16_t, PendingPtr> pending_;
     std::deque<std::uint16_t> write_queue_;
     std::uint64_t connection_generation_ = 0;

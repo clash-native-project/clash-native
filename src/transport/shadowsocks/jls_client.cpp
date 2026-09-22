@@ -1,5 +1,7 @@
 #include <clash_native/transport/shadowsocks/jls_client.hpp>
 
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/shadowsocks/jls.hpp>
 
 #include <botan/auto_rng.h>
@@ -241,9 +243,21 @@ class JlsCallbacks final : public Botan::TLS::Callbacks {
     std::string last_alert_;
 };
 
-class JlsStream final : public core::StreamHandle, public std::enable_shared_from_this<JlsStream> {
+class JlsStream final : public io::StreamHandle, public std::enable_shared_from_this<JlsStream> {
   public:
-    static std::shared_ptr<JlsStream> create(std::unique_ptr<core::StreamHandle> lower,
+    using ReadSignatures =
+        stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
+    using WriteSignatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                           stdexec::set_error_t(std::exception_ptr),
+                                                           stdexec::set_stopped_t()>;
+    // Internal machinery stays handler-style; only the public overrides below
+    // speak senders.
+    using ReadHandler = core::StreamHandle::ReadHandler;
+    using WriteHandler = core::StreamHandle::WriteHandler;
+
+    static std::shared_ptr<JlsStream> create(std::unique_ptr<io::StreamHandle> lower,
                                              std::unique_ptr<Botan::TLS::Client> tls_client,
                                              std::shared_ptr<JlsCallbacks> callbacks,
                                              std::vector<std::uint8_t> pending_plain) {
@@ -254,7 +268,34 @@ class JlsStream final : public core::StreamHandle, public std::enable_shared_fro
         return stream;
     }
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
+            [this, buffer](auto terminal) mutable {
+                this->read_impl(buffer, [terminal = std::move(terminal)](
+                                            const boost::system::error_code &error,
+                                            std::size_t count) mutable { terminal(error, count); });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_read(std::move(receiver), error, count, "jls read");
+            })};
+    }
+
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
+            [this, buffer](auto terminal) mutable {
+                this->write_impl(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t count) mutable {
+                        terminal(error, count);
+                    });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_write(std::move(receiver), error, count, "jls write");
+            })};
+    }
+
+    void read_impl(boost::asio::mutable_buffer buffer, ReadHandler handler) {
         if (read_handler_) {
             post_read(std::move(handler), boost::asio::error::already_started, 0);
             return;
@@ -271,7 +312,7 @@ class JlsStream final : public core::StreamHandle, public std::enable_shared_fro
         pump_read();
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
+    void write_impl(boost::asio::const_buffer buffer, WriteHandler handler) {
         if (write_handler_ || shutdown_requested_) {
             post_write(std::move(handler), boost::asio::error::already_started, 0);
             return;
@@ -327,7 +368,7 @@ class JlsStream final : public core::StreamHandle, public std::enable_shared_fro
     }
 
   private:
-    JlsStream(std::unique_ptr<core::StreamHandle> lower,
+    JlsStream(std::unique_ptr<io::StreamHandle> lower,
               std::unique_ptr<Botan::TLS::Client> tls_client,
               std::shared_ptr<JlsCallbacks> callbacks, std::vector<std::uint8_t> pending_plain)
         : lower_(std::move(lower)), tls_client_(std::move(tls_client)),
@@ -387,8 +428,8 @@ class JlsStream final : public core::StreamHandle, public std::enable_shared_fro
         }
         lower_read_pending_ = true;
         auto self = shared_from_this();
-        lower_->async_read_some(
-            boost::asio::buffer(read_temp_),
+        net::start_read_for_handler(
+            lower_->async_read_some(boost::asio::buffer(read_temp_)),
             [self](const boost::system::error_code &error, std::size_t size) {
                 self->lower_read_pending_ = false;
                 if (error) {
@@ -425,18 +466,18 @@ class JlsStream final : public core::StreamHandle, public std::enable_shared_fro
         wire_current_ = std::move(wire_queue_.front());
         wire_queue_.erase(wire_queue_.begin());
         auto self = shared_from_this();
-        lower_->async_write(boost::asio::buffer(wire_current_),
-                            [self](const boost::system::error_code &error, std::size_t) {
-                                self->wire_write_in_progress_ = false;
-                                self->wire_current_.clear();
-                                if (error) {
-                                    self->finish_read(error, 0);
-                                    self->finish_write(error, 0);
-                                    return;
-                                }
-                                self->start_wire_write();
-                                self->maybe_finish_write();
-                            });
+        net::start_write_for_handler(lower_->async_write(boost::asio::buffer(wire_current_)),
+                                     [self](const boost::system::error_code &error, std::size_t) {
+                                         self->wire_write_in_progress_ = false;
+                                         self->wire_current_.clear();
+                                         if (error) {
+                                             self->finish_read(error, 0);
+                                             self->finish_write(error, 0);
+                                             return;
+                                         }
+                                         self->start_wire_write();
+                                         self->maybe_finish_write();
+                                     });
     }
 
     void maybe_finish_write() {
@@ -483,7 +524,7 @@ class JlsStream final : public core::StreamHandle, public std::enable_shared_fro
         write_plain_size_ = 0;
     }
 
-    std::unique_ptr<core::StreamHandle> lower_;
+    std::unique_ptr<io::StreamHandle> lower_;
     std::unique_ptr<Botan::TLS::Client> tls_client_;
     std::shared_ptr<JlsCallbacks> callbacks_;
     std::vector<std::uint8_t> pending_plain_;
@@ -501,17 +542,48 @@ class JlsStream final : public core::StreamHandle, public std::enable_shared_fro
     std::optional<core::Error> last_error_;
 };
 
-class JlsStreamHandle final : public core::StreamHandle {
+class JlsStreamHandle final : public io::StreamHandle {
   public:
+    using ReadSignatures =
+        stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
+    using WriteSignatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                           stdexec::set_error_t(std::exception_ptr),
+                                                           stdexec::set_stopped_t()>;
+
     explicit JlsStreamHandle(std::shared_ptr<JlsStream> stream) : stream_(std::move(stream)) {}
     ~JlsStreamHandle() override { close(); }
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        stream_->async_read_some(buffer, std::move(handler));
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        auto stream = stream_;
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
+            [stream, buffer](auto terminal) mutable {
+                stream->read_impl(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t count) mutable {
+                        terminal(error, count);
+                    });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_read(std::move(receiver), error, count, "jls read");
+            })};
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
-        stream_->async_write(buffer, std::move(handler));
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        auto stream = stream_;
+        return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
+            [stream, buffer](auto terminal) mutable {
+                stream->write_impl(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t count) mutable {
+                        terminal(error, count);
+                    });
+            },
+            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
+                net::translate_write(std::move(receiver), error, count, "jls write");
+            })};
     }
 
     boost::asio::any_io_executor executor() noexcept override { return stream_->executor(); }
@@ -538,7 +610,7 @@ class JlsStreamHandle final : public core::StreamHandle {
 
 class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperation> {
   public:
-    JlsOpenOperation(std::unique_ptr<core::StreamHandle> stream, JlsClientOptions options,
+    JlsOpenOperation(std::unique_ptr<io::StreamHandle> stream, JlsClientOptions options,
                      JlsOpenHandler handler)
         : stream_(std::move(stream)), options_(std::move(options)), handler_(std::move(handler)),
           timer_(stream_->executor()) {}
@@ -611,8 +683,8 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
         tls_write_current_ = std::move(tls_write_queue_.front());
         tls_write_queue_.erase(tls_write_queue_.begin());
         auto self = shared_from_this();
-        stream_->async_write(
-            boost::asio::buffer(tls_write_current_),
+        net::start_write_for_handler(
+            stream_->async_write(boost::asio::buffer(tls_write_current_)),
             [self](const boost::system::error_code &error, std::size_t) {
                 self->tls_write_in_progress_ = false;
                 self->tls_write_current_.clear();
@@ -631,8 +703,8 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
         }
         read_in_progress_ = true;
         auto self = shared_from_this();
-        stream_->async_read_some(
-            boost::asio::buffer(read_temp_),
+        net::start_read_for_handler(
+            stream_->async_read_some(boost::asio::buffer(read_temp_)),
             [self](const boost::system::error_code &error, std::size_t size) {
                 self->read_in_progress_ = false;
                 if (error) {
@@ -683,12 +755,12 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
                                         std::move(callbacks), std::move(pending_plain_));
         auto handler = std::move(handler_);
         if (handler) {
-            handler(core::Result<std::unique_ptr<core::StreamHandle>>(
+            handler(core::Result<std::unique_ptr<io::StreamHandle>>(
                 std::make_unique<JlsStreamHandle>(std::move(stream))));
         }
     }
 
-    void finish(core::Result<std::unique_ptr<core::StreamHandle>> result) {
+    void finish(core::Result<std::unique_ptr<io::StreamHandle>> result) {
         if (completed_) {
             return;
         }
@@ -704,7 +776,7 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
         }
     }
 
-    std::unique_ptr<core::StreamHandle> stream_;
+    std::unique_ptr<io::StreamHandle> stream_;
     JlsClientOptions options_;
     JlsOpenHandler handler_;
     boost::asio::steady_timer timer_;
@@ -726,7 +798,7 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
 
 } // namespace
 
-void async_open_jls(std::unique_ptr<core::StreamHandle> stream, JlsClientOptions options,
+void async_open_jls(std::unique_ptr<io::StreamHandle> stream, JlsClientOptions options,
                     JlsOpenHandler handler) {
     if (!stream || !handler) {
         if (stream) {
