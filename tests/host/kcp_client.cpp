@@ -1,3 +1,4 @@
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/transport/kcp_client.hpp>
 
@@ -107,19 +108,29 @@ class KcpProbe final : public std::enable_shared_from_this<KcpProbe> {
             }
         });
 
-        stream_->async_write(
-            boost::asio::buffer(payload_),
-            [self](const boost::system::error_code &write_error, std::size_t size) {
-                if (write_error) {
-                    self->fail("KCP write failed: " + write_error.message());
-                    return;
-                }
+        struct WriteReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<KcpProbe> self;
+            void set_value(std::size_t size) && noexcept {
                 if (size != self->payload_.size()) {
                     self->fail("KCP write completed with an unexpected size");
                     return;
                 }
                 self->read_next();
-            });
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const clash_native::core::Error &failure) {
+                    self->fail("KCP write failed: " + failure.context);
+                } catch (...) {
+                    self->fail("KCP write failed");
+                }
+            }
+            void set_stopped() && noexcept { self->fail("KCP write stopped"); }
+        };
+        auto sender = stream_->async_write(boost::asio::buffer(payload_));
+        clash_native::async::start_with_receiver(std::move(sender), WriteReceiver{self});
     }
 
     bool succeeded() const noexcept { return finished_ && error_.empty(); }
@@ -130,27 +141,37 @@ class KcpProbe final : public std::enable_shared_from_this<KcpProbe> {
         if (finished_) {
             return;
         }
-        const auto self = shared_from_this();
-        stream_->async_read_some(
-            boost::asio::buffer(read_buffer_),
-            [self](const boost::system::error_code &read_error, std::size_t size) {
-                if (read_error) {
-                    self->fail("KCP read failed: " + read_error.message());
-                    return;
-                }
-                if (size == 0 || self->received_ + size > self->payload_.size() ||
-                    !std::equal(self->read_buffer_.begin(), self->read_buffer_.begin() + size,
+        struct ReadReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<KcpProbe> self;
+            void set_value(std::optional<std::size_t> size) && noexcept {
+                if (!size || *size == 0 || self->received_ + *size > self->payload_.size() ||
+                    !std::equal(self->read_buffer_.begin(), self->read_buffer_.begin() + *size,
                                 self->payload_.begin() + self->received_)) {
                     self->fail("KCP echo payload did not match");
                     return;
                 }
-                self->received_ += size;
+                self->received_ += *size;
                 if (self->received_ == self->payload_.size()) {
                     self->finish_success();
                     return;
                 }
                 self->read_next();
-            });
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const clash_native::core::Error &failure) {
+                    self->fail("KCP read failed: " + failure.context);
+                } catch (...) {
+                    self->fail("KCP read failed");
+                }
+            }
+            void set_stopped() && noexcept { self->fail("KCP read stopped"); }
+        };
+        const auto self = shared_from_this();
+        auto sender = stream_->async_read_some(boost::asio::buffer(read_buffer_));
+        clash_native::async::start_with_receiver(std::move(sender), ReadReceiver{self});
     }
 
     void finish_success() {
@@ -178,7 +199,7 @@ class KcpProbe final : public std::enable_shared_from_this<KcpProbe> {
     boost::asio::io_context &context_;
     ServerAddress server_;
     boost::asio::steady_timer timer_;
-    std::unique_ptr<clash_native::core::StreamHandle> stream_;
+    std::unique_ptr<clash_native::io::StreamHandle> stream_;
     std::vector<std::uint8_t> payload_;
     std::array<std::uint8_t, 16 * 1024> read_buffer_{};
     std::size_t received_ = 0;

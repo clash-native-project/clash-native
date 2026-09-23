@@ -829,15 +829,30 @@ class ShadowsocksConnectOperation final
                 return;
             }
             auto self = shared_from_this();
-            kcptun_pool_->async_open_stream(
-                endpoint, [self](core::StreamOpenResult stream) mutable {
-                    if (!stream.succeeded()) {
-                        self->finish(std::move(stream));
-                        return;
-                    }
-                    self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(stream.handle));
+            struct PoolOpenReceiver {
+                using receiver_concept = stdexec::receiver_tag;
+                std::shared_ptr<ShadowsocksConnectOperation> self;
+                void set_value(std::unique_ptr<io::StreamHandle> stream) && noexcept {
+                    self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(stream));
                     self->send_initial_request();
-                });
+                }
+                void set_error(std::exception_ptr error) && noexcept {
+                    try {
+                        std::rethrow_exception(std::move(error));
+                    } catch (const core::Error &failure) {
+                        self->finish(core::StreamOpenResult::failed(failure));
+                    } catch (...) {
+                        self->finish(core::StreamOpenResult::failed(
+                            {core::ErrorCode::transport_io, "kcptun pool open failed", {}}));
+                    }
+                }
+                void set_stopped() && noexcept {
+                    self->finish(core::StreamOpenResult::failed(
+                        {core::ErrorCode::cancelled, "kcptun pool open stopped", {}}));
+                }
+            };
+            auto sender = kcptun_pool_->open_stream(endpoint);
+            async::start_with_receiver(std::move(sender), PoolOpenReceiver{self});
             return;
         }
         auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();

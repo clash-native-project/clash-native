@@ -1,5 +1,10 @@
 #include <clash_native/transport/kcp_client.hpp>
 
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/io/stream_handle.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
+
 #include <ikcp.h>
 
 #include <boost/asio/buffer.hpp>
@@ -32,7 +37,10 @@ boost::system::error_code protocol_error() {
 
 class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState> {
   public:
-    KcpStreamState(std::unique_ptr<core::DatagramHandle> datagram,
+    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
+    KcpStreamState(std::unique_ptr<io::DatagramHandle> datagram,
                    boost::asio::ip::udp::endpoint remote_endpoint, KcpClientOptions options,
                    ikcpcb *kcp)
         : datagram_(std::move(datagram)), remote_endpoint_(std::move(remote_endpoint)),
@@ -53,8 +61,7 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
         schedule_update();
     }
 
-    void async_read_some(boost::asio::mutable_buffer buffer,
-                         core::StreamHandle::ReadHandler handler) {
+    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) {
         if (closed_) {
             post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
             return;
@@ -77,7 +84,7 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
         deliver_read();
     }
 
-    void async_write(boost::asio::const_buffer buffer, core::StreamHandle::WriteHandler handler) {
+    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) {
         if (closed_) {
             post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
             return;
@@ -177,30 +184,26 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
         if (closed_) {
             return;
         }
-        auto self = shared_from_this();
-        datagram_->async_receive_from(
-            boost::asio::buffer(receive_buffer_),
-            [self](const boost::system::error_code &error, std::size_t size,
-                   core::DatagramAddress sender) {
+        struct ReceiveReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<KcpStreamState> self;
+            void set_value(io::DatagramPacket packet) && noexcept {
                 if (self->closed_) {
                     return;
                 }
-                if (error) {
-                    self->fail(error);
-                    return;
-                }
-                if (!sender.is_address() || sender.address() != self->remote_endpoint_.address() ||
-                    sender.port() != self->remote_endpoint_.port()) {
+                if (!packet.address.is_address() ||
+                    packet.address.address() != self->remote_endpoint_.address() ||
+                    packet.address.port() != self->remote_endpoint_.port()) {
                     self->start_receive();
                     return;
                 }
-                const auto packet =
-                    std::span<const std::uint8_t>(self->receive_buffer_.data(), size);
+                const auto wire =
+                    std::span<const std::uint8_t>(self->receive_buffer_.data(), packet.size);
                 std::vector<std::vector<std::uint8_t>> decoded;
                 if (self->options_.decode_packet) {
-                    decoded = self->options_.decode_packet(packet);
+                    decoded = self->options_.decode_packet(wire);
                 } else {
-                    decoded.emplace_back(packet.begin(), packet.end());
+                    decoded.emplace_back(wire.begin(), wire.end());
                 }
                 for (const auto &payload : decoded) {
                     if (payload.empty() ||
@@ -215,7 +218,31 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
                 self->deliver_read();
                 self->update_now();
                 self->start_receive();
-            });
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                if (self->closed_) {
+                    return;
+                }
+                self->fail(unpack_udp_error(std::move(error)));
+            }
+            void set_stopped() && noexcept {}
+        };
+        auto sender = datagram_->async_receive_from(boost::asio::buffer(receive_buffer_));
+        async::start_with_receiver(std::move(sender), ReceiveReceiver{shared_from_this()});
+    }
+
+    static boost::system::error_code unpack_udp_error(std::exception_ptr error) noexcept {
+        try {
+            std::rethrow_exception(std::move(error));
+        } catch (const core::Error &failure) {
+            if (failure.cause) {
+                return failure.cause;
+            }
+        } catch (const boost::system::system_error &failure) {
+            return failure.code();
+        } catch (...) {
+        }
+        return boost::asio::error::fault;
     }
 
     void schedule_update() {
@@ -286,23 +313,33 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
             }
             rate_tokens_ -= packet->size();
         }
-        auto self = shared_from_this();
-        datagram_->async_send_to(
-            boost::asio::buffer(*packet), core::DatagramAddress::from_endpoint(remote_endpoint_),
-            [self, packet](const boost::system::error_code &error, std::size_t) {
+        struct SendReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<KcpStreamState> self;
+            std::shared_ptr<std::vector<std::uint8_t>> packet;
+            void set_value(std::size_t) && noexcept {
                 self->send_in_progress_ = false;
                 if (self->closed_) {
-                    return;
-                }
-                if (error) {
-                    self->fail(error);
                     return;
                 }
                 if (!self->send_queue_.empty()) {
                     self->send_queue_.pop_front();
                 }
                 self->pump_output();
-            });
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                self->send_in_progress_ = false;
+                if (self->closed_) {
+                    return;
+                }
+                self->fail(unpack_udp_error(std::move(error)));
+            }
+            void set_stopped() && noexcept { self->send_in_progress_ = false; }
+        };
+        auto sender = datagram_->async_send_to(
+            boost::asio::buffer(*packet), io::DatagramAddress::from_endpoint(remote_endpoint_));
+        async::start_with_receiver(std::move(sender),
+                                   SendReceiver{shared_from_this(), std::move(packet)});
     }
 
     void deliver_read() {
@@ -379,21 +416,20 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
         handler(error, size);
     }
 
-    void post_read(core::StreamHandle::ReadHandler handler, const boost::system::error_code &error,
-                   std::size_t size) {
+    void post_read(ReadHandler handler, const boost::system::error_code &error, std::size_t size) {
         boost::asio::post(executor(), [handler = std::move(handler), error, size]() mutable {
             handler(error, size);
         });
     }
 
-    void post_write(core::StreamHandle::WriteHandler handler,
-                    const boost::system::error_code &error, std::size_t size) {
+    void post_write(WriteHandler handler, const boost::system::error_code &error,
+                    std::size_t size) {
         boost::asio::post(executor(), [handler = std::move(handler), error, size]() mutable {
             handler(error, size);
         });
     }
 
-    std::unique_ptr<core::DatagramHandle> datagram_;
+    std::unique_ptr<io::DatagramHandle> datagram_;
     boost::asio::ip::udp::endpoint remote_endpoint_;
     KcpClientOptions options_;
     ikcpcb *kcp_ = nullptr;
@@ -405,8 +441,8 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
     boost::asio::mutable_buffer read_buffer_;
     std::vector<std::uint8_t> pending_read_;
     std::size_t pending_read_offset_ = 0;
-    core::StreamHandle::ReadHandler read_handler_;
-    core::StreamHandle::WriteHandler write_handler_;
+    ReadHandler read_handler_;
+    WriteHandler write_handler_;
     std::size_t write_size_ = 0;
     bool send_in_progress_ = false;
     std::size_t rate_capacity_ = 0;
@@ -415,16 +451,44 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
     bool closed_ = false;
 };
 
-class KcpStream final : public core::StreamHandle {
+class KcpStream final : public io::StreamHandle {
   public:
     explicit KcpStream(std::shared_ptr<KcpStreamState> state) : state_(std::move(state)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        state_->async_read_some(buffer, std::move(handler));
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        using Signatures =
+            stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                           stdexec::set_error_t(std::exception_ptr),
+                                           stdexec::set_stopped_t()>;
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
+            [state = state_, buffer](auto terminal) mutable {
+                state->async_read_some(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t size) mutable {
+                        terminal(error, size);
+                    });
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                net::translate_read(std::move(receiver), error, size, "kcp stream read");
+            })};
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
-        state_->async_write(buffer, std::move(handler));
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
+        return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
+            [state = state_, buffer](auto terminal) mutable {
+                state->async_write(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t size) mutable {
+                        terminal(error, size);
+                    });
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                net::translate_write(std::move(receiver), error, size, "kcp stream write");
+            })};
     }
 
     boost::asio::any_io_executor executor() noexcept override { return state_->executor(); }
@@ -450,8 +514,8 @@ core::Error configuration_error(const char *message) {
 
 } // namespace
 
-core::Result<std::unique_ptr<core::StreamHandle>>
-make_kcp_client_stream(std::unique_ptr<core::DatagramHandle> datagram,
+core::Result<std::unique_ptr<io::StreamHandle>>
+make_kcp_client_stream(std::unique_ptr<io::DatagramHandle> datagram,
                        boost::asio::ip::udp::endpoint remote_endpoint, KcpClientOptions options) {
     if (!datagram) {
         return core::fail(configuration_error("KCP stream requires a datagram handle"));
@@ -482,7 +546,7 @@ make_kcp_client_stream(std::unique_ptr<core::DatagramHandle> datagram,
     kcp->user = state.get();
     ikcp_setoutput(kcp, &KcpStreamState::output);
     state->start();
-    return std::unique_ptr<core::StreamHandle>(std::make_unique<KcpStream>(std::move(state)));
+    return std::unique_ptr<io::StreamHandle>(std::make_unique<KcpStream>(std::move(state)));
 }
 
 } // namespace clash_native::transport

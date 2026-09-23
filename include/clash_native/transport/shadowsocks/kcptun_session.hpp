@@ -1,6 +1,7 @@
 #pragma once
 
 #include <clash_native/core/outbound.hpp>
+#include <clash_native/io/stream_handle.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 #include <clash_native/transport/shadowsocks/kcptun.hpp>
 
@@ -21,8 +22,8 @@ class KcptunClientPool final {
     KcptunClientPool(const KcptunClientPool &) = delete;
     KcptunClientPool &operator=(const KcptunClientPool &) = delete;
 
-    void async_open_stream(boost::asio::ip::udp::endpoint endpoint,
-                           core::StreamOpenHandler handler);
+    io::AnySender<std::unique_ptr<io::StreamHandle>>
+    open_stream(boost::asio::ip::udp::endpoint endpoint);
     void close() noexcept;
 
   private:

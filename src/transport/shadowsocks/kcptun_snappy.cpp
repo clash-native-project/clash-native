@@ -1,5 +1,10 @@
 #include <clash_native/transport/shadowsocks/kcptun_snappy.hpp>
 
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/io/stream_handle.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
+
 #include <snappy.h>
 
 #include <boost/asio/buffer.hpp>
@@ -84,7 +89,10 @@ std::uint32_t get_u32(const std::uint8_t *input) {
 
 class SnappyStreamState final : public std::enable_shared_from_this<SnappyStreamState> {
   public:
-    explicit SnappyStreamState(std::unique_ptr<core::StreamHandle> transport)
+    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
+    explicit SnappyStreamState(std::unique_ptr<io::StreamHandle> transport)
         : transport_(std::move(transport)) {}
 
     void start() { read_identifier(); }
@@ -95,8 +103,7 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
         return transport_->local_endpoint(error);
     }
 
-    void async_read_some(boost::asio::mutable_buffer buffer,
-                         core::StreamHandle::ReadHandler handler) {
+    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) {
         if (closed_) {
             post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
             return;
@@ -114,7 +121,7 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
         deliver_read();
     }
 
-    void async_write(boost::asio::const_buffer buffer, core::StreamHandle::WriteHandler handler) {
+    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) {
         if (closed_) {
             post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
             return;
@@ -162,7 +169,7 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
   private:
     struct PendingWrite {
         std::shared_ptr<std::vector<std::uint8_t>> packet;
-        core::StreamHandle::WriteHandler handler;
+        WriteHandler handler;
         std::size_t size = 0;
     };
 
@@ -200,20 +207,40 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
         auto pending = std::move(writes_.front());
         writes_.pop_front();
         auto packet = pending.packet;
-        auto self = shared_from_this();
-        transport_->async_write(boost::asio::buffer(*packet),
-                                [self, pending = std::move(pending)](
-                                    const boost::system::error_code &error, std::size_t) mutable {
-                                    self->write_in_progress_ = false;
-                                    if (error) {
-                                        self->close_with_error(error);
-                                        return;
-                                    }
-                                    if (pending.handler) {
-                                        pending.handler({}, pending.size);
-                                    }
-                                    self->pump_write();
-                                });
+        struct WriteReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<SnappyStreamState> self;
+            PendingWrite pending;
+            void set_value(std::size_t) && noexcept {
+                self->write_in_progress_ = false;
+                if (pending.handler) {
+                    pending.handler({}, pending.size);
+                }
+                self->pump_write();
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                self->write_in_progress_ = false;
+                self->close_with_error(unpack_transport_error(std::move(error)));
+            }
+            void set_stopped() && noexcept { self->write_in_progress_ = false; }
+        };
+        auto sender = transport_->async_write(boost::asio::buffer(*packet));
+        async::start_with_receiver(std::move(sender),
+                                   WriteReceiver{shared_from_this(), std::move(pending)});
+    }
+
+    static boost::system::error_code unpack_transport_error(std::exception_ptr error) noexcept {
+        try {
+            std::rethrow_exception(std::move(error));
+        } catch (const core::Error &failure) {
+            if (failure.cause) {
+                return failure.cause;
+            }
+        } catch (const boost::system::system_error &failure) {
+            return failure.code();
+        } catch (...) {
+        }
+        return boost::asio::error::fault;
     }
 
     using ReadExactHandler = std::function<void(const boost::system::error_code &)>;
@@ -228,22 +255,28 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
             handler({});
             return;
         }
-        auto self = shared_from_this();
-        transport_->async_read_some(
-            boost::asio::buffer(static_cast<std::uint8_t *>(buffer.data()) + offset,
-                                buffer.size() - offset),
-            [self, buffer, handler = std::move(handler),
-             offset](const boost::system::error_code &error, std::size_t size) mutable {
-                if (error) {
-                    handler(error);
-                    return;
-                }
-                if (size == 0) {
+        struct ExactReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<SnappyStreamState> self;
+            boost::asio::mutable_buffer buffer;
+            ReadExactHandler handler;
+            std::size_t offset;
+            void set_value(std::optional<std::size_t> size) && noexcept {
+                if (!size || *size == 0) {
                     handler(boost::asio::error::eof);
                     return;
                 }
-                self->read_exact(buffer, std::move(handler), offset + size);
-            });
+                self->read_exact(buffer, std::move(handler), offset + *size);
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                handler(unpack_transport_error(std::move(error)));
+            }
+            void set_stopped() && noexcept { handler(boost::asio::error::operation_aborted); }
+        };
+        auto sender = transport_->async_read_some(boost::asio::buffer(
+            static_cast<std::uint8_t *>(buffer.data()) + offset, buffer.size() - offset));
+        async::start_with_receiver(std::move(sender), ExactReceiver{shared_from_this(), buffer,
+                                                                    std::move(handler), offset});
     }
 
     void read_identifier() {
@@ -397,25 +430,24 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
         writes_.clear();
     }
 
-    void post_read(core::StreamHandle::ReadHandler handler, const boost::system::error_code &error,
-                   std::size_t size) {
+    void post_read(ReadHandler handler, const boost::system::error_code &error, std::size_t size) {
         boost::asio::post(executor(), [handler = std::move(handler), error, size]() mutable {
             handler(error, size);
         });
     }
 
-    void post_write(core::StreamHandle::WriteHandler handler,
-                    const boost::system::error_code &error, std::size_t size) {
+    void post_write(WriteHandler handler, const boost::system::error_code &error,
+                    std::size_t size) {
         boost::asio::post(executor(), [handler = std::move(handler), error, size]() mutable {
             handler(error, size);
         });
     }
 
-    std::unique_ptr<core::StreamHandle> transport_;
+    std::unique_ptr<io::StreamHandle> transport_;
     std::deque<PendingWrite> writes_;
     std::deque<std::shared_ptr<std::vector<std::uint8_t>>> incoming_;
     boost::asio::mutable_buffer read_buffer_;
-    core::StreamHandle::ReadHandler read_handler_;
+    ReadHandler read_handler_;
     std::size_t incoming_offset_ = 0;
     bool write_identifier_sent_ = false;
     bool write_in_progress_ = false;
@@ -423,15 +455,43 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
     bool closed_ = false;
 };
 
-class SnappyStream final : public core::StreamHandle {
+class SnappyStream final : public io::StreamHandle {
   public:
     explicit SnappyStream(std::shared_ptr<SnappyStreamState> state) : state_(std::move(state)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        state_->async_read_some(buffer, std::move(handler));
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        using Signatures =
+            stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                           stdexec::set_error_t(std::exception_ptr),
+                                           stdexec::set_stopped_t()>;
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
+            [state = state_, buffer](auto terminal) mutable {
+                state->async_read_some(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t size) mutable {
+                        terminal(error, size);
+                    });
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                net::translate_read(std::move(receiver), error, size, "snappy stream read");
+            })};
     }
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
-        state_->async_write(buffer, std::move(handler));
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
+        return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
+            [state = state_, buffer](auto terminal) mutable {
+                state->async_write(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t size) mutable {
+                        terminal(error, size);
+                    });
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                net::translate_write(std::move(receiver), error, size, "snappy stream write");
+            })};
     }
     boost::asio::any_io_executor executor() noexcept override { return state_->executor(); }
     boost::asio::ip::tcp::endpoint
@@ -449,8 +509,8 @@ class SnappyStream final : public core::StreamHandle {
 
 } // namespace
 
-core::Result<std::unique_ptr<core::StreamHandle>>
-make_kcptun_snappy_stream(std::unique_ptr<core::StreamHandle> transport) {
+core::Result<std::unique_ptr<io::StreamHandle>>
+make_kcptun_snappy_stream(std::unique_ptr<io::StreamHandle> transport) {
     if (!transport) {
         return core::fail({core::ErrorCode::configuration,
                            "kcptun Snappy stream requires an underlying stream",
@@ -458,7 +518,7 @@ make_kcptun_snappy_stream(std::unique_ptr<core::StreamHandle> transport) {
     }
     auto state = std::make_shared<SnappyStreamState>(std::move(transport));
     state->start();
-    return std::unique_ptr<core::StreamHandle>(std::make_unique<SnappyStream>(std::move(state)));
+    return std::unique_ptr<io::StreamHandle>(std::make_unique<SnappyStream>(std::move(state)));
 }
 
 } // namespace clash_native::transport::shadowsocks

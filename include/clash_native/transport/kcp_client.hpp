@@ -2,6 +2,7 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
+#include <clash_native/io/stream_handle.hpp>
 
 #include <boost/asio/ip/udp.hpp>
 
@@ -37,8 +38,8 @@ struct KcpClientOptions {
 // The datagram handle is owned by the returned stream. KCP has no standard
 // half-close or connection handshake, so shutdown_send reports unsupported
 // and the first application write establishes traffic for the peer.
-core::Result<std::unique_ptr<core::StreamHandle>>
-make_kcp_client_stream(std::unique_ptr<core::DatagramHandle> datagram,
+core::Result<std::unique_ptr<io::StreamHandle>>
+make_kcp_client_stream(std::unique_ptr<io::DatagramHandle> datagram,
                        boost::asio::ip::udp::endpoint remote_endpoint,
                        KcpClientOptions options = {});
 

@@ -1,5 +1,9 @@
 #include <clash_native/transport/shadowsocks/kcptun.hpp>
 
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/io/stream_handle.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/transport/kcp_client.hpp>
 #include <clash_native/transport/shadowsocks/crypto.hpp>
@@ -74,7 +78,10 @@ std::uint32_t get_u32(const std::uint8_t *input) {
 
 class SmuxStreamState final : public std::enable_shared_from_this<SmuxStreamState> {
   public:
-    SmuxStreamState(std::unique_ptr<core::StreamHandle> transport, KcptunClientOptions options)
+    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
+    SmuxStreamState(std::unique_ptr<io::StreamHandle> transport, KcptunClientOptions options)
         : transport_(std::move(transport)), options_(std::move(options)),
           timer_(transport_->executor()) {}
 
@@ -86,8 +93,7 @@ class SmuxStreamState final : public std::enable_shared_from_this<SmuxStreamStat
         schedule_keepalive();
     }
 
-    void async_read_some(boost::asio::mutable_buffer buffer,
-                         core::StreamHandle::ReadHandler handler) {
+    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) {
         if (closed_) {
             post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
             return;
@@ -105,7 +111,7 @@ class SmuxStreamState final : public std::enable_shared_from_this<SmuxStreamStat
         deliver_read();
     }
 
-    void async_write(boost::asio::const_buffer buffer, core::StreamHandle::WriteHandler handler) {
+    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) {
         if (closed_ || local_closed_) {
             post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
             return;
@@ -163,7 +169,7 @@ class SmuxStreamState final : public std::enable_shared_from_this<SmuxStreamStat
 
   private:
     struct PendingWrite {
-        core::StreamHandle::WriteHandler handler;
+        WriteHandler handler;
         std::size_t size = 0;
         std::size_t offset = 0;
         std::shared_ptr<std::vector<std::uint8_t>> data;
@@ -234,17 +240,23 @@ class SmuxStreamState final : public std::enable_shared_from_this<SmuxStreamStat
         queued_writes_.pop_front();
         auto packet = std::move(queued.packet);
         auto pending = std::move(queued.pending);
-        auto self = shared_from_this();
-        transport_->async_write(
-            boost::asio::buffer(*packet),
-            [self, packet, pending](const boost::system::error_code &error, std::size_t) mutable {
+        struct WriteReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<SmuxStreamState> self;
+            std::shared_ptr<std::vector<std::uint8_t>> packet;
+            void set_value(std::size_t) && noexcept {
                 self->write_in_progress_ = false;
-                if (error) {
-                    self->close_with_error(error);
-                    return;
-                }
                 self->pump_write();
-            });
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                self->write_in_progress_ = false;
+                self->close_with_error(unpack_transport_error(std::move(error)));
+            }
+            void set_stopped() && noexcept { self->write_in_progress_ = false; }
+        };
+        auto sender = transport_->async_write(boost::asio::buffer(*packet));
+        async::start_with_receiver(std::move(sender),
+                                   WriteReceiver{shared_from_this(), std::move(packet)});
     }
 
     void read_header() {
@@ -339,22 +351,28 @@ class SmuxStreamState final : public std::enable_shared_from_this<SmuxStreamStat
             handler({});
             return;
         }
-        auto self = shared_from_this();
-        transport_->async_read_some(
-            boost::asio::buffer(static_cast<std::uint8_t *>(buffer.data()) + offset,
-                                buffer.size() - offset),
-            [self, buffer, handler = std::move(handler),
-             offset](const boost::system::error_code &error, std::size_t size) mutable {
-                if (error) {
-                    handler(error);
-                    return;
-                }
-                if (size == 0) {
+        struct ExactReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<SmuxStreamState> self;
+            boost::asio::mutable_buffer buffer;
+            ReadExactHandler handler;
+            std::size_t offset;
+            void set_value(std::optional<std::size_t> size) && noexcept {
+                if (!size || *size == 0) {
                     handler(boost::asio::error::eof);
                     return;
                 }
-                self->read_exact(buffer, std::move(handler), offset + size);
-            });
+                self->read_exact(buffer, std::move(handler), offset + *size);
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                handler(unpack_transport_error(std::move(error)));
+            }
+            void set_stopped() && noexcept { handler(boost::asio::error::operation_aborted); }
+        };
+        auto sender = transport_->async_read_some(boost::asio::buffer(
+            static_cast<std::uint8_t *>(buffer.data()) + offset, buffer.size() - offset));
+        async::start_with_receiver(std::move(sender), ExactReceiver{shared_from_this(), buffer,
+                                                                    std::move(handler), offset});
     }
 
     void deliver_read() {
@@ -424,6 +442,20 @@ class SmuxStreamState final : public std::enable_shared_from_this<SmuxStreamStat
         close();
     }
 
+    static boost::system::error_code unpack_transport_error(std::exception_ptr error) noexcept {
+        try {
+            std::rethrow_exception(std::move(error));
+        } catch (const core::Error &failure) {
+            if (failure.cause) {
+                return failure.cause;
+            }
+        } catch (const boost::system::system_error &failure) {
+            return failure.code();
+        } catch (...) {
+        }
+        return boost::asio::error::fault;
+    }
+
     void finish_read(const boost::system::error_code &error, std::size_t size) {
         if (!read_handler_) {
             return;
@@ -454,25 +486,24 @@ class SmuxStreamState final : public std::enable_shared_from_this<SmuxStreamStat
         }
     }
 
-    void post_read(core::StreamHandle::ReadHandler handler, const boost::system::error_code &error,
-                   std::size_t size) {
+    void post_read(ReadHandler handler, const boost::system::error_code &error, std::size_t size) {
         boost::asio::post(executor(), [handler = std::move(handler), error, size]() mutable {
             handler(error, size);
         });
     }
 
-    void post_write(core::StreamHandle::WriteHandler handler,
-                    const boost::system::error_code &error, std::size_t size) {
+    void post_write(WriteHandler handler, const boost::system::error_code &error,
+                    std::size_t size) {
         boost::asio::post(executor(), [handler = std::move(handler), error, size]() mutable {
             handler(error, size);
         });
     }
 
-    std::unique_ptr<core::StreamHandle> transport_;
+    std::unique_ptr<io::StreamHandle> transport_;
     KcptunClientOptions options_;
     boost::asio::steady_timer timer_;
     boost::asio::mutable_buffer read_buffer_;
-    core::StreamHandle::ReadHandler read_handler_;
+    ReadHandler read_handler_;
     std::deque<std::shared_ptr<std::vector<std::uint8_t>>> incoming_;
     std::size_t incoming_offset_ = 0;
     std::deque<QueuedWrite> queued_writes_;
@@ -491,29 +522,52 @@ class SmuxStreamState final : public std::enable_shared_from_this<SmuxStreamStat
     bool closed_ = false;
 };
 
-class SmuxStream final : public core::StreamHandle {
+class SmuxStream final : public io::StreamHandle {
   public:
     explicit SmuxStream(std::shared_ptr<SmuxStreamState> state) : state_(std::move(state)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        state_->async_read_some(buffer, std::move(handler));
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        using Signatures =
+            stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                           stdexec::set_error_t(std::exception_ptr),
+                                           stdexec::set_stopped_t()>;
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
+            [state = state_, buffer](auto terminal) mutable {
+                state->async_read_some(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t size) mutable {
+                        terminal(error, size);
+                    });
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                net::translate_read(std::move(receiver), error, size, "smux stream read");
+            })};
     }
-
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
-        state_->async_write(buffer, std::move(handler));
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
+        return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
+            [state = state_, buffer](auto terminal) mutable {
+                state->async_write(
+                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t size) mutable {
+                        terminal(error, size);
+                    });
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                net::translate_write(std::move(receiver), error, size, "smux stream write");
+            })};
     }
-
     boost::asio::any_io_executor executor() noexcept override { return state_->executor(); }
-
     boost::asio::ip::tcp::endpoint
     local_endpoint(boost::system::error_code &error) const noexcept override {
         return state_->local_endpoint(error);
     }
-
     void shutdown_send(boost::system::error_code &error) noexcept override {
         state_->shutdown_send(error);
     }
-
     void close() noexcept override { state_->close(); }
 
   private:
@@ -586,7 +640,7 @@ core::Status validate_kcptun_client_options(const KcptunClientOptions &options) 
     return validate_options(options);
 }
 
-core::Result<std::unique_ptr<core::StreamHandle>>
+core::Result<std::unique_ptr<io::StreamHandle>>
 make_kcptun_carrier(runtime::AsioRuntime &runtime, boost::asio::ip::udp::endpoint remote_endpoint,
                     KcptunClientOptions options) {
     apply_mode_defaults(options);
@@ -668,7 +722,7 @@ make_kcptun_carrier(runtime::AsioRuntime &runtime, boost::asio::ip::udp::endpoin
         return core::fail(kcp.error());
     }
 
-    std::unique_ptr<core::StreamHandle> carrier = std::move(kcp.value());
+    std::unique_ptr<io::StreamHandle> carrier = std::move(kcp.value());
     if (!options.no_compression) {
         auto compressed = make_kcptun_snappy_stream(std::move(carrier));
         if (!compressed) {
@@ -679,7 +733,7 @@ make_kcptun_carrier(runtime::AsioRuntime &runtime, boost::asio::ip::udp::endpoin
     return carrier;
 }
 
-core::Result<std::unique_ptr<core::StreamHandle>>
+core::Result<std::unique_ptr<io::StreamHandle>>
 make_kcptun_client_stream(runtime::AsioRuntime &runtime,
                           boost::asio::ip::udp::endpoint remote_endpoint,
                           KcptunClientOptions options) {
@@ -689,7 +743,7 @@ make_kcptun_client_stream(runtime::AsioRuntime &runtime,
     }
     auto state = std::make_shared<SmuxStreamState>(std::move(carrier.value()), std::move(options));
     state->start();
-    return std::unique_ptr<core::StreamHandle>(std::make_unique<SmuxStream>(std::move(state)));
+    return std::unique_ptr<io::StreamHandle>(std::make_unique<SmuxStream>(std::move(state)));
 }
 
 } // namespace clash_native::transport::shadowsocks

@@ -2,6 +2,7 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
+#include <clash_native/io/stream_handle.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 
 #include <boost/asio/ip/udp.hpp>
@@ -48,11 +49,11 @@ core::Status validate_kcptun_client_options(const KcptunClientOptions &options);
 // Creates the encrypted KCP byte carrier before SMUX stream multiplexing.
 // The returned stream is owned by the caller and is suitable for exactly one
 // Kcptun SMUX session.
-core::Result<std::unique_ptr<core::StreamHandle>>
+core::Result<std::unique_ptr<io::StreamHandle>>
 make_kcptun_carrier(runtime::AsioRuntime &runtime, boost::asio::ip::udp::endpoint remote_endpoint,
                     KcptunClientOptions options = {});
 
-core::Result<std::unique_ptr<core::StreamHandle>>
+core::Result<std::unique_ptr<io::StreamHandle>>
 make_kcptun_client_stream(runtime::AsioRuntime &runtime,
                           boost::asio::ip::udp::endpoint remote_endpoint,
                           KcptunClientOptions options = {});

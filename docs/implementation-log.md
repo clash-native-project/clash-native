@@ -2110,3 +2110,18 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-24
+
+- Migrated the kcptun stack off `core::StreamHandle`: KCP states pump
+  UDP through sender receivers and serve io:: streams; the Snappy and
+  SMUX framers drive io:: carriers with receiver-based write pumps and
+  exact-read loops; the pooled SMUX session opens streams through a
+  sender (`just`/`just_error`, synchronous preconditions) and the pool
+  exposes `open_stream(endpoint)` as a sender, bridged with
+  `start_with_receiver` at the Shadowsocks outbound edge, which now
+  feeds `StreamCarrier` io:: handles on both the direct and pooled
+  paths. The host KCP probe runs on senders as well.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.
