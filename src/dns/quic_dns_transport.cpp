@@ -1,7 +1,7 @@
 #include "quic_dns_transport_internal.hpp"
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
-#include <clash_native/net/datagram_handle_adapter.hpp>
+#include <clash_native/io/datagram_handle.hpp>
 
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/dispatch.hpp>
@@ -112,18 +112,15 @@ void QuicDnsTransport::Operation::start_on_strand() {
     started_ = true;
     const auto self = shared_from_this();
     const auto destination = core::Destination::address(owner_.config_.endpoint.address(), port_);
-    // Sessions-plane debt: the QUIC plane still speaks core:: datagrams;
-    // adapt the sender-based open back into its callback shape at the edge.
     struct OpenReceiver {
         using receiver_concept = stdexec::receiver_tag;
         std::shared_ptr<Operation> self;
 
         void set_value(core::DatagramOpenResult result) && noexcept {
             auto operation = std::move(self);
-            std::unique_ptr<core::DatagramHandle> handle;
+            std::unique_ptr<io::DatagramHandle> handle = std::move(result.handle);
             std::optional<core::Error> error = std::move(result.error);
-            if (result.succeeded()) {
-                handle = net::adapt_io_to_core_datagram(std::move(result.handle));
+            if (handle) {
                 error.reset();
             }
             dispatch_opened(std::move(operation), std::move(handle), std::move(error));
@@ -155,11 +152,11 @@ void QuicDnsTransport::Operation::start_on_strand() {
         // rides a shared state instead. Sessions-plane debt with the
         // adapter above.
         static void dispatch_opened(std::shared_ptr<Operation> operation,
-                                    std::unique_ptr<core::DatagramHandle> handle,
+                                    std::unique_ptr<io::DatagramHandle> handle,
                                     std::optional<core::Error> error) noexcept {
             struct StrandState {
                 std::shared_ptr<Operation> operation;
-                std::unique_ptr<core::DatagramHandle> handle;
+                std::unique_ptr<io::DatagramHandle> handle;
                 std::optional<core::Error> error;
             };
             auto state = std::make_shared<StrandState>(
@@ -247,7 +244,7 @@ void QuicDnsTransport::Operation::cancel_all() {
     }
 }
 
-void QuicDnsTransport::Operation::datagram_opened(std::unique_ptr<core::DatagramHandle> handle,
+void QuicDnsTransport::Operation::datagram_opened(std::unique_ptr<io::DatagramHandle> handle,
                                                   std::optional<core::Error> error) {
     if (retired_ || exchanges_.empty()) {
         if (handle) {

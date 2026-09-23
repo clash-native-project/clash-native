@@ -62,7 +62,8 @@ class QuicClientConnection final : public io::MultiplexedSession,
                                    public std::enable_shared_from_this<QuicClientConnection> {
   public:
     using ObserverId = std::uint64_t;
-    using DatagramWriteHandler = core::DatagramHandle::WriteHandler;
+    using DatagramWriteHandler =
+        std::function<void(const boost::system::error_code &, std::size_t)>;
 
     QuicClientConnection(const QuicClientConnection &) = delete;
     QuicClientConnection &operator=(const QuicClientConnection &) = delete;
@@ -103,7 +104,7 @@ class QuicClientConnection final : public io::MultiplexedSession,
 
     std::shared_ptr<Impl> impl_;
     friend std::shared_ptr<QuicClientConnection> make_quic_client_connection(
-        boost::asio::any_io_executor, std::unique_ptr<core::DatagramHandle>,
+        boost::asio::any_io_executor, std::unique_ptr<io::DatagramHandle>,
         boost::asio::ip::udp::endpoint, QuicClientOptions, QuicClientEvents);
 };
 
@@ -111,7 +112,7 @@ class QuicClientConnection final : public io::MultiplexedSession,
 // supplied executor. The handle must support one connected peer endpoint.
 std::shared_ptr<QuicClientConnection>
 make_quic_client_connection(boost::asio::any_io_executor executor,
-                            std::unique_ptr<core::DatagramHandle> datagram,
+                            std::unique_ptr<io::DatagramHandle> datagram,
                             boost::asio::ip::udp::endpoint remote_endpoint,
                             QuicClientOptions options, QuicClientEvents events);
 

@@ -103,10 +103,7 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
     void add_exchange(ExchangeId id, DnsExchangeRequest request);
     void cancel_exchange(ExchangeId id, core::Error error);
     void cancel_all();
-    // Sessions-plane edge: takes an already-adapted core:: handle plus the
-    // open error, mirroring DatagramOpenResult without naming the io::
-    // vocabulary this plane has not adopted yet.
-    void datagram_opened(std::unique_ptr<core::DatagramHandle> handle,
+    void datagram_opened(std::unique_ptr<io::DatagramHandle> handle,
                          std::optional<core::Error> error);
 
     transport::QuicClientEvents make_doq_events();

@@ -91,7 +91,7 @@ bool add_certificates(std::string_view pem, X509_STORE *store, std::size_t &coun
 
 class QuicClientConnection::Impl final : public std::enable_shared_from_this<Impl> {
   public:
-    Impl(boost::asio::any_io_executor executor, std::unique_ptr<core::DatagramHandle> datagram,
+    Impl(boost::asio::any_io_executor executor, std::unique_ptr<io::DatagramHandle> datagram,
          boost::asio::ip::udp::endpoint remote_endpoint, QuicClientOptions options,
          QuicClientEvents events)
         : executor_(std::move(executor)), expiry_timer_(executor_), datagram_(std::move(datagram)),
@@ -801,36 +801,73 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
             return;
         }
         receiving_ = true;
-        auto buffer = std::make_shared<ReceiveBuffer>();
-        const auto self = shared_from_this();
-        datagram_->async_receive_from(
-            boost::asio::buffer(buffer->bytes),
-            [self, buffer](const boost::system::error_code &error, std::size_t length,
-                           core::DatagramAddress sender) {
-                boost::asio::dispatch(self->executor_, [self, buffer, error, length,
-                                                        sender = std::move(sender)] {
+        struct ReceiveReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<Impl> self;
+            std::shared_ptr<ReceiveBuffer> buffer;
+            void set_value(io::DatagramPacket packet) && noexcept {
+                // Hoist before the move below: argument evaluation order
+                // is unspecified, so reading self->executor_ next to
+                // [self = std::move(self)] may observe the moved-from state.
+                auto executor = self->executor_;
+                boost::asio::dispatch(std::move(executor), [self = std::move(self),
+                                                            buffer = std::move(buffer),
+                                                            packet = std::move(packet)] {
                     self->receiving_ = false;
+                    self->check_teardown();
                     if (self->retired_) {
                         return;
                     }
-                    if (error) {
-                        if (error != boost::asio::error::operation_aborted) {
-                            self->fail(transport_error("failed to receive QUIC datagram", error));
-                        }
-                        return;
-                    }
-                    if (sender.is_address() &&
-                        sender.address() == self->remote_endpoint_.address() &&
-                        sender.port() == self->remote_endpoint_.port() && length != 0) {
+                    if (packet.address.is_address() &&
+                        packet.address.address() == self->remote_endpoint_.address() &&
+                        packet.address.port() == self->remote_endpoint_.port() &&
+                        packet.size != 0) {
                         self->process_datagram(
-                            buffer->bytes.data(), length,
-                            boost::asio::ip::udp::endpoint(sender.address(), sender.port()));
+                            buffer->bytes.data(), packet.size,
+                            boost::asio::ip::udp::endpoint(packet.address.address(),
+                                                           packet.address.port()));
                     }
                     if (!self->retired_) {
                         self->receive_next();
                     }
+                    self->check_teardown();
                 });
-            });
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                const auto self = std::move(this->self);
+                boost::asio::dispatch(self->executor_, [self, error = std::move(error)] {
+                    self->receiving_ = false;
+                    self->check_teardown();
+                    if (self->retired_) {
+                        return;
+                    }
+                    try {
+                        std::rethrow_exception(std::move(error));
+                    } catch (const boost::system::system_error &failure) {
+                        if (failure.code() != boost::asio::error::operation_aborted) {
+                            self->fail(
+                                transport_error("failed to receive QUIC datagram", failure.code()));
+                        }
+                    } catch (const core::Error &failure) {
+                        self->fail(failure);
+                    } catch (...) {
+                        self->fail(core::Error{
+                            core::ErrorCode::transport_io, "failed to receive QUIC datagram", {}});
+                    }
+                    self->check_teardown();
+                });
+            }
+            void set_stopped() && noexcept {
+                const auto self = std::move(this->self);
+                boost::asio::dispatch(self->executor_, [self] {
+                    self->receiving_ = false;
+                    self->check_teardown();
+                });
+            }
+        };
+        auto buffer = std::make_shared<ReceiveBuffer>();
+        auto sender = datagram_->async_receive_from(boost::asio::buffer(buffer->bytes));
+        async::start_with_receiver(std::move(sender), ReceiveReceiver{shared_from_this(), buffer});
     }
 
     void process_datagram(const std::uint8_t *data, std::size_t length,
@@ -1075,28 +1112,66 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         sending_ = true;
         auto packet = std::make_shared<std::vector<std::uint8_t>>(std::move(outgoing_.front()));
         outgoing_.pop_front();
-        const auto self = shared_from_this();
-        datagram_->async_send_to(
-            boost::asio::buffer(*packet), core::DatagramAddress::from_endpoint(remote_endpoint_),
-            [self, packet](const boost::system::error_code &error, std::size_t length) {
-                boost::asio::dispatch(self->executor_, [self, packet, error, length] {
+        struct SendReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<Impl> self;
+            std::shared_ptr<std::vector<std::uint8_t>> packet;
+            void set_value(std::size_t length) && noexcept {
+                // Hoist before the move below: argument evaluation order
+                // is unspecified, so reading self->executor_ next to
+                // [self = std::move(self)] may observe the moved-from state.
+                auto executor = self->executor_;
+                boost::asio::dispatch(std::move(executor), [self = std::move(self),
+                                                            packet = std::move(packet), length] {
                     self->sending_ = false;
+                    self->check_teardown();
                     if (self->retired_) {
                         return;
                     }
-                    if (error || length != packet->size()) {
-                        self->fail(error ? transport_error("failed to send QUIC datagram", error)
-                                         : core::Error{core::ErrorCode::transport_io,
-                                                       "QUIC datagram was only partially sent",
-                                                       {}});
+                    if (length != packet->size()) {
+                        self->fail(core::Error{core::ErrorCode::transport_io,
+                                               "QUIC datagram was only partially sent",
+                                               {}});
                         return;
                     }
                     self->send_next_packet();
                     if (self->outgoing_.empty()) {
                         self->request_write();
                     }
+                    self->check_teardown();
                 });
-            });
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                const auto self = std::move(this->self);
+                boost::asio::dispatch(self->executor_, [self, error = std::move(error)] {
+                    self->sending_ = false;
+                    self->check_teardown();
+                    if (self->retired_) {
+                        return;
+                    }
+                    try {
+                        std::rethrow_exception(std::move(error));
+                    } catch (const core::Error &failure) {
+                        self->fail(failure);
+                    } catch (...) {
+                        self->fail(core::Error{
+                            core::ErrorCode::transport_io, "failed to send QUIC datagram", {}});
+                    }
+                    self->check_teardown();
+                });
+            }
+            void set_stopped() && noexcept {
+                const auto self = std::move(this->self);
+                boost::asio::dispatch(self->executor_, [self] {
+                    self->sending_ = false;
+                    self->check_teardown();
+                });
+            }
+        };
+        auto sender = datagram_->async_send_to(
+            boost::asio::buffer(*packet), io::DatagramAddress::from_endpoint(remote_endpoint_));
+        async::start_with_receiver(std::move(sender),
+                                   SendReceiver{shared_from_this(), std::move(packet)});
     }
 
     void schedule_expiry() {
@@ -1146,13 +1221,33 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         multiplexed_streams_.clear();
         active_streams_.clear();
         if (datagram_) {
+            // Cancel and close promptly, but do not release: sender ops
+            // parked on the handle (receive_next/send_next_packet) keep
+            // the Impl alive through their receivers and must still see
+            // a live handle when they complete. The handle dies with the
+            // Impl once they drain.
             datagram_->cancel();
             datagram_->close();
-            datagram_.reset();
         }
         release_protocol();
+        // Join the pump before reporting: parked sender ops still hold
+        // receivers that dispatch back to this strand, so the failure
+        // notification (and everything downstream of it, up to process
+        // teardown) waits until they have drained. Reporting early lets
+        // the caller stop the runtime while completions are still in
+        // flight, which destroys queued strand work out from under them.
+        check_teardown();
+    }
+
+    // Fires events_.failed once the pump has drained after fail(). Runs
+    // on the strand; every receiving_/sending_ transition funnels here.
+    void check_teardown() {
+        if (!retired_ || teardown_notified_ || receiving_ || sending_ || !error_) {
+            return;
+        }
+        teardown_notified_ = true;
         if (events_.failed) {
-            events_.failed(std::move(error));
+            events_.failed(std::move(*error_));
         }
     }
 
@@ -1174,9 +1269,10 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         multiplexed_streams_.clear();
         active_streams_.clear();
         if (datagram_) {
+            // Same lifetime rule as fail(): parked sender ops outlive
+            // this call and complete against the handle.
             datagram_->cancel();
             datagram_->close();
-            datagram_.reset();
         }
         release_protocol();
         stream_writes_.clear();
@@ -1200,7 +1296,7 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
 
     boost::asio::any_io_executor executor_;
     boost::asio::steady_timer expiry_timer_;
-    std::unique_ptr<core::DatagramHandle> datagram_;
+    std::unique_ptr<io::DatagramHandle> datagram_;
     boost::asio::ip::udp::endpoint remote_endpoint_;
     boost::asio::ip::udp::endpoint local_endpoint_;
     QuicClientOptions options_;
@@ -1231,6 +1327,7 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
     bool retired_ = false;
     bool receiving_ = false;
     bool sending_ = false;
+    bool teardown_notified_ = false;
     bool processing_datagram_ = false;
     bool writing_packets_ = false;
     bool write_again_ = false;
@@ -1892,7 +1989,7 @@ void QuicClientConnection::close() noexcept {
 
 std::shared_ptr<QuicClientConnection>
 make_quic_client_connection(boost::asio::any_io_executor executor,
-                            std::unique_ptr<core::DatagramHandle> datagram,
+                            std::unique_ptr<io::DatagramHandle> datagram,
                             boost::asio::ip::udp::endpoint remote_endpoint,
                             QuicClientOptions options, QuicClientEvents events) {
     if (!datagram) {

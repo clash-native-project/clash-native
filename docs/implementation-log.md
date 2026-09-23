@@ -2058,3 +2058,35 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-23
+
+- Migrated the DNS query operation and the QUIC UDP undercarriage to
+  io:: datagrams: `AsioDnsTransport::Operation` keeps a
+  `unique_ptr<io::DatagramHandle>` and drives send/receive through
+  `start_with_receiver` receivers (mismatch re-arms the receive, stop
+  and generation guards preserved); `QuicClientConnection` now takes
+  `unique_ptr<io::DatagramHandle>`, with `receive_next` and
+  `send_next_packet` running through sender receivers that hop back to
+  the connection strand; the QUIC DNS transport passes the opened
+  handle straight through. Deleted `IoToCoreDatagram` and
+  `adapt_io_to_core_datagram`.
+- Two repairs found while validating the QUIC flip with
+  `DnsTransportTest.FailsWhenQuicDnsUpstreamIsUnavailable` (fast
+  ECONNREFUSED on loopback). First, `dispatch(self->executor_,
+  [self = std::move(self), ...])` is an unspecified-evaluation-order
+  use-after-move: clang evaluates the lambda first and the executor
+  read observes the moved-from handle; the executor is now hoisted
+  into a local before the move. Never name an object in one call
+  argument while moving from it in a sibling argument. Second,
+  `fail()`/`retire()` now cancel and close the datagram without
+  releasing it (parked sender ops still complete against the handle,
+  which dies with the Impl), and `fail()` defers `events_.failed`
+  through `check_teardown()` until both pump flags drain, so the
+  session can no longer report (and let the caller stop the runtime)
+  while completions are still in flight; every flag transition
+  funnels through the check. The check must run before the
+  retired early-returns, which was caught during the same debugging.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed (the QUIC unavailable-upstream test 10/10);
+  `pixi run format`, `format-check`, and `git diff --check` pass.
