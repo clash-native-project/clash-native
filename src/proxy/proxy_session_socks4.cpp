@@ -1,12 +1,12 @@
 #include "proxy_session.hpp"
 
-#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
-
-#include <exec/task.hpp>
 
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
+
+#include <exec/asio/use_sender.hpp>
+#include <exec/task.hpp>
 
 #include <algorithm>
 #include <iterator>
@@ -42,28 +42,22 @@ std::optional<std::size_t> null_position(const std::vector<std::uint8_t> &payloa
 } // namespace
 
 exec::task<void> ProxySession::run_socks4_request(std::shared_ptr<ProxySession> self) {
-    using ReadSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
-                                                    stdexec::set_error_t(std::exception_ptr),
-                                                    stdexec::set_stopped_t()>;
     try {
-        co_await async::callback_sender<ReadSigs>(
-            [self](auto terminal) mutable {
-                boost::asio::async_read(self->client_,
-                                        boost::asio::buffer(self->socks4_request_.data() + 1,
-                                                            self->socks4_request_.size() - 1),
-                                        std::move(terminal));
-            },
-            [](auto receiver, const boost::system::error_code &error, auto) {
-                if (error) {
-                    stdexec::set_error(
-                        std::move(receiver),
-                        std::make_exception_ptr(core::Error{
-                            core::ErrorCode::transport_io, "SOCKS4 handshake read failed",
-                            std::error_code(error.value(), std::system_category())}));
-                    return;
-                }
-                stdexec::set_value(std::move(receiver), true);
-            });
+        co_await (boost::asio::async_read(self->client_,
+                                          boost::asio::buffer(self->socks4_request_.data() + 1,
+                                                              self->socks4_request_.size() - 1),
+                                          exec::asio::use_sender) |
+                  stdexec::then([](std::size_t) {}) |
+                  stdexec::let_error([](std::exception_ptr error) {
+                      try {
+                          std::rethrow_exception(std::move(error));
+                      } catch (const boost::system::system_error &failure) {
+                          return stdexec::just_error(std::make_exception_ptr(core::Error{
+                              core::ErrorCode::transport_io, "SOCKS4 handshake read failed",
+                              std::error_code(failure.code().value(), std::system_category())}));
+                      }
+                      std::rethrow_exception(std::current_exception());
+                  }));
     } catch (...) {
         self->close();
         co_return;
@@ -208,26 +202,20 @@ exec::task<void> ProxySession::run_socks4_reply(std::shared_ptr<ProxySession> se
     self->socks4_reply_[1] = status;
     std::copy(self->socks4_request_.begin() + 2, self->socks4_request_.begin() + 8,
               self->socks4_reply_.begin() + 2);
-    using WriteSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
-                                                     stdexec::set_error_t(std::exception_ptr),
-                                                     stdexec::set_stopped_t()>;
     try {
-        co_await async::callback_sender<WriteSigs>(
-            [self](auto terminal) mutable {
-                boost::asio::async_write(self->client_, boost::asio::buffer(self->socks4_reply_),
-                                         std::move(terminal));
-            },
-            [](auto receiver, const boost::system::error_code &error, auto) {
-                if (error) {
-                    stdexec::set_error(
-                        std::move(receiver),
-                        std::make_exception_ptr(core::Error{
-                            core::ErrorCode::transport_io, "SOCKS4 handshake write failed",
-                            std::error_code(error.value(), std::system_category())}));
-                    return;
-                }
-                stdexec::set_value(std::move(receiver), true);
-            });
+        co_await (boost::asio::async_write(self->client_, boost::asio::buffer(self->socks4_reply_),
+                                           exec::asio::use_sender) |
+                  stdexec::then([](std::size_t) {}) |
+                  stdexec::let_error([](std::exception_ptr error) {
+                      try {
+                          std::rethrow_exception(std::move(error));
+                      } catch (const boost::system::system_error &failure) {
+                          return stdexec::just_error(std::make_exception_ptr(core::Error{
+                              core::ErrorCode::transport_io, "SOCKS4 handshake write failed",
+                              std::error_code(failure.code().value(), std::system_category())}));
+                      }
+                      std::rethrow_exception(std::current_exception());
+                  }));
     } catch (...) {
         self->close();
         co_return;

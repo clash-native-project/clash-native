@@ -1,8 +1,10 @@
 #include <clash_native/async/bridge.hpp>
 #include <clash_native/async/callback_sender.hpp>
+
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/trojan_outbound.hpp>
 #include <clash_native/transport/tls_client.hpp>
+#include <exec/asio/use_sender.hpp>
 
 #include "outbound_utils.hpp"
 #include "proxy_address.hpp"
@@ -103,26 +105,22 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     static exec::task<void>
     run(std::shared_ptr<TrojanConnectOperation> self,
         std::shared_ptr<std::vector<boost::asio::ip::tcp::endpoint>> endpoints) {
-        using ConnectSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
-                                                           stdexec::set_error_t(std::exception_ptr),
-                                                           stdexec::set_stopped_t()>;
         try {
             try {
-                co_await async::callback_sender<ConnectSigs>(
-                    [self, endpoints](auto terminal) mutable {
-                        boost::asio::async_connect(*self->socket_, *endpoints, std::move(terminal));
-                    },
-                    [](auto receiver, const boost::system::error_code &error, auto) {
-                        if (error) {
-                            stdexec::set_error(std::move(receiver),
-                                               std::make_exception_ptr(
-                                                   core::Error{core::ErrorCode::endpoint_connection,
-                                                               "failed to connect to Trojan server",
-                                                               to_std_error(error)}));
-                            return;
+                co_await (
+                    boost::asio::async_connect(*self->socket_, *endpoints, exec::asio::use_sender) |
+                    stdexec::then([](const boost::asio::ip::tcp::endpoint &) {}) |
+                    stdexec::let_error([](std::exception_ptr error) {
+                        try {
+                            std::rethrow_exception(std::move(error));
+                        } catch (const boost::system::system_error &failure) {
+                            return stdexec::just_error(std::make_exception_ptr(
+                                core::Error{core::ErrorCode::endpoint_connection,
+                                            "failed to connect to Trojan server",
+                                            to_std_error(failure.code())}));
                         }
-                        stdexec::set_value(std::move(receiver), true);
-                    });
+                        std::rethrow_exception(std::current_exception());
+                    }));
             } catch (const core::Error &failure) {
                 self->finish(core::StreamOpenResult::failed(failure));
                 co_return;

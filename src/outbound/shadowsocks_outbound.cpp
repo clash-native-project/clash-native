@@ -32,6 +32,7 @@
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/system/errc.hpp>
+#include <exec/asio/use_sender.hpp>
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
 
@@ -758,26 +759,22 @@ class ShadowsocksConnectOperation final
     static exec::task<void>
     connect_tcp(std::shared_ptr<ShadowsocksConnectOperation> self,
                 std::shared_ptr<std::vector<boost::asio::ip::tcp::endpoint>> endpoints) {
-        using ConnectSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
-                                                           stdexec::set_error_t(std::exception_ptr),
-                                                           stdexec::set_stopped_t()>;
         try {
             try {
-                co_await async::callback_sender<ConnectSigs>(
-                    [self, endpoints](auto terminal) mutable {
-                        boost::asio::async_connect(*self->socket_, *endpoints, std::move(terminal));
-                    },
-                    [](auto receiver, const boost::system::error_code &error, auto) {
-                        if (error) {
-                            stdexec::set_error(std::move(receiver),
-                                               std::make_exception_ptr(core::Error{
-                                                   core::ErrorCode::endpoint_connection,
-                                                   "failed to connect to Shadowsocks server",
-                                                   detail::to_std_error(error)}));
-                            return;
+                co_await (
+                    boost::asio::async_connect(*self->socket_, *endpoints, exec::asio::use_sender) |
+                    stdexec::then([](const boost::asio::ip::tcp::endpoint &) {}) |
+                    stdexec::let_error([self](std::exception_ptr error) {
+                        try {
+                            std::rethrow_exception(std::move(error));
+                        } catch (const boost::system::system_error &failure) {
+                            return stdexec::just_error(std::make_exception_ptr(
+                                core::Error{core::ErrorCode::endpoint_connection,
+                                            "failed to connect to Shadowsocks server",
+                                            detail::to_std_error(failure.code())}));
                         }
-                        stdexec::set_value(std::move(receiver), true);
-                    });
+                        std::rethrow_exception(std::current_exception());
+                    }));
             } catch (const core::Error &failure) {
                 self->finish(core::StreamOpenResult::failed(failure));
                 co_return;
@@ -1207,26 +1204,20 @@ class ShadowsocksConnectOperation final
             if (self->carrier_) {
                 co_await self->carrier_->async_write(boost::asio::buffer(*wire));
             } else {
-                using WriteSigs =
-                    stdexec::completion_signatures<stdexec::set_value_t(bool),
-                                                   stdexec::set_error_t(std::exception_ptr),
-                                                   stdexec::set_stopped_t()>;
-                co_await async::callback_sender<WriteSigs>(
-                    [self, wire](auto terminal) mutable {
-                        boost::asio::async_write(*self->socket_, boost::asio::buffer(*wire),
-                                                 std::move(terminal));
-                    },
-                    [](auto receiver, const boost::system::error_code &error, auto) {
-                        if (error) {
-                            stdexec::set_error(std::move(receiver),
-                                               std::make_exception_ptr(core::Error{
-                                                   core::ErrorCode::transport_io,
-                                                   "failed to write Shadowsocks TCP request",
-                                                   detail::to_std_error(error)}));
-                            return;
-                        }
-                        stdexec::set_value(std::move(receiver), true);
-                    });
+                co_await (boost::asio::async_write(*self->socket_, boost::asio::buffer(*wire),
+                                                   exec::asio::use_sender) |
+                          stdexec::then([](std::size_t) {}) |
+                          stdexec::let_error([](std::exception_ptr error) {
+                              try {
+                                  std::rethrow_exception(std::move(error));
+                              } catch (const boost::system::system_error &failure) {
+                                  return stdexec::just_error(std::make_exception_ptr(
+                                      core::Error{core::ErrorCode::transport_io,
+                                                  "failed to write Shadowsocks TCP request",
+                                                  detail::to_std_error(failure.code())}));
+                              }
+                              std::rethrow_exception(std::current_exception());
+                          }));
             }
         } catch (const core::Error &failure) {
             self->finish(core::StreamOpenResult::failed(
@@ -1436,26 +1427,20 @@ class ShadowsocksConnectOperation final
             if (self->carrier_) {
                 co_await self->carrier_->async_write(boost::asio::buffer(*wire));
             } else {
-                using WriteSigs =
-                    stdexec::completion_signatures<stdexec::set_value_t(bool),
-                                                   stdexec::set_error_t(std::exception_ptr),
-                                                   stdexec::set_stopped_t()>;
-                co_await async::callback_sender<WriteSigs>(
-                    [self, wire](auto terminal) mutable {
-                        boost::asio::async_write(*self->socket_, boost::asio::buffer(*wire),
-                                                 std::move(terminal));
-                    },
-                    [](auto receiver, const boost::system::error_code &error, auto) {
-                        if (error) {
-                            stdexec::set_error(std::move(receiver),
-                                               std::make_exception_ptr(core::Error{
-                                                   core::ErrorCode::transport_io,
-                                                   "failed to write Shadowsocks legacy request",
-                                                   detail::to_std_error(error)}));
-                            return;
-                        }
-                        stdexec::set_value(std::move(receiver), true);
-                    });
+                co_await (boost::asio::async_write(*self->socket_, boost::asio::buffer(*wire),
+                                                   exec::asio::use_sender) |
+                          stdexec::then([](std::size_t) {}) |
+                          stdexec::let_error([](std::exception_ptr error) {
+                              try {
+                                  std::rethrow_exception(std::move(error));
+                              } catch (const boost::system::system_error &failure) {
+                                  return stdexec::just_error(std::make_exception_ptr(
+                                      core::Error{core::ErrorCode::transport_io,
+                                                  "failed to write Shadowsocks legacy request",
+                                                  detail::to_std_error(failure.code())}));
+                              }
+                              std::rethrow_exception(std::current_exception());
+                          }));
             }
         } catch (const core::Error &failure) {
             self->finish(core::StreamOpenResult::failed(

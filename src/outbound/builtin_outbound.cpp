@@ -1,5 +1,4 @@
 #include <clash_native/async/bridge.hpp>
-#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
@@ -8,6 +7,7 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
 
+#include <exec/asio/use_sender.hpp>
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
 
@@ -137,27 +137,22 @@ class DirectConnectOperation final : public std::enable_shared_from_this<DirectC
         for (const auto &address : addresses) {
             endpoints->emplace_back(address, self->request_.destination.port());
         }
-        using ConnectSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
-                                                           stdexec::set_error_t(std::exception_ptr),
-                                                           stdexec::set_stopped_t()>;
         try {
-            co_await async::callback_sender<ConnectSigs>(
-                [self, endpoints](auto terminal) mutable {
-                    boost::asio::async_connect(self->socket_, *endpoints, std::move(terminal));
-                },
-                [self](auto receiver, const boost::system::error_code &error, auto) {
-                    if (error) {
-                        stdexec::set_error(
-                            std::move(receiver),
-                            std::make_exception_ptr(connection_error(
-                                core::ErrorCode::endpoint_connection,
-                                fmt::format("failed to connect direct target {}",
-                                            destination_text(self->request_.destination)),
-                                error)));
-                        return;
+            co_await (
+                boost::asio::async_connect(self->socket_, *endpoints, exec::asio::use_sender) |
+                stdexec::then([](const boost::asio::ip::tcp::endpoint &) {}) |
+                stdexec::let_error([self](std::exception_ptr error) {
+                    try {
+                        std::rethrow_exception(std::move(error));
+                    } catch (const boost::system::system_error &failure) {
+                        return stdexec::just_error(std::make_exception_ptr(connection_error(
+                            core::ErrorCode::endpoint_connection,
+                            fmt::format("failed to connect direct target {}",
+                                        destination_text(self->request_.destination)),
+                            failure.code())));
                     }
-                    stdexec::set_value(std::move(receiver), true);
-                });
+                    std::rethrow_exception(std::current_exception());
+                }));
         } catch (const core::Error &failure) {
             self->complete(failure);
             co_return;

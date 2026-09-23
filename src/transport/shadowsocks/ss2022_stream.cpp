@@ -11,6 +11,8 @@
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 
+#include <exec/asio/use_sender.hpp>
+
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
 
@@ -773,27 +775,22 @@ class Shadowsocks2022OpenOperation final
                         std::vector<std::uint8_t>{}, self->obfs_options_->mode))));
             co_return;
         }
-        using WriteSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
-                                                         stdexec::set_error_t(std::exception_ptr),
-                                                         stdexec::set_stopped_t()>;
         try {
-            co_await async::callback_sender<WriteSigs>(
-                [self, wire](auto terminal) mutable {
-                    boost::asio::async_write(*self->socket_, boost::asio::buffer(*wire),
-                                             std::move(terminal));
-                },
-                [](auto receiver, const boost::system::error_code &error, auto) {
-                    if (error) {
-                        stdexec::set_error(
-                            std::move(receiver),
-                            std::make_exception_ptr(core::Error{
-                                core::ErrorCode::transport_io,
-                                "failed to write Shadowsocks 2022 request",
-                                std::error_code(error.value(), std::system_category())}));
-                        return;
+            co_await (
+                boost::asio::async_write(*self->socket_, boost::asio::buffer(*wire),
+                                         exec::asio::use_sender) |
+                stdexec::then([](std::size_t) {}) |
+                stdexec::let_error([](std::exception_ptr error) {
+                    try {
+                        std::rethrow_exception(std::move(error));
+                    } catch (const boost::system::system_error &failure) {
+                        return stdexec::just_error(std::make_exception_ptr(core::Error{
+                            core::ErrorCode::transport_io,
+                            "failed to write Shadowsocks 2022 request",
+                            std::error_code(failure.code().value(), std::system_category())}));
                     }
-                    stdexec::set_value(std::move(receiver), true);
-                });
+                    std::rethrow_exception(std::current_exception());
+                }));
         } catch (const core::Error &failure) {
             self->complete(core::StreamOpenResult::failed(failure));
             co_return;

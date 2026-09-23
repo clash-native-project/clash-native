@@ -2237,3 +2237,17 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   pump/timer loops (kcptun/smux/UoT/cipher states, gRPC/WS frames),
   registry-pattern APIs (DNS resolvers, bootstrap), single-call
   bridged leaves (obfs helpers), and the test-only gRPC client API.
+
+## 2026-09-24
+
+- Replaced task-local `callback_sender` wrappers over value-carrying
+  Asio initiations with `exec::asio::use_sender` plus `then`/`let_error`
+  error-context mapping (direct/Trojan/SS/HTTP-proxy connects, SS
+  TCP request writes, SOCKS5/4 handshake reads/writes, ss2022 socket
+  write). Deliberately kept: void-signature initiations (`use_sender`
+  only supports value-carrying signatures — Beast handshake, steady
+  timers), in-band `HttpOpResult` sites in http1_client, custom
+  non-Asio initiations, and all state-machine shells/pumps.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.

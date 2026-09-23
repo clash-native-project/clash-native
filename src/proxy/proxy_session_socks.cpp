@@ -4,13 +4,14 @@
 #include "outbound/proxy_address.hpp"
 #include "socks5_udp_listener.hpp"
 
-#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 #include <fmt/format.h>
+
+#include <exec/asio/use_sender.hpp>
 #include <spdlog/spdlog.h>
 
 #include <exec/task.hpp>
@@ -43,46 +44,32 @@ std::uint8_t socks_error_code(const std::optional<core::Error> &error) {
 // close(), matching the old per-step error branches.
 exec::task<void> ProxySession::read_handshake_exact(std::shared_ptr<ProxySession> self,
                                                     boost::asio::mutable_buffer buffer) {
-    using ReadSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
-                                                    stdexec::set_error_t(std::exception_ptr),
-                                                    stdexec::set_stopped_t()>;
-    co_await async::callback_sender<ReadSigs>(
-        [self, buffer](auto terminal) mutable {
-            boost::asio::async_read(self->client_, buffer, std::move(terminal));
-        },
-        [](auto receiver, const boost::system::error_code &error, auto) {
-            if (error) {
-                stdexec::set_error(
-                    std::move(receiver),
-                    std::make_exception_ptr(
-                        core::Error{core::ErrorCode::transport_io, "SOCKS5 handshake read failed",
-                                    std::error_code(error.value(), std::system_category())}));
-                return;
-            }
-            stdexec::set_value(std::move(receiver), true);
-        });
+    co_await (boost::asio::async_read(self->client_, buffer, exec::asio::use_sender) |
+              stdexec::then([](std::size_t) {}) | stdexec::let_error([](std::exception_ptr error) {
+                  try {
+                      std::rethrow_exception(std::move(error));
+                  } catch (const boost::system::system_error &failure) {
+                      return stdexec::just_error(std::make_exception_ptr(core::Error{
+                          core::ErrorCode::transport_io, "SOCKS5 handshake read failed",
+                          std::error_code(failure.code().value(), std::system_category())}));
+                  }
+                  std::rethrow_exception(std::current_exception());
+              }));
 }
 
 exec::task<void> ProxySession::write_handshake_all(std::shared_ptr<ProxySession> self,
                                                    boost::asio::const_buffer buffer) {
-    using WriteSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
-                                                     stdexec::set_error_t(std::exception_ptr),
-                                                     stdexec::set_stopped_t()>;
-    co_await async::callback_sender<WriteSigs>(
-        [self, buffer](auto terminal) mutable {
-            boost::asio::async_write(self->client_, buffer, std::move(terminal));
-        },
-        [](auto receiver, const boost::system::error_code &error, auto) {
-            if (error) {
-                stdexec::set_error(
-                    std::move(receiver),
-                    std::make_exception_ptr(
-                        core::Error{core::ErrorCode::transport_io, "SOCKS5 handshake write failed",
-                                    std::error_code(error.value(), std::system_category())}));
-                return;
-            }
-            stdexec::set_value(std::move(receiver), true);
-        });
+    co_await (boost::asio::async_write(self->client_, buffer, exec::asio::use_sender) |
+              stdexec::then([](std::size_t) {}) | stdexec::let_error([](std::exception_ptr error) {
+                  try {
+                      std::rethrow_exception(std::move(error));
+                  } catch (const boost::system::system_error &failure) {
+                      return stdexec::just_error(std::make_exception_ptr(core::Error{
+                          core::ErrorCode::transport_io, "SOCKS5 handshake write failed",
+                          std::error_code(failure.code().value(), std::system_category())}));
+                  }
+                  std::rethrow_exception(std::current_exception());
+              }));
 }
 
 // Straight-line SOCKS5 handshake: method negotiation, optional username /
