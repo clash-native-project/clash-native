@@ -274,9 +274,8 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     // Single-use forward session: stop() alone tears it down, so no
     // per-exchange id is kept (the io:: vocabulary cancels via stop).
     std::shared_ptr<io::ExchangeSession> http_session_;
-    // Exchange-plane debt: the upgrade tunnel already runs on io:: while the
-    // forward path still needs the transport upload body; the two sessions
-    // merge when the forward path flips.
+    // Separate session for the upgrade (CONNECT tunnel) path; the forward
+    // path uses http_session_ above.
     std::shared_ptr<io::ExchangeSession> http_tunnel_session_;
     io::StreamUpgradeRequest http_upgrade_request_;
     io::StreamingExchangeResponse http_forward_response_;

@@ -149,8 +149,7 @@ void QuicDnsTransport::Operation::start_on_strand() {
 
         // Copyable strand hop: ferrying move-only captures through
         // asio::dispatch on this path proved unreliable, so the payload
-        // rides a shared state instead. Sessions-plane debt with the
-        // adapter above.
+        // rides a shared state instead.
         static void dispatch_opened(std::shared_ptr<Operation> operation,
                                     std::unique_ptr<io::DatagramHandle> handle,
                                     std::optional<core::Error> error) noexcept {

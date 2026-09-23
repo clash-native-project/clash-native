@@ -2169,3 +2169,12 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-24
+
+- Comment hygiene: removed stale debt notes that referenced the
+  deleted datagram adapter (QUIC DNS strand hop) and the already
+  migrated forward upload body (proxy upgrade session).
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.
