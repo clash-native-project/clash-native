@@ -2225,3 +2225,15 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-24
+
+- Coroutine pass assessment: all linear connect/handshake chains are
+  now tasks (SS/Direct/Trojan/HTTP-proxy connects, SOCKS4/5
+  handshakes, proxy routing, ss2022/shadow-tls/WS-plugin/WS-client
+  opens, DNS DoH1/2/DoT chains). Deliberately left callback-shaped:
+  Botan-driven opens (restls/jls/shadow-tls-v3), ngtcp2/nghttp/beast
+  event loops (QUIC, HTTP/2/3 sessions, HTTP forward orchestration),
+  pump/timer loops (kcptun/smux/UoT/cipher states, gRPC/WS frames),
+  registry-pattern APIs (DNS resolvers, bootstrap), single-call
+  bridged leaves (obfs helpers), and the test-only gRPC client API.
