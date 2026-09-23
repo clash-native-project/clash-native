@@ -2261,3 +2261,10 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   field order, exchange-ID DNS registry shape, owned (non-Dart)
   channel primitives, no `request_stop` teardown flow, completed
   Stage 2/3 and partial Stage 4 statuses.
+
+## 2026-09-24
+
+- Closed the known-issues entry on the four plain-UDP DNS timeout
+  tests: root cause was local AdGuard filtering intercepting loopback
+  UDP DNS traffic, not a project defect. Verified all four pass on
+  the current Windows x64 Release build.

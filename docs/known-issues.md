@@ -4,31 +4,28 @@ This document records observed issues that are deferred for later investigation.
 
 ## Four plain-UDP DNS timeout tests on Windows
 
-- **Status:** Deferred; reproducible baseline issue on the Windows x64 test
-  profile.
+- **Status:** Closed as environmental; no longer reproduces on the Windows
+  x64 test profile.
 - **Scope:** Plain DNS over UDP on the IPv4 loopback, using the local fake DNS
   servers in the test suite. This does not cover DoT, DoH, DoQ, or DoH/3.
+- **Root cause:** local AdGuard filtering intercepted the loopback UDP DNS
+  traffic, so the fake servers' replies never completed the expected
+exchanges. Not a project defect.
 
-The following tests time out instead of completing their expected UDP exchange:
+The following tests used to time out instead of completing their expected
+UDP exchange:
 
 - `ResolverServiceTest.SeparatesCacheEntriesByEdnsSemanticsButIgnoresTransactionId`
 - `ResolverServiceTest.IgnoresResponsesFromUnexpectedUdpSender`
 - `ResolverServiceTest.IgnoresResponsesWithAnUnexpectedQuestion`
 - `ResolverServiceTransportTest.UsesNamedOutboundForPlainUdpEgress`
 
-The first test times out the first EDNS query before the fake server observes a
-usable response, so the second semantic variant does not create its separate
-cache entry. The next two tests intentionally reject a response from the wrong
-sender or with the wrong question and should then complete through the fallback
-server; instead the fallback exchange remains pending until the resolver
-deadline. The named-outbound test opens `DirectOutbound` and reports a
-successful UDP send, but its loopback fake server does not complete the reply,
-so the DNS operation reaches its 500 ms deadline.
-
 The failures were reproduced with the current build and with the pre-KCP
-`stage2-clang-cl-x64` test binary. They therefore predate the kcptun/KCP
-change and are not evidence of a KCP or encrypted-DNS regression. The exact
-Windows UDP scheduling or loopback interaction remains to be isolated.
+`stage2-clang-cl-x64` test binary. They therefore predated the kcptun/KCP
+change and were never evidence of a KCP or encrypted-DNS regression.
+Later full-suite runs pass these tests consistently. If they reappear,
+check for local DNS-filtering software (AdGuard or equivalent) before
+investigating the project code.
 
 ## Classic Shadowsocks half-close exposes Windows relay EOF behavior
 
