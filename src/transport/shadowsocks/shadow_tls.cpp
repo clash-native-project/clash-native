@@ -2,10 +2,12 @@
 #include <clash_native/transport/shadowsocks/shadow_tls_v3.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
+
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/shadowsocks/crypto.hpp>
 #include <clash_native/transport/tls_client.hpp>
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/post.hpp>
@@ -461,80 +463,94 @@ class ShadowTlsOpenOperation final : public std::enable_shared_from_this<ShadowT
         : stream_(std::move(stream)), options_(std::move(options)), handler_(std::move(handler)),
           delay_timer_(stream_->executor()) {}
 
-    void start() {
-        if (options_.version < 1 || options_.version > 3) {
-            finish(core::fail(configuration_error("Shadow-TLS version must be 1, 2, or 3")));
-            return;
+    void start() { scope_.spawn(run_open(shared_from_this())); }
+
+    static exec::task<void> run_open(std::shared_ptr<ShadowTlsOpenOperation> self) {
+        if (self->options_.version < 1 || self->options_.version > 3) {
+            self->finish(core::fail(configuration_error("Shadow-TLS version must be 1, 2, or 3")));
+            co_return;
         }
-        if (options_.host.empty()) {
-            finish(core::fail(configuration_error("Shadow-TLS host is required")));
-            return;
+        if (self->options_.host.empty()) {
+            self->finish(core::fail(configuration_error("Shadow-TLS host is required")));
+            co_return;
         }
-        if (options_.version == 2) {
-            stream_ = std::make_unique<HashingReadStream>(std::move(stream_), options_.password);
+        if (self->options_.version == 2) {
+            self->stream_ = std::make_unique<HashingReadStream>(std::move(self->stream_),
+                                                                self->options_.password);
         }
         transport::TlsClientOptions tls_options;
-        tls_options.server_name = options_.host;
-        tls_options.verify_peer = !options_.skip_cert_verify;
-        tls_options.alpn_protocols = options_.alpn_protocols;
+        tls_options.server_name = self->options_.host;
+        tls_options.verify_peer = !self->options_.skip_cert_verify;
+        tls_options.alpn_protocols = self->options_.alpn_protocols;
         tls_options.handoff_raw_transport = true;
-        if (options_.version == 1 || options_.version == 2) {
+        if (self->options_.version == 1 || self->options_.version == 2) {
             tls_options.maximum_tls_version = TLS1_2_VERSION;
         }
-        struct TlsReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<ShadowTlsOpenOperation> self;
-            void set_value(transport::TlsClientConnection result) && noexcept {
-                self->on_tls_handshake(std::move(result));
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->finish(core::fail(failure));
-                } catch (...) {
-                    self->finish(core::fail(protocol_error("Shadow-TLS handshake failed")));
-                }
-            }
-            void set_stopped() && noexcept { self->finish(core::fail(cancelled_error())); }
-        };
-        auto self = shared_from_this();
-        // No explicit cancel: completion guards drop late terminals.
-        async::start_with_receiver(
-            transport::async_tls_client_handshake(std::move(stream_), std::move(tls_options)),
-            TlsReceiver{self});
-    }
-
-    void on_tls_handshake(transport::TlsClientConnection result) {
-        if (options_.version == 1) {
-            finish(std::move(result.stream));
-            return;
+        transport::TlsClientConnection established;
+        try {
+            // No explicit cancel: completion guards drop late terminals.
+            established = co_await transport::async_tls_client_handshake(std::move(self->stream_),
+                                                                         std::move(tls_options));
+        } catch (const core::Error &failure) {
+            self->finish(core::fail(failure));
+            co_return;
+        } catch (...) {
+            self->finish(core::fail(protocol_error("Shadow-TLS handshake failed")));
+            co_return;
         }
-        auto *hashing = dynamic_cast<HashingReadStream *>(result.stream.get());
+        if (self->completed_) {
+            co_return;
+        }
+        if (self->options_.version == 1) {
+            self->finish(std::move(established.stream));
+            co_return;
+        }
+        auto *hashing = dynamic_cast<HashingReadStream *>(established.stream.get());
         if (!hashing) {
-            finish(core::fail(protocol_error("Shadow-TLS v2 handshake lost its hash stream")));
-            return;
+            self->finish(
+                core::fail(protocol_error("Shadow-TLS v2 handshake lost its hash stream")));
+            co_return;
         }
         auto hash = hashing->digest8();
         if (hash.size() != 8) {
-            finish(core::fail(
+            self->finish(core::fail(
                 protocol_error("Shadow-TLS v2 handshake did not produce a server hash")));
-            return;
+            co_return;
         }
-        auto raw = std::move(result.stream);
-        auto framed = std::make_shared<ShadowTlsV2Stream>(std::move(raw), std::move(hash));
-        delayed_stream_ =
+        auto framed =
+            std::make_shared<ShadowTlsV2Stream>(std::move(established.stream), std::move(hash));
+        self->delayed_stream_ =
             std::make_unique<SharedStreamAdapter<ShadowTlsV2Stream>>(std::move(framed));
-        const auto self = shared_from_this();
-        delay_timer_.expires_after(std::chrono::milliseconds(20));
-        delay_timer_.async_wait([self](const boost::system::error_code &error) {
-            if (error) {
-                self->finish(
-                    core::fail(io_error("Shadow-TLS v2 post-handshake delay failed", error)));
-                return;
-            }
-            self->finish(std::move(self->delayed_stream_));
-        });
+        using DelaySigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
+                                                         stdexec::set_error_t(std::exception_ptr),
+                                                         stdexec::set_stopped_t()>;
+        try {
+            co_await async::callback_sender<DelaySigs>(
+                [self](auto terminal) mutable {
+                    self->delay_timer_.expires_after(std::chrono::milliseconds(20));
+                    self->delay_timer_.async_wait(std::move(terminal));
+                },
+                [](auto receiver, const boost::system::error_code &error) {
+                    if (error) {
+                        stdexec::set_error(
+                            std::move(receiver),
+                            std::make_exception_ptr(
+                                io_error("Shadow-TLS v2 post-handshake delay failed", error)));
+                        return;
+                    }
+                    stdexec::set_value(std::move(receiver), true);
+                });
+        } catch (const core::Error &failure) {
+            self->finish(core::fail(failure));
+            co_return;
+        } catch (...) {
+            self->finish(core::fail(protocol_error("Shadow-TLS v2 post-handshake delay failed")));
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        self->finish(std::move(self->delayed_stream_));
     }
 
     void finish(core::Result<std::unique_ptr<io::StreamHandle>> result) {
@@ -559,6 +575,7 @@ class ShadowTlsOpenOperation final : public std::enable_shared_from_this<ShadowT
     boost::asio::steady_timer delay_timer_;
     std::unique_ptr<io::StreamHandle> delayed_stream_;
     bool completed_ = false;
+    exec::async_scope scope_;
 };
 
 } // namespace

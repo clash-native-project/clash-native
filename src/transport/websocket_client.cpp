@@ -13,6 +13,9 @@
 #include <boost/beast/websocket.hpp>
 #include <boost/system/error_code.hpp>
 
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
+
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
@@ -601,7 +604,101 @@ class WebSocketClientHandshakeOperation final
 
     void start() {
         const auto self = shared_from_this();
-        boost::asio::post(executor_, [self] { self->begin(); });
+        boost::asio::post(executor_, [self] { self->scope_.spawn(run_open(self)); });
+    }
+
+    static exec::task<void> run_open(std::shared_ptr<WebSocketClientHandshakeOperation> self) {
+        if (const auto error = validate_options(self->options_)) {
+            self->finish(core::fail(*error));
+            co_return;
+        }
+        if (self->options_.deadline) {
+            if (*self->options_.deadline <= std::chrono::steady_clock::now()) {
+                self->finish(core::fail(timeout_error()));
+                co_return;
+            }
+            self->timer_.expires_at(*self->options_.deadline);
+            self->timer_.async_wait([self](const boost::system::error_code &error) {
+                if (!error) {
+                    self->finish(core::fail(timeout_error()));
+                }
+            });
+        }
+        if (self->options_.tls) {
+            TlsClientOptions tls_options;
+            tls_options.server_name = self->options_.tls_server_name.empty()
+                                          ? self->options_.host
+                                          : self->options_.tls_server_name;
+            tls_options.verify_peer = self->options_.tls_verify_peer;
+            tls_options.trusted_ca_pem = self->options_.tls_trusted_ca_pem;
+            tls_options.alpn_protocols = self->options_.tls_alpn_protocols;
+            if (tls_options.alpn_protocols.empty()) {
+                tls_options.alpn_protocols = {"http/1.1"};
+            }
+            tls_options.deadline = self->options_.deadline;
+            try {
+                // No explicit cancel: completed_ drops late terminals and
+                // the operation deadline bounds orphans.
+                auto connection = co_await async_tls_client_handshake(std::move(self->stream_),
+                                                                      std::move(tls_options));
+                if (self->completed_) {
+                    if (connection.stream) {
+                        connection.stream->close();
+                    }
+                    co_return;
+                }
+                self->stream_ = std::move(connection.stream);
+            } catch (const core::Error &failure) {
+                self->finish(core::fail(failure));
+                co_return;
+            } catch (...) {
+                self->finish(core::fail(
+                    core::Error{core::ErrorCode::endpoint_connection, "WebSocket TLS failed"}));
+                co_return;
+            }
+        }
+        if (self->completed_ || !self->stream_) {
+            co_return;
+        }
+        self->websocket_ =
+            std::make_shared<BeastWebSocket>(WebSocketStreamAdapter(std::move(self->stream_)));
+        self->websocket_->set_option(
+            websocket::stream_base::timeout::suggested(boost::beast::role_type::client));
+        self->websocket_->read_message_max(self->options_.max_message_size);
+        self->websocket_->auto_fragment(true);
+        const auto headers = self->options_.headers;
+        self->websocket_->set_option(
+            websocket::stream_base::decorator([headers](websocket::request_type &request) {
+                for (const auto &header : headers) {
+                    request.set(header.name, header.value);
+                }
+            }));
+        using HandshakeSigs =
+            stdexec::completion_signatures<stdexec::set_value_t(bool),
+                                           stdexec::set_error_t(std::exception_ptr),
+                                           stdexec::set_stopped_t()>;
+        try {
+            co_await async::callback_sender<HandshakeSigs>(
+                [self](auto terminal) mutable {
+                    self->websocket_->async_handshake(self->options_.host, self->options_.target,
+                                                      std::move(terminal));
+                },
+                [](auto receiver, const boost::system::error_code &error) {
+                    if (error) {
+                        stdexec::set_error(std::move(receiver),
+                                           std::make_exception_ptr(handshake_error(error)));
+                        return;
+                    }
+                    stdexec::set_value(std::move(receiver), true);
+                });
+        } catch (const core::Error &failure) {
+            self->finish(core::fail(failure));
+            co_return;
+        } catch (...) {
+            self->finish(core::fail(handshake_error(boost::asio::error::fault)));
+            co_return;
+        }
+        boost::asio::post(self->executor_, [self] { self->complete_success(); });
     }
 
     void cancel() noexcept override {
@@ -617,119 +714,6 @@ class WebSocketClientHandshakeOperation final
     }
 
   private:
-    void begin() {
-        if (completed_) {
-            return;
-        }
-        if (const auto error = validate_options(options_)) {
-            finish(core::fail(*error));
-            return;
-        }
-        if (options_.deadline) {
-            if (*options_.deadline <= std::chrono::steady_clock::now()) {
-                finish(core::fail(timeout_error()));
-                return;
-            }
-            timer_.expires_at(*options_.deadline);
-            const auto self = shared_from_this();
-            timer_.async_wait([self](const boost::system::error_code &error) {
-                if (!error) {
-                    self->finish(core::fail(timeout_error()));
-                }
-            });
-        }
-
-        if (options_.tls) {
-            start_tls();
-            return;
-        }
-        start_websocket();
-    }
-
-    void start_tls() {
-        TlsClientOptions tls_options;
-        tls_options.server_name =
-            options_.tls_server_name.empty() ? options_.host : options_.tls_server_name;
-        tls_options.verify_peer = options_.tls_verify_peer;
-        tls_options.trusted_ca_pem = options_.tls_trusted_ca_pem;
-        tls_options.alpn_protocols = options_.tls_alpn_protocols;
-        if (tls_options.alpn_protocols.empty()) {
-            tls_options.alpn_protocols = {"http/1.1"};
-        }
-        tls_options.deadline = options_.deadline;
-        struct TlsReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<WebSocketClientHandshakeOperation> self;
-            void set_value(TlsClientConnection connection) && noexcept {
-                if (self->completed_) {
-                    if (connection.stream) {
-                        connection.stream->close();
-                    }
-                    return;
-                }
-                self->stream_ = std::move(connection.stream);
-                self->start_websocket();
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                if (self->completed_) {
-                    return;
-                }
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->finish(core::fail(failure));
-                } catch (...) {
-                    self->finish(core::fail(
-                        core::Error{core::ErrorCode::endpoint_connection, "WebSocket TLS failed"}));
-                }
-            }
-            void set_stopped() && noexcept {
-                if (self->completed_) {
-                    return;
-                }
-                self->finish(core::fail(cancelled_error()));
-            }
-        };
-        const auto self = shared_from_this();
-        // No explicit cancel: completed_ drops late terminals and the
-        // operation deadline bounds orphans.
-        async::start_with_receiver(
-            async_tls_client_handshake(std::move(stream_), std::move(tls_options)),
-            TlsReceiver{self});
-    }
-
-    void start_websocket() {
-        if (completed_ || !stream_) {
-            return;
-        }
-
-        websocket_ = std::make_shared<BeastWebSocket>(WebSocketStreamAdapter(std::move(stream_)));
-        websocket_->set_option(
-            websocket::stream_base::timeout::suggested(boost::beast::role_type::client));
-        websocket_->read_message_max(options_.max_message_size);
-        websocket_->auto_fragment(true);
-        const auto headers = options_.headers;
-        websocket_->set_option(
-            websocket::stream_base::decorator([headers](websocket::request_type &request) {
-                for (const auto &header : headers) {
-                    request.set(header.name, header.value);
-                }
-            }));
-        const auto self = shared_from_this();
-        websocket_->async_handshake(
-            options_.host, options_.target, [self](const boost::system::error_code &error) {
-                if (self->completed_) {
-                    self->websocket_.reset();
-                    return;
-                }
-                if (error) {
-                    self->finish(core::fail(handshake_error(error)));
-                    return;
-                }
-                boost::asio::post(self->executor_, [self] { self->complete_success(); });
-            });
-    }
-
     void complete_success() {
         if (completed_) {
             if (websocket_) {
@@ -775,6 +759,7 @@ class WebSocketClientHandshakeOperation final
     std::shared_ptr<BeastWebSocket> websocket_;
     boost::asio::steady_timer timer_;
     bool completed_ = false;
+    exec::async_scope scope_;
 };
 
 } // namespace

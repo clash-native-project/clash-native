@@ -2178,3 +2178,18 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-24
+
+- Taskified three more connect/handshake chains: the ss2022 open
+  operation (`run_open`: request build, carrier/obfs/socket write
+  branches), the Shadow-TLS v1/v2 open (`run_open`: validation, TLS
+  handshake sender, v1 short-circuit, v2 hash plus delay timer), the
+  WebSocket client handshake (`run_open`: validation, deadline timer,
+  TLS sender, Beast upgrade), and the direct outbound connect
+  (`run_connect`/`connect_addresses`: A/AAAA resolve bridges plus
+  async_connect). Timer/abort/completed_ discipline unchanged; old
+  step methods deleted.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.

@@ -1,4 +1,5 @@
 #include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
@@ -6,6 +7,9 @@
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
+
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include <fmt/format.h>
 
@@ -61,23 +65,113 @@ class DirectConnectOperation final : public std::enable_shared_from_this<DirectC
                                             destination_text(self->request_.destination))});
             }
         });
+        scope_.spawn(run_connect(shared_from_this()));
+    }
 
-        if (request_.resolved_address) {
-            connect(std::vector<boost::asio::ip::address>{*request_.resolved_address});
-            return;
+    static exec::task<void> run_connect(std::shared_ptr<DirectConnectOperation> self) {
+        if (self->request_.resolved_address) {
+            co_await connect_addresses(
+                self, std::vector<boost::asio::ip::address>{*self->request_.resolved_address});
+            co_return;
         }
-        if (request_.destination.is_address()) {
-            connect(std::vector<boost::asio::ip::address>{request_.destination.address()});
-            return;
+        if (self->request_.destination.is_address()) {
+            co_await connect_addresses(
+                self, std::vector<boost::asio::ip::address>{self->request_.destination.address()});
+            co_return;
         }
+        if (!self->resolver_) {
+            self->complete(core::Error{core::ErrorCode::configuration,
+                                       "direct outbound requires a configured DNS resolver"});
+            co_return;
+        }
+        for (const auto type : {dns::DnsRecordType::a, dns::DnsRecordType::aaaa}) {
+            core::Result<dns::DnsAnswer> answer;
+            try {
+                answer = co_await async::bridge_sender<core::Result<dns::DnsAnswer>>(
+                    [self, type](async::BridgeSender<core::Result<dns::DnsAnswer>>::Handler done) {
+                        self->resolver_request_id_ = self->resolver_->resolve(
+                            {self->request_.destination.domain(), type, 1},
+                            [self, done](core::Result<dns::DnsAnswer> result) mutable {
+                                self->resolver_request_id_.reset();
+                                done(std::move(result));
+                            },
+                            std::nullopt);
+                        return [self] { self->abort(); };
+                    });
+            } catch (...) {
+                self->complete(
+                    core::Error{core::ErrorCode::resolution,
+                                fmt::format("failed to resolve direct target {}",
+                                            destination_text(self->request_.destination))});
+                co_return;
+            }
+            if (self->completed_) {
+                co_return;
+            }
+            if (answer) {
+                self->resolved_addresses_.insert(self->resolved_addresses_.end(),
+                                                 answer.value().addresses.begin(),
+                                                 answer.value().addresses.end());
+            } else if (!self->first_resolution_error_) {
+                self->first_resolution_error_ = answer.error();
+            }
+        }
+        if (self->resolved_addresses_.empty()) {
+            if (self->first_resolution_error_) {
+                self->complete(*self->first_resolution_error_);
+            } else {
+                self->complete(
+                    core::Error{core::ErrorCode::resolution,
+                                fmt::format("direct target {} has no resolved addresses",
+                                            destination_text(self->request_.destination))});
+            }
+            co_return;
+        }
+        co_await connect_addresses(self, self->resolved_addresses_);
+    }
 
-        if (!resolver_) {
-            complete(core::Error{core::ErrorCode::configuration,
-                                 "direct outbound requires a configured DNS resolver"});
-            return;
+    static exec::task<void> connect_addresses(std::shared_ptr<DirectConnectOperation> self,
+                                              std::vector<boost::asio::ip::address> addresses) {
+        auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
+        endpoints->reserve(addresses.size());
+        for (const auto &address : addresses) {
+            endpoints->emplace_back(address, self->request_.destination.port());
         }
-
-        resolve_domain(dns::DnsRecordType::a);
+        using ConnectSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
+                                                           stdexec::set_error_t(std::exception_ptr),
+                                                           stdexec::set_stopped_t()>;
+        try {
+            co_await async::callback_sender<ConnectSigs>(
+                [self, endpoints](auto terminal) mutable {
+                    boost::asio::async_connect(self->socket_, *endpoints, std::move(terminal));
+                },
+                [self](auto receiver, const boost::system::error_code &error, auto) {
+                    if (error) {
+                        stdexec::set_error(
+                            std::move(receiver),
+                            std::make_exception_ptr(connection_error(
+                                core::ErrorCode::endpoint_connection,
+                                fmt::format("failed to connect direct target {}",
+                                            destination_text(self->request_.destination)),
+                                error)));
+                        return;
+                    }
+                    stdexec::set_value(std::move(receiver), true);
+                });
+        } catch (const core::Error &failure) {
+            self->complete(failure);
+            co_return;
+        } catch (...) {
+            self->complete(
+                connection_error(core::ErrorCode::endpoint_connection,
+                                 fmt::format("failed to connect direct target {}",
+                                             destination_text(self->request_.destination)),
+                                 boost::asio::error::fault));
+            co_return;
+        }
+        if (!self->completed_) {
+            self->complete(std::nullopt);
+        }
     }
 
     // Abort for sender-driven cancellation: runs on the strand (fully
@@ -103,61 +197,6 @@ class DirectConnectOperation final : public std::enable_shared_from_this<DirectC
     }
 
   private:
-    void resolve_domain(dns::DnsRecordType type) {
-        auto self = shared_from_this();
-        resolver_request_id_ = resolver_->resolve(
-            {request_.destination.domain(), type, 1},
-            [self, type](core::Result<dns::DnsAnswer> result) {
-                self->resolver_request_id_.reset();
-                if (result) {
-                    self->resolved_addresses_.insert(self->resolved_addresses_.end(),
-                                                     result.value().addresses.begin(),
-                                                     result.value().addresses.end());
-                } else if (!self->first_resolution_error_) {
-                    self->first_resolution_error_ = result.error();
-                }
-
-                if (type == dns::DnsRecordType::a) {
-                    self->resolve_domain(dns::DnsRecordType::aaaa);
-                    return;
-                }
-                if (self->resolved_addresses_.empty()) {
-                    if (self->first_resolution_error_) {
-                        self->complete(*self->first_resolution_error_);
-                    } else {
-                        self->complete(
-                            core::Error{core::ErrorCode::resolution,
-                                        fmt::format("direct target {} has no resolved addresses",
-                                                    destination_text(self->request_.destination))});
-                    }
-                    return;
-                }
-                self->connect(self->resolved_addresses_);
-            },
-            std::nullopt);
-    }
-
-    void connect(const std::vector<boost::asio::ip::address> &addresses) {
-        auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
-        endpoints->reserve(addresses.size());
-        for (const auto &address : addresses) {
-            endpoints->emplace_back(address, request_.destination.port());
-        }
-        auto self = shared_from_this();
-        boost::asio::async_connect(
-            socket_, *endpoints,
-            [self, endpoints](const boost::system::error_code &error,
-                              const boost::asio::ip::tcp::endpoint &) {
-                self->complete(error
-                                   ? connection_error(
-                                         core::ErrorCode::endpoint_connection,
-                                         fmt::format("failed to connect direct target {}",
-                                                     destination_text(self->request_.destination)),
-                                         error)
-                                   : std::optional<core::Error>{});
-            });
-    }
-
     void complete(std::optional<core::Error> error) {
         if (completed_) {
             return;
@@ -188,6 +227,7 @@ class DirectConnectOperation final : public std::enable_shared_from_this<DirectC
     boost::asio::steady_timer connect_timer_;
     core::StreamOpenHandler handler_;
     bool completed_ = false;
+    exec::async_scope scope_;
 };
 
 core::StreamOpenResult rejected_stream() {

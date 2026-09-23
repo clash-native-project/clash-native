@@ -1,5 +1,6 @@
 #include <clash_native/transport/shadowsocks/ss2022_stream.hpp>
 
+#include <clash_native/async/bridge.hpp>
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
@@ -9,6 +10,9 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
+
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include <algorithm>
 #include <array>
@@ -663,112 +667,146 @@ class Shadowsocks2022OpenOperation final
         : carrier_(std::move(carrier)), method_(std::move(method)), password_(std::move(password)),
           destination_(std::move(destination)), handler_(std::move(handler)) {}
 
-    void start() {
-        const auto method = cipher_method(method_);
+    void start() { scope_.spawn(run_open(shared_from_this())); }
+
+    static exec::task<void> run_open(std::shared_ptr<Shadowsocks2022OpenOperation> self) {
+        const auto method = cipher_method(self->method_);
         if (!method || !method.value().shadowsocks_2022) {
-            complete(core::StreamOpenResult::failed(
+            self->complete(core::StreamOpenResult::failed(
                 {core::ErrorCode::configuration, "unsupported Shadowsocks 2022 method"}));
-            return;
+            co_return;
         }
-        request_salt_.resize(method.value().key_size);
-        if (!random_bytes(request_salt_)) {
-            complete(core::StreamOpenResult::failed(
+        self->request_salt_.resize(method.value().key_size);
+        if (!random_bytes(self->request_salt_)) {
+            self->complete(core::StreamOpenResult::failed(
                 {core::ErrorCode::authentication, "failed to generate Shadowsocks 2022 salt"}));
-            return;
+            co_return;
         }
-        auto key = derive_shadowsocks_2022_session_key(method_, password_, request_salt_);
-        if (!key || destination_.empty() || destination_.size() + 2 > kMaxChunkPayload) {
-            complete(core::StreamOpenResult::failed(
+        auto key = derive_shadowsocks_2022_session_key(self->method_, self->password_,
+                                                       self->request_salt_);
+        if (!key || self->destination_.empty() ||
+            self->destination_.size() + 2 > kMaxChunkPayload) {
+            self->complete(core::StreamOpenResult::failed(
                 key ? core::Error{core::ErrorCode::protocol_framing,
                                   "invalid Shadowsocks destination address"}
                     : key.error()));
-            return;
+            co_return;
         }
         std::vector<std::uint8_t> fixed;
         fixed.reserve(kFixedHeaderSize);
         fixed.push_back(kClientHeader);
         append_u64(fixed, unix_seconds());
         constexpr std::size_t padding_size = 1;
-        append_u16(fixed, destination_.size() + 2 + padding_size);
-        std::vector<std::uint8_t> variable = destination_;
+        append_u16(fixed, self->destination_.size() + 2 + padding_size);
+        std::vector<std::uint8_t> variable = self->destination_;
         append_u16(variable, padding_size);
         variable.push_back(0);
         std::vector<std::uint8_t> nonce(method.value().nonce_size, 0);
-        auto fixed_record = encrypt_chunk(method_, key.value(), nonce, fixed);
-        auto variable_record = encrypt_chunk(method_, key.value(), nonce, variable);
+        auto fixed_record = encrypt_chunk(self->method_, key.value(), nonce, fixed);
+        auto variable_record = encrypt_chunk(self->method_, key.value(), nonce, variable);
         if (!fixed_record || !variable_record) {
-            complete(core::StreamOpenResult::failed(
+            self->complete(core::StreamOpenResult::failed(
                 {core::ErrorCode::authentication, "failed to encrypt Shadowsocks 2022 request"}));
-            return;
+            co_return;
         }
-        auto wire = std::make_shared<std::vector<std::uint8_t>>(request_salt_);
+        auto wire = std::make_shared<std::vector<std::uint8_t>>(self->request_salt_);
         wire->insert(wire->end(), fixed_record.value().begin(), fixed_record.value().end());
         wire->insert(wire->end(), variable_record.value().begin(), variable_record.value().end());
-        auto self = shared_from_this();
-        if (carrier_) {
-            StreamWriteHandler completion =
-                [self, wire, key = std::move(key.value()), nonce = std::move(nonce)](
-                    const boost::system::error_code &error, std::size_t) mutable {
+        if (self->carrier_) {
+            try {
+                co_await self->carrier_->async_write(boost::asio::buffer(*wire));
+            } catch (const core::Error &failure) {
+                self->complete(core::StreamOpenResult::failed(
+                    {failure.code, "failed to write Shadowsocks 2022 WebSocket request",
+                     failure.cause}));
+                co_return;
+            } catch (...) {
+                self->complete(core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io,
+                     "failed to write Shadowsocks 2022 WebSocket request",
+                     {}}));
+                co_return;
+            }
+            self->complete(
+                core::StreamOpenResult::opened(std::make_unique<Shadowsocks2022StreamHandle>(
+                    std::make_shared<Shadowsocks2022StreamState>(
+                        self->carrier_, self->method_, self->password_, std::move(key.value()),
+                        std::move(nonce), std::move(self->request_salt_),
+                        std::vector<std::uint8_t>{}))));
+            co_return;
+        }
+        if (self->obfs_options_) {
+            core::Status obfs_result;
+            try {
+                if (self->obfs_options_->mode == ObfsMode::http) {
+                    obfs_result = co_await async::bridge_sender<core::Status>(
+                        [self, wire](async::BridgeSender<core::Status>::Handler done) mutable {
+                            async_write_http_obfs_request(
+                                self->socket_, std::move(*wire),
+                                {self->obfs_options_->host, self->obfs_options_->port},
+                                [done](core::Status result) mutable { done(std::move(result)); });
+                            return async::BridgeSender<core::Status>::AbortFn{};
+                        });
+                } else {
+                    obfs_result = co_await async::bridge_sender<core::Status>(
+                        [self, wire](async::BridgeSender<core::Status>::Handler done) mutable {
+                            async_write_tls_obfs_request(
+                                self->socket_, std::move(*wire), self->obfs_options_->host,
+                                [done](core::Status result) mutable { done(std::move(result)); });
+                            return async::BridgeSender<core::Status>::AbortFn{};
+                        });
+                }
+            } catch (...) {
+                self->complete(core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "Shadowsocks obfs request failed", {}}));
+                co_return;
+            }
+            if (!obfs_result) {
+                self->complete(core::StreamOpenResult::failed(obfs_result.error()));
+                co_return;
+            }
+            self->complete(
+                core::StreamOpenResult::opened(std::make_unique<Shadowsocks2022StreamHandle>(
+                    std::make_shared<Shadowsocks2022StreamState>(
+                        self->socket_, self->method_, self->password_, std::move(key.value()),
+                        std::move(nonce), std::move(self->request_salt_),
+                        std::vector<std::uint8_t>{}, self->obfs_options_->mode))));
+            co_return;
+        }
+        using WriteSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
+                                                         stdexec::set_error_t(std::exception_ptr),
+                                                         stdexec::set_stopped_t()>;
+        try {
+            co_await async::callback_sender<WriteSigs>(
+                [self, wire](auto terminal) mutable {
+                    boost::asio::async_write(*self->socket_, boost::asio::buffer(*wire),
+                                             std::move(terminal));
+                },
+                [](auto receiver, const boost::system::error_code &error, auto) {
                     if (error) {
-                        self->complete(core::StreamOpenResult::failed(
-                            {core::ErrorCode::transport_io,
-                             "failed to write Shadowsocks 2022 WebSocket request", error}));
+                        stdexec::set_error(
+                            std::move(receiver),
+                            std::make_exception_ptr(core::Error{
+                                core::ErrorCode::transport_io,
+                                "failed to write Shadowsocks 2022 request",
+                                std::error_code(error.value(), std::system_category())}));
                         return;
                     }
-                    self->complete(core::StreamOpenResult::opened(
-                        std::make_unique<Shadowsocks2022StreamHandle>(
-                            std::make_shared<Shadowsocks2022StreamState>(
-                                self->carrier_, self->method_, self->password_, std::move(key),
-                                std::move(nonce), std::move(self->request_salt_),
-                                std::vector<std::uint8_t>{}))));
-                };
-            // NOTE: name the sender first; argument order is unspecified.
-            auto sender = carrier_->async_write(boost::asio::buffer(*wire));
-            async::start_with_receiver(std::move(sender),
-                                       CarrierWriteBridge{std::move(completion)});
-            return;
+                    stdexec::set_value(std::move(receiver), true);
+                });
+        } catch (const core::Error &failure) {
+            self->complete(core::StreamOpenResult::failed(failure));
+            co_return;
+        } catch (...) {
+            self->complete(core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "failed to write Shadowsocks 2022 request", {}}));
+            co_return;
         }
-        if (obfs_options_) {
-            auto handler = [self, key = std::move(key.value()), nonce = std::move(nonce),
-                            mode = obfs_options_->mode](core::Status result) mutable {
-                if (!result) {
-                    self->complete(core::StreamOpenResult::failed(result.error()));
-                    return;
-                }
-                self->complete(
-                    core::StreamOpenResult::opened(std::make_unique<Shadowsocks2022StreamHandle>(
-                        std::make_shared<Shadowsocks2022StreamState>(
-                            self->socket_, self->method_, self->password_, std::move(key),
-                            std::move(nonce), std::move(self->request_salt_),
-                            std::vector<std::uint8_t>{}, mode))));
-            };
-            if (obfs_options_->mode == ObfsMode::http) {
-                async_write_http_obfs_request(socket_, std::move(*wire),
-                                              {obfs_options_->host, obfs_options_->port},
-                                              std::move(handler));
-            } else {
-                async_write_tls_obfs_request(socket_, std::move(*wire), obfs_options_->host,
-                                             std::move(handler));
-            }
-            return;
-        }
-        boost::asio::async_write(
-            *socket_, boost::asio::buffer(*wire),
-            [self, wire, key = std::move(key.value()), nonce = std::move(nonce)](
-                const boost::system::error_code &error, std::size_t) mutable {
-                if (error) {
-                    self->complete(core::StreamOpenResult::failed(
-                        {core::ErrorCode::transport_io, "failed to write Shadowsocks 2022 request",
-                         error}));
-                    return;
-                }
-                self->complete(
-                    core::StreamOpenResult::opened(std::make_unique<Shadowsocks2022StreamHandle>(
-                        std::make_shared<Shadowsocks2022StreamState>(
-                            self->socket_, self->method_, self->password_, std::move(key),
-                            std::move(nonce), std::move(self->request_salt_),
-                            std::vector<std::uint8_t>{}, ObfsMode::none))));
-            });
+        self->complete(core::StreamOpenResult::opened(std::make_unique<Shadowsocks2022StreamHandle>(
+            std::make_shared<Shadowsocks2022StreamState>(
+                self->socket_, self->method_, self->password_, std::move(key.value()),
+                std::move(nonce), std::move(self->request_salt_), std::vector<std::uint8_t>{},
+                ObfsMode::none))));
     }
 
   private:
@@ -787,6 +825,7 @@ class Shadowsocks2022OpenOperation final
     std::vector<std::uint8_t> request_salt_;
     std::optional<ObfsClientOptions> obfs_options_;
     Shadowsocks2022OpenHandler handler_;
+    exec::async_scope scope_;
 };
 
 } // namespace
