@@ -316,10 +316,7 @@ void ProxySession::open_http_forward_target(core::Destination destination) {
 }
 
 void ProxySession::start_http_upgrade_exchange() {
-    // Proxy-plane debt: remote_ is still core:: until the proxy plane flips;
-    // the session already takes io:: carriers.
-    http_session_ =
-        transport::make_http1_exchange_session(net::adapt_core_to_io(std::move(remote_)));
+    http_session_ = transport::make_http1_exchange_session(std::move(remote_));
     if (!http_session_) {
         send_http_forward_response(502, "Bad Gateway");
         return;
@@ -334,9 +331,7 @@ void ProxySession::start_http_upgrade_exchange() {
 }
 
 void ProxySession::start_http_forward_exchange() {
-    // Proxy-plane debt: see start_http_upgrade_exchange.
-    http_session_ =
-        transport::make_http1_exchange_session(net::adapt_core_to_io(std::move(remote_)));
+    http_session_ = transport::make_http1_exchange_session(std::move(remote_));
     if (!http_session_) {
         send_http_forward_response(502, "Bad Gateway");
         return;
@@ -372,7 +367,9 @@ void ProxySession::handle_http_upgrade_response(
         return;
     }
 
-    remote_ = std::move(upgrade.stream);
+    // Sessions-plane debt: the transport session still speaks the core::
+    // exchange vocabulary, so adapt its tunnel stream at the edge.
+    remote_ = net::adapt_core_to_io(std::move(upgrade.stream));
     if (http_session_) {
         http_session_->stop();
         http_session_.reset();

@@ -303,10 +303,13 @@ class CoreToIoStream final : public io::StreamHandle {
         inner_->shutdown_send(error);
     }
 
+    // Close without releasing: outstanding pulls may still complete, and
+    // destroying the inner handle (notably a TLS stream with a composed
+    // read in flight) under them is a use-after-free. Destruction happens
+    // with the adapter, after all pulls drained.
     void close() noexcept override {
         if (inner_) {
             inner_->close();
-            inner_.reset();
         }
     }
 
@@ -363,10 +366,10 @@ class IoToCoreStream final : public core::StreamHandle {
         inner_->shutdown_send(error);
     }
 
+    // Close without releasing: see CoreToIoStream::close.
     void close() noexcept override {
         if (inner_) {
             inner_->close();
-            inner_.reset();
         }
     }
 

@@ -153,8 +153,7 @@ void ProxySession::handle_open_result(core::StreamOpenResult result) {
         return;
     }
 
-    // Proxy-plane debt: the relay plane still speaks core::.
-    remote_ = net::adapt_io_to_core(std::move(result.handle));
+    remote_ = std::move(result.handle);
     if (protocol_ == Protocol::socks4) {
         send_socks4_reply(0x5a, true);
     } else if (protocol_ == Protocol::socks5) {
@@ -181,8 +180,11 @@ void ProxySession::start_relay() {
     }
 
     auto self = shared_from_this();
+    // Proxy-plane debt: the local ProxyStream still speaks core::; the
+    // relay is io::-native, so adapt the client side at the edge. The
+    // remote side arrives as io:: and passes through untouched.
     relay_ = TcpRelay::start(
-        client_.detach(), std::move(remote_),
+        net::adapt_core_to_io(client_.detach()), std::move(remote_),
         [self](RelayStats stats) {
             if (self->connection_id_ && self->owner_.connection_registry_) {
                 self->owner_.connection_registry_->update_stats(

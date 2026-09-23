@@ -1,6 +1,7 @@
 #pragma once
 
 #include <clash_native/core/outbound.hpp>
+#include <clash_native/io/stream_handle.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
 #include <clash_native/proxy/tcp_relay.hpp>
@@ -225,7 +226,7 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     ProxyServer &owner_;
     ProxyStream client_;
     boost::asio::steady_timer handshake_timer_;
-    std::unique_ptr<core::StreamHandle> remote_;
+    std::unique_ptr<io::StreamHandle> remote_;
     std::shared_ptr<TcpRelay> relay_;
     CloseHandler close_handler_;
     std::optional<observability::ConnectionRegistry::ConnectionId> connection_id_;

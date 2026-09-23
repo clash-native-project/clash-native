@@ -47,6 +47,21 @@ primitive; it is not a packet relay bus between I/O workers.
   not prove deferred 32-bit x86, Linux, Zig, musl, TUN, routing, or router
   hardware behavior.
 
+## Debugging test crashes
+
+- Debug C++ test crashes with the pixi-provided lldb (`pixi.toml`
+  dependency, matching the LLVM toolchain). Do not hand-roll log
+  bisection first; take a native backtrace instead:
+
+```powershell
+pixi run lldb -b -o "run --gtest_filter=Suite.Test" -o "bt" -o "quit" ./build/windows-clang-cl-x64/clash-native-tests.exe
+```
+
+- Release builds carry no PDBs, so expect address-only frames there.
+  When line-level stacks are needed, rebuild with debug info enabled
+  (for example via `scripts/build.py --build-type Debug`) and rerun
+  the failing filter under lldb.
+
 ## Go executable reuse on Windows
 
 Network tests must run a previously built Go executable. Do not use `go run`

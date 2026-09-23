@@ -1694,3 +1694,47 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Fixed `Loopback` in `io_handles_test` with an `executor_work_guard` (the worker's `run()` previously returned with no work, hanging all `use_sender` pulls) and bound it to loopback instead of `0.0.0.0`.
 - Fixed a use-after-move segfault in `http1_client`/`websocket_client` write adapters: `start_with_receiver(handle->async_write(buffer(*bytes)), Receiver{..., move(bytes)})` evaluates arguments in unspecified order, so the receiver move could null `bytes` before dereference. Sender creation is now split from the move with a comment.
 - Validated with the Windows x64 Release clang-cl/MSVC build: zero build errors; `clash-native-tests` reports 224 passed, 3 skipped, 4 failed (the known DNS UDP environment baseline); `pixi run format`, `format-check`, and `git diff --check` pass.
+
+### 2026-09-22 — Coroutine-ize TcpRelay on io:: senders
+
+- Rewrote `proxy::TcpRelay` from callback chains into two `exec::task`
+  pumps (initial payload plus read/write loop, EOF shuts the peer send
+  side) spawned into an `exec::async_scope`; pumps always terminate with
+  a value and joining is an atomic count, so no join state outlives the
+  scope. Teardown stays close-driven like before (no stop source is
+  used); the idle timer keeps its callback leaf shape with a mutex
+  around re-arm/cancel. Rejected alternative, do not reintroduce:
+  joining via `scope.on_empty()` driven with `start_with_receiver`
+  plus `request_stop()` from pump catch/timer/`stop()` — ASan caught
+  a heap-use-after-free where `request_stop()`'s synchronous callback
+  iteration raced spawn opstate self-deletion (`inplace_stop_source`
+  internals), and the join opstate could touch the scope member after
+  its destruction. Closing handles to abort pulls is prompt enough
+  and keeps all teardown on refcounted state.
+- Moved `ProxySession::remote_` to `unique_ptr<io::StreamHandle>`: the
+  open result passes through untouched (deletes the `adapt_io_to_core`
+  debt there) and the HTTP factories take it directly (deletes two
+  `adapt_core_to_io` debts); the relay's client side adapts
+  `ProxyStream` at the edge and the accepted tunnel stream adapts at
+  the sessions-plane edge.
+- Fixed a latent use-after-free the new teardown exposed:
+  `CoreToIoStream`/`IoToCoreStream::close()` released `inner_` while
+  pulls were outstanding, destroying a TLS stream under a composed
+  read. `close()` now only closes; destruction happens with the
+  adapter after pulls drain. Diagnosed with an ASan-instrumented
+  `clash-native-tests` build (heap-use-after-free in
+  `ssl::detail::io_op` after `ProxyStream::~ProxyStream` from
+  `TcpRelay::finish`).
+- Validated with the Windows x64 Release clang-cl/MSVC build: the two
+  HTTPS proxy tests pass 10/10 (previously segfaulted ~always),
+  proxy/DNS/transport groups pass, and full runs report 224 passed
+  with only the known DNS UDP environment failures; `pixi run
+  format`, `format-check`, and `git diff --check` pass.
+
+### 2026-09-22 — Add lldb to the pixi toolchain
+
+- Added `lldb >=22.1.8,<23` to `pixi.toml` dependencies (matches the
+  LLVM 22 toolchain) so crashes can be debugged with native backtraces
+  instead of log bisection; verified with `pixi run lldb` driving a
+  passing test to clean exit. Note: Release builds carry no PDBs, so
+  rich symbolization still needs a debug-info build when the time comes.
