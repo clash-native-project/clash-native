@@ -2096,3 +2096,17 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Added `docs/async-pitfalls.md` collecting the sender-migration rules
   that cost real debugging sessions (evaluation-order moves, pump
   teardown joins, close-without-release, stdexec shape notes).
+
+## 2026-09-24
+
+- Migrated `ProxyStream` off `core::StreamHandle`: it now implements
+  `io::StreamHandle` with sender shells over the raw/TLS socket
+  variant, keeps its handler-style members structurally for the Asio
+  composed operations and Beast parsers that drive the proxy
+  handshakes, and `detach()` hands the relay a native io:: handle
+  (the `adapt_core_to_io` edge is gone). The SOCKS4 user-id/domain
+  reads and the UDP-associate control probe now run through
+  `start_with_receiver` receivers with matching EOF/close semantics.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.

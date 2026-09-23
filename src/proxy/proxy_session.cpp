@@ -180,11 +180,8 @@ void ProxySession::start_relay() {
     }
 
     auto self = shared_from_this();
-    // Proxy-plane debt: the local ProxyStream still speaks core::; the
-    // relay is io::-native, so adapt the client side at the edge. The
-    // remote side arrives as io:: and passes through untouched.
     relay_ = TcpRelay::start(
-        net::adapt_core_to_io(client_.detach()), std::move(remote_),
+        client_.detach(), std::move(remote_),
         [self](RelayStats stats) {
             if (self->connection_id_ && self->owner_.connection_registry_) {
                 self->owner_.connection_registry_->update_stats(

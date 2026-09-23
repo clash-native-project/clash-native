@@ -371,15 +371,21 @@ void ProxySession::send_socks_udp_associate_reply(const boost::asio::ip::udp::en
 }
 
 void ProxySession::read_udp_control() {
-    auto self = shared_from_this();
-    client_.async_read_some(boost::asio::buffer(udp_control_probe_),
-                            [self](const boost::system::error_code &error, std::size_t) {
-                                if (error) {
-                                    self->close();
-                                    return;
-                                }
-                                self->read_udp_control();
-                            });
+    struct ControlReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<ProxySession> self;
+        void set_value(std::optional<std::size_t> size) && noexcept {
+            if (!size) {
+                self->close();
+                return;
+            }
+            self->read_udp_control();
+        }
+        void set_error(std::exception_ptr) && noexcept { self->close(); }
+        void set_stopped() && noexcept { self->close(); }
+    };
+    auto sender = client_.async_read_some(boost::asio::buffer(udp_control_probe_));
+    async::start_with_receiver(std::move(sender), ControlReceiver{shared_from_this()});
 }
 
 void ProxySession::read_socks_udp_packet() {

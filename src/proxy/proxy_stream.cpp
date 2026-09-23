@@ -3,6 +3,7 @@
 #include "http_proxy_utils.hpp"
 
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
@@ -55,6 +56,56 @@ void ProxyStream::async_write(boost::asio::const_buffer buffer, WriteHandler han
                stream_);
 }
 
+io::AnySender<std::optional<std::size_t>>
+ProxyStream::async_read_some(boost::asio::mutable_buffer buffer) {
+    using Signatures =
+        stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
+    return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
+        [this, buffer](auto terminal) mutable {
+            std::visit(
+                [buffer, terminal = std::move(terminal),
+                 executor = executor_](auto &stream) mutable {
+                    if (!stream) {
+                        boost::asio::post(executor, [terminal = std::move(terminal)]() mutable {
+                            terminal(boost::asio::error::operation_aborted, std::size_t{0});
+                        });
+                        return;
+                    }
+                    stream->async_read_some(buffer, std::move(terminal));
+                },
+                stream_);
+        },
+        [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+            net::translate_read(std::move(receiver), error, size, "proxy client read");
+        })};
+}
+
+io::AnySender<std::size_t> ProxyStream::async_write(boost::asio::const_buffer buffer) {
+    using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                      stdexec::set_error_t(std::exception_ptr),
+                                                      stdexec::set_stopped_t()>;
+    return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
+        [this, buffer](auto terminal) mutable {
+            std::visit(
+                [buffer, terminal = std::move(terminal),
+                 executor = executor_](auto &stream) mutable {
+                    if (!stream) {
+                        boost::asio::post(executor, [terminal = std::move(terminal)]() mutable {
+                            terminal(boost::asio::error::operation_aborted, std::size_t{0});
+                        });
+                        return;
+                    }
+                    boost::asio::async_write(*stream, buffer, std::move(terminal));
+                },
+                stream_);
+        },
+        [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+            net::translate_write(std::move(receiver), error, size, "proxy client write");
+        })};
+}
+
 boost::asio::any_io_executor ProxyStream::executor() noexcept { return executor_; }
 
 boost::asio::any_io_executor ProxyStream::get_executor() const noexcept { return executor_; }
@@ -99,9 +150,9 @@ void ProxyStream::close() noexcept {
     visit_socket([&](auto &stream) { stream.lowest_layer().close(ignored); });
 }
 
-std::unique_ptr<core::StreamHandle> ProxyStream::detach() {
+std::unique_ptr<io::StreamHandle> ProxyStream::detach() {
     detached_ = true;
-    return std::unique_ptr<core::StreamHandle>(
+    return std::unique_ptr<io::StreamHandle>(
         new ProxyStream(std::move(stream_), executor_, std::move(tls_context_)));
 }
 

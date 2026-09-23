@@ -51,18 +51,22 @@ enum class HttpAuthenticationResult {
 
 std::uint8_t socks_error_code(const std::optional<core::Error> &error);
 
-class ProxyStream : public core::StreamHandle {
+class ProxyStream : public io::StreamHandle {
   public:
     using executor_type = boost::asio::any_io_executor;
     using Socket = boost::asio::ip::tcp::socket;
     using TlsSocket = boost::asio::ssl::stream<Socket>;
     using Stream = std::variant<std::unique_ptr<Socket>, std::unique_ptr<TlsSocket>>;
+    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
 
     ProxyStream(Socket socket, std::shared_ptr<boost::asio::ssl::context> tls_context);
 
     void async_server_handshake(std::function<void(const boost::system::error_code &)> handler);
     bool tls_enabled() const noexcept;
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override;
+    // Handler-style reads/writes stay for the Asio composed operations
+    // and Beast parsers that drive the proxy handshakes structurally.
+    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler);
     template <typename Handler>
     void async_read_some(boost::asio::mutable_buffer buffer, Handler &&handler) {
         std::visit(
@@ -71,7 +75,10 @@ class ProxyStream : public core::StreamHandle {
             },
             stream_);
     }
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override;
+    void async_write(boost::asio::const_buffer buffer, WriteHandler handler);
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override;
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override;
     template <typename Handler>
     void async_write_some(boost::asio::const_buffer buffer, Handler &&handler) {
         std::visit(
@@ -89,7 +96,7 @@ class ProxyStream : public core::StreamHandle {
     void shutdown_receive(boost::system::error_code &error) noexcept;
     void cancel(boost::system::error_code &error) noexcept;
     void close() noexcept override;
-    std::unique_ptr<core::StreamHandle> detach();
+    std::unique_ptr<io::StreamHandle> detach();
 
   private:
     ProxyStream(Stream stream, boost::asio::any_io_executor executor,
