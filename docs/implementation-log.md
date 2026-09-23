@@ -1822,3 +1822,40 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 232 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-23
+
+- Started the ExchangeSession plane strangler (part 1): added
+  `transport/exchange_session_adapter.hpp` (debt) with io/transport
+  request/response/field converters, `TransportBodyStream` (callback
+  body reads bridged per pull through `async::callback_sender`;
+  EOF completes empty, abort maps to stopped), tunnel/body terminal
+  mapping, and `TransportSession`, a generic io:: view over any
+  callback transport:: session that captures terminals into an
+  `async::oneshot`, rethrows failures as `core::Error`, and cancels
+  the in-flight exchange when the downstream stops. A dual-inheritance
+  session was rejected because `multiplexed_session()` collides by
+  return type across the two bases; the multiplexed view stays null
+  until the multiplexed plane migrates.
+- Migrated DoH1/DoH2/DoH3, the HTTP proxy CONNECT tunnel, and the
+  proxy HTTP upgrade tunnel onto io:: sessions through the adapter.
+  DoH1's single-use session now stops instead of per-exchange cancel;
+  DoH2's shared session drops per-exchange cancel (orphaned exchanges
+  still terminate on their own deadline and late terminals find no
+  pending); DoH3's exchange id degrades to a started flag (it was
+  never cancelled, and complete_exchange's cancel of an already
+  terminal exchange is removed as dead). The proxy upgrade tunnel
+  stream now arrives as io:: with no edge adaptation; the HTTP proxy
+  tunnel stream drives its io:: inner handle directly instead of
+  bridging callbacks.
+- Two traps hit during the work: base-class injected names shadow
+  namespace vocabulary inside adapter classes (all inner types now
+  explicitly `transport::`-qualified), and the transport `Handler`
+  is a `std::function` so oneshot senders ride a shared_ptr into the
+  terminal lambdas.
+- Remaining for part 2: grpc and the proxy forward path (both need
+  the streaming upload-body vocabulary), then native io:: session
+  entries and deletion of transport::ExchangeSession.
+- Validated with the Windows x64 Release clang-cl/MSVC build:
+  targeted DNS/proxy/outbound runs green (30/30); `pixi run format`,
+  `format-check`, and `git diff --check` pass.

@@ -2,7 +2,9 @@
 
 #include "http_proxy_utils.hpp"
 
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
+#include <clash_native/transport/exchange_session_adapter.hpp>
 
 #include <boost/asio/post.hpp>
 #include <boost/asio/write.hpp>
@@ -198,7 +200,7 @@ void ProxySession::begin_http_forward() {
         http_forward_ = true;
         http_upgrade_forward_ = true;
         http_upgrade_request_ = {};
-        http_upgrade_request_.mode = transport::StreamUpgradeMode::upgrade;
+        http_upgrade_request_.mode = io::StreamUpgradeMode::upgrade;
         http_upgrade_request_.scheme = "http";
         http_upgrade_request_.authority = parsed_target->authority;
         http_upgrade_request_.target = parsed_target->origin_target;
@@ -316,18 +318,40 @@ void ProxySession::open_http_forward_target(core::Destination destination) {
 }
 
 void ProxySession::start_http_upgrade_exchange() {
-    http_session_ = transport::make_http1_exchange_session(std::move(remote_));
-    if (!http_session_) {
+    // Exchange-plane debt: the tunnel runs on io:: through the adapter;
+    // the forward path still owns http_session_ until its upload body flips.
+    http_tunnel_session_ = transport::adapt_transport_session(
+        transport::make_http1_exchange_session(std::move(remote_)));
+    if (!http_tunnel_session_) {
         send_http_forward_response(502, "Bad Gateway");
         return;
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
-    auto self = shared_from_this();
-    http_exchange_id_ = http_session_->open_tunnel(
-        std::move(http_upgrade_request_), deadline,
-        [self](core::Result<transport::StreamUpgradeResponse> result) mutable {
+    struct UpgradeReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<ProxySession> self;
+        void set_value(io::StreamUpgradeResponse result) && noexcept {
             self->handle_http_upgrade_response(std::move(result));
-        });
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const core::Error &failure) {
+                self->handle_http_upgrade_response(core::fail(failure));
+            } catch (...) {
+                self->handle_http_upgrade_response(core::fail(core::Error{
+                    core::ErrorCode::endpoint_connection, "HTTP upgrade tunnel failed"}));
+            }
+        }
+        void set_stopped() && noexcept {
+            self->handle_http_upgrade_response(core::fail(
+                core::Error{core::ErrorCode::cancelled, "HTTP upgrade tunnel was cancelled"}));
+        }
+    };
+    auto self = shared_from_this();
+    async::start_with_receiver(
+        http_tunnel_session_->open_tunnel(std::move(http_upgrade_request_), deadline),
+        UpgradeReceiver{self});
 }
 
 void ProxySession::start_http_forward_exchange() {
@@ -345,8 +369,7 @@ void ProxySession::start_http_forward_exchange() {
         });
 }
 
-void ProxySession::handle_http_upgrade_response(
-    core::Result<transport::StreamUpgradeResponse> result) {
+void ProxySession::handle_http_upgrade_response(core::Result<io::StreamUpgradeResponse> result) {
     if (closed_.load(std::memory_order_acquire)) {
         return;
     }
@@ -367,12 +390,11 @@ void ProxySession::handle_http_upgrade_response(
         return;
     }
 
-    // Sessions-plane debt: the transport session still speaks the core::
-    // exchange vocabulary, so adapt its tunnel stream at the edge.
-    remote_ = net::adapt_core_to_io(std::move(upgrade.stream));
-    if (http_session_) {
-        http_session_->stop();
-        http_session_.reset();
+    // The tunnel stream arrives as io:: from the exchange edge; no adaptation.
+    remote_ = std::move(upgrade.stream);
+    if (http_tunnel_session_) {
+        http_tunnel_session_->stop();
+        http_tunnel_session_.reset();
     }
     http_response_ = build_http_upgrade_response_headers(upgrade.response);
     auto self = shared_from_this();
@@ -435,8 +457,8 @@ bool ProxySession::http_forward_request_method_is(std::string_view method) const
     return http_forward_request_method_ == method;
 }
 
-std::string ProxySession::build_http_upgrade_response_headers(
-    const transport::ExchangeResponse &response) const {
+std::string
+ProxySession::build_http_upgrade_response_headers(const io::ExchangeResponse &response) const {
     const auto reason = http::obsolete_reason(static_cast<http::status>(response.status));
     std::string output = fmt::format("HTTP/1.1 {} {}\r\n", response.status, copy_view(reason));
     for (const auto &header : response.headers) {

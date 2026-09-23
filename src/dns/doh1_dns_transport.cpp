@@ -1,7 +1,9 @@
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
+#include <clash_native/io/exchange_session.hpp>
 #include <clash_native/transport/exchange_session.hpp>
+#include <clash_native/transport/exchange_session_adapter.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include <boost/asio/post.hpp>
@@ -242,14 +244,17 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     }
 
     void start_http(std::unique_ptr<io::StreamHandle> stream) {
-        http_session_ = transport::make_http1_exchange_session(std::move(stream));
+        // Exchange-plane debt: the HTTP/1.1 session still speaks transport::;
+        // the adapter bridges it into the io:: vocabulary at the edge.
+        http_session_ = transport::adapt_transport_session(
+            transport::make_http1_exchange_session(std::move(stream)));
         if (!http_session_) {
             finish(core::fail(
                 {core::ErrorCode::configuration, "failed to create an HTTP/1.1 client session"}));
             return;
         }
 
-        transport::ExchangeRequest request;
+        io::ExchangeRequest request;
         request.method = "POST";
         request.scheme = "https";
         request.authority = authority_;
@@ -260,16 +265,41 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
         request.response_body_limit = 0xffff;
         request.keep_alive = false;
 
-        const auto self = shared_from_this();
-        http_exchange_id_ = http_session_->exchange(
-            std::move(request), request_.deadline,
-            [self](core::Result<transport::ExchangeResponse> response) mutable {
+        struct ExchangeReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<Operation> self;
+            void set_value(io::ExchangeResponse response) && noexcept {
                 self->http_exchange_started_ = false;
                 if (self->completed_) {
                     return;
                 }
-                self->http_response(std::move(response));
-            });
+                self->http_response(transport::to_transport_response(response));
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                self->http_exchange_started_ = false;
+                if (self->completed_) {
+                    return;
+                }
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    self->http_response(core::fail(failure));
+                } catch (...) {
+                    self->http_response(core::fail(core::Error{core::ErrorCode::endpoint_connection,
+                                                               "DoH/HTTP/1.1 exchange failed"}));
+                }
+            }
+            void set_stopped() && noexcept {
+                self->http_exchange_started_ = false;
+                if (self->completed_) {
+                    return;
+                }
+                self->http_response(core::fail(cancelled_error()));
+            }
+        };
+        const auto self = shared_from_this();
+        async::start_with_receiver(http_session_->exchange(std::move(request), request_.deadline),
+                                   ExchangeReceiver{self});
         http_exchange_started_ = true;
     }
 
@@ -321,12 +351,11 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
             tls_handshake_.reset();
         }
         if (http_session_) {
-            if (http_exchange_started_) {
-                http_session_->cancel(http_exchange_id_);
-                http_exchange_started_ = false;
-            }
+            // Single-use session: stop() fails the in-flight exchange and
+            // tears the session down; no per-exchange cancel is needed.
             http_session_->stop();
             http_session_.reset();
+            http_exchange_started_ = false;
         }
         owner_.complete(exchange_id_, std::move(result));
     }
@@ -337,8 +366,7 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     Handler handler_;
     boost::asio::steady_timer timer_;
     std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
-    std::shared_ptr<transport::ExchangeSession> http_session_;
-    transport::ExchangeSession::ExchangeId http_exchange_id_ = 0;
+    std::shared_ptr<io::ExchangeSession> http_session_;
     std::string authority_;
     bool http_exchange_started_ = false;
     bool completed_ = false;

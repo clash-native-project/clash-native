@@ -1,5 +1,9 @@
 #include "quic_dns_transport_internal.hpp"
 
+#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/io/exchange_session.hpp>
+#include <clash_native/transport/exchange_session_adapter.hpp>
+
 #include <algorithm>
 #include <cctype>
 #include <string>
@@ -9,6 +13,9 @@
 namespace clash_native::dns {
 namespace {
 using quic_dns_detail::protocol_error;
+core::Error http3_cancelled_error() {
+    return {core::ErrorCode::cancelled, "DoH3 exchange was cancelled"};
+}
 std::string lower_copy(std::string_view value) {
     std::string result(value);
     std::transform(result.begin(), result.end(), result.begin(), [](unsigned char character) {
@@ -33,7 +40,10 @@ void QuicDnsTransport::Operation::start_doh3_session() {
         if (const auto self = weak.lock())
             self->fail_session(std::move(error));
     };
-    auto session = transport::make_http3_exchange_session(quic_, failure);
+    // Exchange-plane debt: the HTTP/3 session still speaks transport::;
+    // the adapter bridges it into the io:: vocabulary at the edge.
+    auto session =
+        transport::adapt_transport_session(transport::make_http3_exchange_session(quic_, failure));
     if (retired_) {
         if (session)
             session->stop();
@@ -63,10 +73,10 @@ void QuicDnsTransport::Operation::open_pending_http3_exchanges() {
 }
 
 void QuicDnsTransport::Operation::submit_http3_exchange(const std::shared_ptr<Exchange> &exchange) {
-    if (!http3_ || retired_ || exchange->result || exchange->http_exchange_id) {
+    if (!http3_ || retired_ || exchange->result || exchange->http_exchange_started) {
         return;
     }
-    transport::ExchangeRequest request;
+    io::ExchangeRequest request;
     request.method = "POST";
     request.scheme = "https";
     request.authority = authority_;
@@ -78,13 +88,37 @@ void QuicDnsTransport::Operation::submit_http3_exchange(const std::shared_ptr<Ex
 
     const auto id = exchange->id;
     const auto weak = weak_from_this();
-    exchange->http_exchange_id =
-        http3_->exchange(std::move(request), exchange->request.deadline,
-                         [weak, id](core::Result<transport::ExchangeResponse> result) mutable {
-                             if (const auto self = weak.lock()) {
-                                 self->on_http3_result(id, std::move(result));
-                             }
-                         });
+    struct Http3Receiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::weak_ptr<Operation> weak;
+        ExchangeId exchange_id;
+        void set_value(io::ExchangeResponse response) && noexcept {
+            if (const auto self = weak.lock()) {
+                self->on_http3_result(exchange_id, transport::to_transport_response(response));
+            }
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            if (const auto self = weak.lock()) {
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    self->on_http3_result(exchange_id, core::fail(failure));
+                } catch (...) {
+                    self->on_http3_result(
+                        exchange_id, core::fail(core::Error{core::ErrorCode::endpoint_connection,
+                                                            "DoH3 exchange failed"}));
+                }
+            }
+        }
+        void set_stopped() && noexcept {
+            if (const auto self = weak.lock()) {
+                self->on_http3_result(exchange_id, core::fail(http3_cancelled_error()));
+            }
+        }
+    };
+    exchange->http_exchange_started = true;
+    async::start_with_receiver(http3_->exchange(std::move(request), exchange->request.deadline),
+                               Http3Receiver{weak, id});
 }
 
 void QuicDnsTransport::Operation::on_http3_result(

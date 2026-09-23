@@ -1,6 +1,7 @@
 #pragma once
 
 #include <clash_native/dns/dns_transport.hpp>
+#include <clash_native/io/exchange_session.hpp>
 #include <clash_native/transport/exchange_session.hpp>
 #include <clash_native/transport/quic_client.hpp>
 
@@ -81,7 +82,10 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
         DnsExchangeRequest request;
         boost::asio::steady_timer deadline_timer;
         std::int64_t stream_id = -1;
-        std::optional<transport::ExchangeSession::ExchangeId> http_exchange_id;
+        // The io:: vocabulary cancels through the stop token, so the
+        // exchange id degrades to a started flag (late terminals are
+        // dropped when the exchange is already gone).
+        bool http_exchange_started = false;
         std::vector<std::uint8_t> doq_response;
         std::optional<core::Result<DnsPacket>> result;
     };
@@ -140,7 +144,7 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
     std::string authority_;
     std::string path_;
     std::shared_ptr<transport::QuicClientConnection> quic_;
-    std::shared_ptr<transport::ExchangeSession> http3_;
+    std::shared_ptr<io::ExchangeSession> http3_;
     std::unordered_map<ExchangeId, std::shared_ptr<Exchange>> exchanges_;
     std::unordered_map<std::int64_t, std::shared_ptr<Exchange>> stream_exchanges_;
     std::deque<ExchangeId> pending_exchanges_;

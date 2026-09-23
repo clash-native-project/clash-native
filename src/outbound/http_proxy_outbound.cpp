@@ -1,10 +1,12 @@
 #include <clash_native/async/bridge.hpp>
-#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/core/base64.hpp>
+#include <clash_native/io/exchange_session.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/http_proxy_outbound.hpp>
 #include <clash_native/transport/exchange_session.hpp>
+#include <clash_native/transport/exchange_session_adapter.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include "outbound_utils.hpp"
@@ -49,48 +51,19 @@ std::string destination_authority(const core::Destination &destination) {
 
 class HttpProxyTunnelStream final : public io::StreamHandle {
   public:
-    using ReadSignatures =
-        stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
-                                       stdexec::set_error_t(std::exception_ptr),
-                                       stdexec::set_stopped_t()>;
-    using WriteSignatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
-                                                           stdexec::set_error_t(std::exception_ptr),
-                                                           stdexec::set_stopped_t()>;
-
-    HttpProxyTunnelStream(std::unique_ptr<core::StreamHandle> stream,
-                          std::shared_ptr<transport::ExchangeSession> session)
+    HttpProxyTunnelStream(std::unique_ptr<io::StreamHandle> stream,
+                          std::shared_ptr<io::ExchangeSession> session)
         : stream_(std::move(stream)), session_(std::move(session)) {}
 
-    // Bridges the legacy inner handle: drives one pull per call and
-    // translates the terminal into the io contract. The handle outlives its
-    // pulls by contract, so capturing this is sound.
+    // The tunnel stream is already io:: (adapted at the exchange edge),
+    // so pulls drive it directly.
     io::AnySender<std::optional<std::size_t>>
     async_read_some(boost::asio::mutable_buffer buffer) override {
-        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
-            [this, buffer](auto terminal) mutable {
-                stream_->async_read_some(
-                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
-                                                             std::size_t count) mutable {
-                        terminal(error, count);
-                    });
-            },
-            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
-                net::translate_read(std::move(receiver), error, count, "http-proxy read");
-            })};
+        return stream_->async_read_some(buffer);
     }
 
     io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
-        return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
-            [this, buffer](auto terminal) mutable {
-                stream_->async_write(
-                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
-                                                             std::size_t count) mutable {
-                        terminal(error, count);
-                    });
-            },
-            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
-                net::translate_write(std::move(receiver), error, count, "http-proxy write");
-            })};
+        return stream_->async_write(buffer);
     }
 
     boost::asio::any_io_executor executor() noexcept override { return stream_->executor(); }
@@ -118,8 +91,8 @@ class HttpProxyTunnelStream final : public io::StreamHandle {
     ~HttpProxyTunnelStream() override { close(); }
 
   private:
-    std::unique_ptr<core::StreamHandle> stream_;
-    std::shared_ptr<transport::ExchangeSession> session_;
+    std::unique_ptr<io::StreamHandle> stream_;
+    std::shared_ptr<io::ExchangeSession> session_;
 };
 
 class HttpProxyConnectOperation final
@@ -270,10 +243,14 @@ class HttpProxyConnectOperation final
             }
             return;
         }
+        // Exchange-plane debt: the HTTP sessions still speak transport::;
+        // the adapter bridges them into the io:: vocabulary at the edge.
         if (alpn == "h2") {
-            session_ = transport::make_http2_exchange_session(std::move(stream));
+            session_ = transport::adapt_transport_session(
+                transport::make_http2_exchange_session(std::move(stream)));
         } else {
-            session_ = transport::make_http1_exchange_session(std::move(stream));
+            session_ = transport::adapt_transport_session(
+                transport::make_http1_exchange_session(std::move(stream)));
         }
         if (!session_) {
             finish(core::StreamOpenResult::failed(
@@ -281,38 +258,58 @@ class HttpProxyConnectOperation final
             return;
         }
 
-        transport::StreamUpgradeRequest tunnel;
+        io::StreamUpgradeRequest tunnel;
         tunnel.authority = destination_authority(request_.destination);
         if (!config_.username.empty()) {
             tunnel.headers.push_back(
                 {"proxy-authorization",
                  "Basic " + core::base64_encode(config_.username + ':' + config_.password)});
         }
-        auto self = shared_from_this();
-        session_->open_tunnel(
-            std::move(tunnel), deadline_,
-            [self](core::Result<transport::StreamUpgradeResponse> result) mutable {
+        struct TunnelReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<HttpProxyConnectOperation> self;
+            void set_value(io::StreamUpgradeResponse result) && noexcept {
                 if (self->completed_) {
-                    if (result && result->stream) {
-                        result->stream->close();
+                    if (result.stream) {
+                        result.stream->close();
                     }
                     return;
                 }
-                if (!result) {
-                    self->finish(core::StreamOpenResult::failed(result.error()));
-                    return;
-                }
-                if (!result->stream) {
-                    const auto status = result->response.status;
+                if (!result.stream) {
+                    const auto status = result.response.status;
                     self->finish(core::StreamOpenResult::failed(
                         {core::ErrorCode::rejected,
                          "HTTP proxy rejected CONNECT with status " + std::to_string(status)}));
                     return;
                 }
                 auto tunnel_stream = std::make_unique<HttpProxyTunnelStream>(
-                    std::move(result->stream), std::move(self->session_));
+                    std::move(result.stream), std::move(self->session_));
                 self->finish(core::StreamOpenResult::opened(std::move(tunnel_stream)));
-            });
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                if (self->completed_) {
+                    return;
+                }
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    self->finish(core::StreamOpenResult::failed(failure));
+                } catch (...) {
+                    self->finish(core::StreamOpenResult::failed(
+                        {core::ErrorCode::endpoint_connection, "HTTP proxy tunnel failed"}));
+                }
+            }
+            void set_stopped() && noexcept {
+                if (self->completed_) {
+                    return;
+                }
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "HTTP proxy tunnel was cancelled"}));
+            }
+        };
+        auto self = shared_from_this();
+        async::start_with_receiver(session_->open_tunnel(std::move(tunnel), deadline_),
+                                   TunnelReceiver{self});
     }
 
   public:
@@ -379,7 +376,7 @@ class HttpProxyConnectOperation final
     core::StreamRequest request_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
     std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
-    std::shared_ptr<transport::ExchangeSession> session_;
+    std::shared_ptr<io::ExchangeSession> session_;
     boost::asio::steady_timer timer_;
     core::StreamOpenHandler handler_;
     std::chrono::steady_clock::time_point deadline_{};

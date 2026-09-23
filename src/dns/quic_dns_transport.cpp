@@ -342,9 +342,8 @@ void QuicDnsTransport::Operation::complete_exchange(ExchangeId id, core::Result<
     const auto exchange = found->second;
     (void)exchange->deadline_timer.cancel();
     if (!result) {
-        if (exchange->http_exchange_id && http3_) {
-            http3_->cancel(*exchange->http_exchange_id);
-        }
+        // The HTTP exchange already reached its terminal to get here; the
+        // io:: vocabulary cancels in-flight work through the stop token.
         if (exchange->stream_id >= 0 && quic_) {
             quic_->shutdown_stream(exchange->stream_id, mode_ == DnsTransportMode::doq
                                                             ? kDoqRequestCancelled

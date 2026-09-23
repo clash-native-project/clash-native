@@ -1,7 +1,9 @@
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
+#include <clash_native/io/exchange_session.hpp>
 #include <clash_native/transport/exchange_session.hpp>
+#include <clash_native/transport/exchange_session_adapter.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include <boost/asio/post.hpp>
@@ -141,7 +143,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
 
     ~Session() { stop(); }
 
-    void exchange(std::uint16_t query_id, transport::ExchangeRequest request,
+    void exchange(std::uint16_t query_id, io::ExchangeRequest request,
                   std::chrono::steady_clock::time_point deadline, Handler handler) {
         if (stopped_ || retired_) {
             complete_immediately(std::move(handler), cancelled_error());
@@ -205,10 +207,9 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     struct Pending {
         explicit Pending(boost::asio::any_io_executor executor) : timer(std::move(executor)) {}
 
-        transport::ExchangeRequest request;
+        io::ExchangeRequest request;
         Handler handler;
         boost::asio::steady_timer timer;
-        transport::ExchangeSession::ExchangeId http_exchange_id = 0;
         bool http_exchange_started = false;
     };
 
@@ -273,8 +274,10 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
                             return;
                         }
                         self->connecting_ = false;
-                        self->http_session_ =
-                            transport::make_http2_exchange_session(std::move(tls->stream));
+                        // Exchange-plane debt: the HTTP/2 session still speaks
+                        // transport::; the adapter bridges it at the edge.
+                        self->http_session_ = transport::adapt_transport_session(
+                            transport::make_http2_exchange_session(std::move(tls->stream)));
                         if (!self->http_session_) {
                             self->connection_failed(
                                 protocol_error("failed to create an HTTP/2 client session"));
@@ -324,13 +327,33 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         if (!http_session_ || pending->http_exchange_started) {
             return;
         }
+        struct SubmitReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<Session> self;
+            std::uint16_t query_id;
+            void set_value(io::ExchangeResponse response) && noexcept {
+                self->finish_pending(query_id, transport::to_transport_response(response));
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    self->finish_pending(query_id, core::fail(failure));
+                } catch (...) {
+                    self->finish_pending(
+                        query_id, core::fail(core::Error{core::ErrorCode::endpoint_connection,
+                                                         "DoH2 exchange failed"}));
+                }
+            }
+            void set_stopped() && noexcept {
+                self->finish_pending(query_id, core::fail(cancelled_error()));
+            }
+        };
         const auto self = shared_from_this();
         pending->http_exchange_started = true;
-        pending->http_exchange_id = http_session_->exchange(
-            std::move(pending->request), pending->timer.expiry(),
-            [self, query_id](core::Result<transport::ExchangeResponse> result) mutable {
-                self->finish_pending(query_id, std::move(result));
-            });
+        async::start_with_receiver(
+            http_session_->exchange(std::move(pending->request), pending->timer.expiry()),
+            SubmitReceiver{self, query_id});
     }
 
     void fail_pending(std::uint16_t query_id, core::Error error) {
@@ -341,9 +364,10 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         auto pending = std::move(found->second);
         pending_.erase(found);
         (void)pending->timer.cancel();
-        if (pending->http_exchange_started && http_session_) {
-            http_session_->cancel(pending->http_exchange_id);
-        }
+        // No per-exchange cancel: the io:: vocabulary cancels through the
+        // stop token, and this edge owns no stop source. The orphaned HTTP
+        // exchange still terminates on its own deadline and its late
+        // terminal finds no pending and is dropped.
         auto handler = std::move(pending->handler);
         if (handler) {
             handler(core::fail(std::move(error)));
@@ -423,7 +447,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     bool verify_peer_;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
     std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
-    std::shared_ptr<transport::ExchangeSession> http_session_;
+    std::shared_ptr<io::ExchangeSession> http_session_;
     std::unordered_map<std::uint16_t, std::shared_ptr<Pending>> pending_;
     std::uint64_t connection_generation_ = 0;
     bool connecting_ = false;
@@ -478,7 +502,7 @@ class Doh2DnsTransport::Operation final
         const auto endpoint = owner_.config_.tcp_endpoint.value_or(boost::asio::ip::tcp::endpoint(
             owner_.config_.endpoint.address(),
             owner_.config_.endpoint.port() == 53 ? 443 : owner_.config_.endpoint.port()));
-        transport::ExchangeRequest request;
+        io::ExchangeRequest request;
         request.method = "POST";
         request.scheme = "https";
         request.authority = authority_for(owner_.config_, endpoint);

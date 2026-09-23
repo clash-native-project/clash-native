@@ -222,6 +222,10 @@ void ProxySession::close() noexcept {
         http_session_->stop();
         http_session_.reset();
     }
+    if (http_tunnel_session_) {
+        http_tunnel_session_->stop();
+        http_tunnel_session_.reset();
+    }
     if (udp_relay_socket_) {
         udp_relay_socket_->close();
         udp_relay_socket_.reset();

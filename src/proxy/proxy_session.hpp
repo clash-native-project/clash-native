@@ -1,6 +1,7 @@
 #pragma once
 
 #include <clash_native/core/outbound.hpp>
+#include <clash_native/io/exchange_session.hpp>
 #include <clash_native/io/stream_handle.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
@@ -208,11 +209,10 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     void open_http_forward_target(core::Destination destination);
     void start_http_upgrade_exchange();
     void start_http_forward_exchange();
-    void handle_http_upgrade_response(core::Result<transport::StreamUpgradeResponse> result);
+    void handle_http_upgrade_response(core::Result<io::StreamUpgradeResponse> result);
     void handle_http_forward_response(core::Result<transport::StreamingExchangeResponse> result);
     bool http_forward_request_method_is(std::string_view method) const noexcept;
-    std::string
-    build_http_upgrade_response_headers(const transport::ExchangeResponse &response) const;
+    std::string build_http_upgrade_response_headers(const io::ExchangeResponse &response) const;
     std::string build_http_forward_response_headers(const transport::ExchangeResponse &response,
                                                     bool has_body);
     void read_http_forward_response_body();
@@ -262,7 +262,11 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     std::string http_forward_request_method_;
     std::shared_ptr<transport::ExchangeSession> http_session_;
     transport::ExchangeSession::ExchangeId http_exchange_id_ = 0;
-    transport::StreamUpgradeRequest http_upgrade_request_;
+    // Exchange-plane debt: the upgrade tunnel already runs on io:: while the
+    // forward path still needs the transport upload body; the two sessions
+    // merge when the forward path flips.
+    std::shared_ptr<io::ExchangeSession> http_tunnel_session_;
+    io::StreamUpgradeRequest http_upgrade_request_;
     transport::StreamingExchangeResponse http_forward_response_;
     bool http_client_keep_alive_ = false;
     bool http_exchange_keep_alive_ = false;
