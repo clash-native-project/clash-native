@@ -8,6 +8,9 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
 
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -217,6 +220,101 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
             });
     }
 
+    // Straight-line connect chain: dial, TLS handshake, session setup.
+    // Every terminal funnels through connection_failed() or submit_waiting(),
+    // so the spawned task always ends with a value.
+    static exec::task<void> run_connect(std::shared_ptr<Session> self, std::uint64_t generation) {
+        try {
+            auto opened = co_await self->dialer_->connect_stream(
+                {core::Destination::address(self->endpoint_.address(), self->endpoint_.port()),
+                 std::nullopt});
+            if (generation != self->connection_generation_ || self->stopped_) {
+                if (opened.handle) {
+                    opened.handle->close();
+                }
+                co_return;
+            }
+            if (!opened.succeeded()) {
+                self->connection_failed(opened.error.value_or(core::Error{
+                    core::ErrorCode::endpoint_connection, "DoH2 dialer failed to open a stream"}));
+                co_return;
+            }
+            transport::TlsClientOptions options;
+            options.server_name = self->server_name_;
+            options.verify_peer = self->verify_peer_;
+            options.alpn_protocols = {"h2"};
+            bool tls_ok = false;
+            transport::TlsClientConnection tls;
+            core::Error tls_error{core::ErrorCode::endpoint_connection,
+                                  "DoH2 TLS handshake failed"};
+            try {
+                tls = co_await transport::async_tls_client_handshake(std::move(opened.handle),
+                                                                     std::move(options));
+                tls_ok = true;
+            } catch (const core::Error &failure) {
+                tls_error = failure;
+            } catch (...) {
+            }
+            if (generation != self->connection_generation_ || self->stopped_) {
+                if (tls_ok && tls.stream) {
+                    tls.stream->close();
+                }
+                co_return;
+            }
+            if (!tls_ok) {
+                self->connection_failed(tls_error);
+                co_return;
+            }
+            if (tls.negotiated_alpn != "h2") {
+                tls.stream->close();
+                self->connection_failed({core::ErrorCode::carrier_handshake,
+                                         "DoH2 upstream did not negotiate the h2 protocol"});
+                co_return;
+            }
+            self->connecting_ = false;
+            self->http_session_ = transport::make_http2_exchange_session(std::move(tls.stream));
+            if (!self->http_session_) {
+                self->connection_failed(
+                    protocol_error("failed to create an HTTP/2 client session"));
+                co_return;
+            }
+            self->submit_waiting();
+        } catch (...) {
+            if (generation == self->connection_generation_ && !self->stopped_) {
+                self->connection_failed(
+                    core::Error{core::ErrorCode::endpoint_connection, "DoH2 connect failed"});
+            }
+        }
+        co_return;
+    }
+
+    // One multiplexed exchange: the timer may erase the pending first, in
+    // which case finish_pending() drops the late terminal.
+    static exec::task<void> run_exchange(std::shared_ptr<Session> self, std::uint16_t query_id,
+                                         std::shared_ptr<io::ExchangeSession> http_session,
+                                         io::ExchangeRequest request,
+                                         std::chrono::steady_clock::time_point deadline) {
+        try {
+            io::ExchangeResponse response;
+            try {
+                response = co_await http_session->exchange(std::move(request), deadline);
+            } catch (const core::Error &failure) {
+                self->finish_pending(query_id, core::fail(failure));
+                co_return;
+            } catch (...) {
+                self->finish_pending(query_id,
+                                     core::fail(core::Error{core::ErrorCode::endpoint_connection,
+                                                            "DoH2 exchange failed"}));
+                co_return;
+            }
+            self->finish_pending(query_id, std::move(response));
+        } catch (...) {
+            self->finish_pending(query_id, core::fail(core::Error{core::ErrorCode::transport_io,
+                                                                  "DoH2 exchange failed"}));
+        }
+        co_return;
+    }
+
     void connect_if_needed() {
         if (stopped_ || retired_ || connecting_ || http_session_ || pending_.empty()) {
             return;
@@ -224,102 +322,9 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         connecting_ = true;
         const auto generation = connection_generation_;
         const auto self = shared_from_this();
-        struct ConnectReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<Session> self;
-            std::uint64_t generation;
-            void set_value(core::StreamOpenResult result) && noexcept {
-                const auto self = this->self;
-                const auto generation = this->generation;
-                if (generation != self->connection_generation_ || self->stopped_) {
-                    if (result.handle) {
-                        result.handle->close();
-                    }
-                    return;
-                }
-                if (!result.succeeded()) {
-                    self->connection_failed(
-                        result.error.value_or(core::Error{core::ErrorCode::endpoint_connection,
-                                                          "DoH2 dialer failed to open a stream"}));
-                    return;
-                }
-                transport::TlsClientOptions options;
-                options.server_name = self->server_name_;
-                options.verify_peer = self->verify_peer_;
-                options.alpn_protocols = {"h2"};
-                struct TlsReceiver {
-                    using receiver_concept = stdexec::receiver_tag;
-                    std::shared_ptr<Session> self;
-                    std::uint64_t generation;
-                    void set_value(transport::TlsClientConnection tls) && noexcept {
-                        if (generation != self->connection_generation_ || self->stopped_) {
-                            if (tls.stream) {
-                                tls.stream->close();
-                            }
-                            return;
-                        }
-                        if (tls.negotiated_alpn != "h2") {
-                            tls.stream->close();
-                            self->connection_failed(
-                                {core::ErrorCode::carrier_handshake,
-                                 "DoH2 upstream did not negotiate the h2 protocol"});
-                            return;
-                        }
-                        self->connecting_ = false;
-                        self->http_session_ =
-                            transport::make_http2_exchange_session(std::move(tls.stream));
-                        if (!self->http_session_) {
-                            self->connection_failed(
-                                protocol_error("failed to create an HTTP/2 client session"));
-                            return;
-                        }
-                        self->submit_waiting();
-                    }
-                    void set_error(std::exception_ptr error) && noexcept {
-                        if (generation != self->connection_generation_ || self->stopped_) {
-                            return;
-                        }
-                        try {
-                            std::rethrow_exception(std::move(error));
-                        } catch (const core::Error &failure) {
-                            self->connection_failed(failure);
-                        } catch (...) {
-                            self->connection_failed(core::Error{
-                                core::ErrorCode::endpoint_connection, "DoH2 TLS handshake failed"});
-                        }
-                    }
-                    void set_stopped() && noexcept {
-                        if (generation != self->connection_generation_ || self->stopped_) {
-                            return;
-                        }
-                        self->connection_failed(cancelled_error());
-                    }
-                };
-                // No explicit cancel: the generation guard drops late
-                // terminals and the request deadline bounds orphans.
-                async::start_with_receiver(transport::async_tls_client_handshake(
-                                               std::move(result.handle), std::move(options)),
-                                           TlsReceiver{self, generation});
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                if (generation != self->connection_generation_ || self->stopped_) {
-                    return;
-                }
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->connection_failed(failure);
-                } catch (...) {
-                    self->connection_failed(
-                        core::Error{core::ErrorCode::endpoint_connection, "DoH2 dialer failed"});
-                }
-            }
-            void set_stopped() && noexcept {}
-        };
-        async::start_with_receiver(
-            dialer_->connect_stream(
-                {core::Destination::address(endpoint_.address(), endpoint_.port()), std::nullopt}),
-            ConnectReceiver{self, generation});
+        // The scope only owns chain tasks (merge-shaped usage); teardown stays
+        // guard-driven, so no stop is ever requested.
+        scope_.spawn(run_connect(self, generation));
     }
 
     void submit_waiting() {
@@ -342,33 +347,10 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         if (!http_session_ || pending->http_exchange_started) {
             return;
         }
-        struct SubmitReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<Session> self;
-            std::uint16_t query_id;
-            void set_value(io::ExchangeResponse response) && noexcept {
-                self->finish_pending(query_id, response);
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->finish_pending(query_id, core::fail(failure));
-                } catch (...) {
-                    self->finish_pending(
-                        query_id, core::fail(core::Error{core::ErrorCode::endpoint_connection,
-                                                         "DoH2 exchange failed"}));
-                }
-            }
-            void set_stopped() && noexcept {
-                self->finish_pending(query_id, core::fail(cancelled_error()));
-            }
-        };
         const auto self = shared_from_this();
         pending->http_exchange_started = true;
-        async::start_with_receiver(
-            http_session_->exchange(std::move(pending->request), pending->timer.expiry()),
-            SubmitReceiver{self, query_id});
+        scope_.spawn(run_exchange(self, query_id, http_session_, std::move(pending->request),
+                                  pending->timer.expiry()));
     }
 
     void fail_pending(std::uint16_t query_id, core::Error error) {
@@ -454,6 +436,8 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     bool verify_peer_;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
     std::shared_ptr<io::ExchangeSession> http_session_;
+    // Owns the connect/exchange chain tasks, which always end with a value.
+    exec::async_scope scope_;
     std::unordered_map<std::uint16_t, std::shared_ptr<Pending>> pending_;
     std::uint64_t connection_generation_ = 0;
     bool connecting_ = false;

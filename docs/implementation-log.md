@@ -2010,3 +2010,15 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-23
+
+- Coroutine-ized the DoH2 session and DoT session connect chains
+  into `exec::task`s: DoH2's dial/TLS/session task plus one task per
+  multiplexed query exchange, and DoT's dial/TLS task feeding its
+  frame pumps. Receivers and chain glue are deleted; generation
+  guards and pending lookups arbitrate late terminals as before.
+  Scopes are owned by the session objects and never stop-requested.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.

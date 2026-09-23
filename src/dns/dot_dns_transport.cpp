@@ -9,6 +9,9 @@
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -155,6 +158,66 @@ class DotDnsTransport::Session final
             });
     }
 
+    // Straight-line connect chain: dial, TLS handshake, then frame pumps.
+    // Every terminal funnels through connection_failed() or the pump
+    // starters, so the spawned task always ends with a value.
+    static exec::task<void> run_connect(std::shared_ptr<Session> self, std::uint64_t generation) {
+        try {
+            auto opened = co_await self->dialer_->connect_stream(
+                {core::Destination::address(self->endpoint_.address(), self->endpoint_.port()),
+                 std::nullopt});
+            if (generation != self->connection_generation_ || self->stopped_) {
+                if (opened.handle) {
+                    opened.handle->close();
+                }
+                co_return;
+            }
+            if (!opened.succeeded()) {
+                self->connection_failed(
+                    opened.error.value_or(core::Error{core::ErrorCode::endpoint_connection,
+                                                      "DoT dialer failed to open a stream"}),
+                    generation);
+                co_return;
+            }
+            transport::TlsClientOptions options;
+            options.server_name = self->server_name_;
+            options.verify_peer = self->verify_peer_;
+            bool tls_ok = false;
+            transport::TlsClientConnection tls;
+            core::Error tls_error{core::ErrorCode::endpoint_connection, "DoT TLS handshake failed"};
+            try {
+                tls = co_await transport::async_tls_client_handshake(std::move(opened.handle),
+                                                                     std::move(options));
+                tls_ok = true;
+            } catch (const core::Error &failure) {
+                tls_error = failure;
+            } catch (...) {
+            }
+            if (generation != self->connection_generation_ || self->stopped_) {
+                if (tls_ok && tls.stream) {
+                    tls.stream->close();
+                }
+                co_return;
+            }
+            if (!tls_ok) {
+                self->connection_failed(tls_error, generation);
+                co_return;
+            }
+            self->tls_stream_ = std::move(tls.stream);
+            self->connecting_ = false;
+            self->connected_ = true;
+            self->read_frame(generation);
+            self->flush_writes(generation);
+        } catch (...) {
+            if (generation == self->connection_generation_ && !self->stopped_) {
+                self->connection_failed(
+                    core::Error{core::ErrorCode::endpoint_connection, "DoT connect failed"},
+                    generation);
+            }
+        }
+        co_return;
+    }
+
     void connect_if_needed() {
         if (stopped_ || retired_ || connected_ || connecting_ || pending_.empty()) {
             return;
@@ -163,94 +226,9 @@ class DotDnsTransport::Session final
         connecting_ = true;
         const auto generation = connection_generation_;
         auto self = shared_from_this();
-        struct ConnectReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<Session> self;
-            std::uint64_t generation;
-            void set_value(core::StreamOpenResult result) && noexcept {
-                const auto self = this->self;
-                const auto generation = this->generation;
-                if (generation != self->connection_generation_ || self->stopped_) {
-                    if (result.handle) {
-                        result.handle->close();
-                    }
-                    return;
-                }
-                if (!result.succeeded()) {
-                    self->connection_failed(
-                        result.error.value_or(core::Error{core::ErrorCode::endpoint_connection,
-                                                          "DoT dialer failed to open a stream"}),
-                        generation);
-                    return;
-                }
-                transport::TlsClientOptions options;
-                options.server_name = self->server_name_;
-                options.verify_peer = self->verify_peer_;
-                struct TlsReceiver {
-                    using receiver_concept = stdexec::receiver_tag;
-                    std::shared_ptr<Session> self;
-                    std::uint64_t generation;
-                    void set_value(transport::TlsClientConnection tls) && noexcept {
-                        if (generation != self->connection_generation_ || self->stopped_) {
-                            if (tls.stream) {
-                                tls.stream->close();
-                            }
-                            return;
-                        }
-                        self->tls_stream_ = std::move(tls.stream);
-                        self->connecting_ = false;
-                        self->connected_ = true;
-                        self->read_frame(generation);
-                        self->flush_writes(generation);
-                    }
-                    void set_error(std::exception_ptr error) && noexcept {
-                        if (generation != self->connection_generation_ || self->stopped_) {
-                            return;
-                        }
-                        try {
-                            std::rethrow_exception(std::move(error));
-                        } catch (const core::Error &failure) {
-                            self->connection_failed(failure, generation);
-                        } catch (...) {
-                            self->connection_failed(
-                                core::Error{core::ErrorCode::endpoint_connection,
-                                            "DoT TLS handshake failed"},
-                                generation);
-                        }
-                    }
-                    void set_stopped() && noexcept {
-                        if (generation != self->connection_generation_ || self->stopped_) {
-                            return;
-                        }
-                        self->connection_failed(cancelled_error(), generation);
-                    }
-                };
-                // No explicit cancel: the generation guard drops late
-                // terminals and the session teardown closes the stream.
-                async::start_with_receiver(transport::async_tls_client_handshake(
-                                               std::move(result.handle), std::move(options)),
-                                           TlsReceiver{self, generation});
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                if (generation != self->connection_generation_ || self->stopped_) {
-                    return;
-                }
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->connection_failed(failure, generation);
-                } catch (...) {
-                    self->connection_failed(
-                        core::Error{core::ErrorCode::endpoint_connection, "DoT dialer failed"},
-                        generation);
-                }
-            }
-            void set_stopped() && noexcept {}
-        };
-        async::start_with_receiver(
-            dialer_->connect_stream(
-                {core::Destination::address(endpoint_.address(), endpoint_.port()), std::nullopt}),
-            ConnectReceiver{self, generation});
+        // The scope only owns chain tasks (merge-shaped usage); teardown stays
+        // guard-driven, so no stop is ever requested.
+        scope_.spawn(run_connect(self, generation));
     }
 
     void flush_writes(std::uint64_t generation = 0) {
@@ -453,6 +431,8 @@ class DotDnsTransport::Session final
     bool verify_peer_;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
     std::unique_ptr<io::StreamHandle> tls_stream_;
+    // Owns the connect chain task, which always ends with a value.
+    exec::async_scope scope_;
     std::unordered_map<std::uint16_t, PendingPtr> pending_;
     std::deque<std::uint16_t> write_queue_;
     std::uint64_t connection_generation_ = 0;
