@@ -1,4 +1,8 @@
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/core/base64.hpp>
+#include <clash_native/io/exchange_session.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
+#include <clash_native/transport/exchange_session_adapter.hpp>
 #include <clash_native/transport/grpc_client.hpp>
 
 #include <boost/asio/dispatch.hpp>
@@ -82,7 +86,10 @@ std::optional<std::string> percent_decode(std::string_view input) {
     return result;
 }
 
-std::optional<std::string_view> find_header(const std::vector<ExchangeField> &headers,
+// Templated over the exchange vocabulary: transport:: and io:: fields share
+// only name/value, and both flow through here during the migration.
+template <typename Field>
+std::optional<std::string_view> find_header(const std::vector<Field> &headers,
                                             std::string_view name) {
     for (const auto &header : headers) {
         if (lower_copy(header.name) == name) {
@@ -92,7 +99,8 @@ std::optional<std::string_view> find_header(const std::vector<ExchangeField> &he
     return std::nullopt;
 }
 
-std::vector<GrpcMetadata> application_metadata(const std::vector<ExchangeField> &headers) {
+template <typename Field>
+std::vector<GrpcMetadata> application_metadata(const std::vector<Field> &headers) {
     std::vector<GrpcMetadata> result;
     for (const auto &header : headers) {
         const auto name = lower_copy(header.name);
@@ -114,7 +122,7 @@ std::vector<GrpcMetadata> application_metadata(const std::vector<ExchangeField> 
     return result;
 }
 
-core::Result<GrpcStatus> parse_status(const std::vector<ExchangeField> &headers) {
+template <typename Field> core::Result<GrpcStatus> parse_status(const std::vector<Field> &headers) {
     const auto status_value = find_header(headers, "grpc-status");
     if (!status_value) {
         return core::fail(
@@ -383,8 +391,8 @@ class GrpcClientCall::RequestBody final : public ExchangeBodyStream,
 };
 
 GrpcClientCall::GrpcClientCall(boost::asio::any_io_executor executor,
-                               std::shared_ptr<ExchangeSession> session, GrpcCallOptions options,
-                               OpenHandler open_handler)
+                               std::shared_ptr<io::ExchangeSession> session,
+                               GrpcCallOptions options, OpenHandler open_handler)
     : executor_(std::move(executor)), session_(std::move(session)), options_(std::move(options)),
       open_handler_(std::move(open_handler)),
       request_body_(std::make_shared<RequestBody>(executor_, options_.max_message_size)),
@@ -397,9 +405,8 @@ GrpcClientCall::~GrpcClientCall() {
     if (response_body_) {
         response_body_->cancel();
     }
-    if (session_ && exchange_id_ != 0) {
-        session_->cancel(exchange_id_);
-    }
+    // No per-exchange cancel: the io:: vocabulary cancels through the stop
+    // token, and body cancels plus late-terminal drops wind the call down.
 }
 
 void GrpcClientCall::start() {
@@ -422,7 +429,7 @@ void GrpcClientCall::start() {
         return;
     }
 
-    StreamingExchangeRequest request;
+    io::StreamingExchangeRequest request;
     request.request.method = "POST";
     request.request.scheme = options_.scheme;
     request.request.authority = options_.authority;
@@ -439,17 +446,37 @@ void GrpcClientCall::start() {
             request.request.headers.push_back({"grpc-timeout", std::move(*timeout)});
         }
     }
-    request.body = request_body_;
+    // Exchange-plane debt: the framed producer still speaks transport::;
+    // it crosses into io:: here and back inside the session adapter.
+    request.body = adapt_transport_body(request_body_);
     const auto deadline = options_.deadline.value_or(std::chrono::steady_clock::time_point::max());
-    const auto self = shared_from_this();
-    exchange_id_ = session_->exchange_streaming(
-        std::move(request), deadline,
-        [self](core::Result<StreamingExchangeResponse> result) mutable {
+    struct ResponseReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<GrpcClientCall> self;
+        void set_value(io::StreamingExchangeResponse result) && noexcept {
             self->on_response(std::move(result));
-        });
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const core::Error &failure) {
+                self->on_response(core::fail(failure));
+            } catch (...) {
+                self->on_response(core::fail(
+                    make_error(core::ErrorCode::endpoint_connection, "gRPC exchange failed")));
+            }
+        }
+        void set_stopped() && noexcept {
+            self->on_response(
+                core::fail(make_error(core::ErrorCode::cancelled, "gRPC exchange was stopped")));
+        }
+    };
+    const auto self = shared_from_this();
+    async::start_with_receiver(session_->exchange_streaming(std::move(request), deadline),
+                               ResponseReceiver{self});
 }
 
-void GrpcClientCall::on_response(core::Result<StreamingExchangeResponse> result) {
+void GrpcClientCall::on_response(core::Result<io::StreamingExchangeResponse> result) {
     if (cancelled_) {
         return;
     }
@@ -628,9 +655,6 @@ void GrpcClientCall::cancel() noexcept {
     if (response_body_) {
         response_body_->cancel();
     }
-    if (session_ && exchange_id_ != 0) {
-        session_->cancel(exchange_id_);
-    }
     if (pending_read_) {
         auto handler = std::move(pending_read_);
         post_read(std::move(handler),
@@ -649,12 +673,26 @@ void GrpcClientCall::read_response() {
         return;
     }
     reading_body_ = true;
+    struct BodyReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<GrpcClientCall> self;
+        void set_value(std::optional<std::size_t> size) && noexcept {
+            if (size) {
+                self->on_response_read({}, *size);
+                return;
+            }
+            self->on_response_read(boost::asio::error::eof, 0);
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            self->on_response_read(net::unpack_error(std::move(error)), 0);
+        }
+        void set_stopped() && noexcept {
+            self->on_response_read(boost::asio::error::operation_aborted, 0);
+        }
+    };
     const auto self = shared_from_this();
-    response_body_->async_read_some(
-        boost::asio::buffer(read_buffer_),
-        [self](const boost::system::error_code &error, std::size_t size) {
-            self->on_response_read(error, size);
-        });
+    async::start_with_receiver(response_body_->async_read_some(boost::asio::buffer(read_buffer_)),
+                               BodyReceiver{self});
 }
 
 void GrpcClientCall::on_response_read(const boost::system::error_code &error, std::size_t size) {
@@ -757,7 +795,7 @@ core::Status GrpcClientCall::finish_response() {
                                      "gRPC response ended with a truncated message frame"));
     }
     const auto trailer_headers =
-        response_body_ ? response_body_->trailers() : std::vector<ExchangeField>{};
+        response_body_ ? response_body_->trailers() : std::vector<io::ExchangeField>{};
     if (find_header(trailer_headers, "grpc-status")) {
         auto trailer_status = parse_status(trailer_headers);
         if (!trailer_status) {
@@ -802,7 +840,7 @@ void GrpcClientCall::post_read(ReadMessageHandler handler,
 }
 
 GrpcClient::GrpcClient(boost::asio::any_io_executor executor,
-                       std::shared_ptr<ExchangeSession> session)
+                       std::shared_ptr<io::ExchangeSession> session)
     : executor_(std::move(executor)), session_(std::move(session)) {}
 
 std::shared_ptr<GrpcClientCall> GrpcClient::start_call(GrpcCallOptions options,

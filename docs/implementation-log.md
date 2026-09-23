@@ -1859,3 +1859,30 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build:
   targeted DNS/proxy/outbound runs green (30/30); `pixi run format`,
   `format-check`, and `git diff --check` pass.
+
+## 2026-09-23
+
+- Finished the ExchangeSession plane strangler (part 2): every
+  remaining consumer now runs on io:: sessions through the adapter.
+- Added `IoUploadBody` (io to transport upload bridge): each
+  transport pull starts one io pull and forwards bytes, EOF (with
+  trailer caching), unpacked `core::Error` causes, or abort on stop.
+  `TransportSession::exchange_streaming` accepts io:: upload bodies
+  through it instead of rejecting them.
+- Migrated gRPC: the session, request (framed producer crosses via
+  `adapt_transport_body`), response head, and body pulls are io::;
+  the header helpers are templated over both field vocabularies.
+  Per-exchange cancel in the destructor/close path is dropped in
+  favor of body cancels plus late-terminal drops.
+- Migrated the proxy forward path: request/response/session are io::,
+  the client-body producer crosses via the adapter, the response body
+  loop pulls through a terminal-mapping receiver into the existing
+  chunk-framing body, and the single-use forward session stops
+  instead of per-exchange cancel (`http_exchange_id_` is gone).
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 232 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.
+- Remaining for part 3: native io:: session entries in
+  http1/http2/http3, io:: upload producers, then deletion of
+  transport::ExchangeSession, transport::ExchangeBodyStream, and the
+  adapter header.

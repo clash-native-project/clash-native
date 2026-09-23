@@ -269,7 +269,9 @@ void ProxySession::begin_http_forward() {
         http_request_body_ = std::make_shared<ProxyRequestBodyStream>(
             client_, http_buffer_, http_request_parser_, header_count, std::move(declared_trailers),
             [this](std::size_t size) { http_forward_request_bytes_ += size; });
-        http_forward_request_.body = http_request_body_;
+        // Exchange-plane debt: the client-body producer still speaks
+        // transport::; it crosses into io:: here and back in the adapter.
+        http_forward_request_.body = transport::adapt_transport_body(http_request_body_);
     }
 
     for (const auto &field : request.base()) {
@@ -355,18 +357,38 @@ void ProxySession::start_http_upgrade_exchange() {
 }
 
 void ProxySession::start_http_forward_exchange() {
-    http_session_ = transport::make_http1_exchange_session(std::move(remote_));
+    http_session_ = transport::adapt_transport_session(
+        transport::make_http1_exchange_session(std::move(remote_)));
     if (!http_session_) {
         send_http_forward_response(502, "Bad Gateway");
         return;
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
-    auto self = shared_from_this();
-    http_exchange_id_ = http_session_->exchange_streaming(
-        std::move(http_forward_request_), deadline,
-        [self](core::Result<transport::StreamingExchangeResponse> result) mutable {
+    struct ForwardReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<ProxySession> self;
+        void set_value(io::StreamingExchangeResponse result) && noexcept {
             self->handle_http_forward_response(std::move(result));
-        });
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const core::Error &failure) {
+                self->handle_http_forward_response(core::fail(failure));
+            } catch (...) {
+                self->handle_http_forward_response(core::fail(core::Error{
+                    core::ErrorCode::endpoint_connection, "HTTP forward exchange failed"}));
+            }
+        }
+        void set_stopped() && noexcept {
+            self->handle_http_forward_response(core::fail(
+                core::Error{core::ErrorCode::cancelled, "HTTP forward exchange was cancelled"}));
+        }
+    };
+    auto self = shared_from_this();
+    async::start_with_receiver(
+        http_session_->exchange_streaming(std::move(http_forward_request_), deadline),
+        ForwardReceiver{self});
 }
 
 void ProxySession::handle_http_upgrade_response(core::Result<io::StreamUpgradeResponse> result) {
@@ -410,7 +432,7 @@ void ProxySession::handle_http_upgrade_response(core::Result<io::StreamUpgradeRe
 }
 
 void ProxySession::handle_http_forward_response(
-    core::Result<transport::StreamingExchangeResponse> result) {
+    core::Result<io::StreamingExchangeResponse> result) {
     if (closed_.load(std::memory_order_acquire)) {
         return;
     }
@@ -478,9 +500,8 @@ ProxySession::build_http_upgrade_response_headers(const io::ExchangeResponse &re
     return output;
 }
 
-std::string
-ProxySession::build_http_forward_response_headers(const transport::ExchangeResponse &response,
-                                                  bool has_body) {
+std::string ProxySession::build_http_forward_response_headers(const io::ExchangeResponse &response,
+                                                              bool has_body) {
     std::unordered_set<std::string> connection_options;
     for (const auto &header : response.headers) {
         if (!is_http_header(header.name, "connection")) {
@@ -532,46 +553,66 @@ void ProxySession::read_http_forward_response_body() {
         finish_http_forward();
         return;
     }
+    struct ForwardBodyReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<ProxySession> self;
+        void set_value(std::optional<std::size_t> size) && noexcept {
+            if (size) {
+                self->on_http_forward_response_read({}, *size);
+                return;
+            }
+            self->on_http_forward_response_read(boost::asio::error::eof, 0);
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            self->on_http_forward_response_read(net::unpack_error(std::move(error)), 0);
+        }
+        void set_stopped() && noexcept {
+            self->on_http_forward_response_read(boost::asio::error::operation_aborted, 0);
+        }
+    };
     auto self = shared_from_this();
-    http_forward_response_.body->async_read_some(
-        boost::asio::buffer(http_forward_response_buffer_),
-        [self](const boost::system::error_code &error, std::size_t size) {
-            if (self->closed_.load(std::memory_order_acquire)) {
-                return;
-            }
-            if (error == boost::asio::error::eof) {
-                self->write_http_forward_response_trailers();
-                return;
-            }
-            if (error) {
-                spdlog::warn("HTTP forward proxy upstream response body read failed: {}",
-                             error.message());
+    async::start_with_receiver(http_forward_response_.body->async_read_some(
+                                   boost::asio::buffer(http_forward_response_buffer_)),
+                               ForwardBodyReceiver{self});
+}
+
+void ProxySession::on_http_forward_response_read(const boost::system::error_code &error,
+                                                 std::size_t size) {
+    const auto self = shared_from_this();
+    if (self->closed_.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (error == boost::asio::error::eof) {
+        self->write_http_forward_response_trailers();
+        return;
+    }
+    if (error) {
+        spdlog::warn("HTTP forward proxy upstream response body read failed: {}", error.message());
+        self->close();
+        return;
+    }
+    if (size == 0) {
+        boost::asio::post(self->client_.get_executor(),
+                          [self] { self->read_http_forward_response_body(); });
+        return;
+    }
+
+    auto framed = std::make_shared<std::vector<std::uint8_t>>();
+    const auto chunk_size = fmt::format("{:x}\r\n", size);
+    framed->reserve(chunk_size.size() + size + 2);
+    framed->insert(framed->end(), chunk_size.begin(), chunk_size.end());
+    framed->insert(framed->end(), self->http_forward_response_buffer_.begin(),
+                   self->http_forward_response_buffer_.begin() + size);
+    framed->insert(framed->end(), {'\r', '\n'});
+    boost::asio::async_write(
+        self->client_, boost::asio::buffer(*framed),
+        [self, framed](const boost::system::error_code &write_error, std::size_t written) {
+            if (write_error) {
                 self->close();
                 return;
             }
-            if (size == 0) {
-                boost::asio::post(self->client_.get_executor(),
-                                  [self] { self->read_http_forward_response_body(); });
-                return;
-            }
-
-            auto framed = std::make_shared<std::vector<std::uint8_t>>();
-            const auto chunk_size = fmt::format("{:x}\r\n", size);
-            framed->reserve(chunk_size.size() + size + 2);
-            framed->insert(framed->end(), chunk_size.begin(), chunk_size.end());
-            framed->insert(framed->end(), self->http_forward_response_buffer_.begin(),
-                           self->http_forward_response_buffer_.begin() + size);
-            framed->insert(framed->end(), {'\r', '\n'});
-            boost::asio::async_write(
-                self->client_, boost::asio::buffer(*framed),
-                [self, framed](const boost::system::error_code &write_error, std::size_t written) {
-                    if (write_error) {
-                        self->close();
-                        return;
-                    }
-                    self->http_forward_response_bytes_ += written;
-                    self->read_http_forward_response_body();
-                });
+            self->http_forward_response_bytes_ += written;
+            self->read_http_forward_response_body();
         });
 }
 
@@ -616,9 +657,6 @@ void ProxySession::reset_http_forward_exchange() {
         http_forward_response_.body.reset();
     }
     if (http_session_) {
-        if (http_exchange_id_ != 0) {
-            http_session_->cancel(http_exchange_id_);
-        }
         http_session_->stop();
         http_session_.reset();
     }
@@ -633,7 +671,6 @@ void ProxySession::reset_http_forward_exchange() {
 
     http_forward_ = false;
     http_upgrade_forward_ = false;
-    http_exchange_id_ = 0;
     http_forward_request_ = {};
     http_upgrade_request_ = {};
     http_forward_response_ = {};

@@ -210,12 +210,13 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     void start_http_upgrade_exchange();
     void start_http_forward_exchange();
     void handle_http_upgrade_response(core::Result<io::StreamUpgradeResponse> result);
-    void handle_http_forward_response(core::Result<transport::StreamingExchangeResponse> result);
+    void handle_http_forward_response(core::Result<io::StreamingExchangeResponse> result);
     bool http_forward_request_method_is(std::string_view method) const noexcept;
     std::string build_http_upgrade_response_headers(const io::ExchangeResponse &response) const;
-    std::string build_http_forward_response_headers(const transport::ExchangeResponse &response,
+    std::string build_http_forward_response_headers(const io::ExchangeResponse &response,
                                                     bool has_body);
     void read_http_forward_response_body();
+    void on_http_forward_response_read(const boost::system::error_code &error, std::size_t size);
     void write_http_forward_response_trailers();
     void reset_http_forward_exchange();
     void finish_http_forward();
@@ -258,16 +259,17 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     boost::beast::flat_buffer http_buffer_;
     std::shared_ptr<ProxyRequestBodyStream::Parser> http_request_parser_;
     std::shared_ptr<ProxyRequestBodyStream> http_request_body_;
-    transport::StreamingExchangeRequest http_forward_request_;
+    io::StreamingExchangeRequest http_forward_request_;
     std::string http_forward_request_method_;
-    std::shared_ptr<transport::ExchangeSession> http_session_;
-    transport::ExchangeSession::ExchangeId http_exchange_id_ = 0;
+    // Single-use forward session: stop() alone tears it down, so no
+    // per-exchange id is kept (the io:: vocabulary cancels via stop).
+    std::shared_ptr<io::ExchangeSession> http_session_;
     // Exchange-plane debt: the upgrade tunnel already runs on io:: while the
     // forward path still needs the transport upload body; the two sessions
     // merge when the forward path flips.
     std::shared_ptr<io::ExchangeSession> http_tunnel_session_;
     io::StreamUpgradeRequest http_upgrade_request_;
-    transport::StreamingExchangeResponse http_forward_response_;
+    io::StreamingExchangeResponse http_forward_response_;
     bool http_client_keep_alive_ = false;
     bool http_exchange_keep_alive_ = false;
     std::array<std::uint8_t, 16 * 1024> http_forward_response_buffer_{};

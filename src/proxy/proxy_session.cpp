@@ -216,9 +216,7 @@ void ProxySession::close() noexcept {
         http_forward_response_.body.reset();
     }
     if (http_session_) {
-        if (http_exchange_id_ != 0) {
-            http_session_->cancel(http_exchange_id_);
-        }
+        // Single-use session: stop() fails the in-flight exchange.
         http_session_->stop();
         http_session_.reset();
     }

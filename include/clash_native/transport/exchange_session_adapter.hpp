@@ -7,6 +7,7 @@
 
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/oneshot.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/core/error.hpp>
 #include <clash_native/core/result.hpp>
 #include <clash_native/io/exchange_session.hpp>
@@ -23,6 +24,7 @@
 #include <chrono>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -156,6 +158,69 @@ adapt_transport_body(std::shared_ptr<transport::ExchangeBodyStream> body) {
     return std::make_shared<TransportBodyStream>(std::move(body));
 }
 
+// transport:: view over a sender-native io:: upload body. Each transport
+// pull starts one io pull and forwards its terminal into the callback:
+// bytes, EOF (trailers are then cached), a packed core::Error unpacked to
+// its cause, or aborted on stop. Completions arrive on the io body's
+// executor; sessions already tolerate producer-executor completion.
+class IoUploadBody final : public transport::ExchangeBodyStream,
+                           public std::enable_shared_from_this<IoUploadBody> {
+  public:
+    explicit IoUploadBody(std::shared_ptr<io::ExchangeBodyStream> body) : body_(std::move(body)) {}
+
+    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+        struct PullReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<IoUploadBody> self;
+            ReadHandler handler;
+            void set_value(std::optional<std::size_t> size) && noexcept {
+                if (size) {
+                    auto callback = std::move(handler);
+                    callback({}, *size);
+                    return;
+                }
+                {
+                    std::lock_guard lock(self->trailers_mutex_);
+                    self->trailers_ = self->body_->trailers();
+                    self->trailers_ready_ = true;
+                }
+                auto callback = std::move(handler);
+                callback(boost::asio::error::eof, 0);
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                auto callback = std::move(handler);
+                callback(net::unpack_error(std::move(error)), 0);
+            }
+            void set_stopped() && noexcept {
+                auto callback = std::move(handler);
+                callback(boost::asio::error::operation_aborted, 0);
+            }
+        };
+        // Shared: PullReceiver must stay alive until the pull settles, and
+        // start_with_receiver takes the receiver by value.
+        async::start_with_receiver(body_->async_read_some(buffer),
+                                   PullReceiver{shared_from_this(), std::move(handler)});
+    }
+
+    std::vector<transport::ExchangeField> trailers() const override {
+        std::lock_guard lock(trailers_mutex_);
+        std::vector<transport::ExchangeField> converted;
+        converted.reserve(trailers_.size());
+        for (const auto &field : trailers_) {
+            converted.push_back(to_transport_field(field));
+        }
+        return converted;
+    }
+
+    void cancel() noexcept override { body_->cancel(); }
+
+  private:
+    std::shared_ptr<io::ExchangeBodyStream> body_;
+    mutable std::mutex trailers_mutex_;
+    std::vector<io::ExchangeField> trailers_;
+    bool trailers_ready_ = false;
+};
+
 inline io::StreamingExchangeResponse to_io_streaming_response(StreamingExchangeResponse response) {
     io::StreamingExchangeResponse converted;
     converted.response = to_io_response(response.response);
@@ -206,15 +271,14 @@ class TransportSession final : public io::ExchangeSession {
         auto sender =
             std::make_shared<async::oneshot::Sender<core::Result<io::StreamingExchangeResponse>>>(
                 std::move(channel.sender));
-        if (request.body) {
-            // The upload body vocabulary flips with grpc (the only streaming
-            // producer); until then streaming uploads stay on transport sessions.
-            sender->send(core::fail(
-                core::Error{core::ErrorCode::unsupported, "streaming upload is not yet migrated"}));
-            return wrap_streaming(0, std::move(channel.receiver));
-        }
         StreamingExchangeRequest transport_request;
         transport_request.request = to_transport_request(request.request);
+        // Upload producers still speak transport::; they ride
+        // adapt_transport_body into the io:: request and cross back here.
+        // Both hops die when the producers flip.
+        if (request.body) {
+            transport_request.body = std::make_shared<IoUploadBody>(std::move(request.body));
+        }
         transport_request.content_length = request.content_length;
         const auto exchange_id = inner_->exchange_streaming(
             std::move(transport_request), deadline,
