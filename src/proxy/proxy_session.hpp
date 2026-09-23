@@ -14,6 +14,9 @@
 #include <boost/beast/core/flat_buffer.hpp>
 #include <boost/beast/http.hpp>
 
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -182,17 +185,11 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     void start_relay();
     void close() noexcept;
 
-    void read_method_count();
-    void read_methods();
-    void send_method_response(std::uint8_t method);
-    void read_auth_header();
-    void read_auth_username();
-    void read_auth_password_length();
-    void read_auth_password();
-    void send_auth_response(bool accepted);
-    void read_request_header();
-    void read_domain_length();
-    void read_request_body();
+    static exec::task<void> read_handshake_exact(std::shared_ptr<ProxySession> self,
+                                                 boost::asio::mutable_buffer buffer);
+    static exec::task<void> write_handshake_all(std::shared_ptr<ProxySession> self,
+                                                boost::asio::const_buffer buffer);
+    static exec::task<void> run_socks5_handshake(std::shared_ptr<ProxySession> self);
     std::uint16_t request_port() const noexcept;
     void open_socks_target();
     void open_socks_udp_association();
@@ -237,6 +234,9 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     ProxyServer &owner_;
     ProxyStream client_;
     boost::asio::steady_timer handshake_timer_;
+    // Owns handshake chain tasks; teardown stays guard-driven, so no
+    // stop is ever requested.
+    exec::async_scope scope_;
     std::unique_ptr<io::StreamHandle> remote_;
     std::shared_ptr<TcpRelay> relay_;
     CloseHandler close_handler_;

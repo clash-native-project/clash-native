@@ -2158,3 +2158,14 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-24
+
+- Taskified the SOCKS5 handshake: `run_socks5_handshake()` runs method
+  negotiation, username/password authentication, and request parsing as
+  one coroutine over exact-read/full-write helpers, spawned on a new
+  session `async_scope`; reply-and-close and target-open terminals stay
+  as methods. The ten replaced step methods are deleted.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.

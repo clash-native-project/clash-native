@@ -4,6 +4,7 @@
 #include "outbound/proxy_address.hpp"
 #include "socks5_udp_listener.hpp"
 
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 
@@ -11,6 +12,8 @@
 #include <boost/asio/write.hpp>
 #include <fmt/format.h>
 #include <spdlog/spdlog.h>
+
+#include <exec/task.hpp>
 
 #include <algorithm>
 #include <span>
@@ -35,113 +38,104 @@ std::uint8_t socks_error_code(const std::optional<core::Error> &error) {
     }
 }
 
-void ProxySession::read_method_count() {
-    auto self = shared_from_this();
-    boost::asio::async_read(client_, boost::asio::buffer(method_header_.data() + 1, 1),
-                            [self](const boost::system::error_code &error, std::size_t) {
-                                if (error) {
-                                    self->close();
-                                    return;
-                                }
-
-                                self->methods_.resize(self->method_header_[1]);
-                                if (self->methods_.empty()) {
-                                    self->send_method_response(kNoAcceptableMethods);
-                                    return;
-                                }
-
-                                self->read_methods();
-                            });
-}
-
-void ProxySession::read_methods() {
-    auto self = shared_from_this();
-    boost::asio::async_read(
-        client_, boost::asio::buffer(methods_),
-        [self](const boost::system::error_code &error, std::size_t) {
+// Handshake transport: exact read / full write over the client stream.
+// Transport failures throw; the handshake task maps every failure to
+// close(), matching the old per-step error branches.
+exec::task<void> ProxySession::read_handshake_exact(std::shared_ptr<ProxySession> self,
+                                                    boost::asio::mutable_buffer buffer) {
+    using ReadSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
+                                                    stdexec::set_error_t(std::exception_ptr),
+                                                    stdexec::set_stopped_t()>;
+    co_await async::callback_sender<ReadSigs>(
+        [self, buffer](auto terminal) mutable {
+            boost::asio::async_read(self->client_, buffer, std::move(terminal));
+        },
+        [](auto receiver, const boost::system::error_code &error, auto) {
             if (error) {
-                self->close();
+                stdexec::set_error(
+                    std::move(receiver),
+                    std::make_exception_ptr(
+                        core::Error{core::ErrorCode::transport_io, "SOCKS5 handshake read failed",
+                                    std::error_code(error.value(), std::system_category())}));
                 return;
             }
-
-            const auto required_method = self->owner_.socks5_users_.empty()
-                                             ? kNoAuthentication
-                                             : kUsernamePasswordAuthentication;
-            const auto method =
-                std::find(self->methods_.begin(), self->methods_.end(), required_method);
-            self->send_method_response(method == self->methods_.end() ? kNoAcceptableMethods
-                                                                      : required_method);
+            stdexec::set_value(std::move(receiver), true);
         });
 }
 
-void ProxySession::send_method_response(std::uint8_t method) {
-    method_response_ = {kSocksVersion, method};
-
-    auto self = shared_from_this();
-    boost::asio::async_write(client_, boost::asio::buffer(method_response_),
-                             [self, method](const boost::system::error_code &error, std::size_t) {
-                                 if (error || (method != kNoAuthentication &&
-                                               method != kUsernamePasswordAuthentication)) {
-                                     self->close();
-                                     return;
-                                 }
-
-                                 if (method == kUsernamePasswordAuthentication) {
-                                     self->read_auth_header();
-                                 } else {
-                                     self->read_request_header();
-                                 }
-                             });
-}
-
-void ProxySession::read_auth_header() {
-    auto self = shared_from_this();
-    boost::asio::async_read(client_, boost::asio::buffer(auth_header_),
-                            [self](const boost::system::error_code &error, std::size_t) {
-                                if (error || self->auth_header_[0] != kSocksAuthVersion ||
-                                    self->auth_header_[1] == 0) {
-                                    self->send_auth_response(false);
-                                    return;
-                                }
-                                self->auth_username_.resize(self->auth_header_[1]);
-                                self->read_auth_username();
-                            });
-}
-
-void ProxySession::read_auth_username() {
-    auto self = shared_from_this();
-    boost::asio::async_read(client_, boost::asio::buffer(auth_username_),
-                            [self](const boost::system::error_code &error, std::size_t) {
-                                if (error) {
-                                    self->close();
-                                    return;
-                                }
-                                self->read_auth_password_length();
-                            });
-}
-
-void ProxySession::read_auth_password_length() {
-    auto self = shared_from_this();
-    boost::asio::async_read(client_, boost::asio::buffer(auth_password_length_),
-                            [self](const boost::system::error_code &error, std::size_t) {
-                                if (error || self->auth_password_length_[0] == 0) {
-                                    self->send_auth_response(false);
-                                    return;
-                                }
-                                self->auth_password_.resize(self->auth_password_length_[0]);
-                                self->read_auth_password();
-                            });
-}
-
-void ProxySession::read_auth_password() {
-    auto self = shared_from_this();
-    boost::asio::async_read(
-        client_, boost::asio::buffer(auth_password_),
-        [self](const boost::system::error_code &error, std::size_t) {
+exec::task<void> ProxySession::write_handshake_all(std::shared_ptr<ProxySession> self,
+                                                   boost::asio::const_buffer buffer) {
+    using WriteSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
+                                                     stdexec::set_error_t(std::exception_ptr),
+                                                     stdexec::set_stopped_t()>;
+    co_await async::callback_sender<WriteSigs>(
+        [self, buffer](auto terminal) mutable {
+            boost::asio::async_write(self->client_, buffer, std::move(terminal));
+        },
+        [](auto receiver, const boost::system::error_code &error, auto) {
             if (error) {
-                self->close();
+                stdexec::set_error(
+                    std::move(receiver),
+                    std::make_exception_ptr(
+                        core::Error{core::ErrorCode::transport_io, "SOCKS5 handshake write failed",
+                                    std::error_code(error.value(), std::system_category())}));
                 return;
             }
+            stdexec::set_value(std::move(receiver), true);
+        });
+}
+
+// Straight-line SOCKS5 handshake: method negotiation, optional username /
+// password authentication, request parse. Terminals (target open, UDP
+// association, reply-and-close) stay as methods; every transport failure
+// closes the session, matching the old chain.
+exec::task<void> ProxySession::run_socks5_handshake(std::shared_ptr<ProxySession> self) {
+    try {
+        co_await read_handshake_exact(self,
+                                      boost::asio::buffer(self->method_header_.data() + 1, 1));
+        self->methods_.resize(self->method_header_[1]);
+        if (self->methods_.empty()) {
+            try {
+                self->method_response_ = {kSocksVersion, kNoAcceptableMethods};
+                co_await write_handshake_all(self, boost::asio::buffer(self->method_response_));
+            } catch (...) {
+            }
+            self->close();
+            co_return;
+        }
+        co_await read_handshake_exact(self, boost::asio::buffer(self->methods_));
+        const auto required_method = self->owner_.socks5_users_.empty()
+                                         ? kNoAuthentication
+                                         : kUsernamePasswordAuthentication;
+        const auto method =
+            std::find(self->methods_.begin(), self->methods_.end(), required_method);
+        const auto negotiated =
+            method == self->methods_.end() ? kNoAcceptableMethods : required_method;
+        self->method_response_ = {kSocksVersion, negotiated};
+        co_await write_handshake_all(self, boost::asio::buffer(self->method_response_));
+        if (negotiated != kNoAuthentication && negotiated != kUsernamePasswordAuthentication) {
+            self->close();
+            co_return;
+        }
+        if (negotiated == kUsernamePasswordAuthentication) {
+            co_await read_handshake_exact(self, boost::asio::buffer(self->auth_header_));
+            if (self->auth_header_[0] != kSocksAuthVersion || self->auth_header_[1] == 0) {
+                self->auth_response_ = {kSocksAuthVersion, 0x01};
+                co_await write_handshake_all(self, boost::asio::buffer(self->auth_response_));
+                self->close();
+                co_return;
+            }
+            self->auth_username_.resize(self->auth_header_[1]);
+            co_await read_handshake_exact(self, boost::asio::buffer(self->auth_username_));
+            co_await read_handshake_exact(self, boost::asio::buffer(self->auth_password_length_));
+            if (self->auth_password_length_[0] == 0) {
+                self->auth_response_ = {kSocksAuthVersion, 0x01};
+                co_await write_handshake_all(self, boost::asio::buffer(self->auth_response_));
+                self->close();
+                co_return;
+            }
+            self->auth_password_.resize(self->auth_password_length_[0]);
+            co_await read_handshake_exact(self, boost::asio::buffer(self->auth_password_));
             const auto username =
                 std::string(self->auth_username_.begin(), self->auth_username_.end());
             const auto password =
@@ -151,87 +145,52 @@ void ProxySession::read_auth_password() {
                 [&username, &password](const Socks5User &candidate) {
                     return candidate.username == username && candidate.password == password;
                 });
-            if (user == self->owner_.socks5_users_.end()) {
-                self->send_auth_response(false);
-                return;
+            const auto accepted = user != self->owner_.socks5_users_.end();
+            if (accepted) {
+                self->authenticated_user_ = user->username;
             }
-            self->authenticated_user_ = user->username;
-            self->send_auth_response(true);
-        });
-}
-
-void ProxySession::send_auth_response(bool accepted) {
-    auth_response_ = {kSocksAuthVersion, static_cast<std::uint8_t>(accepted ? 0x00 : 0x01)};
-    auto self = shared_from_this();
-    boost::asio::async_write(client_, boost::asio::buffer(auth_response_),
-                             [self, accepted](const boost::system::error_code &error, std::size_t) {
-                                 if (error || !accepted) {
-                                     self->close();
-                                     return;
-                                 }
-                                 self->read_request_header();
-                             });
-}
-
-void ProxySession::read_request_header() {
-    auto self = shared_from_this();
-    boost::asio::async_read(client_, boost::asio::buffer(request_header_),
-                            [self](const boost::system::error_code &error, std::size_t) {
-                                if (error || self->request_header_[0] != kSocksVersion) {
-                                    self->close();
-                                    return;
-                                }
-
-                                if (self->request_header_[1] != kConnectCommand &&
-                                    self->request_header_[1] != kUdpAssociateCommand) {
-                                    self->send_socks_reply(0x07, false);
-                                    return;
-                                }
-
-                                switch (self->request_header_[3]) {
-                                case 0x01:
-                                    self->request_body_.resize(6);
-                                    self->read_request_body();
-                                    break;
-                                case 0x03:
-                                    self->read_domain_length();
-                                    break;
-                                case 0x04:
-                                    self->request_body_.resize(18);
-                                    self->read_request_body();
-                                    break;
-                                default:
-                                    self->send_socks_reply(0x08, false);
-                                    break;
-                                }
-                            });
-}
-
-void ProxySession::read_domain_length() {
-    auto self = shared_from_this();
-    boost::asio::async_read(client_, boost::asio::buffer(domain_length_),
-                            [self](const boost::system::error_code &error, std::size_t) {
-                                if (error || self->domain_length_[0] == 0) {
-                                    self->close();
-                                    return;
-                                }
-
-                                self->request_body_.resize(self->domain_length_[0] + 2);
-                                self->read_request_body();
-                            });
-}
-
-void ProxySession::read_request_body() {
-    auto self = shared_from_this();
-    boost::asio::async_read(client_, boost::asio::buffer(request_body_),
-                            [self](const boost::system::error_code &error, std::size_t) {
-                                if (error) {
-                                    self->close();
-                                    return;
-                                }
-
-                                self->open_socks_target();
-                            });
+            self->auth_response_ = {kSocksAuthVersion,
+                                    static_cast<std::uint8_t>(accepted ? 0x00 : 0x01)};
+            co_await write_handshake_all(self, boost::asio::buffer(self->auth_response_));
+            if (!accepted) {
+                self->close();
+                co_return;
+            }
+        }
+        co_await read_handshake_exact(self, boost::asio::buffer(self->request_header_));
+        if (self->request_header_[0] != kSocksVersion) {
+            self->close();
+            co_return;
+        }
+        if (self->request_header_[1] != kConnectCommand &&
+            self->request_header_[1] != kUdpAssociateCommand) {
+            self->send_socks_reply(0x07, false);
+            co_return;
+        }
+        switch (self->request_header_[3]) {
+        case 0x01:
+            self->request_body_.resize(6);
+            break;
+        case 0x03:
+            co_await read_handshake_exact(self, boost::asio::buffer(self->domain_length_));
+            if (self->domain_length_[0] == 0) {
+                self->close();
+                co_return;
+            }
+            self->request_body_.resize(self->domain_length_[0] + 2);
+            break;
+        case 0x04:
+            self->request_body_.resize(18);
+            break;
+        default:
+            self->send_socks_reply(0x08, false);
+            co_return;
+        }
+        co_await read_handshake_exact(self, boost::asio::buffer(self->request_body_));
+        self->open_socks_target();
+    } catch (...) {
+        self->close();
+    }
 }
 
 std::uint16_t ProxySession::request_port() const noexcept {

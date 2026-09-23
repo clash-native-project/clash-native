@@ -76,7 +76,7 @@ void ProxySession::read_protocol_byte() {
                                     }
                                     self->protocol_ = Protocol::socks5;
                                     self->method_header_[0] = self->protocol_byte_[0];
-                                    self->read_method_count();
+                                    self->scope_.spawn(self->run_socks5_handshake(self));
                                     return;
                                 }
 
