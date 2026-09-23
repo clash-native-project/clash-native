@@ -66,7 +66,7 @@ void ProxySession::read_protocol_byte() {
                                     }
                                     self->protocol_ = Protocol::socks4;
                                     self->socks4_request_[0] = self->protocol_byte_[0];
-                                    self->read_socks4_request();
+                                    self->scope_.spawn(self->run_socks4_request(self));
                                     return;
                                 }
 

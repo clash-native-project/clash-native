@@ -176,7 +176,9 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     void reset_handshake_timer();
     void cancel_handshake_timer() noexcept;
     void read_protocol_byte();
-    void read_socks4_request();
+    static exec::task<void> run_socks4_request(std::shared_ptr<ProxySession> self);
+    static exec::task<void> run_socks4_reply(std::shared_ptr<ProxySession> self,
+                                             std::uint8_t status, bool start_relay);
     void read_socks4_user_id();
     void read_socks4_domain();
     void open_socks4_target();

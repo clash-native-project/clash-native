@@ -1,6 +1,9 @@
 #include "proxy_session.hpp"
 
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
+
+#include <exec/task.hpp>
 
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
@@ -38,19 +41,39 @@ std::optional<std::size_t> null_position(const std::vector<std::uint8_t> &payloa
 
 } // namespace
 
-void ProxySession::read_socks4_request() {
-    auto self = shared_from_this();
-    boost::asio::async_read(
-        client_, boost::asio::buffer(socks4_request_.data() + 1, socks4_request_.size() - 1),
-        [self](const boost::system::error_code &error, std::size_t) {
-            if (error || self->socks4_request_[0] != kSocks4Version ||
-                self->socks4_request_[1] != kSocks4Connect) {
-                self->close();
-                return;
-            }
-            self->socks4_payload_.clear();
-            self->read_socks4_user_id();
-        });
+exec::task<void> ProxySession::run_socks4_request(std::shared_ptr<ProxySession> self) {
+    using ReadSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
+                                                    stdexec::set_error_t(std::exception_ptr),
+                                                    stdexec::set_stopped_t()>;
+    try {
+        co_await async::callback_sender<ReadSigs>(
+            [self](auto terminal) mutable {
+                boost::asio::async_read(self->client_,
+                                        boost::asio::buffer(self->socks4_request_.data() + 1,
+                                                            self->socks4_request_.size() - 1),
+                                        std::move(terminal));
+            },
+            [](auto receiver, const boost::system::error_code &error, auto) {
+                if (error) {
+                    stdexec::set_error(
+                        std::move(receiver),
+                        std::make_exception_ptr(core::Error{
+                            core::ErrorCode::transport_io, "SOCKS4 handshake read failed",
+                            std::error_code(error.value(), std::system_category())}));
+                    return;
+                }
+                stdexec::set_value(std::move(receiver), true);
+            });
+    } catch (...) {
+        self->close();
+        co_return;
+    }
+    if (self->socks4_request_[0] != kSocks4Version || self->socks4_request_[1] != kSocks4Connect) {
+        self->close();
+        co_return;
+    }
+    self->socks4_payload_.clear();
+    self->read_socks4_user_id();
 }
 
 void ProxySession::read_socks4_user_id() {
@@ -172,23 +195,48 @@ void ProxySession::open_socks4_target() {
 }
 
 void ProxySession::send_socks4_reply(std::uint8_t status, bool start_relay) {
-    if (closed_.load(std::memory_order_acquire)) {
-        return;
-    }
-    socks4_reply_[0] = 0x00;
-    socks4_reply_[1] = status;
-    std::copy(socks4_request_.begin() + 2, socks4_request_.begin() + 8, socks4_reply_.begin() + 2);
-
     auto self = shared_from_this();
-    boost::asio::async_write(
-        client_, boost::asio::buffer(socks4_reply_),
-        [self, start_relay](const boost::system::error_code &error, std::size_t) {
-            if (error || !start_relay) {
-                self->close();
-                return;
-            }
-            self->start_relay();
-        });
+    self->scope_.spawn(run_socks4_reply(self, status, start_relay));
+}
+
+exec::task<void> ProxySession::run_socks4_reply(std::shared_ptr<ProxySession> self,
+                                                std::uint8_t status, bool start_relay) {
+    if (self->closed_.load(std::memory_order_acquire)) {
+        co_return;
+    }
+    self->socks4_reply_[0] = 0x00;
+    self->socks4_reply_[1] = status;
+    std::copy(self->socks4_request_.begin() + 2, self->socks4_request_.begin() + 8,
+              self->socks4_reply_.begin() + 2);
+    using WriteSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
+                                                     stdexec::set_error_t(std::exception_ptr),
+                                                     stdexec::set_stopped_t()>;
+    try {
+        co_await async::callback_sender<WriteSigs>(
+            [self](auto terminal) mutable {
+                boost::asio::async_write(self->client_, boost::asio::buffer(self->socks4_reply_),
+                                         std::move(terminal));
+            },
+            [](auto receiver, const boost::system::error_code &error, auto) {
+                if (error) {
+                    stdexec::set_error(
+                        std::move(receiver),
+                        std::make_exception_ptr(core::Error{
+                            core::ErrorCode::transport_io, "SOCKS4 handshake write failed",
+                            std::error_code(error.value(), std::system_category())}));
+                    return;
+                }
+                stdexec::set_value(std::move(receiver), true);
+            });
+    } catch (...) {
+        self->close();
+        co_return;
+    }
+    if (!start_relay) {
+        self->close();
+        co_return;
+    }
+    self->start_relay();
 }
 
 } // namespace clash_native::proxy

@@ -2205,3 +2205,13 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-24
+
+- Taskified the SOCKS4 edges: the request read runs as
+  `run_socks4_request` and the reply write as `run_socks4_reply` on
+  the session scope; the user-id/domain pulls were already
+  sender-native.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.
