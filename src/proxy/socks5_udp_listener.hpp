@@ -6,6 +6,9 @@
 
 #include <boost/asio/ip/udp.hpp>
 
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
+
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -40,6 +43,10 @@ class Socks5UdpListener final : public std::enable_shared_from_this<Socks5UdpLis
 
     void receive();
     void process(std::size_t size, boost::asio::ip::udp::endpoint client);
+    static exec::task<void> run_route(std::shared_ptr<Socks5UdpListener> self,
+                                      runtime::RuntimeSnapshotPtr snapshot,
+                                      core::ConnectionMetadata metadata, std::string key,
+                                      boost::asio::ip::udp::endpoint client);
     void send_payload(const std::shared_ptr<Path> &path,
                       std::shared_ptr<std::vector<std::uint8_t>> payload);
     // Single-pull response loop, re-armed per completion; no task needed.
@@ -61,6 +68,7 @@ class Socks5UdpListener final : public std::enable_shared_from_this<Socks5UdpLis
     // threads during teardown.
     std::mutex paths_mutex_;
     bool stopped_ = true;
+    exec::async_scope scope_;
 };
 
 } // namespace clash_native::proxy

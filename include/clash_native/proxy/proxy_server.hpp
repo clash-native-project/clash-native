@@ -4,6 +4,7 @@
 #include <clash_native/core/result.hpp>
 #include <clash_native/dns/fake_ip_store.hpp>
 #include <clash_native/dns/resolver_service.hpp>
+#include <clash_native/io/sender.hpp>
 #include <clash_native/observability/connection_registry.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
@@ -14,6 +15,8 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ip/udp.hpp>
 #include <boost/asio/ssl/context.hpp>
+
+#include <exec/task.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -86,20 +89,30 @@ class ProxyServer {
     using SessionPtr = std::shared_ptr<ProxySession>;
     using DatagramRouteHandler =
         std::function<void(core::DatagramOpenResult, boost::asio::ip::udp::endpoint)>;
+    struct RoutedDatagram {
+        core::DatagramOpenResult result;
+        boost::asio::ip::udp::endpoint target;
+    };
 
     void accept();
     core::Status start_socks5_udp_listener();
-    void open_stream(core::ConnectionMetadata metadata,
-                     std::optional<observability::ConnectionRegistry::ConnectionId> connection_id,
-                     core::StreamOpenHandler handler);
-    void route_stream(runtime::RuntimeSnapshotPtr snapshot, core::ConnectionMetadata metadata,
-                      router::RoutingContext context, std::size_t start,
-                      std::optional<observability::ConnectionRegistry::ConnectionId> connection_id,
-                      core::StreamOpenHandler handler);
-    void open_datagram(runtime::RuntimeSnapshotPtr snapshot, core::ConnectionMetadata metadata,
-                       DatagramRouteHandler handler);
-    void route_datagram(runtime::RuntimeSnapshotPtr snapshot, core::ConnectionMetadata metadata,
-                        router::RoutingContext context, DatagramRouteHandler handler);
+    exec::task<core::StreamOpenResult>
+    open_stream(core::ConnectionMetadata metadata,
+                std::optional<observability::ConnectionRegistry::ConnectionId> connection_id);
+    static exec::task<core::StreamOpenResult>
+    route_stream(ProxyServer &server, runtime::RuntimeSnapshotPtr snapshot,
+                 core::ConnectionMetadata metadata, router::RoutingContext context,
+                 std::size_t start,
+                 std::optional<observability::ConnectionRegistry::ConnectionId> connection_id);
+    exec::task<RoutedDatagram> open_datagram(runtime::RuntimeSnapshotPtr snapshot,
+                                             core::ConnectionMetadata metadata);
+    static exec::task<RoutedDatagram> open_datagram_resolved(ProxyServer &server,
+                                                             runtime::RuntimeSnapshotPtr snapshot,
+                                                             core::ConnectionMetadata metadata);
+    static exec::task<RoutedDatagram> route_datagram(ProxyServer &server,
+                                                     runtime::RuntimeSnapshotPtr snapshot,
+                                                     core::ConnectionMetadata metadata,
+                                                     router::RoutingContext context);
     void stop_on_owner() noexcept;
     void remove_session(const SessionPtr &session) noexcept;
 

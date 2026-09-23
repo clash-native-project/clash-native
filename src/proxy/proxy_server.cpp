@@ -1,4 +1,4 @@
-#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/bridge.hpp>
 #include <clash_native/core/base64.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
@@ -52,34 +52,6 @@ namespace {
 core::Error listener_error(std::string_view operation, const boost::system::error_code &error) {
     return {core::ErrorCode::transport_io, fmt::format("failed to {} proxy listener", operation),
             std::error_code(error.value(), std::system_category())};
-}
-
-// Proxy-plane debt: drives a sender-based outbound open into a callback
-// handler. Delete when the proxy plane runs on senders.
-template <class Sender>
-void start_open_for_handler(Sender &&sender, core::StreamOpenHandler handler) {
-    struct Receiver {
-        using receiver_concept = stdexec::receiver_tag;
-        core::StreamOpenHandler handler;
-        void set_value(core::StreamOpenResult result) && noexcept {
-            std::move(handler)(std::move(result));
-        }
-        void set_error(std::exception_ptr error) && noexcept {
-            try {
-                std::rethrow_exception(std::move(error));
-            } catch (const core::Error &failure) {
-                handler(core::StreamOpenResult::failed(failure));
-            } catch (...) {
-                handler(core::StreamOpenResult::failed(core::Error{
-                    core::ErrorCode::endpoint_connection, "proxy outbound open failed"}));
-            }
-        }
-        void set_stopped() && noexcept {
-            handler(core::StreamOpenResult::failed(
-                core::Error{core::ErrorCode::cancelled, "proxy outbound open was cancelled"}));
-        }
-    };
-    async::start_with_receiver(std::forward<Sender>(sender), Receiver{std::move(handler)});
 }
 
 } // namespace
@@ -486,15 +458,13 @@ void ProxyServer::accept() {
     });
 }
 
-void ProxyServer::open_stream(
+exec::task<core::StreamOpenResult> ProxyServer::open_stream(
     core::ConnectionMetadata metadata,
-    std::optional<observability::ConnectionRegistry::ConnectionId> connection_id,
-    core::StreamOpenHandler handler) {
+    std::optional<observability::ConnectionRegistry::ConnectionId> connection_id) {
     const auto snapshot = snapshot_store_->load();
     if (!snapshot) {
-        handler(core::StreamOpenResult::failed(
-            {core::ErrorCode::configuration, "proxy runtime snapshot is not published"}));
-        return;
+        co_return core::StreamOpenResult::failed(
+            {core::ErrorCode::configuration, "proxy runtime snapshot is not published"});
     }
     if (snapshot->fake_ip_store && metadata.destination.is_address() &&
         metadata.destination.address().is_v4()) {
@@ -503,159 +473,182 @@ void ProxyServer::open_stream(
             metadata.destination = core::Destination::domain(*domain, metadata.destination.port());
         }
     }
-    route_stream(snapshot, std::move(metadata), {}, 0, connection_id, std::move(handler));
+    co_return co_await route_stream(*this, snapshot, std::move(metadata), {}, 0, connection_id);
 }
 
-void ProxyServer::route_stream(
-    runtime::RuntimeSnapshotPtr snapshot, core::ConnectionMetadata metadata,
+exec::task<core::StreamOpenResult> ProxyServer::route_stream(
+    ProxyServer &server, runtime::RuntimeSnapshotPtr snapshot, core::ConnectionMetadata metadata,
     router::RoutingContext context, std::size_t start,
-    std::optional<observability::ConnectionRegistry::ConnectionId> connection_id,
-    core::StreamOpenHandler handler) {
-    const auto evaluation = snapshot->router->evaluate(metadata, context, start);
-    if (const auto *need = std::get_if<router::NeedMetadata>(&evaluation)) {
-        if (need->need != router::MetadataNeed::destination_ip ||
-            !metadata.destination.is_domain() || !snapshot->resolver) {
-            handler(core::StreamOpenResult::failed(
-                {core::ErrorCode::resolution, "destination IP enrichment is not configured"}));
-            return;
-        }
-
-        context.destination_lookup = router::LookupState::in_progress;
-        const auto resolver = snapshot->resolver;
-        const auto gate = callback_gate_;
-        auto self = this;
-        const auto request_id = std::make_shared<dns::ResolverService::RequestId>();
-        *request_id = resolver->resolve(
-            {metadata.destination.domain(), dns::DnsRecordType::a, 1},
-            [self, gate, resolver, request_id, snapshot, connection_id,
-             metadata = std::move(metadata), context = std::move(context), start = need->rule_index,
-             handler = std::move(handler)](core::Result<dns::DnsAnswer> result) mutable {
-                if (!gate->load(std::memory_order_acquire)) {
-                    return;
-                }
-                self->resolver_requests_.erase(*request_id);
-                auto addresses = std::make_shared<std::vector<boost::asio::ip::address>>();
-                if (result) {
-                    addresses->insert(addresses->end(), result.value().addresses.begin(),
-                                      result.value().addresses.end());
-                }
-                const auto ipv6_request_id = std::make_shared<dns::ResolverService::RequestId>();
-                *ipv6_request_id = resolver->resolve(
-                    {metadata.destination.domain(), dns::DnsRecordType::aaaa, 1},
-                    [self, gate, snapshot, ipv6_request_id, metadata = std::move(metadata),
-                     context = std::move(context), start, connection_id,
-                     handler = std::move(handler),
-                     addresses](core::Result<dns::DnsAnswer> ipv6_result) mutable {
-                        if (!gate->load(std::memory_order_acquire)) {
-                            return;
+    std::optional<observability::ConnectionRegistry::ConnectionId> connection_id) {
+    const auto failed = [](core::Error error) {
+        return core::StreamOpenResult::failed(std::move(error));
+    };
+    const auto cancelled = [] {
+        return core::StreamOpenResult::failed(
+            {core::ErrorCode::cancelled, "proxy route was cancelled", {}});
+    };
+    const auto stopped = [&server] {
+        return !server.callback_gate_->load(std::memory_order_acquire);
+    };
+    // Resolve bridge: registers the registry request for server stop and
+    // unregisters on terminal; the aborter cancels late.
+    const auto resolve_addresses =
+        [&server, snapshot](std::string host,
+                            dns::DnsRecordType type) -> exec::task<core::Result<dns::DnsAnswer>> {
+        core::Result<dns::DnsAnswer> answer;
+        try {
+            answer = co_await async::bridge_sender<core::Result<dns::DnsAnswer>>(
+                [&server, snapshot, host = std::move(host),
+                 type](async::BridgeSender<core::Result<dns::DnsAnswer>>::Handler done) mutable {
+                    auto resolver = snapshot->resolver;
+                    auto id = std::make_shared<dns::ResolverService::RequestId>();
+                    *id = resolver->resolve(
+                        {std::move(host), type, 1},
+                        [&server, id, done](core::Result<dns::DnsAnswer> result) mutable {
+                            server.resolver_requests_.erase(*id);
+                            done(std::move(result));
+                        },
+                        server.runtime_.scheduler());
+                    server.resolver_requests_.insert(*id);
+                    return [&server, snapshot, id] {
+                        if (snapshot->resolver) {
+                            snapshot->resolver->cancel(*id);
                         }
-                        self->resolver_requests_.erase(*ipv6_request_id);
-                        if (ipv6_result) {
-                            addresses->insert(addresses->end(),
-                                              ipv6_result.value().addresses.begin(),
-                                              ipv6_result.value().addresses.end());
-                        }
-                        if (!addresses->empty()) {
-                            context.destination_lookup = router::LookupState::resolved;
-                            context.destination_addresses = std::move(*addresses);
-                            context.destination_address = context.destination_addresses.front();
-                        } else {
-                            context.destination_lookup = router::LookupState::failed;
-                            context.destination_addresses.clear();
-                            context.destination_address.reset();
-                        }
-                        self->route_stream(snapshot, std::move(metadata), std::move(context), start,
-                                           connection_id, std::move(handler));
-                    },
-                    self->runtime_.scheduler());
-                self->resolver_requests_.insert(*ipv6_request_id);
-            },
-            runtime_.scheduler());
-        resolver_requests_.insert(*request_id);
-        return;
-    }
-
-    const auto *matched = std::get_if<router::Matched>(&evaluation);
-    if (!matched) {
-        handler(core::StreamOpenResult::failed(
-            {core::ErrorCode::resolution, "routing requires destination IP enrichment"}));
-        return;
-    }
-
-    switch (matched->decision.action.kind) {
-    case router::RouteActionKind::direct:
-        if (connection_id && connection_registry_) {
-            connection_registry_->update_outbound(*connection_id, "direct");
-        }
-        if (metadata.destination.is_domain() && !context.destination_address &&
-            snapshot->resolver) {
-            const auto gate = callback_gate_;
-            auto destination = metadata.destination;
-            const auto domain = destination.domain();
-            outbound::detail::resolve_host(
-                runtime_, snapshot->resolver, domain,
-                [this, gate, destination = std::move(destination), handler = std::move(handler)](
-                    core::Result<outbound::detail::AddressList> result) mutable {
-                    if (!gate->load(std::memory_order_acquire)) {
-                        return;
-                    }
-                    if (!result || result.value().empty()) {
-                        handler(core::StreamOpenResult::failed(
-                            result ? core::Error{core::ErrorCode::resolution,
-                                                 "direct destination resolved to no addresses"}
-                                   : result.error()));
-                        return;
-                    }
-                    start_open_for_handler(direct_outbound_->connect_stream(
-                                               {std::move(destination), result.value().front()}),
-                                           std::move(handler));
+                        server.resolver_requests_.erase(*id);
+                    };
                 });
-            return;
+        } catch (...) {
+            co_return core::fail(
+                core::Error{core::ErrorCode::resolution, "proxy route DNS enrichment failed", {}});
         }
-        start_open_for_handler(direct_outbound_->connect_stream(
-                                   {std::move(metadata.destination), context.destination_address}),
-                               std::move(handler));
-        return;
-    case router::RouteActionKind::reject:
-        if (connection_id && connection_registry_) {
-            connection_registry_->update_outbound(*connection_id, "reject");
+        co_return answer;
+    };
+    for (;;) {
+        const auto evaluation = snapshot->router->evaluate(metadata, context, start);
+        if (const auto *need = std::get_if<router::NeedMetadata>(&evaluation)) {
+            if (need->need != router::MetadataNeed::destination_ip ||
+                !metadata.destination.is_domain() || !snapshot->resolver) {
+                co_return failed(
+                    {core::ErrorCode::resolution, "destination IP enrichment is not configured"});
+            }
+            context.destination_lookup = router::LookupState::in_progress;
+            std::vector<boost::asio::ip::address> addresses;
+            for (const auto type : {dns::DnsRecordType::a, dns::DnsRecordType::aaaa}) {
+                auto answer = co_await resolve_addresses(metadata.destination.domain(), type);
+                if (stopped()) {
+                    co_return cancelled();
+                }
+                if (answer) {
+                    addresses.insert(addresses.end(), answer.value().addresses.begin(),
+                                     answer.value().addresses.end());
+                }
+            }
+            if (!addresses.empty()) {
+                context.destination_lookup = router::LookupState::resolved;
+                context.destination_addresses = std::move(addresses);
+                context.destination_address = context.destination_addresses.front();
+            } else {
+                context.destination_lookup = router::LookupState::failed;
+                context.destination_addresses.clear();
+                context.destination_address.reset();
+            }
+            start = need->rule_index;
+            continue;
         }
-        start_open_for_handler(reject_outbound_->connect_stream(
-                                   {std::move(metadata.destination), context.destination_address}),
-                               std::move(handler));
-        return;
-    case router::RouteActionKind::named:
-        if (!snapshot->outbounds) {
-            handler(core::StreamOpenResult::failed(
-                {core::ErrorCode::configuration, "proxy outbound registry is missing"}));
-            return;
+        const auto *matched = std::get_if<router::Matched>(&evaluation);
+        if (!matched) {
+            co_return failed(
+                {core::ErrorCode::resolution, "routing requires destination IP enrichment"});
         }
-        {
+        const auto dial =
+            [&server](std::shared_ptr<core::Outbound> outbound,
+                      core::StreamRequest request) -> exec::task<core::StreamOpenResult> {
+            try {
+                co_return co_await outbound->connect_stream(std::move(request));
+            } catch (const core::Error &failure) {
+                co_return core::StreamOpenResult::failed(failure);
+            } catch (...) {
+                co_return core::StreamOpenResult::failed(core::Error{
+                    core::ErrorCode::endpoint_connection, "proxy outbound open failed"});
+            }
+        };
+        switch (matched->decision.action.kind) {
+        case router::RouteActionKind::direct: {
+            if (connection_id && server.connection_registry_) {
+                server.connection_registry_->update_outbound(*connection_id, "direct");
+            }
+            if (metadata.destination.is_domain() && !context.destination_address &&
+                snapshot->resolver) {
+                const auto domain = metadata.destination.domain();
+                core::Result<outbound::detail::AddressList> resolved;
+                try {
+                    resolved =
+                        co_await async::bridge_sender<core::Result<outbound::detail::AddressList>>(
+                            [&server, domain](
+                                async::BridgeSender<core::Result<outbound::detail::AddressList>>::
+                                    Handler done) mutable {
+                                outbound::detail::resolve_host(
+                                    server.runtime_, server.snapshot_store_->load()->resolver,
+                                    domain,
+                                    [done](core::Result<outbound::detail::AddressList>
+                                               result) mutable { done(std::move(result)); });
+                                return async::BridgeSender<
+                                    core::Result<outbound::detail::AddressList>>::AbortFn{};
+                            });
+                } catch (...) {
+                    co_return failed(
+                        {core::ErrorCode::resolution, "direct destination resolution failed"});
+                }
+                if (stopped()) {
+                    co_return cancelled();
+                }
+                if (!resolved || resolved.value().empty()) {
+                    co_return failed(
+                        resolved ? core::Error{core::ErrorCode::resolution,
+                                               "direct destination resolved to no addresses"}
+                                 : resolved.error());
+                }
+                auto destination = metadata.destination;
+                co_return co_await dial(server.direct_outbound_,
+                                        {std::move(destination), resolved.value().front()});
+            }
+            co_return co_await dial(server.direct_outbound_,
+                                    {std::move(metadata.destination), context.destination_address});
+        }
+        case router::RouteActionKind::reject: {
+            if (connection_id && server.connection_registry_) {
+                server.connection_registry_->update_outbound(*connection_id, "reject");
+            }
+            co_return co_await dial(server.reject_outbound_,
+                                    {std::move(metadata.destination), context.destination_address});
+        }
+        case router::RouteActionKind::named: {
+            if (!snapshot->outbounds) {
+                co_return failed(
+                    {core::ErrorCode::configuration, "proxy outbound registry is missing"});
+            }
             const auto selected = snapshot->outbounds->select(matched->decision.action.target);
             if (!selected) {
-                handler(core::StreamOpenResult::failed(selected.error()));
-                return;
+                co_return failed(selected.error());
             }
-            if (connection_id && connection_registry_) {
-                connection_registry_->update_outbound(*connection_id,
-                                                      selected.value()->descriptor().id);
+            if (connection_id && server.connection_registry_) {
+                server.connection_registry_->update_outbound(*connection_id,
+                                                             selected.value()->descriptor().id);
             }
-            start_open_for_handler(
-                selected.value()->connect_stream(
-                    {std::move(metadata.destination), context.destination_address}),
-                std::move(handler));
+            co_return co_await dial(selected.value(),
+                                    {std::move(metadata.destination), context.destination_address});
         }
-        return;
+        }
     }
 }
-
-void ProxyServer::open_datagram(runtime::RuntimeSnapshotPtr snapshot,
-                                core::ConnectionMetadata metadata, DatagramRouteHandler handler) {
+exec::task<ProxyServer::RoutedDatagram>
+ProxyServer::open_datagram(runtime::RuntimeSnapshotPtr snapshot,
+                           core::ConnectionMetadata metadata) {
     if (!snapshot) {
-        handler(core::DatagramOpenResult::failed(
-                    {core::ErrorCode::configuration, "proxy runtime snapshot is not published"}),
-                {});
-        return;
+        co_return RoutedDatagram{
+            core::DatagramOpenResult::failed(
+                {core::ErrorCode::configuration, "proxy runtime snapshot is not published"}),
+            {}};
     }
     if (snapshot->fake_ip_store && metadata.destination.is_address() &&
         metadata.destination.address().is_v4()) {
@@ -664,57 +657,72 @@ void ProxyServer::open_datagram(runtime::RuntimeSnapshotPtr snapshot,
             metadata.destination = core::Destination::domain(*domain, metadata.destination.port());
         }
     }
-
-    router::RoutingContext context;
     if (metadata.destination.is_address()) {
+        router::RoutingContext context;
         context.destination_lookup = router::LookupState::resolved;
         context.destination_address = metadata.destination.address();
         context.destination_addresses.push_back(metadata.destination.address());
-        route_datagram(std::move(snapshot), std::move(metadata), std::move(context),
-                       std::move(handler));
-        return;
+        co_return co_await route_datagram(*this, std::move(snapshot), std::move(metadata),
+                                          std::move(context));
     }
-
-    const auto gate = callback_gate_;
-    const auto domain = metadata.destination.domain();
-    auto resolver = snapshot->resolver;
-    outbound::detail::resolve_host(
-        runtime_, std::move(resolver), domain,
-        [this, gate, snapshot = std::move(snapshot), metadata = std::move(metadata),
-         handler = std::move(handler)](core::Result<outbound::detail::AddressList> result) mutable {
-            if (!gate->load(std::memory_order_acquire)) {
-                return;
-            }
-            if (!result || result.value().empty()) {
-                handler(core::DatagramOpenResult::failed(
-                            result ? core::Error{core::ErrorCode::resolution,
-                                                 "UDP destination resolved to no addresses"}
-                                   : result.error()),
-                        {});
-                return;
-            }
-            router::RoutingContext context;
-            context.destination_lookup = router::LookupState::resolved;
-            context.destination_addresses = std::move(result.value());
-            context.destination_address = context.destination_addresses.front();
-            route_datagram(std::move(snapshot), std::move(metadata), std::move(context),
-                           std::move(handler));
-        });
+    co_return co_await open_datagram_resolved(*this, std::move(snapshot), std::move(metadata));
 }
 
-void ProxyServer::route_datagram(runtime::RuntimeSnapshotPtr snapshot,
-                                 core::ConnectionMetadata metadata, router::RoutingContext context,
-                                 DatagramRouteHandler handler) {
+exec::task<ProxyServer::RoutedDatagram>
+ProxyServer::open_datagram_resolved(ProxyServer &server, runtime::RuntimeSnapshotPtr snapshot,
+                                    core::ConnectionMetadata metadata) {
+    const auto domain = metadata.destination.domain();
+    core::Result<outbound::detail::AddressList> resolved;
+    try {
+        resolved = co_await async::bridge_sender<core::Result<outbound::detail::AddressList>>(
+            [&server,
+             domain](async::BridgeSender<core::Result<outbound::detail::AddressList>>::Handler
+                         done) mutable {
+                outbound::detail::resolve_host(
+                    server.runtime_, server.snapshot_store_->load()->resolver, domain,
+                    [done](core::Result<outbound::detail::AddressList> result) mutable {
+                        done(std::move(result));
+                    });
+                return async::BridgeSender<core::Result<outbound::detail::AddressList>>::AbortFn{};
+            });
+    } catch (...) {
+        co_return RoutedDatagram{core::DatagramOpenResult::failed(
+                                     {core::ErrorCode::resolution, "UDP resolution failed", {}}),
+                                 {}};
+    }
+    if (!server.callback_gate_->load(std::memory_order_acquire)) {
+        co_return RoutedDatagram{core::DatagramOpenResult::failed(
+                                     {core::ErrorCode::cancelled, "proxy route was cancelled", {}}),
+                                 {}};
+    }
+    if (!resolved || resolved.value().empty()) {
+        co_return RoutedDatagram{core::DatagramOpenResult::failed(
+                                     resolved
+                                         ? core::Error{core::ErrorCode::resolution,
+                                                       "UDP destination resolved to no addresses"}
+                                         : resolved.error()),
+                                 {}};
+    }
+    router::RoutingContext context;
+    context.destination_lookup = router::LookupState::resolved;
+    context.destination_addresses = std::move(resolved.value());
+    context.destination_address = context.destination_addresses.front();
+    co_return co_await route_datagram(server, std::move(snapshot), std::move(metadata),
+                                      std::move(context));
+}
+
+exec::task<ProxyServer::RoutedDatagram>
+ProxyServer::route_datagram(ProxyServer &server, runtime::RuntimeSnapshotPtr snapshot,
+                            core::ConnectionMetadata metadata, router::RoutingContext context) {
+    const auto failed = [](core::Error error, boost::asio::ip::udp::endpoint target) {
+        return RoutedDatagram{core::DatagramOpenResult::failed(std::move(error)), target};
+    };
     const auto evaluation = snapshot->router->evaluate(metadata, context);
     const auto *matched = std::get_if<router::Matched>(&evaluation);
     if (!matched) {
-        handler(
-            core::DatagramOpenResult::failed(
-                {core::ErrorCode::resolution, "UDP routing requires destination IP enrichment"}),
-            {});
-        return;
+        co_return failed(
+            {core::ErrorCode::resolution, "UDP routing requires destination IP enrichment"}, {});
     }
-
     const auto destination_address =
         context.destination_address
             ? context.destination_address
@@ -722,10 +730,8 @@ void ProxyServer::route_datagram(runtime::RuntimeSnapshotPtr snapshot,
                    ? std::optional<boost::asio::ip::address>(metadata.destination.address())
                    : std::nullopt);
     if (!destination_address) {
-        handler(core::DatagramOpenResult::failed(
-                    {core::ErrorCode::resolution, "UDP destination has no resolved address"}),
-                {});
-        return;
+        co_return failed({core::ErrorCode::resolution, "UDP destination has no resolved address"},
+                         {});
     }
     const boost::asio::ip::udp::endpoint target(*destination_address, metadata.destination.port());
     const core::DatagramRequest request{
@@ -733,65 +739,35 @@ void ProxyServer::route_datagram(runtime::RuntimeSnapshotPtr snapshot,
     std::shared_ptr<core::Outbound> outbound;
     switch (matched->decision.action.kind) {
     case router::RouteActionKind::direct:
-        outbound = direct_outbound_;
+        outbound = server.direct_outbound_;
         break;
     case router::RouteActionKind::reject:
-        outbound = reject_outbound_;
+        outbound = server.reject_outbound_;
         break;
     case router::RouteActionKind::named:
         if (!snapshot->outbounds) {
-            handler(core::DatagramOpenResult::failed(
-                        {core::ErrorCode::configuration, "proxy outbound registry is missing"}),
-                    target);
-            return;
+            co_return failed({core::ErrorCode::configuration, "proxy outbound registry is missing"},
+                             target);
         }
         {
             const auto selected = snapshot->outbounds->select(matched->decision.action.target);
             if (!selected) {
-                handler(core::DatagramOpenResult::failed(selected.error()), target);
-                return;
+                co_return failed(selected.error(), target);
             }
             outbound = selected.value();
         }
         break;
     }
-    // Proxy-plane debt: drives a sender-based outbound open into the
-    // route handler. Delete when the datagram plane runs on senders.
-    struct RouteReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        DatagramRouteHandler handler;
-        boost::asio::ip::udp::endpoint target;
-
-        void set_value(core::DatagramOpenResult result) && noexcept {
-            auto callback = std::move(handler);
-            callback(std::move(result), target);
-        }
-
-        void set_error(std::exception_ptr error) && noexcept {
-            core::DatagramOpenResult result;
-            try {
-                std::rethrow_exception(std::move(error));
-            } catch (const core::Error &failure) {
-                result = core::DatagramOpenResult::failed(failure);
-            } catch (...) {
-                result = core::DatagramOpenResult::failed(core::Error{
-                    core::ErrorCode::endpoint_connection, "proxy datagram open failed"});
-            }
-            auto callback = std::move(handler);
-            callback(std::move(result), target);
-        }
-
-        void set_stopped() && noexcept {
-            auto callback = std::move(handler);
-            callback(core::DatagramOpenResult::failed(core::Error{
-                         core::ErrorCode::cancelled, "proxy datagram open was cancelled"}),
-                     target);
-        }
-    };
-    async::start_with_receiver(outbound->open_datagram(std::move(request)),
-                               RouteReceiver{std::move(handler), target});
+    try {
+        co_return RoutedDatagram{co_await outbound->open_datagram(std::move(request)), target};
+    } catch (const core::Error &failure) {
+        co_return failed(failure, target);
+    } catch (...) {
+        co_return failed(
+            core::Error{core::ErrorCode::endpoint_connection, "proxy datagram open failed"},
+            target);
+    }
 }
-
 void ProxyServer::remove_session(const SessionPtr &session) noexcept {
     std::lock_guard lock(sessions_mutex_);
     sessions_.erase(session);

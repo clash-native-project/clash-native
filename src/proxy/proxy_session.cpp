@@ -1,5 +1,6 @@
 #include "proxy_session.hpp"
 
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 
 #include <boost/asio/read.hpp>
@@ -120,9 +121,22 @@ void ProxySession::open_target(core::Destination destination) {
         connection_id_ = owner_.connection_registry_->add(metadata, {});
     }
     auto self = shared_from_this();
-    owner_.open_stream(std::move(metadata), connection_id_, [self](core::StreamOpenResult result) {
-        self->handle_open_result(std::move(result));
-    });
+    self->scope_.spawn(run_open_target(self, std::move(metadata), connection_id_));
+}
+
+exec::task<void> ProxySession::run_open_target(
+    std::shared_ptr<ProxySession> self, core::ConnectionMetadata metadata,
+    std::optional<observability::ConnectionRegistry::ConnectionId> connection_id) {
+    core::StreamOpenResult result;
+    try {
+        result = co_await self->owner_.open_stream(std::move(metadata), connection_id);
+    } catch (const core::Error &failure) {
+        result = core::StreamOpenResult::failed(failure);
+    } catch (...) {
+        result = core::StreamOpenResult::failed(
+            {core::ErrorCode::endpoint_connection, "proxy outbound open failed", {}});
+    }
+    self->handle_open_result(std::move(result));
 }
 
 void ProxySession::handle_open_result(core::StreamOpenResult result) {

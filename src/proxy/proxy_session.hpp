@@ -181,6 +181,9 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     void read_socks4_domain();
     void open_socks4_target();
     void open_target(core::Destination destination);
+    static exec::task<void>
+    run_open_target(std::shared_ptr<ProxySession> self, core::ConnectionMetadata metadata,
+                    std::optional<observability::ConnectionRegistry::ConnectionId> connection_id);
     void handle_open_result(core::StreamOpenResult result);
     void start_relay();
     void close() noexcept;
@@ -196,6 +199,9 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     void send_socks_udp_associate_reply(const boost::asio::ip::udp::endpoint &endpoint);
     void read_udp_control();
     void read_socks_udp_packet();
+    static exec::task<void> run_udp_route(std::shared_ptr<ProxySession> self,
+                                          runtime::RuntimeSnapshotPtr snapshot,
+                                          core::ConnectionMetadata metadata, std::string key);
     bool accept_udp_sender(const boost::asio::ip::udp::endpoint &sender);
     void process_socks_udp_packet(std::size_t size);
     void send_udp_payload(const std::shared_ptr<UdpPath> &path,

@@ -179,52 +179,62 @@ void Socks5UdpListener::process(std::size_t size, boost::asio::ip::udp::endpoint
         {},
         {}};
     auto self = shared_from_this();
-    owner_.open_datagram(snapshot_, std::move(metadata),
-                         [self, key, client](core::DatagramOpenResult result,
-                                             boost::asio::ip::udp::endpoint target) mutable {
-                             if (self->stopped_) {
-                                 if (result.handle) {
-                                     result.handle->close();
-                                 }
-                                 return;
-                             }
-                             std::vector<std::shared_ptr<std::vector<std::uint8_t>>> payloads;
-                             bool has_pending = false;
-                             {
-                                 std::lock_guard lock(self->paths_mutex_);
-                                 auto pending = self->pending_.find(key);
-                                 if (pending != self->pending_.end()) {
-                                     payloads = std::move(pending->second);
-                                     self->pending_.erase(pending);
-                                     has_pending = true;
-                                 }
-                             }
-                             if (!has_pending) {
-                                 if (result.handle) {
-                                     result.handle->close();
-                                 }
-                                 return;
-                             }
-                             if (!result.succeeded()) {
-                                 return;
-                             }
-                             auto path = std::make_shared<Path>();
-                             path->key = key;
-                             // The open already yields io::; no adaptation remains.
-                             path->handle =
-                                 std::shared_ptr<io::DatagramHandle>(std::move(result.handle));
-                             path->target = target;
-                             path->client = client;
-                             path->receive_buffer.resize(path->handle->max_datagram_size());
-                             {
-                                 std::lock_guard lock(self->paths_mutex_);
-                                 self->paths_.emplace(key, path);
-                             }
-                             self->receive_response(path);
-                             for (auto &queued : payloads) {
-                                 self->send_payload(path, std::move(queued));
-                             }
-                         });
+    self->scope_.spawn(run_route(self, snapshot_, std::move(metadata), std::move(key), client));
+}
+
+exec::task<void> Socks5UdpListener::run_route(std::shared_ptr<Socks5UdpListener> self,
+                                              runtime::RuntimeSnapshotPtr snapshot,
+                                              core::ConnectionMetadata metadata, std::string key,
+                                              boost::asio::ip::udp::endpoint client) {
+    ProxyServer::RoutedDatagram routed;
+    try {
+        routed = co_await self->owner_.open_datagram(std::move(snapshot), std::move(metadata));
+    } catch (...) {
+        // Late route failure with no pending path to attach: drop.
+        co_return;
+    }
+    auto result = std::move(routed.result);
+    const auto target = routed.target;
+    if (self->stopped_) {
+        if (result.handle) {
+            result.handle->close();
+        }
+        co_return;
+    }
+    std::vector<std::shared_ptr<std::vector<std::uint8_t>>> payloads;
+    bool has_pending = false;
+    {
+        std::lock_guard lock(self->paths_mutex_);
+        auto pending = self->pending_.find(key);
+        if (pending != self->pending_.end()) {
+            payloads = std::move(pending->second);
+            self->pending_.erase(pending);
+            has_pending = true;
+        }
+    }
+    if (!has_pending) {
+        if (result.handle) {
+            result.handle->close();
+        }
+        co_return;
+    }
+    if (!result.succeeded()) {
+        co_return;
+    }
+    auto path = std::make_shared<Path>();
+    path->key = key;
+    path->handle = std::shared_ptr<io::DatagramHandle>(std::move(result.handle));
+    path->target = target;
+    path->client = client;
+    path->receive_buffer.resize(path->handle->max_datagram_size());
+    {
+        std::lock_guard lock(self->paths_mutex_);
+        self->paths_.emplace(key, path);
+    }
+    self->receive_response(path);
+    for (auto &queued : payloads) {
+        self->send_payload(path, std::move(queued));
+    }
 }
 
 void Socks5UdpListener::send_payload(const std::shared_ptr<Path> &path,

@@ -444,51 +444,60 @@ void ProxySession::process_socks_udp_packet(std::size_t size) {
         authenticated_user_,
         {}};
     auto self = shared_from_this();
-    owner_.open_datagram(udp_snapshot_, std::move(metadata),
-                         [self, key](core::DatagramOpenResult result,
-                                     boost::asio::ip::udp::endpoint target) mutable {
-                             if (self->closed_.load(std::memory_order_acquire)) {
-                                 if (result.handle) {
-                                     result.handle->close();
-                                 }
-                                 return;
-                             }
-                             std::vector<std::shared_ptr<std::vector<std::uint8_t>>> payloads;
-                             bool has_pending = false;
-                             {
-                                 std::lock_guard lock(self->udp_paths_mutex_);
-                                 auto packets = self->pending_udp_packets_.find(key);
-                                 if (packets != self->pending_udp_packets_.end()) {
-                                     payloads = std::move(packets->second);
-                                     self->pending_udp_packets_.erase(packets);
-                                     has_pending = true;
-                                 }
-                             }
-                             if (!has_pending) {
-                                 if (result.handle) {
-                                     result.handle->close();
-                                 }
-                                 return;
-                             }
-                             if (!result.succeeded()) {
-                                 return;
-                             }
-                             auto path = std::make_shared<UdpPath>();
-                             path->key = key;
-                             // The open already yields io::; no adaptation remains.
-                             path->handle =
-                                 std::shared_ptr<io::DatagramHandle>(std::move(result.handle));
-                             path->target = target;
-                             path->receive_buffer.resize(path->handle->max_datagram_size());
-                             {
-                                 std::lock_guard lock(self->udp_paths_mutex_);
-                                 self->udp_paths_.emplace(key, path);
-                             }
-                             self->receive_udp_response(path);
-                             for (auto &packet : payloads) {
-                                 self->send_udp_payload(path, std::move(packet));
-                             }
-                         });
+    self->scope_.spawn(run_udp_route(self, udp_snapshot_, std::move(metadata), std::move(key)));
+}
+
+exec::task<void> ProxySession::run_udp_route(std::shared_ptr<ProxySession> self,
+                                             runtime::RuntimeSnapshotPtr snapshot,
+                                             core::ConnectionMetadata metadata, std::string key) {
+    ProxyServer::RoutedDatagram routed;
+    try {
+        routed = co_await self->owner_.open_datagram(std::move(snapshot), std::move(metadata));
+    } catch (...) {
+        // Late route failure with no pending path to attach: drop.
+        co_return;
+    }
+    auto result = std::move(routed.result);
+    const auto target = routed.target;
+    if (self->closed_.load(std::memory_order_acquire)) {
+        if (result.handle) {
+            result.handle->close();
+        }
+        co_return;
+    }
+    std::vector<std::shared_ptr<std::vector<std::uint8_t>>> payloads;
+    bool has_pending = false;
+    {
+        std::lock_guard lock(self->udp_paths_mutex_);
+        auto packets = self->pending_udp_packets_.find(key);
+        if (packets != self->pending_udp_packets_.end()) {
+            payloads = std::move(packets->second);
+            self->pending_udp_packets_.erase(packets);
+            has_pending = true;
+        }
+    }
+    if (!has_pending) {
+        if (result.handle) {
+            result.handle->close();
+        }
+        co_return;
+    }
+    if (!result.succeeded()) {
+        co_return;
+    }
+    auto path = std::make_shared<UdpPath>();
+    path->key = key;
+    path->handle = std::shared_ptr<io::DatagramHandle>(std::move(result.handle));
+    path->target = target;
+    path->receive_buffer.resize(path->handle->max_datagram_size());
+    {
+        std::lock_guard lock(self->udp_paths_mutex_);
+        self->udp_paths_.emplace(key, path);
+    }
+    self->receive_udp_response(path);
+    for (auto &packet : payloads) {
+        self->send_udp_payload(path, std::move(packet));
+    }
 }
 
 void ProxySession::send_udp_payload(const std::shared_ptr<UdpPath> &path,

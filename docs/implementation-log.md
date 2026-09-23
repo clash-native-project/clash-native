@@ -2193,3 +2193,15 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-24
+
+- Taskified proxy routing: `route_stream`/`route_datagram` (plus the
+  snapshot/fake-ip wrappers `open_stream`/`open_datagram`) are now
+  sender-returning coroutines over resolve bridges and dial senders,
+  with server-stop gates mapping to cancelled results; the session and
+  UDP listener drive them through spawned open/route tasks. Deleted
+  the `start_open_for_handler`/`RouteReceiver` bridges.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.
