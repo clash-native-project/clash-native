@@ -1,11 +1,15 @@
 #include <clash_native/transport/shadowsocks/websocket_plugin.hpp>
 
+#include <clash_native/async/bridge.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/system/errc.hpp>
+
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include <memory>
 #include <string>
@@ -32,7 +36,7 @@ class WebSocketPluginOperation final
 
     void start() {
         auto self = shared_from_this();
-        boost::asio::post(executor_, [self] { self->start_on_executor(); });
+        boost::asio::post(executor_, [self] { self->scope_.spawn(run_open(self)); });
     }
 
     void cancel() noexcept override {
@@ -59,42 +63,51 @@ class WebSocketPluginOperation final
     }
 
   private:
-    void start_on_executor() {
-        if (completed_) {
-            return;
+    static exec::task<void> run_open(std::shared_ptr<WebSocketPluginOperation> self) {
+        if (self->options_.host.empty()) {
+            self->finish(core::fail(configuration_error("WebSocket plugin host is required")));
+            co_return;
         }
-        if (options_.host.empty()) {
-            finish(core::fail(configuration_error("WebSocket plugin host is required")));
-            return;
+        if (self->options_.path.empty()) {
+            self->options_.path = "/";
         }
-        if (options_.path.empty()) {
-            options_.path = "/";
+        if (self->completed_ || !self->stream_) {
+            co_return;
         }
-        start_websocket();
-    }
-
-    void start_websocket() {
-        if (completed_ || !stream_) {
-            return;
+        core::Result<std::unique_ptr<io::StreamHandle>> result;
+        try {
+            result = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
+                [self](async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                           done) mutable {
+                    WebSocketClientOptions options;
+                    options.host = self->options_.host;
+                    options.target = self->options_.path;
+                    options.tls = self->options_.tls;
+                    options.tls_server_name = self->options_.host;
+                    options.tls_verify_peer = !self->options_.skip_cert_verify;
+                    options.tls_alpn_protocols = {"http/1.1"};
+                    self->websocket_ = async_websocket_client_handshake(
+                        std::move(self->stream_), std::move(options),
+                        [self,
+                         done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
+                            self->websocket_.reset();
+                            done(std::move(opened));
+                        });
+                    return [self] {
+                        if (self->websocket_) {
+                            self->websocket_->cancel();
+                        }
+                    };
+                });
+        } catch (...) {
+            self->finish(core::fail(core::Error{
+                core::ErrorCode::endpoint_connection, "WebSocket plugin handshake failed", {}}));
+            co_return;
         }
-        WebSocketClientOptions websocket_options;
-        websocket_options.host = options_.host;
-        websocket_options.target = options_.path;
-        websocket_options.tls = options_.tls;
-        websocket_options.tls_server_name = options_.host;
-        websocket_options.tls_verify_peer = !options_.skip_cert_verify;
-        websocket_options.tls_alpn_protocols = {"http/1.1"};
-        auto self = shared_from_this();
-        websocket_ = async_websocket_client_handshake(
-            std::move(stream_), std::move(websocket_options),
-            [self](core::Result<std::unique_ptr<io::StreamHandle>> result) mutable {
-                self->websocket_.reset();
-                if (!result) {
-                    self->finish(core::fail(result.error()));
-                    return;
-                }
-                self->finish(std::move(result.value()));
-            });
+        if (self->completed_) {
+            co_return;
+        }
+        self->finish(std::move(result));
     }
 
     void finish(core::Result<std::unique_ptr<io::StreamHandle>> result) {
@@ -118,6 +131,7 @@ class WebSocketPluginOperation final
     WebSocketPluginHandler handler_;
     std::shared_ptr<clash_native::transport::WebSocketClientHandshake> websocket_;
     bool completed_ = false;
+    exec::async_scope scope_;
 };
 
 class WebSocketPluginMuxOperation final
@@ -131,7 +145,7 @@ class WebSocketPluginMuxOperation final
 
     void start() {
         auto self = shared_from_this();
-        boost::asio::post(executor_, [self] { self->start_on_executor(); });
+        boost::asio::post(executor_, [self] { self->scope_.spawn(run_open(self)); });
     }
 
     void cancel() noexcept override {
@@ -163,54 +177,92 @@ class WebSocketPluginMuxOperation final
     }
 
   private:
-    void start_on_executor() {
-        if (completed_) {
-            return;
-        }
-        if (options_.host.empty()) {
-            finish(core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>(
+    static exec::task<void> run_open(std::shared_ptr<WebSocketPluginMuxOperation> self) {
+        if (self->options_.host.empty()) {
+            self->finish(core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>(
                 core::fail(configuration_error("WebSocket plugin host is required"))));
-            return;
+            co_return;
         }
-        if (options_.path.empty()) {
-            options_.path = "/";
+        if (self->options_.path.empty()) {
+            self->options_.path = "/";
         }
-        start_websocket();
-    }
-
-    void start_websocket() {
-        if (completed_ || !stream_) {
-            return;
+        if (self->completed_ || !self->stream_) {
+            co_return;
         }
-        WebSocketClientOptions websocket_options;
-        websocket_options.host = options_.host;
-        websocket_options.target = options_.path;
-        websocket_options.tls = options_.tls;
-        websocket_options.tls_server_name = options_.host;
-        websocket_options.tls_verify_peer = !options_.skip_cert_verify;
-        websocket_options.tls_alpn_protocols = {"http/1.1"};
-        auto self = shared_from_this();
-        websocket_ = async_websocket_client_handshake(
-            std::move(stream_), std::move(websocket_options),
-            [self](core::Result<std::unique_ptr<io::StreamHandle>> result) mutable {
-                self->websocket_.reset();
-                if (!result) {
-                    self->finish(
-                        core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>(
-                            core::fail(result.error())));
-                    return;
-                }
-                WebSocketMuxOptions mux_options;
-                mux_options.protocol = self->options_.mux_protocol;
-                mux_options.smux_version = self->options_.smux_version;
-                self->mux_ = async_open_websocket_mux(
-                    std::move(result.value()), mux_options,
-                    [self](core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>
-                               mux_result) mutable {
-                        self->mux_.reset();
-                        self->finish(std::move(mux_result));
+        core::Result<std::unique_ptr<io::StreamHandle>> ws_result;
+        try {
+            ws_result =
+                co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
+                    [self](async::BridgeSender<
+                           core::Result<std::unique_ptr<io::StreamHandle>>>::Handler done) mutable {
+                        WebSocketClientOptions websocket_options;
+                        websocket_options.host = self->options_.host;
+                        websocket_options.target = self->options_.path;
+                        websocket_options.tls = self->options_.tls;
+                        websocket_options.tls_server_name = self->options_.host;
+                        websocket_options.tls_verify_peer = !self->options_.skip_cert_verify;
+                        websocket_options.tls_alpn_protocols = {"http/1.1"};
+                        self->websocket_ = async_websocket_client_handshake(
+                            std::move(self->stream_), std::move(websocket_options),
+                            [self,
+                             done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
+                                self->websocket_.reset();
+                                done(std::move(opened));
+                            });
+                        return [self] {
+                            if (self->websocket_) {
+                                self->websocket_->cancel();
+                            }
+                        };
                     });
-            });
+        } catch (...) {
+            self->finish(core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>(
+                core::fail(core::Error{core::ErrorCode::endpoint_connection,
+                                       "WebSocket plugin handshake failed",
+                                       {}})));
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        if (!ws_result) {
+            self->finish(core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>(
+                core::fail(ws_result.error())));
+            co_return;
+        }
+        WebSocketMuxOptions mux_options;
+        mux_options.protocol = self->options_.mux_protocol;
+        mux_options.smux_version = self->options_.smux_version;
+        core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>> mux_result;
+        try {
+            mux_result = co_await async::bridge_sender<
+                core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>>(
+                [self, mux_options,
+                 stream = std::make_shared<std::unique_ptr<io::StreamHandle>>(
+                     std::move(ws_result.value()))](
+                    async::BridgeSender<core::Result<std::shared_ptr<
+                        clash_native::io::MultiplexedSession>>>::Handler done) mutable {
+                    self->mux_ = async_open_websocket_mux(
+                        std::move(*stream), mux_options,
+                        [self,
+                         done](core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>
+                                   opened) mutable {
+                            self->mux_.reset();
+                            done(std::move(opened));
+                        });
+                    return [self] {
+                        if (self->mux_) {
+                            self->mux_->cancel();
+                        }
+                    };
+                });
+        } catch (...) {
+            self->finish(
+                core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>(core::fail(
+                    core::Error{core::ErrorCode::transport_io, "WebSocket mux open failed", {}})));
+            co_return;
+        }
+        self->finish(std::move(mux_result));
     }
 
     void finish(core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>> result) {
@@ -235,6 +287,7 @@ class WebSocketPluginMuxOperation final
     std::shared_ptr<clash_native::transport::WebSocketClientHandshake> websocket_;
     std::shared_ptr<WebSocketMuxHandshake> mux_;
     bool completed_ = false;
+    exec::async_scope scope_;
 };
 
 } // namespace

@@ -2215,3 +2215,13 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-24
+
+- Taskified the WebSocket plugin opens: `WebSocketPluginOperation`
+  and `WebSocketPluginMuxOperation` run as `run_open` coroutines over
+  handshake/mux bridges with cancel-handle aborters; the pool
+  queue/lifecycle stays callback-driven by design.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.
