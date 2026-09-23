@@ -2,6 +2,7 @@
 
 #include <clash_native/async/bridge.hpp>
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/datagram_handle_adapter.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
@@ -90,6 +91,63 @@ std::vector<std::uint8_t> append_tcp_record(std::string_view method,
     return result;
 }
 
+// Bridges one carrier pull/push back into a legacy (error, size) handler.
+struct CarrierReadBridge {
+    using receiver_concept = stdexec::receiver_tag;
+    core::StreamHandle::ReadHandler handler;
+    void set_value(std::optional<std::size_t> size) && noexcept {
+        auto callback = std::move(handler);
+        if (size) {
+            callback({}, *size);
+        } else {
+            callback(boost::asio::error::eof, 0);
+        }
+    }
+    void set_error(std::exception_ptr error) && noexcept {
+        auto callback = std::move(handler);
+        callback(net::unpack_error(std::move(error)), 0);
+    }
+    void set_stopped() && noexcept {
+        auto callback = std::move(handler);
+        callback(boost::asio::error::operation_aborted, 0);
+    }
+};
+
+struct SocketDatagramBridge {
+    using receiver_concept = stdexec::receiver_tag;
+    std::function<void(const boost::system::error_code &, std::size_t, io::DatagramAddress)>
+        handler;
+    void set_value(io::DatagramPacket packet) && noexcept {
+        auto callback = std::move(handler);
+        callback({}, packet.size, std::move(packet.address));
+    }
+    void set_error(std::exception_ptr error) && noexcept {
+        auto callback = std::move(handler);
+        callback(net::unpack_error(std::move(error)), 0, {});
+    }
+    void set_stopped() && noexcept {
+        auto callback = std::move(handler);
+        callback(boost::asio::error::operation_aborted, 0, {});
+    }
+};
+
+struct CarrierWriteBridge {
+    using receiver_concept = stdexec::receiver_tag;
+    core::StreamHandle::WriteHandler handler;
+    void set_value(std::size_t size) && noexcept {
+        auto callback = std::move(handler);
+        callback({}, size);
+    }
+    void set_error(std::exception_ptr error) && noexcept {
+        auto callback = std::move(handler);
+        callback(net::unpack_error(std::move(error)), 0);
+    }
+    void set_stopped() && noexcept {
+        auto callback = std::move(handler);
+        callback(boost::asio::error::operation_aborted, 0);
+    }
+};
+
 class ShadowsocksStreamHandle final : public io::StreamHandle {
   private:
     using ReadSignatures =
@@ -171,12 +229,16 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
                     });
                 return;
             }
-            carrier->async_write(boost::asio::buffer(*wire),
-                                 [self, wire, handler = std::move(handler), size](
-                                     const boost::system::error_code &error, std::size_t) mutable {
-                                     self->write_in_progress = false;
-                                     handler(error, error ? 0 : size);
-                                 });
+            core::StreamHandle::WriteHandler completion =
+                [self, wire, handler = std::move(handler),
+                 size](const boost::system::error_code &error, std::size_t) mutable {
+                    self->write_in_progress = false;
+                    handler(error, error ? 0 : size);
+                };
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = carrier->async_write(boost::asio::buffer(*wire));
+            async::start_with_receiver(std::move(sender),
+                                       CarrierWriteBridge{std::move(completion)});
         }
 
         void read(boost::asio::mutable_buffer buffer, core::StreamHandle::ReadHandler handler) {
@@ -392,9 +454,9 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
         void read_exact_carrier(boost::asio::mutable_buffer buffer,
                                 std::shared_ptr<ExactReadHandler> callback) {
             auto self = shared_from_this();
-            carrier->async_read_some(
-                buffer, [self, buffer, callback = std::move(callback)](
-                            const boost::system::error_code &error, std::size_t size) mutable {
+            core::StreamHandle::ReadHandler completion =
+                [self, buffer, callback = std::move(callback)](
+                    const boost::system::error_code &error, std::size_t size) mutable {
                     auto &handler = *callback;
                     if (error) {
                         handler(error);
@@ -411,7 +473,10 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
                     auto remaining = boost::asio::mutable_buffer(
                         static_cast<std::uint8_t *>(buffer.data()) + size, buffer.size() - size);
                     self->read_exact_carrier(remaining, callback);
-                });
+                };
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = carrier->async_read_some(buffer);
+            async::start_with_receiver(std::move(sender), CarrierReadBridge{std::move(completion)});
         }
 
         void finish_read(const boost::system::error_code &error, std::size_t size) {
@@ -971,8 +1036,9 @@ class ShadowsocksConnectOperation final
             }
             return;
         }
-        auto write_handler = [self, wire, key = std::move(key.value())](
-                                 const boost::system::error_code &error, std::size_t) mutable {
+        core::StreamHandle::WriteHandler completion = [self, wire, key = std::move(key.value())](
+                                                          const boost::system::error_code &error,
+                                                          std::size_t) mutable {
             if (error) {
                 self->finish(core::StreamOpenResult::failed(
                     {core::ErrorCode::transport_io, "failed to write Shadowsocks TCP request",
@@ -993,10 +1059,12 @@ class ShadowsocksConnectOperation final
             }
         };
         if (carrier_) {
-            carrier_->async_write(boost::asio::buffer(*wire), std::move(write_handler));
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = carrier_->async_write(boost::asio::buffer(*wire));
+            async::start_with_receiver(std::move(sender),
+                                       CarrierWriteBridge{std::move(completion)});
         } else {
-            boost::asio::async_write(*socket_, boost::asio::buffer(*wire),
-                                     std::move(write_handler));
+            boost::asio::async_write(*socket_, boost::asio::buffer(*wire), std::move(completion));
         }
     }
 
@@ -1012,8 +1080,7 @@ class ShadowsocksConnectOperation final
                     return;
                 }
                 self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
-                self->carrier_->async_write(
-                    boost::asio::buffer(*wire),
+                core::StreamHandle::WriteHandler completion =
                     [self, wire, key = std::move(key)](const boost::system::error_code &error,
                                                        std::size_t) mutable {
                         if (error) {
@@ -1030,7 +1097,11 @@ class ShadowsocksConnectOperation final
                             std::make_unique<ShadowsocksStreamHandle>(
                                 self->carrier_, self->config_.method, self->config_.password,
                                 std::move(key), self->write_nonce_)));
-                    });
+                    };
+                // NOTE: name the sender first; argument order is unspecified.
+                auto sender = self->carrier_->async_write(boost::asio::buffer(*wire));
+                async::start_with_receiver(std::move(sender),
+                                           CarrierWriteBridge{std::move(completion)});
             });
     }
 
@@ -1112,8 +1183,9 @@ class ShadowsocksConnectOperation final
             return;
         }
         auto write_cipher = std::make_shared<ss::LegacyStreamCipher>(std::move(cipher.value()));
-        auto write_handler = [self, wire, write_cipher](const boost::system::error_code &error,
-                                                        std::size_t) mutable {
+        core::StreamHandle::WriteHandler completion = [self, wire, write_cipher](
+                                                          const boost::system::error_code &error,
+                                                          std::size_t) mutable {
             if (error) {
                 self->finish(core::StreamOpenResult::failed(
                     {core::ErrorCode::transport_io, "failed to write Shadowsocks legacy request",
@@ -1137,10 +1209,12 @@ class ShadowsocksConnectOperation final
             handler(core::StreamOpenResult::opened(std::move(stream.value())));
         };
         if (carrier_) {
-            carrier_->async_write(boost::asio::buffer(*wire), std::move(write_handler));
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = carrier_->async_write(boost::asio::buffer(*wire));
+            async::start_with_receiver(std::move(sender),
+                                       CarrierWriteBridge{std::move(completion)});
         } else {
-            boost::asio::async_write(*socket_, boost::asio::buffer(*wire),
-                                     std::move(write_handler));
+            boost::asio::async_write(*socket_, boost::asio::buffer(*wire), std::move(completion));
         }
     }
 
@@ -1159,8 +1233,7 @@ class ShadowsocksConnectOperation final
                     return;
                 }
                 self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
-                self->carrier_->async_write(
-                    boost::asio::buffer(*wire),
+                core::StreamHandle::WriteHandler completion =
                     [self, wire, cipher](const boost::system::error_code &error,
                                          std::size_t) mutable {
                         if (error) {
@@ -1181,7 +1254,11 @@ class ShadowsocksConnectOperation final
                             return;
                         }
                         handler(core::StreamOpenResult::opened(std::move(stream.value())));
-                    });
+                    };
+                // NOTE: name the sender first; argument order is unspecified.
+                auto sender = self->carrier_->async_write(boost::asio::buffer(*wire));
+                async::start_with_receiver(std::move(sender),
+                                           CarrierWriteBridge{std::move(completion)});
             });
     }
 
@@ -1249,9 +1326,13 @@ class ShadowsocksConnectOperation final
     bool completed_ = false;
 };
 
-class ShadowsocksDatagramHandle final : public core::DatagramHandle {
+class ShadowsocksDatagramHandle final : public io::DatagramHandle {
   public:
     struct State : std::enable_shared_from_this<State> {
+        using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t,
+                                               io::DatagramAddress)>;
+        using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
         State(std::shared_ptr<net::UdpStream> socket, boost::asio::ip::udp::endpoint server,
               std::string method, std::string password)
             : socket(std::move(socket)), server(std::move(server)), method(std::move(method)),
@@ -1263,10 +1344,10 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
             }
         }
 
-        void send(boost::asio::const_buffer buffer, core::DatagramAddress destination,
+        void send(boost::asio::const_buffer buffer, io::DatagramAddress destination,
                   WriteHandler handler) {
             const auto target = destination.to_destination();
-            auto address = detail::encode_proxy_address(target);
+            auto address = detail::encode_proxy_address(net::to_core_destination(target));
             const auto method_info = ss::cipher_method(method);
             if (!address || !method_info) {
                 boost::asio::post(socket->executor(), [handler = std::move(handler)]() mutable {
@@ -1287,12 +1368,16 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
                 }
                 auto packet = std::make_shared<std::vector<std::uint8_t>>(std::move(wire.value()));
                 auto self = shared_from_this();
-                socket->async_send_to(
-                    boost::asio::buffer(*packet), core::DatagramAddress::from_endpoint(server),
-                    [self, packet, handler = std::move(handler),
-                     payload_size](const boost::system::error_code &error, std::size_t) mutable {
-                        handler(error, error ? 0 : payload_size);
-                    });
+                WriteHandler completion = [self, packet, handler = std::move(handler),
+                                           payload_size](const boost::system::error_code &error,
+                                                         std::size_t) mutable {
+                    handler(error, error ? 0 : payload_size);
+                };
+                // NOTE: name the sender first; argument order is unspecified.
+                auto sender = socket->async_send_to(boost::asio::buffer(*packet),
+                                                    io::DatagramAddress::from_endpoint(server));
+                async::start_with_receiver(std::move(sender),
+                                           CarrierWriteBridge{std::move(completion)});
                 return;
             }
             std::vector<std::uint8_t> plaintext = std::move(address.value());
@@ -1306,12 +1391,16 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
             }
             auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(encoded.value()));
             auto self = shared_from_this();
-            socket->async_send_to(boost::asio::buffer(*wire),
-                                  core::DatagramAddress::from_endpoint(server),
-                                  [self, wire, handler = std::move(handler), payload_size](
-                                      const boost::system::error_code &error, std::size_t) mutable {
-                                      handler(error, error ? 0 : payload_size);
-                                  });
+            WriteHandler completion = [self, wire, handler = std::move(handler),
+                                       payload_size](const boost::system::error_code &error,
+                                                     std::size_t) mutable {
+                handler(error, error ? 0 : payload_size);
+            };
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = socket->async_send_to(boost::asio::buffer(*wire),
+                                                io::DatagramAddress::from_endpoint(server));
+            async::start_with_receiver(std::move(sender),
+                                       CarrierWriteBridge{std::move(completion)});
         }
 
         void receive(boost::asio::mutable_buffer buffer, ReadHandler handler) {
@@ -1324,41 +1413,28 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
             receive_in_progress = true;
             output_buffer = buffer;
             receive_handler = std::move(handler);
-            auto self = shared_from_this();
-            socket->async_receive_from(boost::asio::buffer(receive_buffer),
-                                       [self](const boost::system::error_code &error,
-                                              std::size_t size, core::DatagramAddress sender) {
-                                           if (error) {
-                                               self->finish_receive(error, 0, {});
-                                               return;
-                                           }
-                                           if (!sender.is_address() ||
-                                               sender.address() != self->server.address() ||
-                                               sender.port() != self->server.port()) {
-                                               self->receive_next();
-                                               return;
-                                           }
-                                           self->decode_response(size);
-                                       });
+            receive_next();
         }
 
         void receive_next() {
             auto self = shared_from_this();
-            socket->async_receive_from(boost::asio::buffer(receive_buffer),
-                                       [self](const boost::system::error_code &error,
-                                              std::size_t size, core::DatagramAddress sender) {
-                                           if (error) {
-                                               self->finish_receive(error, 0, {});
-                                               return;
-                                           }
-                                           if (!sender.is_address() ||
-                                               sender.address() != self->server.address() ||
-                                               sender.port() != self->server.port()) {
-                                               self->receive_next();
-                                               return;
-                                           }
-                                           self->decode_response(size);
-                                       });
+            ReadHandler completion = [self](const boost::system::error_code &error,
+                                            std::size_t size, io::DatagramAddress sender) {
+                if (error) {
+                    self->finish_receive(error, 0, {});
+                    return;
+                }
+                if (!sender.is_address() || sender.address() != self->server.address() ||
+                    sender.port() != self->server.port()) {
+                    self->receive_next();
+                    return;
+                }
+                self->decode_response(size);
+            };
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = socket->async_receive_from(boost::asio::buffer(receive_buffer));
+            async::start_with_receiver(std::move(sender),
+                                       SocketDatagramBridge{std::move(completion)});
         }
 
         void decode_response(std::size_t size) {
@@ -1390,19 +1466,18 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
             const auto payload_offset = address.value().size;
             const auto payload_size = plaintext.size() - payload_offset;
             if (address.value().destination.is_address()) {
-                complete_payload(
-                    plaintext, payload_offset, payload_size,
-                    core::DatagramAddress::address(address.value().destination.address(),
-                                                   address.value().destination.port()));
+                complete_payload(plaintext, payload_offset, payload_size,
+                                 io::DatagramAddress::address(address.value().destination.address(),
+                                                              address.value().destination.port()));
                 return;
             }
             complete_payload(plaintext, payload_offset, payload_size,
-                             core::DatagramAddress::domain(address.value().destination.domain(),
-                                                           address.value().destination.port()));
+                             io::DatagramAddress::domain(address.value().destination.domain(),
+                                                         address.value().destination.port()));
         }
 
         void complete_payload(const std::vector<std::uint8_t> &plaintext, std::size_t offset,
-                              std::size_t size, core::DatagramAddress sender) {
+                              std::size_t size, io::DatagramAddress sender) {
             if (size > output_buffer.size()) {
                 finish_receive(boost::asio::error::message_size, 0, {});
                 return;
@@ -1414,7 +1489,7 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
         }
 
         void finish_receive(const boost::system::error_code &error, std::size_t size,
-                            core::DatagramAddress sender) {
+                            io::DatagramAddress sender) {
             receive_in_progress = false;
             auto handler = std::move(receive_handler);
             if (handler) {
@@ -1455,13 +1530,60 @@ class ShadowsocksDatagramHandle final : public core::DatagramHandle {
   public:
     explicit ShadowsocksDatagramHandle(std::shared_ptr<State> state) : state_(std::move(state)) {}
 
-    void async_send_to(boost::asio::const_buffer buffer, core::DatagramAddress destination,
-                       WriteHandler handler) override {
-        state_->send(buffer, std::move(destination), std::move(handler));
+    io::AnySender<std::size_t> async_send_to(boost::asio::const_buffer buffer,
+                                             io::DatagramAddress destination) override {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
+        return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
+            [state = state_, buffer, destination](auto terminal) mutable {
+                state->send(buffer, std::move(destination), std::move(terminal));
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                if (!error) {
+                    stdexec::set_value(std::move(receiver), size);
+                    return;
+                }
+                if (error == boost::asio::error::operation_aborted) {
+                    stdexec::set_stopped(std::move(receiver));
+                    return;
+                }
+                stdexec::set_error(
+                    std::move(receiver),
+                    std::make_exception_ptr(core::Error{
+                        core::ErrorCode::transport_io, "shadowsocks datagram send failed", error}));
+            })};
     }
 
-    void async_receive_from(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        state_->receive(buffer, std::move(handler));
+    io::AnySender<io::DatagramPacket>
+    async_receive_from(boost::asio::mutable_buffer buffer) override {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(io::DatagramPacket),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
+        return io::AnySender<io::DatagramPacket>{async::callback_sender<Signatures>(
+            [state = state_, buffer](auto terminal) mutable {
+                state->receive(buffer, [terminal = std::move(terminal)](
+                                           const boost::system::error_code &error, std::size_t size,
+                                           io::DatagramAddress source) mutable {
+                    terminal(error, size, std::move(source));
+                });
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size,
+               io::DatagramAddress source) {
+                if (!error) {
+                    stdexec::set_value(std::move(receiver),
+                                       io::DatagramPacket{size, std::move(source)});
+                    return;
+                }
+                if (error == boost::asio::error::operation_aborted) {
+                    stdexec::set_stopped(std::move(receiver));
+                    return;
+                }
+                stdexec::set_error(std::move(receiver),
+                                   std::make_exception_ptr(
+                                       core::Error{core::ErrorCode::transport_io,
+                                                   "shadowsocks datagram receive failed", error}));
+            })};
     }
 
     boost::asio::any_io_executor executor() noexcept override { return state_->socket->executor(); }
@@ -1688,9 +1810,8 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
                         }
                         const auto request_destination =
                             version == 2 ? initial_destination : std::nullopt;
-                        // Datagram-plane debt: UDP-over-TCP still speaks core::.
                         auto datagram = ss::make_udp_over_tcp_datagram_handle(
-                            net::adapt_io_to_core(std::move(result.handle)),
+                            std::move(result.handle),
                             {version == 2 ? ss::UdpOverTcpVersion::version2
                                           : ss::UdpOverTcpVersion::legacy,
                              request_destination});
@@ -1699,7 +1820,7 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
                             return;
                         }
                         handler(core::DatagramOpenResult::opened(
-                            net::adapt_core_to_io_datagram(std::move(datagram.value())),
+                            std::move(datagram.value()),
                             core::DatagramSemantics::multi_destination));
                     });
                 });
@@ -1750,15 +1871,13 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
                         return;
                     }
                     handler(core::DatagramOpenResult::opened(
-                        net::adapt_core_to_io_datagram(std::move(handle.value())),
-                        core::DatagramSemantics::multi_destination));
+                        std::move(handle.value()), core::DatagramSemantics::multi_destination));
                     return;
                 }
                 auto state = std::make_shared<ShadowsocksDatagramHandle::State>(
                     std::move(socket), server, config.method, config.password);
                 handler(core::DatagramOpenResult::opened(
-                    net::adapt_core_to_io_datagram(
-                        std::make_unique<ShadowsocksDatagramHandle>(std::move(state))),
+                    std::make_unique<ShadowsocksDatagramHandle>(std::move(state)),
                     core::DatagramSemantics::multi_destination));
             });
         return async::BridgeSender<core::DatagramOpenResult>::AbortFn{};

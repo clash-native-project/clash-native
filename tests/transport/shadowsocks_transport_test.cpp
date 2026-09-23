@@ -8,6 +8,8 @@
 
 #include <gtest/gtest.h>
 
+#include <stdexec/execution.hpp>
+
 #include <boost/asio/error.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/post.hpp>
@@ -21,6 +23,8 @@
 #include <memory>
 #include <numeric>
 #include <string>
+#include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -28,30 +32,29 @@ namespace {
 
 using clash_native::transport::shadowsocks::LegacyStreamCipher;
 
-class BufferedStream final : public clash_native::core::StreamHandle {
+class BufferedStream final : public clash_native::io::StreamHandle {
   public:
     BufferedStream(boost::asio::any_io_executor executor, std::vector<std::uint8_t> input)
         : executor_(std::move(executor)), input_(std::move(input)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+    clash_native::io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
         if (input_.empty()) {
-            boost::asio::post(executor_, [handler = std::move(handler)]() mutable {
-                handler(boost::asio::error::eof, 0);
-            });
-            return;
+            return clash_native::io::AnySender<std::optional<std::size_t>>{
+                stdexec::just(std::optional<std::size_t>{})};
         }
         const auto size = std::min(buffer.size(), input_.size());
         std::memcpy(buffer.data(), input_.data(), size);
         input_.erase(input_.begin(), input_.begin() + static_cast<std::ptrdiff_t>(size));
-        boost::asio::post(executor_,
-                          [handler = std::move(handler), size]() mutable { handler({}, size); });
+        return clash_native::io::AnySender<std::optional<std::size_t>>{
+            stdexec::just(std::optional<std::size_t>{size})};
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
+    clash_native::io::AnySender<std::size_t>
+    async_write(boost::asio::const_buffer buffer) override {
         written_.insert(written_.end(), static_cast<const std::uint8_t *>(buffer.data()),
                         static_cast<const std::uint8_t *>(buffer.data()) + buffer.size());
-        boost::asio::post(executor_, [handler = std::move(handler),
-                                      size = buffer.size()]() mutable { handler({}, size); });
+        return clash_native::io::AnySender<std::size_t>{stdexec::just(buffer.size())};
     }
 
     boost::asio::any_io_executor executor() noexcept override { return executor_; }
@@ -302,29 +305,21 @@ TEST(ShadowsocksTransportTest, PreservesDomainAddressInUdpOverTcpResponse) {
     ASSERT_TRUE(datagram);
 
     std::array<std::uint8_t, 8> payload{};
-    std::promise<void> completed;
-    auto future = completed.get_future();
-    boost::system::error_code receive_error;
-    std::size_t received_size = 0;
-    clash_native::core::DatagramAddress source;
-    datagram.value()->async_receive_from(
-        boost::asio::buffer(payload), [&completed, &receive_error, &received_size, &source](
-                                          const boost::system::error_code &error, std::size_t size,
-                                          clash_native::core::DatagramAddress sender) {
-            receive_error = error;
-            received_size = size;
-            source = std::move(sender);
-            completed.set_value();
-        });
-    context.run();
-
-    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
-    EXPECT_FALSE(receive_error);
-    EXPECT_EQ(received_size, 2U);
-    EXPECT_EQ(std::string(reinterpret_cast<const char *>(payload.data()), received_size), "ok");
-    ASSERT_TRUE(source.is_domain());
-    EXPECT_EQ(source.domain(), domain);
-    EXPECT_EQ(source.port(), 443);
+    // The state posts completions to the context; pump it while blocked.
+    auto work = boost::asio::require(context.get_executor(),
+                                     boost::asio::execution::outstanding_work.tracked);
+    std::thread runner([&] { context.run(); });
+    auto wait =
+        stdexec::sync_wait(datagram.value()->async_receive_from(boost::asio::buffer(payload)));
+    ASSERT_TRUE(wait.has_value());
+    const auto packet = std::move(std::get<0>(*wait));
+    EXPECT_EQ(packet.size, 2U);
+    EXPECT_EQ(std::string(reinterpret_cast<const char *>(payload.data()), packet.size), "ok");
+    ASSERT_TRUE(packet.address.is_domain());
+    EXPECT_EQ(packet.address.domain(), domain);
+    EXPECT_EQ(packet.address.port(), 443);
+    context.stop();
+    runner.join();
 }
 
 TEST(ShadowsocksTransportTest, ParsesResTlsRecordScript) {

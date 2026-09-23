@@ -1,5 +1,12 @@
 #include <clash_native/transport/shadowsocks/udp_over_tcp.hpp>
 
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/io/sender.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
+
+#include <stdexec/execution.hpp>
+
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/system/errc.hpp>
@@ -20,6 +27,49 @@ namespace clash_native::transport::shadowsocks {
 
 namespace {
 
+// Bridges one stream push/pull back into a legacy (error, size) handler.
+struct StreamWriteBridge {
+    using receiver_concept = stdexec::receiver_tag;
+    std::function<void(const boost::system::error_code &, std::size_t)> handler;
+    void set_value(std::size_t size) && noexcept {
+        auto callback = std::move(handler);
+        callback({}, size);
+    }
+    void set_error(std::exception_ptr error) && noexcept {
+        auto callback = std::move(handler);
+        callback(net::unpack_error(std::move(error)), 0);
+    }
+    void set_stopped() && noexcept {
+        auto callback = std::move(handler);
+        callback(boost::asio::error::operation_aborted, 0);
+    }
+};
+
+struct StreamReadBridge {
+    using receiver_concept = stdexec::receiver_tag;
+    std::function<void(const boost::system::error_code &, std::size_t)> handler;
+    void set_value(std::optional<std::size_t> size) && noexcept {
+        auto callback = std::move(handler);
+        if (size) {
+            callback({}, *size);
+        } else {
+            callback(boost::asio::error::eof, 0);
+        }
+    }
+    void set_error(std::exception_ptr error) && noexcept {
+        auto callback = std::move(handler);
+        callback(net::unpack_error(std::move(error)), 0);
+    }
+    void set_stopped() && noexcept {
+        auto callback = std::move(handler);
+        callback(boost::asio::error::operation_aborted, 0);
+    }
+};
+
+} // namespace
+
+namespace {
+
 constexpr std::size_t kMaxDatagramSize = 65507;
 constexpr std::uint8_t kIpv4Family = 0x00;
 constexpr std::uint8_t kIpv6Family = 0x01;
@@ -36,7 +86,8 @@ boost::system::error_code message_size_error() {
     return boost::system::errc::make_error_code(boost::system::errc::message_size);
 }
 
-core::Result<std::vector<std::uint8_t>> encode_destination(const core::Destination &destination) {
+template <typename Destination>
+core::Result<std::vector<std::uint8_t>> encode_destination(const Destination &destination) {
     std::vector<std::uint8_t> result;
     if (destination.is_address()) {
         const auto address = destination.address();
@@ -108,11 +159,15 @@ encode_request_destination(const core::Destination &destination) {
 
 class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpState> {
   public:
-    UdpOverTcpState(std::unique_ptr<core::StreamHandle> stream, UdpOverTcpOptions options)
+    using ReadHandler =
+        std::function<void(const boost::system::error_code &, std::size_t, io::DatagramAddress)>;
+    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
+    UdpOverTcpState(std::unique_ptr<io::StreamHandle> stream, UdpOverTcpOptions options)
         : stream_(std::move(stream)), options_(std::move(options)) {}
 
-    void send(boost::asio::const_buffer buffer, core::DatagramAddress destination,
-              core::DatagramHandle::WriteHandler handler) {
+    void send(boost::asio::const_buffer buffer, io::DatagramAddress destination,
+              WriteHandler handler) {
         if (closed_) {
             post_write_result(std::move(handler), boost::asio::error::operation_aborted, 0);
             return;
@@ -195,24 +250,27 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
         auto handler = std::move(pending.handler);
         const auto size = pending.size;
         const auto includes_request = pending.includes_request;
-        stream_->async_write(boost::asio::buffer(*packet),
-                             [self, packet, handler = std::move(handler), size, includes_request](
-                                 const boost::system::error_code &error, std::size_t) mutable {
-                                 self->write_in_progress_ = false;
-                                 if (includes_request) {
-                                     self->request_pending_ = false;
-                                     self->request_written_ = !error;
-                                 }
-                                 if (error) {
-                                     handler(error, 0);
-                                 } else {
-                                     handler({}, size);
-                                 }
-                                 self->pump_write();
-                             });
+        std::function<void(const boost::system::error_code &, std::size_t)> completion =
+            [self, packet, handler = std::move(handler), size,
+             includes_request](const boost::system::error_code &error, std::size_t) mutable {
+                self->write_in_progress_ = false;
+                if (includes_request) {
+                    self->request_pending_ = false;
+                    self->request_written_ = !error;
+                }
+                if (error) {
+                    handler(error, 0);
+                } else {
+                    handler({}, size);
+                }
+                self->pump_write();
+            };
+        // NOTE: name the sender first; argument order is unspecified.
+        auto sender = stream_->async_write(boost::asio::buffer(*packet));
+        async::start_with_receiver(std::move(sender), StreamWriteBridge{std::move(completion)});
     }
 
-    void receive(boost::asio::mutable_buffer buffer, core::DatagramHandle::ReadHandler handler) {
+    void receive(boost::asio::mutable_buffer buffer, ReadHandler handler) {
         if (closed_) {
             post_read_result(std::move(handler), boost::asio::error::operation_aborted, 0, {});
             return;
@@ -268,20 +326,19 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
 
     struct PendingWrite {
         std::shared_ptr<std::vector<std::uint8_t>> packet;
-        core::DatagramHandle::WriteHandler handler;
+        WriteHandler handler;
         std::size_t size = 0;
         bool includes_request = false;
     };
 
-    void post_write_result(core::DatagramHandle::WriteHandler handler,
-                           const boost::system::error_code &error, std::size_t size) {
+    void post_write_result(WriteHandler handler, const boost::system::error_code &error,
+                           std::size_t size) {
         boost::asio::post(stream_->executor(), [handler = std::move(handler), error,
                                                 size]() mutable { handler(error, size); });
     }
 
-    void post_read_result(core::DatagramHandle::ReadHandler handler,
-                          const boost::system::error_code &error, std::size_t size,
-                          core::DatagramAddress source) {
+    void post_read_result(ReadHandler handler, const boost::system::error_code &error,
+                          std::size_t size, io::DatagramAddress source) {
         boost::asio::post(stream_->executor(),
                           [handler = std::move(handler), error, size, source]() mutable {
                               handler(error, size, source);
@@ -293,8 +350,7 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
         auto self = shared_from_this();
         auto read_buffer =
             boost::asio::mutable_buffer(buffer->data() + offset, buffer->size() - offset);
-        stream_->async_read_some(
-            read_buffer,
+        std::function<void(const boost::system::error_code &, std::size_t)> pull =
             [self, buffer = std::move(buffer), offset, completion = std::move(completion)](
                 const boost::system::error_code &error, std::size_t size) mutable {
                 if (error) {
@@ -311,7 +367,10 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
                     return;
                 }
                 self->read_exact(std::move(buffer), next, std::move(completion));
-            });
+            };
+        // NOTE: name the sender first; argument order is unspecified.
+        auto sender = stream_->async_read_some(read_buffer);
+        async::start_with_receiver(std::move(sender), StreamReadBridge{std::move(pull)});
     }
 
     void read_family() {
@@ -381,7 +440,7 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
                        const auto port_value =
                            static_cast<std::uint16_t>((*port)[0] << 8 | (*port)[1]);
                        self->read_payload_length(
-                           core::DatagramAddress::domain(std::move(domain), port_value));
+                           io::DatagramAddress::domain(std::move(domain), port_value));
                    });
     }
 
@@ -416,7 +475,7 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
                 parsed_address = boost::asio::ip::address_v6(bytes);
             }
             const auto port_value = static_cast<std::uint16_t>((*port)[0] << 8 | (*port)[1]);
-            self->read_payload_length(core::DatagramAddress::address(parsed_address, port_value));
+            self->read_payload_length(io::DatagramAddress::address(parsed_address, port_value));
         });
     }
 
@@ -433,7 +492,7 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
         });
     }
 
-    void read_payload_length(core::DatagramAddress source) {
+    void read_payload_length(io::DatagramAddress source) {
         auto length = std::make_shared<std::vector<std::uint8_t>>(2);
         auto self = shared_from_this();
         read_exact(length, 0, [self, length, source](const boost::system::error_code &error) {
@@ -446,7 +505,7 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
         });
     }
 
-    void read_payload_bytes(core::DatagramAddress source, std::size_t size) {
+    void read_payload_bytes(io::DatagramAddress source, std::size_t size) {
         auto payload = std::make_shared<std::vector<std::uint8_t>>(size);
         auto self = shared_from_this();
         read_exact(payload, 0, [self, payload, source](const boost::system::error_code &error) {
@@ -466,7 +525,7 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
     }
 
     void finish_receive(const boost::system::error_code &error, std::size_t size,
-                        core::DatagramAddress source) {
+                        io::DatagramAddress source) {
         read_in_progress_ = false;
         auto handler = std::move(receive_handler_);
         if (handler) {
@@ -474,11 +533,11 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
         }
     }
 
-    std::unique_ptr<core::StreamHandle> stream_;
+    std::unique_ptr<io::StreamHandle> stream_;
     UdpOverTcpOptions options_;
     std::deque<PendingWrite> writes_;
     boost::asio::mutable_buffer output_buffer_;
-    core::DatagramHandle::ReadHandler receive_handler_;
+    ReadHandler receive_handler_;
     bool request_written_ = false;
     bool request_pending_ = false;
     bool connect_mode_ = false;
@@ -487,17 +546,62 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
     bool closed_ = false;
 };
 
-class UdpOverTcpHandle final : public core::DatagramHandle {
+class UdpOverTcpHandle final : public io::DatagramHandle {
   public:
     explicit UdpOverTcpHandle(std::shared_ptr<UdpOverTcpState> state) : state_(std::move(state)) {}
 
-    void async_send_to(boost::asio::const_buffer buffer, core::DatagramAddress destination,
-                       WriteHandler handler) override {
-        state_->send(buffer, std::move(destination), std::move(handler));
+    io::AnySender<std::size_t> async_send_to(boost::asio::const_buffer buffer,
+                                             io::DatagramAddress destination) override {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
+        return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
+            [state = state_, buffer, destination](auto terminal) mutable {
+                state->send(buffer, std::move(destination), std::move(terminal));
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                if (!error) {
+                    stdexec::set_value(std::move(receiver), size);
+                    return;
+                }
+                if (error == boost::asio::error::operation_aborted) {
+                    stdexec::set_stopped(std::move(receiver));
+                    return;
+                }
+                stdexec::set_error(std::move(receiver), std::make_exception_ptr(core::Error{
+                                                            core::ErrorCode::transport_io,
+                                                            "UDP-over-TCP send failed", error}));
+            })};
     }
 
-    void async_receive_from(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        state_->receive(buffer, std::move(handler));
+    io::AnySender<io::DatagramPacket>
+    async_receive_from(boost::asio::mutable_buffer buffer) override {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(io::DatagramPacket),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
+        return io::AnySender<io::DatagramPacket>{async::callback_sender<Signatures>(
+            [state = state_, buffer](auto terminal) mutable {
+                state->receive(buffer, [terminal = std::move(terminal)](
+                                           const boost::system::error_code &error, std::size_t size,
+                                           io::DatagramAddress source) mutable {
+                    terminal(error, size, std::move(source));
+                });
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size,
+               io::DatagramAddress source) {
+                if (!error) {
+                    stdexec::set_value(std::move(receiver),
+                                       io::DatagramPacket{size, std::move(source)});
+                    return;
+                }
+                if (error == boost::asio::error::operation_aborted) {
+                    stdexec::set_stopped(std::move(receiver));
+                    return;
+                }
+                stdexec::set_error(std::move(receiver), std::make_exception_ptr(core::Error{
+                                                            core::ErrorCode::transport_io,
+                                                            "UDP-over-TCP receive failed", error}));
+            })};
     }
 
     boost::asio::any_io_executor executor() noexcept override { return state_->executor(); }
@@ -513,8 +617,8 @@ class UdpOverTcpHandle final : public core::DatagramHandle {
 
 } // namespace
 
-core::Result<std::unique_ptr<core::DatagramHandle>>
-make_udp_over_tcp_datagram_handle(std::unique_ptr<core::StreamHandle> stream,
+core::Result<std::unique_ptr<io::DatagramHandle>>
+make_udp_over_tcp_datagram_handle(std::unique_ptr<io::StreamHandle> stream,
                                   UdpOverTcpOptions options) {
     if (!stream) {
         return core::fail(
@@ -525,7 +629,7 @@ make_udp_over_tcp_datagram_handle(std::unique_ptr<core::StreamHandle> stream,
         return core::fail({core::ErrorCode::configuration, "unsupported UDP-over-TCP version", {}});
     }
     auto state = std::make_shared<UdpOverTcpState>(std::move(stream), std::move(options));
-    return std::unique_ptr<core::DatagramHandle>(
+    return std::unique_ptr<io::DatagramHandle>(
         std::make_unique<UdpOverTcpHandle>(std::move(state)));
 }
 

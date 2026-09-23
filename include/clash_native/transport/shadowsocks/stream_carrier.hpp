@@ -1,11 +1,15 @@
 #pragma once
 
-#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/core/outbound.hpp>
+#include <clash_native/io/sender.hpp>
 #include <clash_native/io/stream_handle.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/write.hpp>
+
+#include <stdexec/execution.hpp>
 
 #include <exception>
 #include <memory>
@@ -34,29 +38,63 @@ class StreamCarrier final : public std::enable_shared_from_this<StreamCarrier> {
 
     explicit StreamCarrier(std::shared_ptr<io::StreamHandle> stream) : stream_(std::move(stream)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer,
-                         core::StreamHandle::ReadHandler handler) {
+    // Sender-native exterior: the cipher layers pull/push through here
+    // regardless of which backing leg the carrier was built over. Legs that
+    // still speak callbacks are bridged per operation; the core:: leg dies
+    // with the mux-fed paths.
+    io::AnySender<std::optional<std::size_t>> async_read_some(boost::asio::mutable_buffer buffer) {
         if (stream_) {
-            drive_read(stream_, buffer, std::move(handler));
-            return;
+            return stream_->async_read_some(buffer);
         }
+        using Signatures =
+            stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                           stdexec::set_error_t(std::exception_ptr),
+                                           stdexec::set_stopped_t()>;
         if (legacy_stream_) {
-            legacy_stream_->async_read_some(buffer, std::move(handler));
-            return;
+            auto legacy = legacy_stream_;
+            return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
+                [legacy, buffer](auto terminal) mutable {
+                    legacy->async_read_some(buffer, std::move(terminal));
+                },
+                [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                    net::translate_read(std::move(receiver), error, size, "carrier read");
+                })};
         }
-        socket_->async_read_some(buffer, std::move(handler));
+        auto socket = socket_;
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
+            [socket, buffer](auto terminal) mutable {
+                socket->async_read_some(buffer, std::move(terminal));
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                net::translate_read(std::move(receiver), error, size, "carrier read");
+            })};
     }
 
-    void async_write(boost::asio::const_buffer buffer, core::StreamHandle::WriteHandler handler) {
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) {
         if (stream_) {
-            drive_write(stream_, buffer, std::move(handler));
-            return;
+            return stream_->async_write(buffer);
         }
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
         if (legacy_stream_) {
-            legacy_stream_->async_write(buffer, std::move(handler));
-            return;
+            auto legacy = legacy_stream_;
+            return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
+                [legacy, buffer](auto terminal) mutable {
+                    legacy->async_write(buffer, std::move(terminal));
+                },
+                [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                    net::translate_write(std::move(receiver), error, size, "carrier write");
+                })};
         }
-        boost::asio::async_write(*socket_, buffer, std::move(handler));
+        auto socket = socket_;
+        return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
+            [socket, buffer](auto terminal) mutable {
+                boost::asio::async_write(*socket, buffer, std::move(terminal));
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                net::translate_write(std::move(receiver), error, size, "carrier write");
+            })};
     }
 
     boost::asio::any_io_executor executor() noexcept {
@@ -107,62 +145,6 @@ class StreamCarrier final : public std::enable_shared_from_this<StreamCarrier> {
     std::shared_ptr<boost::asio::ip::tcp::socket> socket() const noexcept { return socket_; }
 
   private:
-    // Drives a sender-based handle to completion on the heap, translating the
-    // terminal back into the legacy handler call. Unqualified completions:
-    // the erased sender invokes the receiver as an lvalue.
-    static void drive_read(const std::shared_ptr<io::StreamHandle> &stream,
-                           boost::asio::mutable_buffer buffer,
-                           core::StreamHandle::ReadHandler handler) {
-        struct Receiver {
-            core::StreamHandle::ReadHandler handler;
-            void set_value(std::optional<std::size_t> count) noexcept {
-                if (count) {
-                    std::move(handler)(boost::system::error_code{}, *count);
-                } else {
-                    std::move(handler)(boost::asio::error::eof, std::size_t{0});
-                }
-            }
-            void set_error(std::exception_ptr error) noexcept {
-                std::move(handler)(unpack_error(std::move(error)), std::size_t{0});
-            }
-            void set_stopped() noexcept {
-                std::move(handler)(boost::asio::error::operation_aborted, std::size_t{0});
-            }
-        };
-        async::start_with_receiver(stream->async_read_some(buffer), Receiver{std::move(handler)});
-    }
-
-    static void drive_write(const std::shared_ptr<io::StreamHandle> &stream,
-                            boost::asio::const_buffer buffer,
-                            core::StreamHandle::WriteHandler handler) {
-        struct Receiver {
-            core::StreamHandle::WriteHandler handler;
-            void set_value(std::size_t count) noexcept {
-                std::move(handler)(boost::system::error_code{}, count);
-            }
-            void set_error(std::exception_ptr error) noexcept {
-                std::move(handler)(unpack_error(std::move(error)), std::size_t{0});
-            }
-            void set_stopped() noexcept {
-                std::move(handler)(boost::asio::error::operation_aborted, std::size_t{0});
-            }
-        };
-        async::start_with_receiver(stream->async_write(buffer), Receiver{std::move(handler)});
-    }
-
-    static boost::system::error_code unpack_error(std::exception_ptr error) noexcept {
-        try {
-            std::rethrow_exception(std::move(error));
-        } catch (const core::Error &failure) {
-            if (failure.cause) {
-                return {failure.cause.value(), boost::system::system_category()};
-            }
-            return boost::asio::error::fault;
-        } catch (...) {
-            return boost::asio::error::fault;
-        }
-    }
-
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
     std::shared_ptr<io::StreamHandle> stream_;
     // Transitional: carriers built over not-yet-migrated core:: streams

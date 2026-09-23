@@ -1952,3 +1952,26 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-23
+
+- Moved the Shadowsocks chain onto io:: handles (part of the
+  stream-plane strangler): StreamCarrier exposes sender-native
+  read/write over all three backing legs (raw socket and legacy
+  core:: legs bridged per operation); the legacy, ss2022, and AEAD
+  cipher states drive carrier io:: pulls/pushes through small
+  terminal-mapping receivers instead of callback legs; shadow-tls-v3
+  takes and returns io:: handles with an io:: shell over its shared
+  framing state; UDP-over-TCP takes an io:: stream and serves an
+  io:: datagram handle; legacy and AEAD UDP framers serve io::
+  datagram handles. Both Shadowsocks outbound exits now hand io::
+  handles out with no adaptation.
+- Remaining core:: legs are all mux-fed (kcptun SMUX, WebSocket mux
+  pool, snappy over kcptun) and migrate with the multiplexed plane;
+  the carrier keeps those backing legs plus their per-op bridges.
+- Fixed a test hang along the way: the rewritten UDP-over-TCP test
+  dropped the context pump its posted completions need, so a runner
+  thread now pumps the context during the blocking wait.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.

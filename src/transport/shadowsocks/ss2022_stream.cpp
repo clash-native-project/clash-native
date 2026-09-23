@@ -1,6 +1,7 @@
 #include <clash_native/transport/shadowsocks/ss2022_stream.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/shadowsocks/crypto.hpp>
 
@@ -26,6 +27,45 @@
 namespace clash_native::transport::shadowsocks {
 
 namespace {
+
+// Bridges one carrier pull/push back into a legacy (error, size) handler.
+struct CarrierReadBridge {
+    using receiver_concept = stdexec::receiver_tag;
+    core::StreamHandle::ReadHandler handler;
+    void set_value(std::optional<std::size_t> size) && noexcept {
+        auto callback = std::move(handler);
+        if (size) {
+            callback({}, *size);
+        } else {
+            callback(boost::asio::error::eof, 0);
+        }
+    }
+    void set_error(std::exception_ptr error) && noexcept {
+        auto callback = std::move(handler);
+        callback(net::unpack_error(std::move(error)), 0);
+    }
+    void set_stopped() && noexcept {
+        auto callback = std::move(handler);
+        callback(boost::asio::error::operation_aborted, 0);
+    }
+};
+
+struct CarrierWriteBridge {
+    using receiver_concept = stdexec::receiver_tag;
+    core::StreamHandle::WriteHandler handler;
+    void set_value(std::size_t size) && noexcept {
+        auto callback = std::move(handler);
+        callback({}, size);
+    }
+    void set_error(std::exception_ptr error) && noexcept {
+        auto callback = std::move(handler);
+        callback(net::unpack_error(std::move(error)), 0);
+    }
+    void set_stopped() && noexcept {
+        auto callback = std::move(handler);
+        callback(boost::asio::error::operation_aborted, 0);
+    }
+};
 
 constexpr std::size_t kMaxChunkPayload = 0x3fff;
 constexpr std::size_t kFixedHeaderSize = 1 + sizeof(std::uint64_t) + sizeof(std::uint16_t);
@@ -212,12 +252,15 @@ class Shadowsocks2022StreamState final
                 });
             return;
         }
-        carrier_->async_write(boost::asio::buffer(*wire),
-                              [self, wire, handler = std::move(handler), size = buffer.size()](
-                                  const boost::system::error_code &error, std::size_t) mutable {
-                                  self->write_in_progress_ = false;
-                                  handler(error, error ? 0 : size);
-                              });
+        core::StreamHandle::WriteHandler completion =
+            [self, wire, handler = std::move(handler),
+             size = buffer.size()](const boost::system::error_code &error, std::size_t) mutable {
+                self->write_in_progress_ = false;
+                handler(error, error ? 0 : size);
+            };
+        // NOTE: name the sender first; argument order is unspecified.
+        auto sender = carrier_->async_write(boost::asio::buffer(*wire));
+        async::start_with_receiver(std::move(sender), CarrierWriteBridge{std::move(completion)});
     }
 
     boost::asio::any_io_executor executor() noexcept { return carrier_->executor(); }
@@ -511,9 +554,9 @@ class Shadowsocks2022StreamState final
 
     void read_exact_carrier(boost::asio::mutable_buffer buffer, ExactReadHandler handler) {
         auto self = shared_from_this();
-        carrier_->async_read_some(
-            buffer, [self, buffer, handler = std::move(handler)](
-                        const boost::system::error_code &error, std::size_t size) mutable {
+        core::StreamHandle::ReadHandler completion =
+            [self, buffer, handler = std::move(handler)](const boost::system::error_code &error,
+                                                         std::size_t size) mutable {
                 if (error) {
                     handler(error);
                     return;
@@ -529,7 +572,10 @@ class Shadowsocks2022StreamState final
                 auto remaining = boost::asio::mutable_buffer(
                     static_cast<std::uint8_t *>(buffer.data()) + size, buffer.size() - size);
                 self->read_exact_carrier(remaining, std::move(handler));
-            });
+            };
+        // NOTE: name the sender first; argument order is unspecified.
+        auto sender = carrier_->async_read_some(buffer);
+        async::start_with_receiver(std::move(sender), CarrierReadBridge{std::move(completion)});
     }
 
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
@@ -659,8 +705,7 @@ class Shadowsocks2022OpenOperation final
         wire->insert(wire->end(), variable_record.value().begin(), variable_record.value().end());
         auto self = shared_from_this();
         if (carrier_) {
-            carrier_->async_write(
-                boost::asio::buffer(*wire),
+            core::StreamHandle::WriteHandler completion =
                 [self, wire, key = std::move(key.value()), nonce = std::move(nonce)](
                     const boost::system::error_code &error, std::size_t) mutable {
                     if (error) {
@@ -675,7 +720,11 @@ class Shadowsocks2022OpenOperation final
                                 self->carrier_, self->method_, self->password_, std::move(key),
                                 std::move(nonce), std::move(self->request_salt_),
                                 std::vector<std::uint8_t>{}))));
-                });
+                };
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = carrier_->async_write(boost::asio::buffer(*wire));
+            async::start_with_receiver(std::move(sender),
+                                       CarrierWriteBridge{std::move(completion)});
             return;
         }
         if (obfs_options_) {

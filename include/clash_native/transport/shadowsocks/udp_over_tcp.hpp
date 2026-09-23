@@ -2,6 +2,8 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
+#include <clash_native/io/datagram_handle.hpp>
+#include <clash_native/io/stream_handle.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -25,8 +27,8 @@ struct UdpOverTcpOptions {
 // Adapts the stream opened to the Shadowsocks UoT magic destination to the
 // addressed DatagramHandle interface. Version 2 writes its request lazily on
 // the first datagram; both versions use per-datagram addresses on the wire.
-core::Result<std::unique_ptr<core::DatagramHandle>>
-make_udp_over_tcp_datagram_handle(std::unique_ptr<core::StreamHandle> stream,
+core::Result<std::unique_ptr<io::DatagramHandle>>
+make_udp_over_tcp_datagram_handle(std::unique_ptr<io::StreamHandle> stream,
                                   UdpOverTcpOptions options);
 
 } // namespace clash_native::transport::shadowsocks

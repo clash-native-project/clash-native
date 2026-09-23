@@ -254,8 +254,8 @@ class JlsStream final : public io::StreamHandle, public std::enable_shared_from_
                                                            stdexec::set_stopped_t()>;
     // Internal machinery stays handler-style; only the public overrides below
     // speak senders.
-    using ReadHandler = core::StreamHandle::ReadHandler;
-    using WriteHandler = core::StreamHandle::WriteHandler;
+    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
 
     static std::shared_ptr<JlsStream> create(std::unique_ptr<io::StreamHandle> lower,
                                              std::unique_ptr<Botan::TLS::Client> tls_client,

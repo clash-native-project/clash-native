@@ -555,9 +555,7 @@ void async_open_shadow_tls(std::unique_ptr<io::StreamHandle> stream, ShadowTlsCl
         return;
     }
     if (options.version == 3) {
-        // Shadow-TLS v3 debt: the v3 plane still takes core:: carriers.
-        async_open_shadow_tls_v3(net::adapt_io_to_core(std::move(stream)), std::move(options),
-                                 std::move(handler));
+        async_open_shadow_tls_v3(std::move(stream), std::move(options), std::move(handler));
         return;
     }
     std::make_shared<ShadowTlsOpenOperation>(std::move(stream), std::move(options),
