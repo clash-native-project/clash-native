@@ -1886,3 +1886,32 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   http1/http2/http3, io:: upload producers, then deletion of
   transport::ExchangeSession, transport::ExchangeBodyStream, and the
   adapter header.
+
+## 2026-09-23
+
+- Moved the SOCKS5 UDP relay (standalone listener and per-session
+  association paths) onto io:: datagram handles: path handles are the
+  opened io:: handles with no adaptation, sends drive io:: senders
+  with terminal-mapping receivers, and the response loops re-arm one
+  io:: pull per completion. The proxy no longer uses
+  `IoToCoreDatagram`. Added `net::to_core_destination` for the proxy
+  address codec, which still speaks core:: destinations.
+- Single-pull loops stay callback re-armed rather than tasks: a pump
+  task version was tried first and crashed intermittently in
+  teardown; tasks pay off for multi-step chains (relay pumps, HTTP/1
+  tasks), not for one pull plus re-arm. Path maps are now mutex
+  guarded because receiver terminals race stop()/close() from owner
+  threads during teardown.
+- Three latent issues fixed along the way, all with permanent tests:
+  a use-after-move from unspecified argument evaluation order (the
+  sender must be named before the receiver moves the payload; same
+  class as the earlier http1/websocket fixes), throwing out of
+  `let_error` recovery functions in the `UdpStream` io send/receive
+  chains (recoveries now return explicit `just_error` senders), and
+  the previously untested io receive path (new sync_wait, task-await,
+  and abort-while-parked tests; aborts surface as stopped per the
+  handle contract).
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed (including the SOCKS5/Stage1/proxy-server
+  combination that caught the teardown race); `pixi run format`,
+  `format-check`, and `git diff --check` pass.

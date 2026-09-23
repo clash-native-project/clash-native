@@ -228,12 +228,17 @@ void ProxySession::close() noexcept {
         udp_relay_socket_->close();
         udp_relay_socket_.reset();
     }
-    for (auto &[key, path] : udp_paths_) {
+    std::unordered_map<std::string, std::shared_ptr<UdpPath>> udp_paths;
+    {
+        std::lock_guard lock(udp_paths_mutex_);
+        udp_paths = std::move(udp_paths_);
+        udp_paths_.clear();
+        pending_udp_packets_.clear();
+    }
+    for (auto &[key, path] : udp_paths) {
         (void)key;
         path->handle->close();
     }
-    udp_paths_.clear();
-    pending_udp_packets_.clear();
     udp_snapshot_.reset();
 
     if (connection_id_ && owner_.connection_registry_) {

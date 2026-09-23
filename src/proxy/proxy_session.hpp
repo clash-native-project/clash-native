@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -148,7 +149,7 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
   private:
     struct UdpPath {
         std::string key;
-        std::shared_ptr<core::DatagramHandle> handle;
+        std::shared_ptr<io::DatagramHandle> handle;
         boost::asio::ip::udp::endpoint target;
         boost::asio::ip::udp::endpoint response_source;
         std::vector<std::uint8_t> receive_buffer;
@@ -193,9 +194,9 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     void process_socks_udp_packet(std::size_t size);
     void send_udp_payload(const std::shared_ptr<UdpPath> &path,
                           std::shared_ptr<std::vector<std::uint8_t>> payload);
+    // Single-pull response loop, re-armed per completion; no task needed.
     void receive_udp_response(const std::shared_ptr<UdpPath> &path);
-    void send_socks_udp_response(core::DatagramAddress source,
-                                 std::span<const std::uint8_t> payload);
+    void send_socks_udp_response(io::DatagramAddress source, std::span<const std::uint8_t> payload);
     void send_socks4_reply(std::uint8_t status, bool start_relay);
     void send_socks_reply(std::uint8_t reply, bool start_relay);
 
@@ -288,6 +289,9 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     std::unordered_map<std::string, std::shared_ptr<UdpPath>> udp_paths_;
     std::unordered_map<std::string, std::vector<std::shared_ptr<std::vector<std::uint8_t>>>>
         pending_udp_packets_;
+    // Guards udp_paths_/pending_udp_packets_: receiver terminals race
+    // close() from owner threads during teardown.
+    std::mutex udp_paths_mutex_;
 };
 
 } // namespace clash_native::proxy

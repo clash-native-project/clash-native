@@ -106,16 +106,21 @@ io::AnySender<std::size_t> UdpStream::async_send_to(boost::asio::const_buffer bu
             transport_error("udp send requires an IP destination", unsupported)))};
     }
     const auto endpoint = boost::asio::ip::udp::endpoint(destination.address(), destination.port());
+    // NOTE: the recovery builds its error sender explicitly and never throws
+    // out of the let_error function; throwing across the adaptor frames
+    // proved unreliable on this toolchain.
     return io::AnySender<std::size_t>{
         socket_->async_send_to(buffer, endpoint, exec::asio::use_sender) |
-        stdexec::let_error([](std::exception_ptr error) -> decltype(stdexec::just(std::size_t(0))) {
+        stdexec::let_error([](std::exception_ptr error) {
             try {
                 std::rethrow_exception(error);
             } catch (const boost::system::system_error &failure) {
-                std::rethrow_exception(
+                return stdexec::just_error(
                     std::make_exception_ptr(transport_error("udp send", failure.code())));
+            } catch (...) {
+                return stdexec::just_error(std::current_exception());
             }
-            std::rethrow_exception(error);
+            return stdexec::just_error(std::current_exception());
         })};
 }
 
@@ -127,16 +132,17 @@ UdpStream::async_receive_from(boost::asio::mutable_buffer buffer) {
         stdexec::then([sender](std::size_t size) {
             return io::DatagramPacket{size, io::DatagramAddress::from_endpoint(*sender)};
         }) |
-        stdexec::let_error(
-            [](std::exception_ptr error) -> decltype(stdexec::just(io::DatagramPacket{})) {
-                try {
-                    std::rethrow_exception(error);
-                } catch (const boost::system::system_error &failure) {
-                    std::rethrow_exception(
-                        std::make_exception_ptr(transport_error("udp receive", failure.code())));
-                }
+        stdexec::let_error([](std::exception_ptr error) {
+            try {
                 std::rethrow_exception(error);
-            })};
+            } catch (const boost::system::system_error &failure) {
+                return stdexec::just_error(
+                    std::make_exception_ptr(transport_error("udp receive", failure.code())));
+            } catch (...) {
+                return stdexec::just_error(std::current_exception());
+            }
+            return stdexec::just_error(std::current_exception());
+        })};
 }
 
 void UdpStream::async_send_to(boost::asio::const_buffer buffer, core::DatagramAddress destination,

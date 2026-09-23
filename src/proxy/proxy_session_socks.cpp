@@ -3,6 +3,8 @@
 #include "outbound/outbound_utils.hpp"
 #include "outbound/proxy_address.hpp"
 #include "socks5_udp_listener.hpp"
+
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/datagram_handle_adapter.hpp>
 
 #include <boost/asio/read.hpp>
@@ -439,22 +441,29 @@ void ProxySession::process_socks_udp_packet(std::size_t size) {
     }
     const std::string key(reinterpret_cast<const char *>(key_bytes.value().data()),
                           key_bytes.value().size());
-    const auto existing = udp_paths_.find(key);
-    if (existing != udp_paths_.end()) {
-        send_udp_payload(existing->second, std::move(payload));
+    std::shared_ptr<UdpPath> existing_path;
+    {
+        std::lock_guard lock(udp_paths_mutex_);
+        const auto existing = udp_paths_.find(key);
+        if (existing != udp_paths_.end()) {
+            existing_path = existing->second;
+        } else {
+            auto pending = pending_udp_packets_.find(key);
+            if (pending != pending_udp_packets_.end()) {
+                pending->second.push_back(std::move(payload));
+                return;
+            }
+            if (udp_paths_.size() + pending_udp_packets_.size() >= kMaxUdpPathsPerAssociation) {
+                return;
+            }
+            pending_udp_packets_.emplace(
+                key, std::vector<std::shared_ptr<std::vector<std::uint8_t>>>{payload});
+        }
+    }
+    if (existing_path) {
+        send_udp_payload(existing_path, std::move(payload));
         return;
     }
-
-    auto pending = pending_udp_packets_.find(key);
-    if (pending != pending_udp_packets_.end()) {
-        pending->second.push_back(std::move(payload));
-        return;
-    }
-    if (udp_paths_.size() + pending_udp_packets_.size() >= kMaxUdpPathsPerAssociation) {
-        return;
-    }
-    pending_udp_packets_.emplace(key,
-                                 std::vector<std::shared_ptr<std::vector<std::uint8_t>>>{payload});
 
     const auto sender = *udp_client_endpoint_;
     core::ConnectionMetadata metadata{
@@ -475,26 +484,37 @@ void ProxySession::process_socks_udp_packet(std::size_t size) {
                                  }
                                  return;
                              }
-                             auto packets = self->pending_udp_packets_.find(key);
-                             if (packets == self->pending_udp_packets_.end()) {
+                             std::vector<std::shared_ptr<std::vector<std::uint8_t>>> payloads;
+                             bool has_pending = false;
+                             {
+                                 std::lock_guard lock(self->udp_paths_mutex_);
+                                 auto packets = self->pending_udp_packets_.find(key);
+                                 if (packets != self->pending_udp_packets_.end()) {
+                                     payloads = std::move(packets->second);
+                                     self->pending_udp_packets_.erase(packets);
+                                     has_pending = true;
+                                 }
+                             }
+                             if (!has_pending) {
                                  if (result.handle) {
                                      result.handle->close();
                                  }
                                  return;
                              }
-                             auto payloads = std::move(packets->second);
-                             self->pending_udp_packets_.erase(packets);
                              if (!result.succeeded()) {
                                  return;
                              }
                              auto path = std::make_shared<UdpPath>();
                              path->key = key;
-                             // Datagram-plane debt: the UDP relay still speaks core::.
-                             path->handle = std::shared_ptr<core::DatagramHandle>(
-                                 net::adapt_io_to_core_datagram(std::move(result.handle)));
+                             // The open already yields io::; no adaptation remains.
+                             path->handle =
+                                 std::shared_ptr<io::DatagramHandle>(std::move(result.handle));
                              path->target = target;
                              path->receive_buffer.resize(path->handle->max_datagram_size());
-                             self->udp_paths_.emplace(key, path);
+                             {
+                                 std::lock_guard lock(self->udp_paths_mutex_);
+                                 self->udp_paths_.emplace(key, path);
+                             }
                              self->receive_udp_response(path);
                              for (auto &packet : payloads) {
                                  self->send_udp_payload(path, std::move(packet));
@@ -504,57 +524,100 @@ void ProxySession::process_socks_udp_packet(std::size_t size) {
 
 void ProxySession::send_udp_payload(const std::shared_ptr<UdpPath> &path,
                                     std::shared_ptr<std::vector<std::uint8_t>> payload) {
-    auto self = shared_from_this();
-    const auto payload_buffer = boost::asio::buffer(*payload);
-    path->handle->async_send_to(
-        payload_buffer, core::DatagramAddress::from_endpoint(path->target),
-        [self, path, payload](const boost::system::error_code &error, std::size_t) {
-            if (error && error != boost::asio::error::operation_aborted &&
-                !self->closed_.load(std::memory_order_acquire)) {
-                spdlog::warn("Proxy outbound UDP send failed: {}", error.message());
-                if (error == boost::asio::error::message_size) {
+    struct UdpSendReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<ProxySession> self;
+        std::shared_ptr<UdpPath> path;
+        std::shared_ptr<std::vector<std::uint8_t>> payload;
+        void set_value(std::size_t) && noexcept {}
+        void set_error(std::exception_ptr error) && noexcept {
+            if (self->closed_.load(std::memory_order_acquire)) {
+                return;
+            }
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const core::Error &failure) {
+                spdlog::warn("Proxy outbound UDP send failed: {}", failure.context);
+                if (failure.cause ==
+                    std::error_code(boost::asio::error::message_size, std::system_category())) {
                     spdlog::warn("Proxy outbound UDP datagram exceeds the supported size limit");
                 }
+            } catch (...) {
+                spdlog::warn("Proxy outbound UDP send failed");
+            }
+            std::shared_ptr<UdpPath> retired;
+            {
+                std::lock_guard lock(self->udp_paths_mutex_);
                 const auto found = self->udp_paths_.find(path->key);
                 if (found != self->udp_paths_.end() && found->second == path) {
-                    path->handle->close();
+                    retired = found->second;
                     self->udp_paths_.erase(found);
                 }
             }
-        });
+            if (retired) {
+                retired->handle->close();
+            }
+        }
+        void set_stopped() && noexcept {}
+    };
+    auto self = shared_from_this();
+    // NOTE: name the sender first; argument order is unspecified.
+    auto sender = path->handle->async_send_to(boost::asio::buffer(*payload),
+                                              io::DatagramAddress::from_endpoint(path->target));
+    async::start_with_receiver(std::move(sender), UdpSendReceiver{self, path, std::move(payload)});
 }
 
 void ProxySession::receive_udp_response(const std::shared_ptr<UdpPath> &path) {
     if (closed_.load(std::memory_order_acquire)) {
         return;
     }
-    auto self = shared_from_this();
-    path->handle->async_receive_from(
-        boost::asio::buffer(path->receive_buffer),
-        [self, path](const boost::system::error_code &error, std::size_t size,
-                     core::DatagramAddress source) {
-            if (error) {
-                if (error != boost::asio::error::operation_aborted &&
-                    !self->closed_.load(std::memory_order_acquire)) {
-                    const auto found = self->udp_paths_.find(path->key);
-                    if (found != self->udp_paths_.end() && found->second == path) {
-                        self->udp_paths_.erase(found);
-                    }
-                }
+    struct UdpReceiveReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<ProxySession> self;
+        std::shared_ptr<UdpPath> path;
+        void set_value(io::DatagramPacket packet) && noexcept {
+            if (self->closed_.load(std::memory_order_acquire)) {
                 return;
             }
             self->send_socks_udp_response(
-                source, std::span<const std::uint8_t>(path->receive_buffer.data(), size));
+                packet.address,
+                std::span<const std::uint8_t>(path->receive_buffer.data(), packet.size));
             self->receive_udp_response(path);
-        });
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            if (self->closed_.load(std::memory_order_acquire)) {
+                return;
+            }
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const core::Error &failure) {
+                spdlog::warn("Proxy outbound UDP receive failed: {}", failure.context);
+            } catch (...) {
+                spdlog::warn("Proxy outbound UDP receive failed");
+            }
+            std::lock_guard lock(self->udp_paths_mutex_);
+            const auto found = self->udp_paths_.find(path->key);
+            if (found != self->udp_paths_.end() && found->second == path) {
+                self->udp_paths_.erase(found);
+            }
+        }
+        void set_stopped() && noexcept {
+            // Teardown aborted the pull; close() already retired the maps.
+        }
+    };
+    auto self = shared_from_this();
+    // NOTE: name the sender first; argument order is unspecified.
+    auto sender = path->handle->async_receive_from(boost::asio::buffer(path->receive_buffer));
+    async::start_with_receiver(std::move(sender), UdpReceiveReceiver{self, path});
 }
 
-void ProxySession::send_socks_udp_response(core::DatagramAddress source,
+void ProxySession::send_socks_udp_response(io::DatagramAddress source,
                                            std::span<const std::uint8_t> payload) {
     if (closed_.load(std::memory_order_acquire) || !udp_client_endpoint_) {
         return;
     }
-    auto address = outbound::detail::encode_proxy_address(source.to_destination());
+    auto address =
+        outbound::detail::encode_proxy_address(net::to_core_destination(source.to_destination()));
     if (!address) {
         return;
     }
@@ -563,10 +626,17 @@ void ProxySession::send_socks_udp_response(core::DatagramAddress source,
     packet->insert(packet->end(), {0, 0, 0});
     packet->insert(packet->end(), address.value().begin(), address.value().end());
     packet->insert(packet->end(), payload.begin(), payload.end());
-    auto self = shared_from_this();
-    udp_relay_socket_->async_send_to(
-        boost::asio::buffer(*packet), core::DatagramAddress::from_endpoint(*udp_client_endpoint_),
-        [self, packet](const boost::system::error_code &, std::size_t) {});
+    struct UdpResponseReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<std::vector<std::uint8_t>> packet;
+        void set_value(std::size_t) && noexcept {}
+        void set_error(std::exception_ptr) && noexcept {}
+        void set_stopped() && noexcept {}
+    };
+    // NOTE: name the sender first; argument order is unspecified.
+    auto sender = udp_relay_socket_->async_send_to(
+        boost::asio::buffer(*packet), io::DatagramAddress::from_endpoint(*udp_client_endpoint_));
+    async::start_with_receiver(std::move(sender), UdpResponseReceiver{std::move(packet)});
 }
 
 void ProxySession::send_socks_reply(std::uint8_t reply, bool start_relay) {

@@ -1,3 +1,4 @@
+#include <clash_native/core/error.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 
@@ -6,10 +7,18 @@
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/ip/address.hpp>
 
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
+
+#include <stdexec/execution.hpp>
+
 #include <array>
 #include <chrono>
 #include <future>
+#include <optional>
 #include <string>
+#include <thread>
+#include <tuple>
 #include <utility>
 
 namespace {
@@ -117,5 +126,126 @@ TEST(UdpStreamTest, SendsAndReceivesDatagramsWithPeerEndpoints) {
     stream.close();
     boost::system::error_code ignored;
     peer.close(ignored);
+    runtime.stop();
+}
+
+TEST(UdpStreamTest, ReceivesDatagramsThroughTheIoSender) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    const auto test_address = udp_test_address(runtime.context());
+    clash_native::net::UdpStream stream(runtime.context().get_executor());
+    boost::system::error_code error;
+    stream.open(boost::asio::ip::udp::v4(), error);
+    ASSERT_FALSE(error);
+    stream.bind({test_address, 0}, error);
+    ASSERT_FALSE(error);
+
+    boost::asio::ip::udp::socket peer(runtime.context(), {test_address, 0});
+    const auto stream_endpoint = stream.local_endpoint(error);
+    ASSERT_FALSE(error);
+
+    runtime.start();
+
+    const std::string query = "dns-query-io";
+    ASSERT_EQ(peer.send_to(boost::asio::buffer(query), stream_endpoint, 0, error), query.size());
+    ASSERT_FALSE(error);
+
+    std::array<char, 32> incoming_buffer{};
+    auto wait = stdexec::sync_wait(stream.async_receive_from(boost::asio::buffer(incoming_buffer)));
+    ASSERT_TRUE(wait.has_value());
+    auto packet = std::move(std::get<0>(*wait));
+    EXPECT_EQ(packet.size, query.size());
+    ASSERT_TRUE(packet.address.is_address());
+    EXPECT_EQ(packet.address.port(), peer.local_endpoint().port());
+    EXPECT_EQ(std::string(incoming_buffer.data(), packet.size), query);
+
+    stream.close();
+    boost::system::error_code ignored;
+    peer.close(ignored);
+    runtime.stop();
+}
+
+TEST(UdpStreamTest, ReceivesDatagramsAwaitedInsideATask) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    const auto test_address = udp_test_address(runtime.context());
+    auto stream = std::make_shared<clash_native::net::UdpStream>(runtime.serialized_executor());
+    boost::system::error_code error;
+    stream->open(boost::asio::ip::udp::v4(), error);
+    ASSERT_FALSE(error);
+    stream->bind({test_address, 0}, error);
+    ASSERT_FALSE(error);
+
+    boost::asio::ip::udp::socket peer(runtime.context(), {test_address, 0});
+    const auto stream_endpoint = stream->local_endpoint(error);
+    ASSERT_FALSE(error);
+
+    runtime.start();
+
+    const std::string query = "dns-query-task";
+    ASSERT_EQ(peer.send_to(boost::asio::buffer(query), stream_endpoint, 0, error), query.size());
+    ASSERT_FALSE(error);
+
+    exec::async_scope scope;
+    std::optional<clash_native::io::DatagramPacket> got;
+    std::array<char, 32> incoming_buffer{};
+    scope.spawn([&]() -> exec::task<void> {
+        auto packet = co_await stream->async_receive_from(boost::asio::buffer(incoming_buffer));
+        got = std::move(packet);
+        co_return;
+    }());
+    auto empty = stdexec::sync_wait(scope.on_empty());
+    ASSERT_TRUE(empty.has_value());
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->size, query.size());
+
+    stream->close();
+    boost::system::error_code ignored;
+    peer.close(ignored);
+    runtime.stop();
+}
+
+TEST(UdpStreamTest, AbortedReceiveFailsTheAwaitingTask) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    const auto test_address = udp_test_address(runtime.context());
+    auto stream = std::make_shared<clash_native::net::UdpStream>(runtime.serialized_executor());
+    boost::system::error_code error;
+    stream->open(boost::asio::ip::udp::v4(), error);
+    ASSERT_FALSE(error);
+    stream->bind({test_address, 0}, error);
+    ASSERT_FALSE(error);
+
+    runtime.start();
+
+    // Aborting a parked pull completes stopped (per the handle contract),
+    // which unwinds the awaiting task past any catch: the guard observes
+    // teardown, and neither a value nor an error may surface.
+    exec::async_scope scope;
+    bool settled = false;
+    bool got_value = false;
+    bool got_error = false;
+    struct Guard {
+        bool *settled;
+        ~Guard() { *settled = true; }
+    };
+    std::array<char, 32> incoming_buffer{};
+    scope.spawn([&]() -> exec::task<void> {
+        Guard guard{&settled};
+        try {
+            auto packet = co_await stream->async_receive_from(boost::asio::buffer(incoming_buffer));
+            (void)packet;
+            got_value = true;
+        } catch (...) {
+            got_error = true;
+        }
+        co_return;
+    }());
+    // Let the pull park, then abort it from another thread.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    stream->close();
+    auto empty = stdexec::sync_wait(scope.on_empty());
+    ASSERT_TRUE(empty.has_value());
+    EXPECT_TRUE(settled);
+    EXPECT_FALSE(got_value);
+    EXPECT_FALSE(got_error);
+
     runtime.stop();
 }

@@ -16,6 +16,15 @@
 
 namespace clash_native::net {
 
+// Datagram-plane debt: converts an io:: destination into the core::
+// vocabulary for helpers (proxy address codecs) that still speak core::.
+// Delete with those helpers.
+inline core::Destination to_core_destination(const io::Destination &destination) {
+    return destination.is_domain()
+               ? core::Destination::domain(destination.domain(), destination.port())
+               : core::Destination::address(destination.address(), destination.port());
+}
+
 // Datagram-plane debt: exposes an io:: carrier as core::DatagramHandle
 // for planes that still speak core:: (the DNS query operation and the
 // legacy QUIC plane flip separately). Delete with those planes.
