@@ -141,39 +141,6 @@ struct DatagramRequest {
     std::shared_ptr<const EndpointDialTrace> dial_trace;
 };
 
-class StreamHandle {
-  public:
-    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
-    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
-
-    virtual void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) = 0;
-    virtual void async_write(boost::asio::const_buffer buffer, WriteHandler handler) = 0;
-    virtual boost::asio::any_io_executor executor() noexcept = 0;
-    virtual boost::asio::ip::tcp::endpoint
-    local_endpoint(boost::system::error_code &error) const noexcept = 0;
-    virtual void shutdown_send(boost::system::error_code &error) noexcept = 0;
-    virtual void close() noexcept = 0;
-
-    virtual ~StreamHandle() = default;
-};
-
-class DatagramHandle {
-  public:
-    using ReadHandler =
-        std::function<void(const boost::system::error_code &, std::size_t, DatagramAddress)>;
-    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
-
-    virtual void async_send_to(boost::asio::const_buffer buffer, DatagramAddress destination,
-                               WriteHandler handler) = 0;
-    virtual void async_receive_from(boost::asio::mutable_buffer buffer, ReadHandler handler) = 0;
-    virtual boost::asio::any_io_executor executor() noexcept = 0;
-    virtual std::size_t max_datagram_size() const noexcept { return 65507; }
-    virtual void cancel() noexcept = 0;
-    virtual void close() noexcept = 0;
-
-    virtual ~DatagramHandle() = default;
-};
-
 struct StreamOpenResult {
     OpenStatus status = OpenStatus::failed;
     std::unique_ptr<io::StreamHandle> handle;

@@ -1,5 +1,5 @@
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/io/stream_handle.hpp>
-#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/transport/websocket_client.hpp>
 
@@ -27,7 +27,7 @@
 namespace {
 
 using namespace std::chrono_literals;
-using clash_native::core::StreamHandle;
+using clash_native::io::StreamHandle;
 
 constexpr std::size_t kPayloadSize = 256 * 1024;
 
@@ -109,8 +109,7 @@ class WebSocketProbe final : public std::enable_shared_from_this<WebSocketProbe>
                     self->fail("WebSocket handshake failed: " + result.error().context);
                     return;
                 }
-                // Probe debt: the echo checks still speak callback-style core::.
-                self->stream_ = clash_native::net::adapt_io_to_core(std::move(result.value()));
+                self->stream_ = std::move(result.value());
                 self->write_payload();
             });
     }
@@ -120,47 +119,67 @@ class WebSocketProbe final : public std::enable_shared_from_this<WebSocketProbe>
 
   private:
     void write_payload() {
+        struct WriteReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<WebSocketProbe> self;
+            void set_value(std::size_t size) && noexcept {
+                if (size != self->payload_.size()) {
+                    self->fail("WebSocket write completed with an unexpected size");
+                    return;
+                }
+                self->read_next();
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const clash_native::core::Error &failure) {
+                    self->fail("WebSocket write failed: " + failure.context);
+                } catch (...) {
+                    self->fail("WebSocket write failed");
+                }
+            }
+            void set_stopped() && noexcept { self->fail("WebSocket write stopped"); }
+        };
         const auto self = shared_from_this();
-        stream_->async_write(boost::asio::buffer(payload_),
-                             [self](const boost::system::error_code &error, std::size_t size) {
-                                 if (error) {
-                                     self->fail("WebSocket write failed: " + error.message());
-                                     return;
-                                 }
-                                 if (size != self->payload_.size()) {
-                                     self->fail(
-                                         "WebSocket write completed with an unexpected size");
-                                     return;
-                                 }
-                                 self->read_next();
-                             });
+        auto sender = stream_->async_write(boost::asio::buffer(payload_));
+        clash_native::async::start_with_receiver(std::move(sender), WriteReceiver{self});
     }
 
     void read_next() {
         if (finished_) {
             return;
         }
-        const auto self = shared_from_this();
-        stream_->async_read_some(
-            boost::asio::buffer(read_buffer_),
-            [self](const boost::system::error_code &error, std::size_t size) {
-                if (error) {
-                    self->fail("WebSocket read failed: " + error.message());
-                    return;
-                }
-                if (size == 0 || self->received_ + size > self->payload_.size() ||
-                    !std::equal(self->read_buffer_.begin(), self->read_buffer_.begin() + size,
+        struct ReadReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<WebSocketProbe> self;
+            void set_value(std::optional<std::size_t> size) && noexcept {
+                if (!size || *size == 0 || self->received_ + *size > self->payload_.size() ||
+                    !std::equal(self->read_buffer_.begin(), self->read_buffer_.begin() + *size,
                                 self->payload_.begin() + self->received_)) {
                     self->fail("WebSocket echo payload did not match");
                     return;
                 }
-                self->received_ += size;
+                self->received_ += *size;
                 if (self->received_ == self->payload_.size()) {
                     self->finish_success();
                     return;
                 }
                 self->read_next();
-            });
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const clash_native::core::Error &failure) {
+                    self->fail("WebSocket read failed: " + failure.context);
+                } catch (...) {
+                    self->fail("WebSocket read failed");
+                }
+            }
+            void set_stopped() && noexcept { self->fail("WebSocket read stopped"); }
+        };
+        const auto self = shared_from_this();
+        auto sender = stream_->async_read_some(boost::asio::buffer(read_buffer_));
+        clash_native::async::start_with_receiver(std::move(sender), ReadReceiver{self});
     }
 
     void finish_success() {

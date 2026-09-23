@@ -110,16 +110,13 @@ void start_write_for_handler(Sender &&sender, Handler &&handler) {
                                Receiver{std::forward<Handler>(handler)});
 }
 
-// Adapts a project stream handle to the Asio read/write stream concepts.
-// Templated so the legacy core:: handles and the migrated io:: handles share
-// one implementation; the core:: specialization is deleted together with the
-// old interfaces at the end of the migration.
-template <typename StreamHandle> class StreamHandleAdapter final {
+// Adapts an io:: stream handle to the Asio read/write stream concepts.
+class StreamHandleAdapter final {
   public:
     using executor_type = boost::asio::any_io_executor;
     using lowest_layer_type = StreamHandleAdapter;
 
-    explicit StreamHandleAdapter(std::unique_ptr<StreamHandle> handle)
+    explicit StreamHandleAdapter(std::unique_ptr<io::StreamHandle> handle)
         : handle_(std::move(handle)) {}
 
     executor_type get_executor() const noexcept { return handle_->executor(); }
@@ -149,35 +146,16 @@ template <typename StreamHandle> class StreamHandleAdapter final {
         }
     }
 
-    std::unique_ptr<StreamHandle> release() noexcept { return std::move(handle_); }
+    std::unique_ptr<io::StreamHandle> release() noexcept { return std::move(handle_); }
 
   private:
-    // Legacy path: forwards to the callback-style handle directly.
-    template <typename Handler>
-    static void read_some(std::unique_ptr<core::StreamHandle> &handle,
-                          boost::asio::mutable_buffer buffer, Handler &&handler)
-        requires std::same_as<StreamHandle, core::StreamHandle>
-    {
-        handle->async_read_some(buffer, std::forward<Handler>(handler));
-    }
-
-    template <typename Handler>
-    static void write_some(std::unique_ptr<core::StreamHandle> &handle,
-                           boost::asio::const_buffer buffer, Handler &&handler)
-        requires std::same_as<StreamHandle, core::StreamHandle>
-    {
-        handle->async_write(buffer, std::forward<Handler>(handler));
-    }
-
-    // Migrated path: drives the sender to completion on the heap and
-    // translates the terminal signal back into a handler call. End-of-stream
-    // surfaces as eof (Asio convention); core::Error failures surface through
-    // their preserved error_code, falling back to fault when absent.
+    // Drives the sender to completion on the heap and translates the
+    // terminal signal back into a handler call. End-of-stream surfaces as
+    // eof (Asio convention); core::Error failures surface through their
+    // preserved error_code, falling back to fault when absent.
     template <typename Handler>
     static void read_some(std::unique_ptr<io::StreamHandle> &handle,
-                          boost::asio::mutable_buffer buffer, Handler &&handler)
-        requires std::same_as<StreamHandle, io::StreamHandle>
-    {
+                          boost::asio::mutable_buffer buffer, Handler &&handler) {
         struct Receiver {
             using receiver_concept = stdexec::receiver_tag;
             std::decay_t<Handler> handler;
@@ -208,9 +186,7 @@ template <typename StreamHandle> class StreamHandleAdapter final {
 
     template <typename Handler>
     static void write_some(std::unique_ptr<io::StreamHandle> &handle,
-                           boost::asio::const_buffer buffer, Handler &&handler)
-        requires std::same_as<StreamHandle, io::StreamHandle>
-    {
+                           boost::asio::const_buffer buffer, Handler &&handler) {
         struct Receiver {
             using receiver_concept = stdexec::receiver_tag;
             std::decay_t<Handler> handler;
@@ -234,160 +210,7 @@ template <typename StreamHandle> class StreamHandleAdapter final {
                                    Receiver{std::forward<Handler>(handler)});
     }
 
-    std::unique_ptr<StreamHandle> handle_;
+    std::unique_ptr<io::StreamHandle> handle_;
 };
-
-// Proxy-plane debt: exposes a core:: handle as io::StreamHandle for callers
-// that already run on senders (the proxy plane still produces core:: handles
-// and flips separately). Delete when the producers hand out io:: handles
-// directly — the handle outlives its pulls by contract, so capturing this in
-// the initiation is sound.
-class CoreToIoStream final : public io::StreamHandle {
-  public:
-    using ReadSignatures =
-        stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
-                                       stdexec::set_error_t(std::exception_ptr),
-                                       stdexec::set_stopped_t()>;
-    using WriteSignatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
-                                                           stdexec::set_error_t(std::exception_ptr),
-                                                           stdexec::set_stopped_t()>;
-
-    explicit CoreToIoStream(std::unique_ptr<core::StreamHandle> inner)
-        : executor_(inner->executor()), inner_(std::move(inner)) {}
-
-    io::AnySender<std::optional<std::size_t>>
-    async_read_some(boost::asio::mutable_buffer buffer) override {
-        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
-            [this, buffer](auto terminal) mutable {
-                inner_->async_read_some(
-                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
-                                                             std::size_t count) mutable {
-                        terminal(error, count);
-                    });
-            },
-            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
-                translate_read(std::move(receiver), error, count, "core handle read");
-            })};
-    }
-
-    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
-        return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
-            [this, buffer](auto terminal) mutable {
-                inner_->async_write(
-                    buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
-                                                             std::size_t count) mutable {
-                        terminal(error, count);
-                    });
-            },
-            [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
-                translate_write(std::move(receiver), error, count, "core handle write");
-            })};
-    }
-
-    boost::asio::any_io_executor executor() noexcept override { return executor_; }
-
-    boost::asio::ip::tcp::endpoint
-    local_endpoint(boost::system::error_code &error) const noexcept override {
-        if (!inner_) {
-            error = boost::asio::error::bad_descriptor;
-            return {};
-        }
-        return inner_->local_endpoint(error);
-    }
-
-    void shutdown_send(boost::system::error_code &error) noexcept override {
-        if (!inner_) {
-            error = boost::asio::error::bad_descriptor;
-            return;
-        }
-        inner_->shutdown_send(error);
-    }
-
-    // Close without releasing: outstanding pulls may still complete, and
-    // destroying the inner handle (notably a TLS stream with a composed
-    // read in flight) under them is a use-after-free. Destruction happens
-    // with the adapter, after all pulls drained.
-    void close() noexcept override {
-        if (inner_) {
-            inner_->close();
-        }
-    }
-
-  private:
-    boost::asio::any_io_executor executor_;
-    std::unique_ptr<core::StreamHandle> inner_;
-};
-
-inline std::unique_ptr<io::StreamHandle>
-adapt_core_to_io(std::unique_ptr<core::StreamHandle> stream) {
-    return std::make_unique<CoreToIoStream>(std::move(stream));
-}
-
-// Sessions/datagram-plane debt: exposes an io:: carrier as core::StreamHandle
-// for planes that still speak core:: (legacy MultiplexedSession, UDP-over-TCP
-// and friends flip separately). Delete with those planes.
-class IoToCoreStream final : public core::StreamHandle {
-  public:
-    explicit IoToCoreStream(std::unique_ptr<io::StreamHandle> inner)
-        : executor_(inner->executor()), inner_(std::move(inner)) {}
-
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        if (!inner_) {
-            post_error(std::move(handler), boost::asio::error::bad_descriptor);
-            return;
-        }
-        start_read_for_handler(inner_->async_read_some(buffer), std::move(handler));
-    }
-
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
-        if (!inner_) {
-            post_error(std::move(handler), boost::asio::error::bad_descriptor);
-            return;
-        }
-        start_write_for_handler(inner_->async_write(buffer), std::move(handler));
-    }
-
-    boost::asio::any_io_executor executor() noexcept override { return executor_; }
-
-    boost::asio::ip::tcp::endpoint
-    local_endpoint(boost::system::error_code &error) const noexcept override {
-        if (!inner_) {
-            error = boost::asio::error::bad_descriptor;
-            return {};
-        }
-        return inner_->local_endpoint(error);
-    }
-
-    void shutdown_send(boost::system::error_code &error) noexcept override {
-        if (!inner_) {
-            error = boost::asio::error::bad_descriptor;
-            return;
-        }
-        inner_->shutdown_send(error);
-    }
-
-    // Close without releasing: see CoreToIoStream::close.
-    void close() noexcept override {
-        if (inner_) {
-            inner_->close();
-        }
-    }
-
-  private:
-    void post_error(core::StreamHandle::ReadHandler handler,
-                    boost::system::error_code error) const {
-        boost::asio::post(executor_, [handler = std::move(handler), error]() mutable {
-            handler(error, std::size_t{0});
-        });
-    }
-
-    boost::asio::any_io_executor executor_;
-    std::unique_ptr<io::StreamHandle> inner_;
-};
-
-inline std::unique_ptr<core::StreamHandle>
-adapt_io_to_core(std::unique_ptr<io::StreamHandle> stream) {
-    return std::make_unique<IoToCoreStream>(std::move(stream));
-}
 
 } // namespace clash_native::net

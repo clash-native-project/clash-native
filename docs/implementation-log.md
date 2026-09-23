@@ -2125,3 +2125,23 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-24
+
+- Finished the old handle bases: deleted `core::StreamHandle` and
+  `core::DatagramHandle` from `core/outbound.hpp`. Handler aliases
+  across the transports and the Shadowsocks outbound became file-local
+  `StreamReadHandler`/`StreamWriteHandler`; `StreamCarrier` lost its
+  core:: leg; `TcpStream`/`UdpStream` dropped their core:: bases and
+  callback legs; `StreamHandleAdapter` is now a concrete io::
+  Asio-concept adapter; `CoreToIoStream`/`IoToCoreStream` and both
+  adapt functions are gone, and `datagram_handle_adapter.hpp` is
+  deleted with `to_core_destination` moved next to the proxy address
+  codec that is its only remaining consumer.
+- Collateral flips the deletion flushed out: the DNS server's UDP
+  receive/respond path, the SOCKS5 listener and session UDP receive
+  paths, the DNS probe stream fake, the host WebSocket echo probe,
+  and the UDP stream test all run on io:: senders now.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.

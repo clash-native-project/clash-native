@@ -53,6 +53,9 @@ namespace clash_native::transport::shadowsocks {
 
 namespace {
 
+using StreamReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+using StreamWriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
 constexpr std::size_t kTlsHeaderSize = 5;
 constexpr std::size_t kTlsHmacSize = 4;
 constexpr std::size_t kTlsRandomSize = 32;
@@ -298,7 +301,7 @@ bool verify_chain(std::string_view password, const std::vector<std::uint8_t> &ch
 // handler for the framing chains below.
 struct LowerReadBridge {
     using receiver_concept = stdexec::receiver_tag;
-    core::StreamHandle::ReadHandler handler;
+    StreamReadHandler handler;
     void set_value(std::optional<std::size_t> size) && noexcept {
         auto callback = std::move(handler);
         if (size) {
@@ -319,7 +322,7 @@ struct LowerReadBridge {
 
 struct LowerWriteBridge {
     using receiver_concept = stdexec::receiver_tag;
-    core::StreamHandle::WriteHandler handler;
+    StreamWriteHandler handler;
     void set_value(std::size_t size) && noexcept {
         auto callback = std::move(handler);
         callback({}, size);
@@ -428,10 +431,8 @@ class ShadowTlsV3Stream final : public io::StreamHandle,
             offset += size;
         }
         auto self = shared_from_this();
-        core::StreamHandle::WriteHandler completion = [self](const boost::system::error_code &error,
-                                                             std::size_t) {
-            self->finish_write(error);
-        };
+        StreamWriteHandler completion = [self](const boost::system::error_code &error,
+                                               std::size_t) { self->finish_write(error); };
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = lower_->async_write(boost::asio::buffer(write_wire_));
         async::start_with_receiver(std::move(sender), LowerWriteBridge{std::move(completion)});
@@ -524,17 +525,17 @@ class ShadowTlsV3Stream final : public io::StreamHandle,
             return;
         }
         auto self = shared_from_this();
-        core::StreamHandle::ReadHandler completion =
-            [self, buffer, offset, handler = std::move(handler)](
-                const boost::system::error_code &error, std::size_t size) mutable {
-                if (error) {
-                    handler(error);
-                } else if (size == 0) {
-                    handler(boost::asio::error::eof);
-                } else {
-                    self->read_exact(buffer, offset + size, std::move(handler));
-                }
-            };
+        StreamReadHandler completion = [self, buffer, offset, handler = std::move(handler)](
+                                           const boost::system::error_code &error,
+                                           std::size_t size) mutable {
+            if (error) {
+                handler(error);
+            } else if (size == 0) {
+                handler(boost::asio::error::eof);
+            } else {
+                self->read_exact(buffer, offset + size, std::move(handler));
+            }
+        };
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = lower_->async_read_some(boost::asio::mutable_buffer(
             static_cast<std::uint8_t *>(buffer.data()) + offset, buffer.size() - offset));
@@ -768,8 +769,8 @@ class ShadowTlsV3OpenOperation final
         tls_write_current_ = std::move(tls_write_queue_.front());
         tls_write_queue_.erase(tls_write_queue_.begin());
         auto self = shared_from_this();
-        core::StreamHandle::WriteHandler completion = [self](const boost::system::error_code &error,
-                                                             std::size_t) {
+        StreamWriteHandler completion = [self](const boost::system::error_code &error,
+                                               std::size_t) {
             self->tls_write_in_progress_ = false;
             self->tls_write_current_.clear();
             if (error) {
@@ -791,8 +792,8 @@ class ShadowTlsV3OpenOperation final
         }
         read_in_progress_ = true;
         auto self = shared_from_this();
-        core::StreamHandle::ReadHandler completion = [self](const boost::system::error_code &error,
-                                                            std::size_t size) {
+        StreamReadHandler completion = [self](const boost::system::error_code &error,
+                                              std::size_t size) {
             self->read_in_progress_ = false;
             if (error) {
                 self->finish(

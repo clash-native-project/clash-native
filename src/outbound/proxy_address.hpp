@@ -2,6 +2,7 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
+#include <clash_native/io/address.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -16,6 +17,14 @@ struct DecodedProxyAddress {
     core::Destination destination;
     std::size_t size = 0;
 };
+
+// Converts an io:: dial/route target into the core:: vocabulary for the
+// proxy address codecs above, which still speak core::.
+inline core::Destination to_core_destination(const io::Destination &destination) {
+    return destination.is_domain()
+               ? core::Destination::domain(destination.domain(), destination.port())
+               : core::Destination::address(destination.address(), destination.port());
+}
 
 inline core::Result<std::vector<std::uint8_t>>
 encode_proxy_address(const core::Destination &destination) {

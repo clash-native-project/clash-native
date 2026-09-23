@@ -36,6 +36,9 @@ namespace clash_native::transport::shadowsocks {
 
 namespace {
 
+using StreamReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+using StreamWriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
 constexpr std::size_t kTlsHeaderSize = 5;
 constexpr std::size_t kTlsHmacSize = 4;
 constexpr std::size_t kMaxTlsPlaintext = 16384;
@@ -169,8 +172,8 @@ class ShadowTlsV2Stream final : public io::StreamHandle,
   public:
     // Internal machinery stays handler-style; only the public overrides below
     // speak senders.
-    using ReadHandler = core::StreamHandle::ReadHandler;
-    using WriteHandler = core::StreamHandle::WriteHandler;
+    using ReadHandler = StreamReadHandler;
+    using WriteHandler = StreamWriteHandler;
     using ReadSignatures =
         stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
                                        stdexec::set_error_t(std::exception_ptr),

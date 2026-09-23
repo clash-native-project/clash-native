@@ -28,10 +28,13 @@ namespace clash_native::transport::shadowsocks {
 
 namespace {
 
+using StreamReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+using StreamWriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
 // Bridges one carrier pull/push back into a legacy (error, size) handler.
 struct CarrierReadBridge {
     using receiver_concept = stdexec::receiver_tag;
-    core::StreamHandle::ReadHandler handler;
+    StreamReadHandler handler;
     void set_value(std::optional<std::size_t> size) && noexcept {
         auto callback = std::move(handler);
         if (size) {
@@ -52,7 +55,7 @@ struct CarrierReadBridge {
 
 struct CarrierWriteBridge {
     using receiver_concept = stdexec::receiver_tag;
-    core::StreamHandle::WriteHandler handler;
+    StreamWriteHandler handler;
     void set_value(std::size_t size) && noexcept {
         auto callback = std::move(handler);
         callback({}, size);
@@ -188,7 +191,7 @@ class Shadowsocks2022StreamState final
           write_key_(std::move(write_key)), write_nonce_(std::move(write_nonce)),
           request_salt_(std::move(request_salt)), initial_wire_(std::move(initial_wire)) {}
 
-    void read(boost::asio::mutable_buffer buffer, core::StreamHandle::ReadHandler handler) {
+    void read(boost::asio::mutable_buffer buffer, StreamReadHandler handler) {
         if (read_in_progress_) {
             post_read(std::move(handler), boost::asio::error::already_started, 0);
             return;
@@ -217,7 +220,7 @@ class Shadowsocks2022StreamState final
         }
     }
 
-    void write(boost::asio::const_buffer buffer, core::StreamHandle::WriteHandler handler) {
+    void write(boost::asio::const_buffer buffer, StreamWriteHandler handler) {
         if (write_in_progress_) {
             post_write(std::move(handler), boost::asio::error::already_started, 0);
             return;
@@ -252,7 +255,7 @@ class Shadowsocks2022StreamState final
                 });
             return;
         }
-        core::StreamHandle::WriteHandler completion =
+        StreamWriteHandler completion =
             [self, wire, handler = std::move(handler),
              size = buffer.size()](const boost::system::error_code &error, std::size_t) mutable {
                 self->write_in_progress_ = false;
@@ -517,7 +520,7 @@ class Shadowsocks2022StreamState final
 
     void increment_read_nonce() { increment_nonce(read_nonce_); }
 
-    void copy_pending(boost::asio::mutable_buffer buffer, core::StreamHandle::ReadHandler handler) {
+    void copy_pending(boost::asio::mutable_buffer buffer, StreamReadHandler handler) {
         const auto count = std::min(buffer.size(), pending_plaintext_.size() - pending_offset_);
         std::memcpy(buffer.data(), pending_plaintext_.data() + pending_offset_, count);
         pending_offset_ += count;
@@ -533,28 +536,26 @@ class Shadowsocks2022StreamState final
     }
 
     void finish_read(const boost::system::error_code &error, std::size_t size,
-                     core::StreamHandle::ReadHandler handler) {
+                     StreamReadHandler handler) {
         read_in_progress_ = false;
         if (handler) {
             handler(error, size);
         }
     }
 
-    void post_read(core::StreamHandle::ReadHandler handler, boost::system::error_code error,
-                   std::size_t size) {
+    void post_read(StreamReadHandler handler, boost::system::error_code error, std::size_t size) {
         boost::asio::post(carrier_->executor(), [handler = std::move(handler), error,
                                                  size]() mutable { handler(error, size); });
     }
 
-    void post_write(core::StreamHandle::WriteHandler handler, boost::system::error_code error,
-                    std::size_t size) {
+    void post_write(StreamWriteHandler handler, boost::system::error_code error, std::size_t size) {
         boost::asio::post(carrier_->executor(), [handler = std::move(handler), error,
                                                  size]() mutable { handler(error, size); });
     }
 
     void read_exact_carrier(boost::asio::mutable_buffer buffer, ExactReadHandler handler) {
         auto self = shared_from_this();
-        core::StreamHandle::ReadHandler completion =
+        StreamReadHandler completion =
             [self, buffer, handler = std::move(handler)](const boost::system::error_code &error,
                                                          std::size_t size) mutable {
                 if (error) {
@@ -598,7 +599,7 @@ class Shadowsocks2022StreamState final
     bool read_in_progress_ = false;
     bool write_in_progress_ = false;
     boost::asio::mutable_buffer read_buffer_;
-    core::StreamHandle::ReadHandler read_handler_;
+    StreamReadHandler read_handler_;
 };
 
 io::AnySender<std::optional<std::size_t>>
@@ -705,7 +706,7 @@ class Shadowsocks2022OpenOperation final
         wire->insert(wire->end(), variable_record.value().begin(), variable_record.value().end());
         auto self = shared_from_this();
         if (carrier_) {
-            core::StreamHandle::WriteHandler completion =
+            StreamWriteHandler completion =
                 [self, wire, key = std::move(key.value()), nonce = std::move(nonce)](
                     const boost::system::error_code &error, std::size_t) mutable {
                     if (error) {

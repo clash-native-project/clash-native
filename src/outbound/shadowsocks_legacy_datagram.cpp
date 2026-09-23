@@ -6,7 +6,6 @@
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/io/sender.hpp>
-#include <clash_native/net/datagram_handle_adapter.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/shadowsocks/crypto.hpp>
 #include <clash_native/transport/shadowsocks/legacy_packet.hpp>
@@ -91,7 +90,8 @@ class LegacyDatagramState final : public std::enable_shared_from_this<LegacyData
 
     void send(boost::asio::const_buffer buffer, io::DatagramAddress destination,
               WriteHandler handler) {
-        auto address = encode_proxy_address(net::to_core_destination(destination.to_destination()));
+        auto address = encode_proxy_address(
+            outbound::detail::to_core_destination(destination.to_destination()));
         if (!address) {
             boost::asio::post(socket_->executor(), [handler = std::move(handler)]() mutable {
                 handler(protocol_error(), 0);

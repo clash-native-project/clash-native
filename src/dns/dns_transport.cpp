@@ -1,7 +1,6 @@
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
-#include <clash_native/net/datagram_handle_adapter.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
 

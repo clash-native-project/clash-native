@@ -17,7 +17,7 @@ namespace clash_native::net {
 
 class TlsStream final : public io::StreamHandle {
   public:
-    using SslStream = boost::asio::ssl::stream<StreamHandleAdapter<io::StreamHandle>>;
+    using SslStream = boost::asio::ssl::stream<StreamHandleAdapter>;
 
     TlsStream(std::shared_ptr<boost::asio::ssl::context> context,
               std::unique_ptr<io::StreamHandle> stream);

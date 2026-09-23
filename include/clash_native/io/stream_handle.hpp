@@ -13,7 +13,7 @@
 
 namespace clash_native::io {
 
-// Sender-based counterpart of core::StreamHandle: the universal async byte
+// The universal async byte
 // stream. Every async operation returns a sender (connected once, completing
 // exactly once) instead of taking a callback:
 //

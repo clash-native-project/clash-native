@@ -3,7 +3,7 @@
 #include "outbound/outbound_utils.hpp"
 #include "outbound/proxy_address.hpp"
 #include <clash_native/async/start_with_receiver.hpp>
-#include <clash_native/net/datagram_handle_adapter.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
 
 #include <fmt/format.h>
@@ -86,21 +86,32 @@ void Socks5UdpListener::receive() {
     if (stopped_ || !socket_) {
         return;
     }
+    struct ReceiveReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<Socks5UdpListener> self;
+        void set_value(io::DatagramPacket packet) && noexcept {
+            if (self->stopped_) {
+                return;
+            }
+            if (packet.address.is_address()) {
+                self->process(packet.size, {packet.address.address(), packet.address.port()});
+            }
+            self->receive();
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            if (self->stopped_) {
+                return;
+            }
+            if (net::unpack_error(std::move(error)) != boost::asio::error::operation_aborted) {
+                spdlog::warn("SOCKS5 UDP listener receive failed");
+            }
+            self->receive();
+        }
+        void set_stopped() && noexcept { self->receive(); }
+    };
     auto self = shared_from_this();
-    socket_->async_receive_from(boost::asio::buffer(receive_buffer_),
-                                [self](const boost::system::error_code &error, std::size_t size,
-                                       core::DatagramAddress source) {
-                                    if (self->stopped_) {
-                                        return;
-                                    }
-                                    if (!error && source.is_address()) {
-                                        self->process(size, {source.address(), source.port()});
-                                    } else if (error != boost::asio::error::operation_aborted) {
-                                        spdlog::warn("SOCKS5 UDP listener receive failed: {}",
-                                                     error.message());
-                                    }
-                                    self->receive();
-                                });
+    auto sender = socket_->async_receive_from(boost::asio::buffer(receive_buffer_));
+    async::start_with_receiver(std::move(sender), ReceiveReceiver{self});
 }
 
 std::string Socks5UdpListener::path_key(const boost::asio::ip::udp::endpoint &client,
@@ -311,8 +322,8 @@ void Socks5UdpListener::send_response(const std::shared_ptr<Path> &path, io::Dat
     if (stopped_ || !socket_) {
         return;
     }
-    const auto address =
-        outbound::detail::encode_proxy_address(net::to_core_destination(source.to_destination()));
+    const auto address = outbound::detail::encode_proxy_address(
+        outbound::detail::to_core_destination(source.to_destination()));
     if (!address) {
         return;
     }

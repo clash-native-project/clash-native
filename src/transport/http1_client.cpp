@@ -39,6 +39,9 @@ namespace clash_native::transport {
 
 namespace {
 
+using StreamReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+using StreamWriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
 namespace http = boost::beast::http;
 using HttpMessage = http::request<http::vector_body<std::uint8_t>>;
 using HttpTunnelMessage = http::request<http::empty_body>;
@@ -262,8 +265,7 @@ class Http1TunnelState final : public std::enable_shared_from_this<Http1TunnelSt
     }
 
   private:
-    void post_read(core::StreamHandle::ReadHandler handler, boost::system::error_code error,
-                   std::size_t size) {
+    void post_read(StreamReadHandler handler, boost::system::error_code error, std::size_t size) {
         boost::asio::post(stream_->executor(),
                           [handler = std::move(handler), error, size]() mutable {
                               if (handler) {
@@ -272,8 +274,7 @@ class Http1TunnelState final : public std::enable_shared_from_this<Http1TunnelSt
                           });
     }
 
-    void post_write(core::StreamHandle::WriteHandler handler, boost::system::error_code error,
-                    std::size_t size) {
+    void post_write(StreamWriteHandler handler, boost::system::error_code error, std::size_t size) {
         boost::asio::post(stream_->executor(),
                           [handler = std::move(handler), error, size]() mutable {
                               if (handler) {

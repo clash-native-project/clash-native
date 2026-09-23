@@ -6,7 +6,7 @@
 #include <clash_native/io/exchange_tunnel_stream.hpp>
 #include <clash_native/io/multiplexed_session.hpp>
 #include <clash_native/io/sender.hpp>
-#include <clash_native/net/datagram_handle_adapter.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/quic_client.hpp>
 
 #include <boost/asio/error.hpp>
@@ -32,6 +32,9 @@
 namespace clash_native::transport {
 
 namespace {
+
+using StreamReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+using StreamWriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
 
 std::uint64_t timestamp_now() noexcept {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -384,7 +387,7 @@ class Http3ClientSession final : public io::ExchangeSession,
         std::uint64_t streaming_response_body_bytes_consumed = 0;
         std::size_t buffered_response_payload_credit = 0;
         std::vector<std::uint8_t> tunnel_outgoing;
-        core::StreamHandle::WriteHandler tunnel_write_handler;
+        StreamWriteHandler tunnel_write_handler;
         std::size_t tunnel_write_size = 0;
         std::size_t pending_payload_credit = 0;
         std::size_t deferred_receive_credit = 0;
@@ -1318,7 +1321,7 @@ class Http3ClientSession final : public io::ExchangeSession,
         pending->tunnel_state = std::make_shared<io::detail::HttpTunnelStreamState>(
             executor_,
             [weak, pending, stream_id](std::vector<std::uint8_t> bytes,
-                                       core::StreamHandle::WriteHandler handler) mutable {
+                                       StreamWriteHandler handler) mutable {
                 const auto self = weak.lock();
                 if (!self || self->retired_ || pending->tunnel_write_closed ||
                     pending->tunnel_write_handler) {

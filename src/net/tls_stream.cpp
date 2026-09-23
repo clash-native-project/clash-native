@@ -21,8 +21,7 @@ core::Error transport_error(const char *what, const boost::system::error_code &e
 TlsStream::TlsStream(std::shared_ptr<boost::asio::ssl::context> context,
                      std::unique_ptr<io::StreamHandle> stream)
     : context_(std::move(context)),
-      stream_(std::make_unique<SslStream>(StreamHandleAdapter<io::StreamHandle>(std::move(stream)),
-                                          *context_)) {}
+      stream_(std::make_unique<SslStream>(StreamHandleAdapter(std::move(stream)), *context_)) {}
 
 io::AnySender<std::optional<std::size_t>>
 TlsStream::async_read_some(boost::asio::mutable_buffer buffer) {

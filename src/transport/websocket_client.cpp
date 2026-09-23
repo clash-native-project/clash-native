@@ -30,6 +30,9 @@ namespace clash_native::transport {
 
 namespace {
 
+using StreamReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+using StreamWriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
 class WebSocketStreamAdapter {
   public:
     using executor_type = boost::asio::any_io_executor;
@@ -258,15 +261,14 @@ class WebSocketStreamState final : public std::enable_shared_from_this<WebSocket
 
     ~WebSocketStreamState() { close(); }
 
-    void async_read_some(boost::asio::mutable_buffer buffer,
-                         core::StreamHandle::ReadHandler handler) {
+    void async_read_some(boost::asio::mutable_buffer buffer, StreamReadHandler handler) {
         const auto self = shared_from_this();
         boost::asio::dispatch(executor_, [self, buffer, handler = std::move(handler)]() mutable {
             self->read(buffer, std::move(handler));
         });
     }
 
-    void async_write(boost::asio::const_buffer buffer, core::StreamHandle::WriteHandler handler) {
+    void async_write(boost::asio::const_buffer buffer, StreamWriteHandler handler) {
         auto bytes = std::make_shared<std::vector<std::uint8_t>>(buffer.size());
         boost::asio::buffer_copy(boost::asio::buffer(*bytes), buffer);
         const auto self = shared_from_this();
@@ -308,7 +310,7 @@ class WebSocketStreamState final : public std::enable_shared_from_this<WebSocket
     }
 
   private:
-    void read(boost::asio::mutable_buffer buffer, core::StreamHandle::ReadHandler handler) {
+    void read(boost::asio::mutable_buffer buffer, StreamReadHandler handler) {
         if (buffer.size() == 0) {
             post_read(std::move(handler), {}, 0);
             return;
@@ -392,8 +394,7 @@ class WebSocketStreamState final : public std::enable_shared_from_this<WebSocket
         finish_read({}, copied);
     }
 
-    void write(std::shared_ptr<std::vector<std::uint8_t>> bytes,
-               core::StreamHandle::WriteHandler handler) {
+    void write(std::shared_ptr<std::vector<std::uint8_t>> bytes, StreamWriteHandler handler) {
         if (closed_ || !stream_) {
             post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
             return;
@@ -474,7 +475,7 @@ class WebSocketStreamState final : public std::enable_shared_from_this<WebSocket
         post_write(std::move(handler), error, size);
     }
 
-    void post_read(core::StreamHandle::ReadHandler handler, const boost::system::error_code &error,
+    void post_read(StreamReadHandler handler, const boost::system::error_code &error,
                    std::size_t size) {
         boost::asio::post(executor_, [handler = std::move(handler), error, size]() mutable {
             if (handler) {
@@ -483,8 +484,8 @@ class WebSocketStreamState final : public std::enable_shared_from_this<WebSocket
         });
     }
 
-    void post_write(core::StreamHandle::WriteHandler handler,
-                    const boost::system::error_code &error, std::size_t size) {
+    void post_write(StreamWriteHandler handler, const boost::system::error_code &error,
+                    std::size_t size) {
         boost::asio::post(executor_, [handler = std::move(handler), error, size]() mutable {
             if (handler) {
                 handler(error, size);
@@ -499,8 +500,8 @@ class WebSocketStreamState final : public std::enable_shared_from_this<WebSocket
     std::vector<std::uint8_t> incoming_;
     std::size_t incoming_offset_ = 0;
     boost::asio::mutable_buffer read_buffer_;
-    core::StreamHandle::ReadHandler read_handler_;
-    core::StreamHandle::WriteHandler write_handler_;
+    StreamReadHandler read_handler_;
+    StreamWriteHandler write_handler_;
     std::size_t write_size_ = 0;
     boost::system::error_code read_error_;
     bool read_in_progress_ = false;

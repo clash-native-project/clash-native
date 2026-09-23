@@ -1,4 +1,7 @@
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/core/error.hpp>
+#include <clash_native/io/datagram_handle.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 
@@ -26,9 +29,8 @@ namespace {
 using UdpEndpoint = boost::asio::ip::udp::endpoint;
 
 struct ReceivedDatagram {
-    boost::system::error_code error;
-    std::size_t size = 0;
-    clash_native::core::DatagramAddress sender;
+    std::optional<clash_native::io::DatagramPacket> packet;
+    std::optional<clash_native::core::Error> error;
 };
 
 boost::asio::ip::address_v4 udp_test_address(boost::asio::io_context &context) {
@@ -68,11 +70,33 @@ TEST(UdpStreamTest, SendsAndReceivesDatagramsWithPeerEndpoints) {
     std::array<char, 32> incoming_buffer{};
     auto incoming = std::make_shared<std::promise<ReceivedDatagram>>();
     auto incoming_future = incoming->get_future();
-    stream.async_receive_from(boost::asio::buffer(incoming_buffer),
-                              [incoming](const auto &receive_error, std::size_t size,
-                                         clash_native::core::DatagramAddress sender) {
-                                  incoming->set_value({receive_error, size, std::move(sender)});
-                              });
+    struct IncomingReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<std::promise<ReceivedDatagram>> incoming;
+        void set_value(clash_native::io::DatagramPacket packet) && noexcept {
+            incoming->set_value(ReceivedDatagram{std::move(packet), std::nullopt});
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const clash_native::core::Error &failure) {
+                incoming->set_value(ReceivedDatagram{std::nullopt, failure});
+            } catch (...) {
+                incoming->set_value(ReceivedDatagram{
+                    std::nullopt,
+                    clash_native::core::Error{
+                        clash_native::core::ErrorCode::transport_io, "udp receive failed", {}}});
+            }
+        }
+        void set_stopped() && noexcept {
+            incoming->set_value(ReceivedDatagram{
+                std::nullopt, clash_native::core::Error{clash_native::core::ErrorCode::cancelled,
+                                                        "udp receive stopped",
+                                                        {}}});
+        }
+    };
+    auto receive_sender = stream.async_receive_from(boost::asio::buffer(incoming_buffer));
+    clash_native::async::start_with_receiver(std::move(receive_sender), IncomingReceiver{incoming});
 
     const std::string query = "dns-query";
     auto query_sent = std::make_shared<std::promise<boost::system::error_code>>();
@@ -86,11 +110,12 @@ TEST(UdpStreamTest, SendsAndReceivesDatagramsWithPeerEndpoints) {
     ASSERT_EQ(incoming_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     const auto received = incoming_future.get();
     EXPECT_FALSE(received.error);
-    EXPECT_EQ(received.size, query.size());
-    ASSERT_TRUE(received.sender.is_address());
-    EXPECT_EQ(received.sender.address(), peer.local_endpoint().address());
-    EXPECT_EQ(received.sender.port(), peer.local_endpoint().port());
-    EXPECT_EQ(std::string(incoming_buffer.data(), received.size), query);
+    ASSERT_TRUE(received.packet);
+    EXPECT_EQ(received.packet->size, query.size());
+    ASSERT_TRUE(received.packet->address.is_address());
+    EXPECT_EQ(received.packet->address.address(), peer.local_endpoint().address());
+    EXPECT_EQ(received.packet->address.port(), peer.local_endpoint().port());
+    EXPECT_EQ(std::string(incoming_buffer.data(), received.packet->size), query);
 
     std::array<char, 32> response_buffer{};
     auto response_received = std::make_shared<std::promise<ReceivedDatagram>>();
@@ -99,29 +124,52 @@ TEST(UdpStreamTest, SendsAndReceivesDatagramsWithPeerEndpoints) {
     peer.async_receive_from(
         boost::asio::buffer(response_buffer), *response_sender,
         [response_received, response_sender](const auto &receive_error, std::size_t size) {
-            response_received->set_value(
-                {receive_error, size,
-                 clash_native::core::DatagramAddress::from_endpoint(*response_sender)});
+            if (receive_error) {
+                response_received->set_value(ReceivedDatagram{
+                    std::nullopt,
+                    clash_native::core::Error{
+                        clash_native::core::ErrorCode::transport_io, "peer receive failed", {}}});
+                return;
+            }
+            response_received->set_value(ReceivedDatagram{
+                clash_native::io::DatagramPacket{
+                    size, clash_native::io::DatagramAddress::from_endpoint(*response_sender)},
+                std::nullopt});
         });
 
     const std::string response = "dns-response";
     auto response_sent = std::make_shared<std::promise<boost::system::error_code>>();
     auto response_sent_future = response_sent->get_future();
-    stream.async_send_to(boost::asio::buffer(response), received.sender,
-                         [response_sent](const auto &send_error, std::size_t) {
-                             response_sent->set_value(send_error);
-                         });
+    struct SendReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<std::promise<boost::system::error_code>> response_sent;
+        void set_value(std::size_t) && noexcept {
+            response_sent->set_value(boost::system::error_code{});
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            response_sent->set_value(clash_native::net::unpack_error(std::move(error)));
+        }
+        void set_stopped() && noexcept {
+            response_sent->set_value(boost::asio::error::operation_aborted);
+        }
+    };
+    auto send_sender = stream.async_send_to(
+        boost::asio::buffer(response),
+        clash_native::io::DatagramAddress::from_endpoint(
+            {received.packet->address.address(), received.packet->address.port()}));
+    clash_native::async::start_with_receiver(std::move(send_sender), SendReceiver{response_sent});
 
     ASSERT_EQ(response_sent_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_FALSE(response_sent_future.get());
     ASSERT_EQ(response_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     const auto response_result = response_future.get();
     EXPECT_FALSE(response_result.error);
-    EXPECT_EQ(response_result.size, response.size());
-    ASSERT_TRUE(response_result.sender.is_address());
-    EXPECT_EQ(response_result.sender.address(), stream_endpoint.address());
-    EXPECT_EQ(response_result.sender.port(), stream_endpoint.port());
-    EXPECT_EQ(std::string(response_buffer.data(), response_result.size), response);
+    ASSERT_TRUE(response_result.packet);
+    EXPECT_EQ(response_result.packet->size, response.size());
+    ASSERT_TRUE(response_result.packet->address.is_address());
+    EXPECT_EQ(response_result.packet->address.address(), stream_endpoint.address());
+    EXPECT_EQ(response_result.packet->address.port(), stream_endpoint.port());
+    EXPECT_EQ(std::string(response_buffer.data(), response_result.packet->size), response);
 
     stream.close();
     boost::system::error_code ignored;

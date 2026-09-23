@@ -215,18 +215,21 @@ class FakeDnsTransport final : public clash_native::dns::DnsTransport,
     bool completed_ = false;
 };
 
-class ProbeDnsStream final : public clash_native::core::StreamHandle {
+class ProbeDnsStream final : public clash_native::io::StreamHandle {
   public:
     explicit ProbeDnsStream(boost::asio::any_io_executor executor,
                             std::shared_ptr<std::atomic_bool> closed)
         : executor_(std::move(executor)), closed_(std::move(closed)) {}
 
-    void async_read_some(boost::asio::mutable_buffer, ReadHandler handler) override {
-        handler(boost::asio::error::eof, 0);
+    clash_native::io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer) override {
+        return clash_native::io::AnySender<std::optional<std::size_t>>{
+            stdexec::just(std::optional<std::size_t>{})};
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
-        handler({}, buffer.size());
+    clash_native::io::AnySender<std::size_t>
+    async_write(boost::asio::const_buffer buffer) override {
+        return clash_native::io::AnySender<std::size_t>{stdexec::just(buffer.size())};
     }
 
     boost::asio::any_io_executor executor() noexcept override { return executor_; }
@@ -255,10 +258,10 @@ class ProbeDnsDialer final : public clash_native::dns::DnsUpstreamDialer {
     clash_native::io::AnySender<clash_native::core::StreamOpenResult>
     connect_stream(clash_native::core::StreamRequest) override {
         ++*calls_;
-        // Test debt: the probe stream is still core::; adapt at the edge.
-        return clash_native::io::AnySender<clash_native::core::StreamOpenResult>{stdexec::just(
-            clash_native::core::StreamOpenResult::opened(clash_native::net::adapt_core_to_io(
-                std::make_unique<ProbeDnsStream>(executor_, closed_))))};
+        std::unique_ptr<clash_native::io::StreamHandle> stream =
+            std::make_unique<ProbeDnsStream>(executor_, closed_);
+        return clash_native::io::AnySender<clash_native::core::StreamOpenResult>{
+            stdexec::just(clash_native::core::StreamOpenResult::opened(std::move(stream)))};
     }
 
   private:

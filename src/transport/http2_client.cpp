@@ -34,6 +34,9 @@ namespace clash_native::transport {
 
 namespace {
 
+using StreamReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+using StreamWriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
 core::Error io_error(std::string context, const boost::system::error_code &error) {
     return {core::ErrorCode::transport_io, std::move(context),
             std::error_code(error.value(), std::system_category())};
@@ -114,8 +117,7 @@ class Http2ClientSession final : public io::ExchangeSession,
   public:
     explicit Http2ClientSession(std::unique_ptr<io::StreamHandle> stream)
         : executor_(stream->executor()),
-          stream_(std::make_unique<net::StreamHandleAdapter<io::StreamHandle>>(std::move(stream))) {
-    }
+          stream_(std::make_unique<net::StreamHandleAdapter>(std::move(stream))) {}
 
     ~Http2ClientSession() { close_http2(); }
 
@@ -373,7 +375,7 @@ class Http2ClientSession final : public io::ExchangeSession,
         std::size_t body_offset = 0;
         std::vector<std::uint8_t> tunnel_outgoing;
         std::size_t tunnel_outgoing_offset = 0;
-        core::StreamHandle::WriteHandler tunnel_write_handler;
+        StreamWriteHandler tunnel_write_handler;
         std::size_t tunnel_write_size = 0;
         std::shared_ptr<io::detail::HttpTunnelStreamState> tunnel_state;
         std::int32_t stream_id = -1;
@@ -1261,7 +1263,7 @@ class Http2ClientSession final : public io::ExchangeSession,
         pending->tunnel_state = std::make_shared<io::detail::HttpTunnelStreamState>(
             executor_,
             [weak, pending, stream_id](std::vector<std::uint8_t> bytes,
-                                       core::StreamHandle::WriteHandler handler) mutable {
+                                       StreamWriteHandler handler) mutable {
                 const auto self = weak.lock();
                 if (!self || self->retired_ || pending->tunnel_write_closed ||
                     pending->tunnel_write_handler) {
@@ -1580,7 +1582,7 @@ class Http2ClientSession final : public io::ExchangeSession,
     }
 
     boost::asio::any_io_executor executor_;
-    std::unique_ptr<net::StreamHandleAdapter<io::StreamHandle>> stream_;
+    std::unique_ptr<net::StreamHandleAdapter> stream_;
     nghttp2_session *http2_session_ = nullptr;
     std::optional<core::Error> initialization_error_;
     std::unordered_map<ExchangeId, PendingPtr> pending_;

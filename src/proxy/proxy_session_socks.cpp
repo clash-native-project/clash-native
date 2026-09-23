@@ -5,7 +5,7 @@
 #include "socks5_udp_listener.hpp"
 
 #include <clash_native/async/start_with_receiver.hpp>
-#include <clash_native/net/datagram_handle_adapter.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
@@ -392,25 +392,29 @@ void ProxySession::read_socks_udp_packet() {
     if (closed_.load(std::memory_order_acquire) || !udp_relay_socket_) {
         return;
     }
-    auto self = shared_from_this();
-    udp_relay_socket_->async_receive_from(
-        boost::asio::buffer(udp_receive_buffer_),
-        [self](const boost::system::error_code &error, std::size_t size,
-               core::DatagramAddress sender) {
-            if (error) {
-                if (error != boost::asio::error::operation_aborted) {
-                    self->close();
-                }
-                return;
-            }
-            if (!sender.is_address() || !self->accept_udp_sender(boost::asio::ip::udp::endpoint(
-                                            sender.address(), sender.port()))) {
+    struct UdpPacketReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<ProxySession> self;
+        void set_value(io::DatagramPacket packet) && noexcept {
+            if (!packet.address.is_address() ||
+                !self->accept_udp_sender(boost::asio::ip::udp::endpoint(packet.address.address(),
+                                                                        packet.address.port()))) {
                 self->read_socks_udp_packet();
                 return;
             }
-            self->process_socks_udp_packet(size);
+            self->process_socks_udp_packet(packet.size);
             self->read_socks_udp_packet();
-        });
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            if (net::unpack_error(std::move(error)) != boost::asio::error::operation_aborted) {
+                self->close();
+            }
+        }
+        void set_stopped() && noexcept {}
+    };
+    auto self = shared_from_this();
+    auto sender = udp_relay_socket_->async_receive_from(boost::asio::buffer(udp_receive_buffer_));
+    async::start_with_receiver(std::move(sender), UdpPacketReceiver{self});
 }
 
 bool ProxySession::accept_udp_sender(const boost::asio::ip::udp::endpoint &sender) {
@@ -622,8 +626,8 @@ void ProxySession::send_socks_udp_response(io::DatagramAddress source,
     if (closed_.load(std::memory_order_acquire) || !udp_client_endpoint_) {
         return;
     }
-    auto address =
-        outbound::detail::encode_proxy_address(net::to_core_destination(source.to_destination()));
+    auto address = outbound::detail::encode_proxy_address(
+        outbound::detail::to_core_destination(source.to_destination()));
     if (!address) {
         return;
     }

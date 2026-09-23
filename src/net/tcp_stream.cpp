@@ -22,16 +22,6 @@ core::Error transport_error(const char *what, const boost::system::error_code &e
 
 TcpStream::TcpStream(boost::asio::ip::tcp::socket socket) : socket_(std::move(socket)) {}
 
-void TcpStream::async_read_some(boost::asio::mutable_buffer buffer,
-                                core::StreamHandle::ReadHandler handler) {
-    socket_.async_read_some(buffer, std::move(handler));
-}
-
-void TcpStream::async_write(boost::asio::const_buffer buffer,
-                            core::StreamHandle::WriteHandler handler) {
-    boost::asio::async_write(socket_, buffer, std::move(handler));
-}
-
 io::AnySender<std::optional<std::size_t>>
 TcpStream::async_read_some(boost::asio::mutable_buffer buffer) {
     // use_sender turns the Asio initiation into a sender (error_code mapped

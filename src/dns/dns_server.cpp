@@ -1,3 +1,4 @@
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_server.hpp>
 
@@ -214,28 +215,48 @@ void DnsServer::receive_udp() {
     if (!running_.load(std::memory_order_acquire)) {
         return;
     }
-    const auto gate = callback_gate_;
-    udp_socket_.async_receive_from(
-        boost::asio::buffer(udp_buffer_),
-        [this, gate](const boost::system::error_code &error, std::size_t size,
-                     core::DatagramAddress sender) {
+    struct ReceiveReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        DnsServer *server;
+        std::shared_ptr<std::atomic_bool> gate;
+        void set_value(io::DatagramPacket packet) && noexcept {
             if (!gate->load(std::memory_order_acquire)) {
                 return;
             }
-            if (!error) {
-                const auto query = DnsMessageCodec::decode_packet(
-                    std::span<const std::uint8_t>(udp_buffer_.data(), size));
-                if (query) {
-                    if (sender.is_address()) {
-                        resolve_udp(std::move(query.value()), boost::asio::ip::udp::endpoint(
-                                                                  sender.address(), sender.port()));
-                    }
-                }
+            const auto query = DnsMessageCodec::decode_packet(
+                std::span<const std::uint8_t>(server->udp_buffer_.data(), packet.size));
+            if (query && packet.address.is_address()) {
+                server->resolve_udp(std::move(query.value()),
+                                    boost::asio::ip::udp::endpoint(packet.address.address(),
+                                                                   packet.address.port()));
             }
             if (gate->load(std::memory_order_acquire)) {
-                receive_udp();
+                server->receive_udp();
             }
-        });
+        }
+        void set_error(std::exception_ptr) && noexcept {
+            if (gate->load(std::memory_order_acquire)) {
+                server->receive_udp();
+            }
+        }
+        void set_stopped() && noexcept {}
+    };
+    auto sender = udp_socket_.async_receive_from(boost::asio::buffer(udp_buffer_));
+    async::start_with_receiver(std::move(sender), ReceiveReceiver{this, callback_gate_});
+}
+
+void DnsServer::send_udp_response(boost::asio::ip::udp::endpoint recipient,
+                                  std::shared_ptr<std::vector<std::uint8_t>> payload) {
+    struct DropReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<std::vector<std::uint8_t>> payload;
+        void set_value(std::size_t) && noexcept {}
+        void set_error(std::exception_ptr) && noexcept {}
+        void set_stopped() && noexcept {}
+    };
+    auto sender = udp_socket_.async_send_to(boost::asio::buffer(*payload),
+                                            io::DatagramAddress::from_endpoint(recipient));
+    async::start_with_receiver(std::move(sender), DropReceiver{std::move(payload)});
 }
 
 void DnsServer::accept_tcp() {
@@ -320,9 +341,7 @@ void DnsServer::resolve_udp(DnsPacket query, boost::asio::ip::udp::endpoint send
             return;
         }
         auto payload = std::make_shared<std::vector<std::uint8_t>>(response.value());
-        udp_socket_.async_send_to(boost::asio::buffer(*payload),
-                                  core::DatagramAddress::from_endpoint(sender),
-                                  [payload](const boost::system::error_code &, std::size_t) {});
+        send_udp_response(sender, std::move(payload));
         return;
     }
     auto resolver_owner = snapshot ? snapshot->resolver : resolver_owner_;
@@ -333,9 +352,7 @@ void DnsServer::resolve_udp(DnsPacket query, boost::asio::ip::udp::endpoint send
             limit_udp_response(query, DnsMessageCodec::encode_error_response(query, 2));
         if (response) {
             auto payload = std::make_shared<std::vector<std::uint8_t>>(response.value());
-            udp_socket_.async_send_to(boost::asio::buffer(*payload),
-                                      core::DatagramAddress::from_endpoint(sender),
-                                      [payload](const boost::system::error_code &, std::size_t) {});
+            send_udp_response(sender, std::move(payload));
         }
         return;
     }
@@ -359,9 +376,7 @@ void DnsServer::resolve_udp(DnsPacket query, boost::asio::ip::udp::endpoint send
                 return;
             }
             auto payload = std::make_shared<std::vector<std::uint8_t>>(response.value());
-            udp_socket_.async_send_to(boost::asio::buffer(*payload),
-                                      core::DatagramAddress::from_endpoint(sender),
-                                      [payload](const boost::system::error_code &, std::size_t) {});
+            send_udp_response(sender, std::move(payload));
         },
         runtime_.scheduler());
     if (const auto pending = query_requests_.find(token); pending != query_requests_.end()) {

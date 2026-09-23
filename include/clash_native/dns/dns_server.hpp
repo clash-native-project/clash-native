@@ -53,6 +53,8 @@ class DnsServer final {
 
   private:
     void receive_udp();
+    void send_udp_response(boost::asio::ip::udp::endpoint recipient,
+                           std::shared_ptr<std::vector<std::uint8_t>> payload);
     void accept_tcp();
     void read_tcp_query(std::shared_ptr<boost::asio::ip::tcp::socket> socket);
     void close_tcp_socket(const std::shared_ptr<boost::asio::ip::tcp::socket> &socket) noexcept;

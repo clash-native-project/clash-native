@@ -3,7 +3,6 @@
 #include <clash_native/async/bridge.hpp>
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
-#include <clash_native/net/datagram_handle_adapter.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
@@ -52,6 +51,9 @@ namespace ss = clash_native::transport::shadowsocks;
 
 namespace {
 
+using StreamReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+using StreamWriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
 constexpr std::size_t kAeadTagSize = 16;
 constexpr std::size_t kMaxChunkPayload = 0x3fff;
 constexpr std::size_t kMaxUdpWireSize = 65507;
@@ -94,7 +96,7 @@ std::vector<std::uint8_t> append_tcp_record(std::string_view method,
 // Bridges one carrier pull/push back into a legacy (error, size) handler.
 struct CarrierReadBridge {
     using receiver_concept = stdexec::receiver_tag;
-    core::StreamHandle::ReadHandler handler;
+    StreamReadHandler handler;
     void set_value(std::optional<std::size_t> size) && noexcept {
         auto callback = std::move(handler);
         if (size) {
@@ -133,7 +135,7 @@ struct SocketDatagramBridge {
 
 struct CarrierWriteBridge {
     using receiver_concept = stdexec::receiver_tag;
-    core::StreamHandle::WriteHandler handler;
+    StreamWriteHandler handler;
     void set_value(std::size_t size) && noexcept {
         auto callback = std::move(handler);
         callback({}, size);
@@ -185,7 +187,7 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
             }
         }
 
-        void write(boost::asio::const_buffer buffer, core::StreamHandle::WriteHandler handler) {
+        void write(boost::asio::const_buffer buffer, StreamWriteHandler handler) {
             if (write_in_progress) {
                 boost::asio::post(carrier->executor(), [handler = std::move(handler)]() mutable {
                     handler(boost::asio::error::already_started, 0);
@@ -229,19 +231,19 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
                     });
                 return;
             }
-            core::StreamHandle::WriteHandler completion =
-                [self, wire, handler = std::move(handler),
-                 size](const boost::system::error_code &error, std::size_t) mutable {
-                    self->write_in_progress = false;
-                    handler(error, error ? 0 : size);
-                };
+            StreamWriteHandler completion = [self, wire, handler = std::move(handler),
+                                             size](const boost::system::error_code &error,
+                                                   std::size_t) mutable {
+                self->write_in_progress = false;
+                handler(error, error ? 0 : size);
+            };
             // NOTE: name the sender first; argument order is unspecified.
             auto sender = carrier->async_write(boost::asio::buffer(*wire));
             async::start_with_receiver(std::move(sender),
                                        CarrierWriteBridge{std::move(completion)});
         }
 
-        void read(boost::asio::mutable_buffer buffer, core::StreamHandle::ReadHandler handler) {
+        void read(boost::asio::mutable_buffer buffer, StreamReadHandler handler) {
             if (read_in_progress) {
                 boost::asio::post(carrier->executor(), [handler = std::move(handler)]() mutable {
                     handler(boost::asio::error::already_started, 0);
@@ -432,8 +434,7 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
                 });
         }
 
-        void copy_pending(boost::asio::mutable_buffer buffer,
-                          core::StreamHandle::ReadHandler handler) {
+        void copy_pending(boost::asio::mutable_buffer buffer, StreamReadHandler handler) {
             const auto remaining = pending_plaintext.size() - pending_offset;
             const auto copied = std::min(buffer.size(), remaining);
             std::memcpy(buffer.data(), pending_plaintext.data() + pending_offset, copied);
@@ -454,26 +455,26 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
         void read_exact_carrier(boost::asio::mutable_buffer buffer,
                                 std::shared_ptr<ExactReadHandler> callback) {
             auto self = shared_from_this();
-            core::StreamHandle::ReadHandler completion =
-                [self, buffer, callback = std::move(callback)](
-                    const boost::system::error_code &error, std::size_t size) mutable {
-                    auto &handler = *callback;
-                    if (error) {
-                        handler(error);
-                        return;
-                    }
-                    if (size == 0) {
-                        handler(boost::asio::error::eof);
-                        return;
-                    }
-                    if (size == buffer.size()) {
-                        handler({});
-                        return;
-                    }
-                    auto remaining = boost::asio::mutable_buffer(
-                        static_cast<std::uint8_t *>(buffer.data()) + size, buffer.size() - size);
-                    self->read_exact_carrier(remaining, callback);
-                };
+            StreamReadHandler completion = [self, buffer, callback = std::move(callback)](
+                                               const boost::system::error_code &error,
+                                               std::size_t size) mutable {
+                auto &handler = *callback;
+                if (error) {
+                    handler(error);
+                    return;
+                }
+                if (size == 0) {
+                    handler(boost::asio::error::eof);
+                    return;
+                }
+                if (size == buffer.size()) {
+                    handler({});
+                    return;
+                }
+                auto remaining = boost::asio::mutable_buffer(
+                    static_cast<std::uint8_t *>(buffer.data()) + size, buffer.size() - size);
+                self->read_exact_carrier(remaining, callback);
+            };
             // NOTE: name the sender first; argument order is unspecified.
             auto sender = carrier->async_read_some(buffer);
             async::start_with_receiver(std::move(sender), CarrierReadBridge{std::move(completion)});
@@ -503,7 +504,7 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
         std::vector<std::uint8_t> pending_plaintext;
         std::size_t pending_offset = 0;
         boost::asio::mutable_buffer read_buffer;
-        core::StreamHandle::ReadHandler read_handler;
+        StreamReadHandler read_handler;
         bool read_key_ready = false;
         ss::ObfsMode obfs_mode = ss::ObfsMode::none;
         bool obfs_response_ready = true;
@@ -1051,9 +1052,9 @@ class ShadowsocksConnectOperation final
             }
             return;
         }
-        core::StreamHandle::WriteHandler completion = [self, wire, key = std::move(key.value())](
-                                                          const boost::system::error_code &error,
-                                                          std::size_t) mutable {
+        StreamWriteHandler completion = [self, wire, key = std::move(key.value())](
+                                            const boost::system::error_code &error,
+                                            std::size_t) mutable {
             if (error) {
                 self->finish(core::StreamOpenResult::failed(
                     {core::ErrorCode::transport_io, "failed to write Shadowsocks TCP request",
@@ -1095,24 +1096,24 @@ class ShadowsocksConnectOperation final
                     return;
                 }
                 self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
-                core::StreamHandle::WriteHandler completion =
-                    [self, wire, key = std::move(key)](const boost::system::error_code &error,
-                                                       std::size_t) mutable {
-                        if (error) {
-                            self->finish(core::StreamOpenResult::failed(
-                                {core::ErrorCode::transport_io,
-                                 "failed to write Shadowsocks WebSocket request",
-                                 detail::to_std_error(error)}));
-                            return;
-                        }
-                        auto handler = std::move(self->handler_);
-                        self->cancel_timer();
-                        self->completed_ = true;
-                        handler(core::StreamOpenResult::opened(
-                            std::make_unique<ShadowsocksStreamHandle>(
-                                self->carrier_, self->config_.method, self->config_.password,
-                                std::move(key), self->write_nonce_)));
-                    };
+                StreamWriteHandler completion = [self, wire, key = std::move(key)](
+                                                    const boost::system::error_code &error,
+                                                    std::size_t) mutable {
+                    if (error) {
+                        self->finish(core::StreamOpenResult::failed(
+                            {core::ErrorCode::transport_io,
+                             "failed to write Shadowsocks WebSocket request",
+                             detail::to_std_error(error)}));
+                        return;
+                    }
+                    auto handler = std::move(self->handler_);
+                    self->cancel_timer();
+                    self->completed_ = true;
+                    handler(
+                        core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
+                            self->carrier_, self->config_.method, self->config_.password,
+                            std::move(key), self->write_nonce_)));
+                };
                 // NOTE: name the sender first; argument order is unspecified.
                 auto sender = self->carrier_->async_write(boost::asio::buffer(*wire));
                 async::start_with_receiver(std::move(sender),
@@ -1198,9 +1199,9 @@ class ShadowsocksConnectOperation final
             return;
         }
         auto write_cipher = std::make_shared<ss::LegacyStreamCipher>(std::move(cipher.value()));
-        core::StreamHandle::WriteHandler completion = [self, wire, write_cipher](
-                                                          const boost::system::error_code &error,
-                                                          std::size_t) mutable {
+        StreamWriteHandler completion = [self, wire,
+                                         write_cipher](const boost::system::error_code &error,
+                                                       std::size_t) mutable {
             if (error) {
                 self->finish(core::StreamOpenResult::failed(
                     {core::ErrorCode::transport_io, "failed to write Shadowsocks legacy request",
@@ -1248,28 +1249,28 @@ class ShadowsocksConnectOperation final
                     return;
                 }
                 self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
-                core::StreamHandle::WriteHandler completion =
-                    [self, wire, cipher](const boost::system::error_code &error,
-                                         std::size_t) mutable {
-                        if (error) {
-                            self->finish(core::StreamOpenResult::failed(
-                                {core::ErrorCode::transport_io,
-                                 "failed to write Shadowsocks WebSocket request",
-                                 detail::to_std_error(error)}));
-                            return;
-                        }
-                        auto handler = std::move(self->handler_);
-                        self->cancel_timer();
-                        self->completed_ = true;
-                        auto stream = ss::make_legacy_stream_handle(
-                            self->carrier_, self->config_.method, self->config_.password,
-                            std::move(*cipher));
-                        if (!stream) {
-                            handler(core::StreamOpenResult::failed(stream.error()));
-                            return;
-                        }
-                        handler(core::StreamOpenResult::opened(std::move(stream.value())));
-                    };
+                StreamWriteHandler completion = [self, wire,
+                                                 cipher](const boost::system::error_code &error,
+                                                         std::size_t) mutable {
+                    if (error) {
+                        self->finish(core::StreamOpenResult::failed(
+                            {core::ErrorCode::transport_io,
+                             "failed to write Shadowsocks WebSocket request",
+                             detail::to_std_error(error)}));
+                        return;
+                    }
+                    auto handler = std::move(self->handler_);
+                    self->cancel_timer();
+                    self->completed_ = true;
+                    auto stream =
+                        ss::make_legacy_stream_handle(self->carrier_, self->config_.method,
+                                                      self->config_.password, std::move(*cipher));
+                    if (!stream) {
+                        handler(core::StreamOpenResult::failed(stream.error()));
+                        return;
+                    }
+                    handler(core::StreamOpenResult::opened(std::move(stream.value())));
+                };
                 // NOTE: name the sender first; argument order is unspecified.
                 auto sender = self->carrier_->async_write(boost::asio::buffer(*wire));
                 async::start_with_receiver(std::move(sender),
@@ -1362,7 +1363,7 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
         void send(boost::asio::const_buffer buffer, io::DatagramAddress destination,
                   WriteHandler handler) {
             const auto target = destination.to_destination();
-            auto address = detail::encode_proxy_address(net::to_core_destination(target));
+            auto address = detail::encode_proxy_address(detail::to_core_destination(target));
             const auto method_info = ss::cipher_method(method);
             if (!address || !method_info) {
                 boost::asio::post(socket->executor(), [handler = std::move(handler)]() mutable {

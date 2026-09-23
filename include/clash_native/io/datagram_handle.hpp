@@ -18,7 +18,7 @@ struct DatagramPacket {
     DatagramAddress address;
 };
 
-// Sender-based counterpart of core::DatagramHandle. Same completion contract
+// Datagram handle. Same completion contract
 // as StreamHandle: set_value(T) on success, set_error(exception_ptr) carrying
 // a core::Error on failure, set_stopped() on cancellation. Datagrams have no
 // EOF: closing the handle aborts outstanding operations (surfaced as
