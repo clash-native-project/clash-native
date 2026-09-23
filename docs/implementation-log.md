@@ -2268,3 +2268,10 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   tests: root cause was local AdGuard filtering intercepting loopback
   UDP DNS traffic, not a project defect. Verified all four pass on
   the current Windows x64 Release build.
+
+## 2026-09-24
+
+- Documented the taskification boundary in `docs/async-pitfalls.md`:
+  engine drivers, pump loops, registry APIs, bridged leaves,
+  void-signature initiations, and test-only APIs stay callback-shaped
+  on purpose.

@@ -70,3 +70,28 @@ completion. (`CoreToIo`/`IoToCore` adapters follow the same rule.)
   guards, generations, and deadlines, with late completions dropped.
 - Prefer re-armed receivers over tasks for single-outstanding-pull
   loops; never run two pulls on one consumer.
+
+## What stays callback-shaped on purpose
+
+Not every callback is debt. Linear connect/handshake chains become
+tasks; the following keep their shape deliberately:
+
+- Third-party engine drivers: Botan TLS opens (restls/jls/shadow-tls-v3),
+  ngtcp2 (QUIC), nghttp2/3 (HTTP/2/3 sessions), Beast upgrade/forward
+  orchestration with keep-alive session reuse. Task-ifying them means
+  fighting the engine's own event model.
+- Pump and timer loops: kcptun/smux/snappy sessions, KCP, UoT, cipher
+  stream states, gRPC/WebSocket frame pumps, UDP single-pull loops.
+  Re-armed receivers are the correct shape; see the teardown join rule
+  above.
+- Registry-pattern APIs: DNS resolvers, bootstrap, query service
+  (cancel-by-ID). Converting them means redesigning the interface,
+  not transliterating a chain.
+- Single-call bridged leaves: obfs request/response helpers, TLS
+  handshake narrow waist, pool queue/lifecycle managers.
+- `exec::asio::use_sender` only supports value-carrying signatures
+  (`(error, values...)`); void-signature initiations (Beast handshake,
+  steady timers) and in-band-error contracts (http1 `HttpOpResult`)
+  stay on `callback_sender`.
+- Test-only APIs (e.g. the gRPC client): convert if and when a
+  production caller appears.
