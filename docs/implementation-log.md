@@ -2275,3 +2275,13 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   engine drivers, pump loops, registry APIs, bridged leaves,
   void-signature initiations, and test-only APIs stay callback-shaped
   on purpose.
+
+## 2026-09-24
+
+- Added Trojan UDP-over-TCP: new `src/transport/trojan/` protocol
+  directory with `packet_conn` (`addr|u16len|CRLF|payload` framing,
+  8192-byte send chunking, CRLF/ceiling validation) over
+  `io::StreamHandle`, wired into `TrojanOutbound::open_datagram`
+  (UDP command header, multi-destination semantics). New
+  `trojan_transport_test` covers wire bytes, round-trip, chunking,
+  and framing errors. Full suite: 240 passed.

@@ -4,6 +4,7 @@
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/trojan_outbound.hpp>
 #include <clash_native/transport/tls_client.hpp>
+#include <clash_native/transport/trojan/packet_conn.hpp>
 #include <exec/asio/use_sender.hpp>
 
 #include "outbound_utils.hpp"
@@ -63,9 +64,9 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     TrojanConnectOperation(runtime::AsioRuntime &runtime,
                            std::shared_ptr<dns::ResolverService> resolver,
                            TrojanOutboundConfig config, core::StreamRequest request,
-                           core::StreamOpenHandler handler)
+                           core::StreamOpenHandler handler, std::uint8_t command = 0x01)
         : runtime_(runtime), resolver_(std::move(resolver)), config_(std::move(config)),
-          request_(std::move(request)),
+          request_(std::move(request)), command_(command),
           socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.serialized_executor())),
           timer_(runtime.serialized_executor()), handler_(std::move(handler)) {}
 
@@ -226,7 +227,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
             wire->insert(wire->end(), password_key.value().begin(), password_key.value().end());
             wire->push_back('\r');
             wire->push_back('\n');
-            wire->push_back(0x01);
+            wire->push_back(self->command_);
             wire->insert(wire->end(), address.value().begin(), address.value().end());
             wire->push_back('\r');
             wire->push_back('\n');
@@ -321,6 +322,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     std::shared_ptr<dns::ResolverService> resolver_;
     TrojanOutboundConfig config_;
     core::StreamRequest request_;
+    std::uint8_t command_ = 0x01;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
     std::unique_ptr<io::StreamHandle> transport_stream_;
     boost::asio::steady_timer timer_;
@@ -376,9 +378,47 @@ io::AnySender<core::StreamOpenResult> TrojanOutbound::connect_stream(core::Strea
         });
 }
 
-io::AnySender<core::DatagramOpenResult> TrojanOutbound::open_datagram(core::DatagramRequest) {
-    return io::AnySender<core::DatagramOpenResult>{
-        stdexec::just(core::DatagramOpenResult::unsupported())};
+io::AnySender<core::DatagramOpenResult>
+TrojanOutbound::open_datagram(core::DatagramRequest request) {
+    auto &runtime = runtime_;
+    auto resolver = resolver_;
+    auto config = config_;
+    return async::bridge_sender<core::DatagramOpenResult>(
+        [&runtime, resolver = std::move(resolver), config = std::move(config),
+         request = std::move(request)](
+            async::BridgeSender<core::DatagramOpenResult>::Handler terminal) mutable {
+            auto handler = std::move(terminal);
+            if (!request.initial_destination) {
+                handler(core::DatagramOpenResult::failed(
+                    {core::ErrorCode::configuration,
+                     "Trojan UDP association requires an initial destination"}));
+                return async::BridgeSender<core::DatagramOpenResult>::AbortFn{};
+            }
+            core::StreamRequest stream_request{*request.initial_destination, std::nullopt,
+                                               request.dial_trace};
+            auto operation = std::make_shared<TrojanConnectOperation>(
+                runtime, std::move(resolver), std::move(config), std::move(stream_request),
+                [handler = std::move(handler)](core::StreamOpenResult result) mutable {
+                    if (!result.succeeded()) {
+                        handler(core::DatagramOpenResult::failed(result.error.value_or(
+                            core::Error{core::ErrorCode::transport_io,
+                                        "failed to open Trojan UDP association"})));
+                        return;
+                    }
+                    auto packet =
+                        transport::trojan::make_trojan_packet_conn(std::move(result.handle));
+                    if (!packet) {
+                        handler(core::DatagramOpenResult::failed(packet.error()));
+                        return;
+                    }
+                    handler(core::DatagramOpenResult::opened(
+                        std::move(packet.value()), core::DatagramSemantics::multi_destination));
+                },
+                transport::trojan::kCommandUdp);
+            operation->start();
+            return async::BridgeSender<core::DatagramOpenResult>::AbortFn{
+                [operation] { operation->abort(); }};
+        });
 }
 
 } // namespace clash_native::outbound

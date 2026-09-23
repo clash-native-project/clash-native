@@ -46,7 +46,7 @@ class TrojanOutbound final : public core::Outbound {
     TrojanOutboundConfig config_;
     std::shared_ptr<dns::ResolverService> resolver_;
     core::OutboundDescriptor descriptor_;
-    core::OutboundCapabilities capabilities_{true, core::DatagramSemantics::unsupported,
+    core::OutboundCapabilities capabilities_{true, core::DatagramSemantics::multi_destination,
                                              core::TargetRequirement::domain_or_ip,
                                              core::TargetRequirement::domain_or_ip};
 };

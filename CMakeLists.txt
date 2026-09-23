@@ -165,6 +165,7 @@ add_library(clash-native-core STATIC
     src/transport/endpoint_dialer.cpp
     src/transport/quic_client.cpp
     src/transport/tls_client.cpp
+    src/transport/trojan/packet_conn.cpp
     src/outbound/shadowsocks_outbound.cpp
     src/outbound/trojan_outbound.cpp
     src/outbound/http_proxy_outbound.cpp
@@ -344,6 +345,7 @@ if(BUILD_TESTING)
         tests/transport/websocket_client_test.cpp
         tests/transport/udp_stream_test.cpp
         tests/transport/shadowsocks_transport_test.cpp
+        tests/transport/trojan_transport_test.cpp
     )
 
     target_include_directories(clash-native-tests
