@@ -2090,3 +2090,9 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed (the QUIC unavailable-upstream test 10/10);
   `pixi run format`, `format-check`, and `git diff --check` pass.
+
+## 2026-09-24
+
+- Added `docs/async-pitfalls.md` collecting the sender-migration rules
+  that cost real debugging sessions (evaluation-order moves, pump
+  teardown joins, close-without-release, stdexec shape notes).
