@@ -1,5 +1,14 @@
 #include <clash_native/transport/shadowsocks/websocket_mux.hpp>
 
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/oneshot.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/core/result.hpp>
+#include <clash_native/io/sender.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
+
+#include <stdexec/execution.hpp>
+
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/system/errc.hpp>
@@ -90,16 +99,17 @@ class WebSocketMuxSession;
 
 class WebSocketMuxStreamState final : public std::enable_shared_from_this<WebSocketMuxStreamState> {
   public:
+    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
     WebSocketMuxStreamState(std::shared_ptr<WebSocketMuxSession> session,
-                            transport::MultiplexedSession::StreamId operation_id,
-                            std::uint32_t wire_id)
+                            io::MultiplexedSession::StreamId operation_id, std::uint32_t wire_id)
         : session_(std::move(session)), operation_id_(operation_id), wire_id_(wire_id) {}
 
     ~WebSocketMuxStreamState() { close(); }
 
-    void async_read_some(boost::asio::mutable_buffer buffer,
-                         core::StreamHandle::ReadHandler handler);
-    void async_write(boost::asio::const_buffer buffer, core::StreamHandle::WriteHandler handler);
+    void read_some(boost::asio::mutable_buffer buffer, ReadHandler handler);
+    void write_some(boost::asio::const_buffer buffer, WriteHandler handler);
     boost::asio::any_io_executor executor() noexcept;
     boost::asio::ip::tcp::endpoint local_endpoint(boost::system::error_code &error) const noexcept;
     void shutdown_send(boost::system::error_code &error) noexcept;
@@ -111,7 +121,7 @@ class WebSocketMuxStreamState final : public std::enable_shared_from_this<WebSoc
     void on_session_error(const boost::system::error_code &error);
     void on_open_error(const boost::system::error_code &error);
 
-    transport::MultiplexedSession::StreamId operation_id() const noexcept { return operation_id_; }
+    io::MultiplexedSession::StreamId operation_id() const noexcept { return operation_id_; }
     std::uint32_t wire_id() const noexcept { return wire_id_; }
     bool closed() const noexcept { return closed_; }
     bool local_closed() const noexcept { return local_closed_; }
@@ -122,23 +132,21 @@ class WebSocketMuxStreamState final : public std::enable_shared_from_this<WebSoc
     struct PendingWrite {
         std::shared_ptr<std::vector<std::uint8_t>> data;
         std::size_t offset = 0;
-        core::StreamHandle::WriteHandler handler;
+        WriteHandler handler;
     };
 
     void deliver_read();
     void finish_read(const boost::system::error_code &error, std::size_t size);
     void finish_write(const boost::system::error_code &error, std::size_t size = 0);
-    void post_read(core::StreamHandle::ReadHandler handler, const boost::system::error_code &error,
-                   std::size_t size);
-    void post_write(core::StreamHandle::WriteHandler handler,
-                    const boost::system::error_code &error, std::size_t size);
+    void post_read(ReadHandler handler, const boost::system::error_code &error, std::size_t size);
+    void post_write(WriteHandler handler, const boost::system::error_code &error, std::size_t size);
     void pump_write();
 
     std::shared_ptr<WebSocketMuxSession> session_;
-    transport::MultiplexedSession::StreamId operation_id_ = 0;
+    io::MultiplexedSession::StreamId operation_id_ = 0;
     std::uint32_t wire_id_ = 0;
     boost::asio::mutable_buffer read_buffer_;
-    core::StreamHandle::ReadHandler read_handler_;
+    ReadHandler read_handler_;
     std::deque<std::shared_ptr<std::vector<std::uint8_t>>> incoming_;
     std::size_t incoming_offset_ = 0;
     std::shared_ptr<PendingWrite> pending_write_;
@@ -154,18 +162,38 @@ class WebSocketMuxStreamState final : public std::enable_shared_from_this<WebSoc
     std::uint32_t consumed_since_update_ = 0;
 };
 
-class WebSocketMuxStream final : public core::StreamHandle {
+class WebSocketMuxStream final : public io::StreamHandle {
   public:
     explicit WebSocketMuxStream(std::shared_ptr<WebSocketMuxStreamState> state)
         : state_(std::move(state)) {}
     ~WebSocketMuxStream() override { close(); }
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        state_->async_read_some(buffer, std::move(handler));
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        using Signatures =
+            stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                           stdexec::set_error_t(std::exception_ptr),
+                                           stdexec::set_stopped_t()>;
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
+            [state = state_, buffer](auto terminal) mutable {
+                state->read_some(buffer, std::move(terminal));
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                net::translate_read(std::move(receiver), error, size, "mux stream read");
+            })};
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
-        state_->async_write(buffer, std::move(handler));
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
+        return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
+            [state = state_, buffer](auto terminal) mutable {
+                state->write_some(buffer, std::move(terminal));
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                net::translate_write(std::move(receiver), error, size, "mux stream write");
+            })};
     }
 
     boost::asio::any_io_executor executor() noexcept override { return state_->executor(); }
@@ -185,10 +213,14 @@ class WebSocketMuxStream final : public core::StreamHandle {
     std::shared_ptr<WebSocketMuxStreamState> state_;
 };
 
-class WebSocketMuxSession final : public transport::MultiplexedSession,
+// Terminal captured into a oneshot per open; the entry wrapper rethrows
+// failures per the io:: sender contract.
+using MuxOpenTerminal = core::Result<std::unique_ptr<io::StreamHandle>>;
+
+class WebSocketMuxSession final : public io::MultiplexedSession,
                                   public std::enable_shared_from_this<WebSocketMuxSession> {
   public:
-    WebSocketMuxSession(std::unique_ptr<core::StreamHandle> carrier, WebSocketMuxOptions options)
+    WebSocketMuxSession(std::unique_ptr<io::StreamHandle> carrier, WebSocketMuxOptions options)
         : carrier_(std::move(carrier)), options_(std::move(options)),
           executor_(this->carrier_->executor()) {}
 
@@ -196,9 +228,9 @@ class WebSocketMuxSession final : public transport::MultiplexedSession,
 
     void start() { read_more(); }
 
-    StreamId open_stream(MultiplexedStreamRequest request,
-                         std::chrono::steady_clock::time_point deadline,
-                         StreamHandler handler) override;
+    io::AnySender<std::unique_ptr<io::StreamHandle>>
+    open_stream(io::MultiplexedStreamRequest request,
+                std::chrono::steady_clock::time_point deadline) override;
     void cancel(StreamId stream_id) noexcept override;
     std::size_t active_streams() const noexcept override { return streams_.size(); }
     std::optional<std::size_t> max_concurrent_streams() const noexcept override {
@@ -231,8 +263,30 @@ class WebSocketMuxSession final : public transport::MultiplexedSession,
 
     struct PendingOpen {
         std::shared_ptr<WebSocketMuxStreamState> stream;
-        StreamHandler handler;
+        async::oneshot::Sender<MuxOpenTerminal> handler;
     };
+
+    io::AnySender<std::unique_ptr<io::StreamHandle>>
+    wrap_open(StreamId operation_id, async::oneshot::Receiver<MuxOpenTerminal> receiver) {
+        auto sender =
+            std::move(receiver) |
+            stdexec::then(
+                [](std::optional<MuxOpenTerminal> terminal) -> std::unique_ptr<io::StreamHandle> {
+                    if (!terminal) {
+                        throw core::Error{core::ErrorCode::cancelled,
+                                          "WebSocket mux stream open was abandoned"};
+                    }
+                    if (!*terminal) {
+                        throw terminal->error();
+                    }
+                    return std::move(terminal->value());
+                }) |
+            stdexec::let_stopped([self = shared_from_this(), operation_id] {
+                self->cancel(operation_id);
+                return stdexec::just_stopped();
+            });
+        return io::AnySender<std::unique_ptr<io::StreamHandle>>{std::move(sender)};
+    }
 
     std::vector<std::uint8_t> make_open_frame(std::uint32_t wire_id) const;
     std::vector<std::uint8_t> make_data_frame(std::uint32_t wire_id, const std::uint8_t *data,
@@ -253,7 +307,7 @@ class WebSocketMuxSession final : public transport::MultiplexedSession,
     std::optional<std::uint32_t> allocate_wire_id();
     std::shared_ptr<WebSocketMuxStreamState> find_stream(std::uint32_t wire_id);
 
-    std::unique_ptr<core::StreamHandle> carrier_;
+    std::unique_ptr<io::StreamHandle> carrier_;
     WebSocketMuxOptions options_;
     boost::asio::any_io_executor executor_;
     std::array<std::uint8_t, 16 * 1024> read_buffer_{};
@@ -284,8 +338,7 @@ WebSocketMuxStreamState::local_endpoint(boost::system::error_code &error) const 
     return {};
 }
 
-void WebSocketMuxStreamState::async_read_some(boost::asio::mutable_buffer buffer,
-                                              core::StreamHandle::ReadHandler handler) {
+void WebSocketMuxStreamState::read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) {
     if (closed_) {
         post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
         return;
@@ -303,8 +356,7 @@ void WebSocketMuxStreamState::async_read_some(boost::asio::mutable_buffer buffer
     deliver_read();
 }
 
-void WebSocketMuxStreamState::async_write(boost::asio::const_buffer buffer,
-                                          core::StreamHandle::WriteHandler handler) {
+void WebSocketMuxStreamState::write_some(boost::asio::const_buffer buffer, WriteHandler handler) {
     if (closed_ || local_closed_) {
         post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
         return;
@@ -452,14 +504,14 @@ void WebSocketMuxStreamState::finish_write(const boost::system::error_code &erro
     }
 }
 
-void WebSocketMuxStreamState::post_read(core::StreamHandle::ReadHandler handler,
-                                        const boost::system::error_code &error, std::size_t size) {
+void WebSocketMuxStreamState::post_read(ReadHandler handler, const boost::system::error_code &error,
+                                        std::size_t size) {
     boost::asio::post(executor(), [handler = std::move(handler), error, size]() mutable {
         handler(error, size);
     });
 }
 
-void WebSocketMuxStreamState::post_write(core::StreamHandle::WriteHandler handler,
+void WebSocketMuxStreamState::post_write(WriteHandler handler,
                                          const boost::system::error_code &error, std::size_t size) {
     boost::asio::post(executor(), [handler = std::move(handler), error, size]() mutable {
         handler(error, size);
@@ -671,19 +723,44 @@ void WebSocketMuxSession::pump_write() {
     writes_.pop_front();
     auto self = shared_from_this();
     auto frame = pending.bytes;
-    carrier_->async_write(boost::asio::buffer(*frame),
-                          [self, pending = std::move(pending)](
-                              const boost::system::error_code &error, std::size_t) mutable {
-                              self->writing_ = false;
-                              if (pending.completed) {
-                                  pending.completed(error);
-                              }
-                              if (error) {
-                                  self->fail(error);
-                                  return;
-                              }
-                              self->pump_write();
-                          });
+    struct WriteReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<WebSocketMuxSession> self;
+        QueuedFrame pending;
+        void set_value(std::size_t) && noexcept {
+            self->writing_ = false;
+            if (pending.completed) {
+                pending.completed({});
+            }
+            self->pump_write();
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            self->writing_ = false;
+            boost::system::error_code code = boost::asio::error::fault;
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const core::Error &failure) {
+                if (failure.cause) {
+                    code = {failure.cause.value(), boost::system::system_category()};
+                }
+            } catch (...) {
+            }
+            if (pending.completed) {
+                pending.completed(code);
+            }
+            self->fail(code);
+        }
+        void set_stopped() && noexcept {
+            self->writing_ = false;
+            if (pending.completed) {
+                pending.completed(boost::asio::error::operation_aborted);
+            }
+            self->fail(boost::asio::error::operation_aborted);
+        }
+    };
+    // NOTE: name the sender first; argument order is unspecified.
+    auto sender = carrier_->async_write(boost::asio::buffer(*frame));
+    async::start_with_receiver(std::move(sender), WriteReceiver{self, std::move(pending)});
 }
 
 void WebSocketMuxSession::read_more() {
@@ -691,26 +768,44 @@ void WebSocketMuxSession::read_more() {
         return;
     }
     reading_ = true;
-    auto self = shared_from_this();
-    carrier_->async_read_some(
-        boost::asio::buffer(read_buffer_),
-        [self](const boost::system::error_code &error, std::size_t size) {
+    struct ReadReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<WebSocketMuxSession> self;
+        void set_value(std::optional<std::size_t> size) && noexcept {
             self->reading_ = false;
-            if (error) {
-                self->fail(error);
-                return;
-            }
-            if (size == 0) {
+            if (!size || *size == 0) {
                 self->fail(boost::asio::error::eof);
                 return;
             }
             self->input_.insert(self->input_.end(), self->read_buffer_.begin(),
-                                self->read_buffer_.begin() + static_cast<std::ptrdiff_t>(size));
+                                self->read_buffer_.begin() + static_cast<std::ptrdiff_t>(*size));
             self->parse_frames();
             if (!self->closed_) {
                 self->read_more();
             }
-        });
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            self->reading_ = false;
+            boost::system::error_code code = boost::asio::error::fault;
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const core::Error &failure) {
+                if (failure.cause) {
+                    code = {failure.cause.value(), boost::system::system_category()};
+                }
+            } catch (...) {
+            }
+            self->fail(code);
+        }
+        void set_stopped() && noexcept {
+            self->reading_ = false;
+            self->fail(boost::asio::error::operation_aborted);
+        }
+    };
+    auto self = shared_from_this();
+    // NOTE: name the sender first; argument order is unspecified.
+    auto sender = carrier_->async_read_some(boost::asio::buffer(read_buffer_));
+    async::start_with_receiver(std::move(sender), ReadReceiver{self});
 }
 
 void WebSocketMuxSession::parse_frames() {
@@ -829,52 +924,49 @@ bool WebSocketMuxSession::parse_smux_frame() {
     return true;
 }
 
-WebSocketMuxSession::StreamId
-WebSocketMuxSession::open_stream(MultiplexedStreamRequest request,
-                                 std::chrono::steady_clock::time_point deadline,
-                                 StreamHandler handler) {
+io::AnySender<std::unique_ptr<io::StreamHandle>>
+WebSocketMuxSession::open_stream(io::MultiplexedStreamRequest request,
+                                 std::chrono::steady_clock::time_point deadline) {
+    auto channel = async::oneshot::channel<MuxOpenTerminal>();
     const auto operation_id = next_operation_id_++;
-    if (!request.bidirectional) {
-        boost::asio::post(executor_, [handler = std::move(handler)]() mutable {
-            handler(core::fail({core::ErrorCode::unsupported,
-                                "WebSocket mux only supports bidirectional streams",
-                                {}}));
+    // Shared: the failure paths below post copyable closures; the pending
+    // fulfiller crosses into the posted lambda through shared ownership.
+    auto sender =
+        std::make_shared<async::oneshot::Sender<MuxOpenTerminal>>(std::move(channel.sender));
+    auto fail_post = [this, sender](core::Error error) {
+        boost::asio::post(executor_, [sender, error = std::move(error)]() mutable {
+            sender->send(core::fail(std::move(error)));
         });
-        return operation_id;
+    };
+    if (!request.bidirectional) {
+        fail_post({core::ErrorCode::unsupported,
+                   "WebSocket mux only supports bidirectional streams",
+                   {}});
+        return wrap_open(operation_id, std::move(channel.receiver));
     }
     if (closed_) {
-        boost::asio::post(executor_, [handler = std::move(handler)]() mutable {
-            handler(
-                core::fail({core::ErrorCode::transport_io, "WebSocket mux session is closed", {}}));
-        });
-        return operation_id;
+        fail_post({core::ErrorCode::transport_io, "WebSocket mux session is closed", {}});
+        return wrap_open(operation_id, std::move(channel.receiver));
     }
     if (deadline <= std::chrono::steady_clock::now()) {
-        boost::asio::post(executor_, [handler = std::move(handler)]() mutable {
-            handler(
-                core::fail({core::ErrorCode::timeout, "WebSocket mux stream open timed out", {}}));
-        });
-        return operation_id;
+        fail_post({core::ErrorCode::timeout, "WebSocket mux stream open timed out", {}});
+        return wrap_open(operation_id, std::move(channel.receiver));
     }
     if (streams_.size() >= options_.max_concurrent_streams) {
-        boost::asio::post(executor_, [handler = std::move(handler)]() mutable {
-            handler(core::fail(
-                {core::ErrorCode::transport_io, "WebSocket mux stream capacity is exhausted", {}}));
-        });
-        return operation_id;
+        fail_post(
+            {core::ErrorCode::transport_io, "WebSocket mux stream capacity is exhausted", {}});
+        return wrap_open(operation_id, std::move(channel.receiver));
     }
     const auto wire_id = allocate_wire_id();
     if (!wire_id) {
-        boost::asio::post(executor_, [handler = std::move(handler)]() mutable {
-            handler(core::fail(
-                {core::ErrorCode::transport_io, "WebSocket mux stream ID space is exhausted", {}}));
-        });
-        return operation_id;
+        fail_post(
+            {core::ErrorCode::transport_io, "WebSocket mux stream ID space is exhausted", {}});
+        return wrap_open(operation_id, std::move(channel.receiver));
     }
     auto stream =
         std::make_shared<WebSocketMuxStreamState>(shared_from_this(), operation_id, *wire_id);
     streams_.emplace(*wire_id, stream);
-    pending_opens_.emplace(operation_id, PendingOpen{stream, std::move(handler)});
+    pending_opens_.emplace(operation_id, PendingOpen{stream, std::move(*sender)});
     enqueue_frame(make_open_frame(*wire_id), [self = shared_from_this(), operation_id](
                                                  const boost::system::error_code &error) {
         const auto pending = self->pending_opens_.find(operation_id);
@@ -886,13 +978,13 @@ WebSocketMuxSession::open_stream(MultiplexedStreamRequest request,
         if (error) {
             self->streams_.erase(entry.stream->wire_id());
             entry.stream->on_open_error(error);
-            entry.handler(core::fail(stream_error(error, "WebSocket mux stream open failed")));
+            entry.handler.send(core::fail(stream_error(error, "WebSocket mux stream open failed")));
             return;
         }
-        entry.handler(std::unique_ptr<core::StreamHandle>(
-            std::make_unique<WebSocketMuxStream>(std::move(entry.stream))));
+        entry.handler.send(
+            MuxOpenTerminal{std::make_unique<WebSocketMuxStream>(std::move(entry.stream))});
     });
-    return operation_id;
+    return wrap_open(operation_id, std::move(channel.receiver));
 }
 
 void WebSocketMuxSession::cancel(StreamId stream_id) noexcept {
@@ -902,7 +994,7 @@ void WebSocketMuxSession::cancel(StreamId stream_id) noexcept {
         pending_opens_.erase(pending);
         streams_.erase(entry.stream->wire_id());
         entry.stream->on_open_error(boost::asio::error::operation_aborted);
-        entry.handler(core::fail(
+        entry.handler.send(core::fail(
             {core::ErrorCode::cancelled, "WebSocket mux stream open was cancelled", {}}));
         return;
     }
@@ -938,7 +1030,7 @@ void WebSocketMuxSession::fail_pending(const boost::system::error_code &error) {
     for (auto &[id, entry] : pending) {
         (void)id;
         entry.stream->on_open_error(error);
-        entry.handler(core::fail(stream_error(error, "WebSocket mux stream open failed")));
+        entry.handler.send(core::fail(stream_error(error, "WebSocket mux stream open failed")));
     }
 }
 
@@ -971,7 +1063,7 @@ class WebSocketMuxHandshakeOperation final
     : public WebSocketMuxHandshake,
       public std::enable_shared_from_this<WebSocketMuxHandshakeOperation> {
   public:
-    WebSocketMuxHandshakeOperation(std::unique_ptr<core::StreamHandle> websocket,
+    WebSocketMuxHandshakeOperation(std::unique_ptr<io::StreamHandle> websocket,
                                    WebSocketMuxOptions options, WebSocketMuxHandler handler)
         : executor_(websocket->executor()), websocket_(std::move(websocket)),
           options_(std::move(options)), handler_(std::move(handler)) {}
@@ -1019,7 +1111,7 @@ class WebSocketMuxHandshakeOperation final
     }
 
   private:
-    using Session = clash_native::transport::MultiplexedSession;
+    using Session = clash_native::io::MultiplexedSession;
 
     void finish_success(std::shared_ptr<Session> session) {
         finish(core::Result<std::shared_ptr<Session>>(std::move(session)));
@@ -1044,7 +1136,7 @@ class WebSocketMuxHandshakeOperation final
     }
 
     boost::asio::any_io_executor executor_;
-    std::unique_ptr<core::StreamHandle> websocket_;
+    std::unique_ptr<io::StreamHandle> websocket_;
     WebSocketMuxOptions options_;
     WebSocketMuxHandler handler_;
     bool completed_ = false;
@@ -1053,7 +1145,7 @@ class WebSocketMuxHandshakeOperation final
 } // namespace
 
 std::shared_ptr<WebSocketMuxHandshake>
-async_open_websocket_mux(std::unique_ptr<core::StreamHandle> websocket, WebSocketMuxOptions options,
+async_open_websocket_mux(std::unique_ptr<io::StreamHandle> websocket, WebSocketMuxOptions options,
                          WebSocketMuxHandler handler) {
     if (!websocket || !handler) {
         if (websocket) {

@@ -2037,3 +2037,24 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-23
+
+- Migrated the multiplexed plane to io:: and deleted
+  transport::MultiplexedSession: WebSocket mux sessions serve io::
+  streams from sender-native opens (oneshot terminals with
+  stop-to-cancel); the mux pool and plugin handshake carry io::
+  sessions and streams; QUIC connections open io:: streams and
+  datagrams with io:: handles throughout; the HTTP/2 and HTTP/3
+  stub opens and transport bases are removed (their io::
+  multiplexed view stays null, and nobody consumed the old stubs).
+- WebSocket/QUIC stream and datagram states keep their
+  callback-parked machinery underneath sender shells, matching the
+  cipher-state treatment; kcptun SMUX stays on core:: (mux-fed, like
+  its pool) and migrates with any future kcptun work.
+- One repair along the way: splitting a stream handle edit dropped
+  the original read body, which was reconstructed verbatim and
+  re-verified by review before building.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.

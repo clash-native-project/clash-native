@@ -1,6 +1,13 @@
 #include <clash_native/transport/quic_client.hpp>
 
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/oneshot.hpp>
+#include <clash_native/io/sender.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
+
 #include "transport/builtin_ca_bundle.hpp"
+
+#include <stdexec/execution.hpp>
 
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/dispatch.hpp>
@@ -1232,10 +1239,10 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
 
 namespace {
 
-class QuicStreamHandle final : public core::StreamHandle {
+class QuicStreamHandle final : public io::StreamHandle {
   public:
     QuicStreamHandle(std::shared_ptr<QuicClientConnection> connection,
-                     MultiplexedSession::StreamId operation_id, std::int64_t stream_id)
+                     io::MultiplexedSession::StreamId operation_id, std::int64_t stream_id)
         : connection_(std::move(connection)), operation_id_(operation_id), stream_id_(stream_id),
           executor_(connection_->executor()) {
         observer_id_ = connection_->observe_stream(
@@ -1256,7 +1263,40 @@ class QuicStreamHandle final : public core::StreamHandle {
 
     ~QuicStreamHandle() override { close(); }
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        using Signatures =
+            stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                           stdexec::set_error_t(std::exception_ptr),
+                                           stdexec::set_stopped_t()>;
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
+            [self = this, buffer](auto terminal) mutable {
+                self->read(buffer, std::move(terminal));
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                net::translate_read(std::move(receiver), error, size, "quic stream read");
+            })};
+    }
+
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
+        return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
+            [self = this, buffer](auto terminal) mutable {
+                self->write(buffer, std::move(terminal));
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                net::translate_write(std::move(receiver), error, size, "quic stream write");
+            })};
+    }
+
+    // The observer machinery below stays callback-parked; each pull/write
+    // bridges once through the shells above.
+    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
+    void read(boost::asio::mutable_buffer buffer, ReadHandler handler) {
         if (read_pending_) {
             post_read(boost::asio::error::operation_aborted, 0, std::move(handler));
             return;
@@ -1272,7 +1312,7 @@ class QuicStreamHandle final : public core::StreamHandle {
         fulfill_read();
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
+    void write(boost::asio::const_buffer buffer, WriteHandler handler) {
         if (closed_ || send_shutdown_) {
             post_write(boost::asio::error::operation_aborted, 0, std::move(handler));
             return;
@@ -1465,7 +1505,7 @@ class QuicStreamHandle final : public core::StreamHandle {
     }
 
     std::shared_ptr<QuicClientConnection> connection_;
-    MultiplexedSession::StreamId operation_id_;
+    io::MultiplexedSession::StreamId operation_id_;
     std::int64_t stream_id_;
     boost::asio::any_io_executor executor_;
     QuicClientConnection::ObserverId observer_id_ = 0;
@@ -1482,8 +1522,12 @@ class QuicStreamHandle final : public core::StreamHandle {
     bool closed_ = false;
 };
 
-class QuicDatagramHandle final : public core::DatagramHandle {
+class QuicDatagramHandle final : public io::DatagramHandle {
   public:
+    using ReadHandler =
+        std::function<void(const boost::system::error_code &, std::size_t, io::DatagramAddress)>;
+    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
     explicit QuicDatagramHandle(std::shared_ptr<QuicClientConnection> connection)
         : connection_(std::move(connection)), executor_(connection_->executor()) {
         observer_id_ = connection_->observe_datagrams(QuicDatagramObserver{
@@ -1493,8 +1537,63 @@ class QuicDatagramHandle final : public core::DatagramHandle {
 
     ~QuicDatagramHandle() override { close(); }
 
-    void async_send_to(boost::asio::const_buffer buffer, core::DatagramAddress destination,
-                       WriteHandler handler) override {
+    io::AnySender<std::size_t> async_send_to(boost::asio::const_buffer buffer,
+                                             io::DatagramAddress destination) override {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
+        return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
+            [self = this, buffer, destination](auto terminal) mutable {
+                self->send(buffer, std::move(destination), std::move(terminal));
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                if (!error) {
+                    stdexec::set_value(std::move(receiver), size);
+                    return;
+                }
+                if (error == boost::asio::error::operation_aborted) {
+                    stdexec::set_stopped(std::move(receiver));
+                    return;
+                }
+                stdexec::set_error(std::move(receiver), std::make_exception_ptr(core::Error{
+                                                            core::ErrorCode::transport_io,
+                                                            "QUIC datagram send failed", error}));
+            })};
+    }
+
+    io::AnySender<io::DatagramPacket>
+    async_receive_from(boost::asio::mutable_buffer buffer) override {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(io::DatagramPacket),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
+        return io::AnySender<io::DatagramPacket>{async::callback_sender<Signatures>(
+            [self = this, buffer](auto terminal) mutable {
+                self->receive(buffer, [terminal = std::move(terminal)](
+                                          const boost::system::error_code &error, std::size_t size,
+                                          io::DatagramAddress source) mutable {
+                    terminal(error, size, std::move(source));
+                });
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size,
+               io::DatagramAddress source) {
+                if (!error) {
+                    stdexec::set_value(std::move(receiver),
+                                       io::DatagramPacket{size, std::move(source)});
+                    return;
+                }
+                if (error == boost::asio::error::operation_aborted) {
+                    stdexec::set_stopped(std::move(receiver));
+                    return;
+                }
+                stdexec::set_error(
+                    std::move(receiver),
+                    std::make_exception_ptr(core::Error{core::ErrorCode::transport_io,
+                                                        "QUIC datagram receive failed", error}));
+            })};
+    }
+
+    void send(boost::asio::const_buffer buffer, io::DatagramAddress destination,
+              WriteHandler handler) {
         if (closed_) {
             post_write(boost::asio::error::operation_aborted, 0, std::move(handler));
             return;
@@ -1516,7 +1615,7 @@ class QuicDatagramHandle final : public core::DatagramHandle {
         connection_->async_send_datagram(std::move(bytes), std::move(handler));
     }
 
-    void async_receive_from(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+    void receive(boost::asio::mutable_buffer buffer, ReadHandler handler) {
         if (read_pending_) {
             post_read(boost::asio::error::operation_aborted, 0, {}, std::move(handler));
             return;
@@ -1578,7 +1677,7 @@ class QuicDatagramHandle final : public core::DatagramHandle {
         if (datagram.bytes.size() > read_size_) {
             read_pending_ = false;
             post_read(boost::asio::error::message_size, 0,
-                      core::DatagramAddress::from_endpoint(connection_->remote_endpoint()),
+                      io::DatagramAddress::from_endpoint(connection_->remote_endpoint()),
                       std::move(read_handler_));
             return;
         }
@@ -1587,7 +1686,7 @@ class QuicDatagramHandle final : public core::DatagramHandle {
         }
         read_pending_ = false;
         post_read({}, datagram.bytes.size(),
-                  core::DatagramAddress::from_endpoint(connection_->remote_endpoint()),
+                  io::DatagramAddress::from_endpoint(connection_->remote_endpoint()),
                   std::move(read_handler_));
     }
 
@@ -1608,7 +1707,7 @@ class QuicDatagramHandle final : public core::DatagramHandle {
     }
 
     void post_read(const boost::system::error_code &error, std::size_t size,
-                   core::DatagramAddress sender, ReadHandler handler) {
+                   io::DatagramAddress sender, ReadHandler handler) {
         boost::asio::post(executor_, [handler = std::move(handler), error, size, sender]() mutable {
             if (handler) {
                 handler(error, size, sender);
@@ -1650,45 +1749,64 @@ QuicOpenStreamResult QuicClientConnection::open_unidirectional_stream() {
     return impl_->open_stream(true);
 }
 
-MultiplexedSession::StreamId
-QuicClientConnection::open_stream(MultiplexedStreamRequest request,
-                                  std::chrono::steady_clock::time_point deadline,
-                                  StreamHandler handler) {
-    const auto operation_id = impl_->next_operation_id();
-    const auto completion = std::make_shared<StreamHandler>(std::move(handler));
-    auto post_failure = [executor = impl_->executor(), completion](core::Error error) mutable {
-        boost::asio::post(executor, [completion, error = std::move(error)]() mutable {
-            if (*completion) {
-                (*completion)(core::fail(std::move(error)));
-            }
+namespace {
+
+using QuicOpenTerminal = core::Result<std::unique_ptr<io::StreamHandle>>;
+
+io::AnySender<std::unique_ptr<io::StreamHandle>>
+wrap_quic_open(std::shared_ptr<QuicClientConnection> self,
+               QuicClientConnection::StreamId operation_id,
+               async::oneshot::Receiver<QuicOpenTerminal> receiver) {
+    auto sender =
+        std::move(receiver) |
+        stdexec::then(
+            [](std::optional<QuicOpenTerminal> terminal) -> std::unique_ptr<io::StreamHandle> {
+                if (!terminal) {
+                    throw core::Error{core::ErrorCode::cancelled, "QUIC stream open was abandoned"};
+                }
+                if (!*terminal) {
+                    throw terminal->error();
+                }
+                return std::move(terminal->value());
+            }) |
+        stdexec::let_stopped([self = std::move(self), operation_id] {
+            self->cancel(operation_id);
+            return stdexec::just_stopped();
         });
-    };
+    return io::AnySender<std::unique_ptr<io::StreamHandle>>{std::move(sender)};
+}
+
+} // namespace
+
+io::AnySender<std::unique_ptr<io::StreamHandle>>
+QuicClientConnection::open_stream(io::MultiplexedStreamRequest request,
+                                  std::chrono::steady_clock::time_point deadline) {
+    auto channel = async::oneshot::channel<QuicOpenTerminal>();
+    const auto operation_id = impl_->next_operation_id();
     if (!request.bidirectional) {
-        post_failure(core::Error{core::ErrorCode::unsupported,
-                                 "QUIC unidirectional streams are not StreamHandle-compatible",
-                                 {}});
-        return operation_id;
+        channel.sender.send(core::fail(core::Error{core::ErrorCode::unsupported,
+                                                   "QUIC unidirectional streams are not "
+                                                   "StreamHandle-compatible",
+                                                   {}}));
+        return wrap_quic_open(shared_from_this(), operation_id, std::move(channel.receiver));
     }
     if (deadline <= Clock::now()) {
-        post_failure(core::Error{core::ErrorCode::timeout, "QUIC stream open timed out", {}});
-        return operation_id;
+        channel.sender.send(
+            core::fail(core::Error{core::ErrorCode::timeout, "QUIC stream open timed out", {}}));
+        return wrap_quic_open(shared_from_this(), operation_id, std::move(channel.receiver));
     }
     const auto opened = impl_->open_stream(false);
     if (opened.state != QuicOpenStreamResult::State::opened || opened.stream_id < 0) {
-        post_failure(opened.error.value_or(
-            core::Error{core::ErrorCode::transport_io, "QUIC stream could not be opened", {}}));
-        return operation_id;
+        channel.sender.send(core::fail(opened.error.value_or(
+            core::Error{core::ErrorCode::transport_io, "QUIC stream could not be opened", {}})));
+        return wrap_quic_open(shared_from_this(), operation_id, std::move(channel.receiver));
     }
     const auto tracked_id = impl_->track_multiplexed_stream(opened.stream_id);
     const auto connection = shared_from_this();
-    auto stream = std::make_unique<QuicStreamHandle>(connection, tracked_id, opened.stream_id);
-    boost::asio::post(impl_->executor(),
-                      [handler = std::move(*completion), stream = std::move(stream)]() mutable {
-                          if (handler) {
-                              handler(std::move(stream));
-                          }
-                      });
-    return tracked_id;
+    std::unique_ptr<io::StreamHandle> stream =
+        std::make_unique<QuicStreamHandle>(connection, tracked_id, opened.stream_id);
+    channel.sender.send(QuicOpenTerminal{std::move(stream)});
+    return wrap_quic_open(shared_from_this(), operation_id, std::move(channel.receiver));
 }
 
 void QuicClientConnection::cancel(StreamId stream_id) noexcept {
@@ -1727,7 +1845,7 @@ void QuicClientConnection::async_send_datagram(std::vector<std::uint8_t> data,
     impl_->async_send_datagram(std::move(data), std::move(handler));
 }
 
-std::unique_ptr<core::DatagramHandle> QuicClientConnection::open_datagram() {
+std::unique_ptr<io::DatagramHandle> QuicClientConnection::open_datagram() {
     return std::make_unique<QuicDatagramHandle>(shared_from_this());
 }
 

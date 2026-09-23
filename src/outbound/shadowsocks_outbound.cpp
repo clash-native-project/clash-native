@@ -856,7 +856,7 @@ class ShadowsocksConnectOperation final
             }
             websocket_mux_pool_->async_open_stream(
                 std::move(*endpoints), websocket_options(),
-                [self](core::Result<std::unique_ptr<core::StreamHandle>> stream) mutable {
+                [self](core::Result<std::unique_ptr<io::StreamHandle>> stream) mutable {
                     if (!stream) {
                         self->finish(core::StreamOpenResult::failed(stream.error()));
                         return;

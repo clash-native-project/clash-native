@@ -150,11 +150,10 @@ class WebSocketPluginMuxOperation final
                 if (self->stream_) {
                     self->stream_->close();
                 }
-                self->finish(
-                    core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>(
-                        core::fail({core::ErrorCode::cancelled,
-                                    "WebSocket plugin mux handshake was cancelled",
-                                    {}})));
+                self->finish(core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>(
+                    core::fail({core::ErrorCode::cancelled,
+                                "WebSocket plugin mux handshake was cancelled",
+                                {}})));
             });
         } catch (...) {
             if (stream_) {
@@ -169,7 +168,7 @@ class WebSocketPluginMuxOperation final
             return;
         }
         if (options_.host.empty()) {
-            finish(core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>(
+            finish(core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>(
                 core::fail(configuration_error("WebSocket plugin host is required"))));
             return;
         }
@@ -197,26 +196,24 @@ class WebSocketPluginMuxOperation final
                 self->websocket_.reset();
                 if (!result) {
                     self->finish(
-                        core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>(
+                        core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>(
                             core::fail(result.error())));
                     return;
                 }
                 WebSocketMuxOptions mux_options;
                 mux_options.protocol = self->options_.mux_protocol;
                 mux_options.smux_version = self->options_.smux_version;
-                // Sessions-plane debt: the mux plane still speaks core::.
                 self->mux_ = async_open_websocket_mux(
-                    net::adapt_io_to_core(std::move(result.value())), mux_options,
-                    [self](
-                        core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>
-                            mux_result) mutable {
+                    std::move(result.value()), mux_options,
+                    [self](core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>
+                               mux_result) mutable {
                         self->mux_.reset();
                         self->finish(std::move(mux_result));
                     });
             });
     }
 
-    void finish(core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>> result) {
+    void finish(core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>> result) {
         if (completed_) {
             return;
         }
@@ -269,7 +266,7 @@ async_open_websocket_plugin_mux(std::unique_ptr<io::StreamHandle> stream,
             stream->close();
         }
         if (handler) {
-            handler(core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>(
+            handler(core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>(
                 core::fail(configuration_error(
                     "WebSocket plugin mux requires a stream and completion handler"))));
         }
@@ -300,9 +297,34 @@ void WebSocketPluginMuxPool::async_open_stream(
             self->session_.reset();
         }
         if (self->session_) {
-            self->session_->open_stream({},
-                                        std::chrono::steady_clock::now() + std::chrono::seconds(15),
-                                        std::move(handler));
+            struct OpenReceiver {
+                using receiver_concept = stdexec::receiver_tag;
+                StreamHandler handler;
+                void set_value(std::unique_ptr<io::StreamHandle> stream) && noexcept {
+                    auto callback = std::move(handler);
+                    callback(std::move(stream));
+                }
+                void set_error(std::exception_ptr error) && noexcept {
+                    auto callback = std::move(handler);
+                    try {
+                        std::rethrow_exception(std::move(error));
+                    } catch (const core::Error &failure) {
+                        callback(core::fail(failure));
+                    } catch (...) {
+                        callback(core::fail(
+                            core::Error{core::ErrorCode::transport_io, "mux open failed", {}}));
+                    }
+                }
+                void set_stopped() && noexcept {
+                    auto callback = std::move(handler);
+                    callback(core::fail(
+                        core::Error{core::ErrorCode::cancelled, "mux open stopped", {}}));
+                }
+            };
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = self->session_->open_stream({}, std::chrono::steady_clock::now() +
+                                                              std::chrono::seconds(15));
+            async::start_with_receiver(std::move(sender), OpenReceiver{std::move(handler)});
             return;
         }
         if (endpoints.empty()) {
@@ -349,7 +371,7 @@ void WebSocketPluginMuxPool::async_open_carrier(std::unique_ptr<io::StreamHandle
     auto self = shared_from_this();
     async_open_websocket_plugin_mux(
         std::move(stream), std::move(options),
-        [self](core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>> result) {
+        [self](core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>> result) {
             self->opening_ = false;
             if (!result) {
                 self->fail_pending(result.error());
@@ -371,8 +393,34 @@ void WebSocketPluginMuxPool::drain_pending() {
     auto pending = std::move(pending_);
     pending_.clear();
     for (auto &request : pending) {
-        session_->open_stream({}, std::chrono::steady_clock::now() + std::chrono::seconds(15),
-                              std::move(request.handler));
+        struct OpenReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            StreamHandler handler;
+            void set_value(std::unique_ptr<io::StreamHandle> stream) && noexcept {
+                auto callback = std::move(handler);
+                callback(std::move(stream));
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                auto callback = std::move(handler);
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    callback(core::fail(failure));
+                } catch (...) {
+                    callback(core::fail(
+                        core::Error{core::ErrorCode::transport_io, "mux open failed", {}}));
+                }
+            }
+            void set_stopped() && noexcept {
+                auto callback = std::move(handler);
+                callback(
+                    core::fail(core::Error{core::ErrorCode::cancelled, "mux open stopped", {}}));
+            }
+        };
+        // NOTE: name the sender first; argument order is unspecified.
+        auto sender =
+            session_->open_stream({}, std::chrono::steady_clock::now() + std::chrono::seconds(15));
+        async::start_with_receiver(std::move(sender), OpenReceiver{std::move(request.handler)});
     }
 }
 

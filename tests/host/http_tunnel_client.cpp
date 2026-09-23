@@ -651,46 +651,56 @@ class RawQuicProbe final : public std::enable_shared_from_this<RawQuicProbe> {
 
         datagram_buffer_.fill(0);
         const auto self = shared_from_this();
-        datagram_->async_receive_from(
-            boost::asio::buffer(datagram_buffer_),
-            [self](const boost::system::error_code &error, std::size_t size,
-                   clash_native::core::DatagramAddress) {
-                if (error ||
-                    std::string(reinterpret_cast<const char *>(self->datagram_buffer_.data()),
-                                size) != self->datagram_payload_) {
+        struct DatagramReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<RawQuicProbe> self;
+            void set_value(clash_native::io::DatagramPacket packet) && noexcept {
+                if (std::string(reinterpret_cast<const char *>(self->datagram_buffer_.data()),
+                                packet.size) != self->datagram_payload_) {
                     self->finish("QUIC DATAGRAM echo failed");
                     return;
                 }
                 self->datagram_done_ = true;
                 self->maybe_finish();
-            });
+            }
+            void set_error(std::exception_ptr) && noexcept {
+                self->finish("QUIC DATAGRAM echo failed");
+            }
+            void set_stopped() && noexcept { self->finish("QUIC DATAGRAM echo stopped"); }
+        };
+        auto receive_sender = datagram_->async_receive_from(boost::asio::buffer(datagram_buffer_));
+        clash_native::async::start_with_receiver(std::move(receive_sender), DatagramReceiver{self});
         const auto payload =
             std::vector<std::uint8_t>(datagram_payload_.begin(), datagram_payload_.end());
-        datagram_->async_send_to(
-            boost::asio::buffer(payload),
-            clash_native::core::DatagramAddress::from_endpoint(connection_->remote_endpoint()),
-            [self](const boost::system::error_code &error, std::size_t size) {
-                if (error || size != self->datagram_payload_.size()) {
+        struct SendReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<RawQuicProbe> self;
+            void set_value(std::size_t size) && noexcept {
+                if (size != self->datagram_payload_.size()) {
                     self->finish("QUIC DATAGRAM send failed");
                 }
-            });
+            }
+            void set_error(std::exception_ptr) && noexcept {
+                self->finish("QUIC DATAGRAM send failed");
+            }
+            void set_stopped() && noexcept { self->finish("QUIC DATAGRAM send stopped"); }
+        };
+        auto send_sender = datagram_->async_send_to(
+            boost::asio::buffer(payload),
+            clash_native::io::DatagramAddress::from_endpoint(connection_->remote_endpoint()));
+        clash_native::async::start_with_receiver(std::move(send_sender), SendReceiver{self});
 
         stream_handles_.resize(kStreamCount);
         stream_payloads_.resize(kStreamCount);
         for (std::size_t index = 0; index < kStreamCount; ++index) {
             stream_payloads_[index] = "quic-stream-" + std::to_string(index);
-            clash_native::transport::MultiplexedStreamRequest request;
-            connection_->open_stream(
-                request, std::chrono::steady_clock::now() + 10s,
-                [self, index](
-                    clash_native::core::Result<std::unique_ptr<clash_native::core::StreamHandle>>
-                        result) {
-                    if (!result) {
-                        self->finish("QUIC multiplexed stream open failed: " +
-                                     result.error().context);
-                        return;
-                    }
-                    self->stream_handles_[index] = std::move(result.value());
+            clash_native::io::MultiplexedStreamRequest request;
+            struct OpenReceiver {
+                using receiver_concept = stdexec::receiver_tag;
+                std::shared_ptr<RawQuicProbe> self;
+                std::size_t index;
+                void set_value(std::unique_ptr<clash_native::io::StreamHandle> stream) && noexcept {
+                    self->stream_handles_[index] = std::move(stream);
                     ++self->streams_opened_;
                     if (self->streams_opened_ == kStreamCount &&
                         self->connection_->active_streams() < kStreamCount) {
@@ -698,42 +708,90 @@ class RawQuicProbe final : public std::enable_shared_from_this<RawQuicProbe> {
                         return;
                     }
                     self->write_stream(index);
-                });
+                }
+                void set_error(std::exception_ptr error) && noexcept {
+                    try {
+                        std::rethrow_exception(std::move(error));
+                    } catch (const clash_native::core::Error &failure) {
+                        self->finish("QUIC multiplexed stream open failed: " + failure.context);
+                    } catch (...) {
+                        self->finish("QUIC multiplexed stream open failed");
+                    }
+                }
+                void set_stopped() && noexcept {
+                    self->finish("QUIC multiplexed stream open stopped");
+                }
+            };
+            auto sender = connection_->open_stream(request, std::chrono::steady_clock::now() + 10s);
+            clash_native::async::start_with_receiver(std::move(sender), OpenReceiver{self, index});
         }
     }
 
     void write_stream(std::size_t index) {
-        const auto self = shared_from_this();
-        auto &stream = stream_handles_[index];
-        stream->async_write(
-            boost::asio::buffer(stream_payloads_[index]),
-            [self, index](const boost::system::error_code &error, std::size_t size) {
-                if (error || size != self->stream_payloads_[index].size()) {
+        struct WriteReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<RawQuicProbe> self;
+            std::size_t index;
+            void set_value(std::size_t size) && noexcept {
+                if (size != self->stream_payloads_[index].size()) {
                     self->finish("QUIC multiplexed stream write failed");
                     return;
                 }
-                auto buffer = std::make_shared<std::array<std::uint8_t, 128>>();
-                self->stream_buffers_[index] = buffer;
-                self->stream_handles_[index]->async_read_some(
-                    boost::asio::buffer(*buffer),
-                    [self, index, buffer](const boost::system::error_code &read_error,
-                                          std::size_t read_size) {
-                        if (read_error) {
-                            self->finish("QUIC multiplexed stream echo read failed: " +
-                                         read_error.message());
-                            return;
-                        }
-                        if (std::string(reinterpret_cast<const char *>(buffer->data()),
-                                        read_size) != self->stream_payloads_[index]) {
-                            self->finish("QUIC multiplexed stream echo mismatch");
-                            return;
-                        }
-                        self->stream_handles_[index]->close();
-                        self->stream_handles_[index].reset();
-                        ++self->streams_done_;
-                        self->maybe_finish();
-                    });
-            });
+                self->read_stream(index);
+            }
+            void set_error(std::exception_ptr) && noexcept {
+                self->finish("QUIC multiplexed stream write failed");
+            }
+            void set_stopped() && noexcept {
+                self->finish("QUIC multiplexed stream write stopped");
+            }
+        };
+        const auto self = shared_from_this();
+        auto sender =
+            stream_handles_[index]->async_write(boost::asio::buffer(stream_payloads_[index]));
+        clash_native::async::start_with_receiver(std::move(sender), WriteReceiver{self, index});
+    }
+
+    void read_stream(std::size_t index) {
+        struct ReadReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<RawQuicProbe> self;
+            std::size_t index;
+            std::shared_ptr<std::array<std::uint8_t, 128>> buffer;
+            void set_value(std::optional<std::size_t> size) && noexcept {
+                if (!size) {
+                    self->finish("QUIC multiplexed stream echo read failed: eof");
+                    return;
+                }
+                if (std::string(reinterpret_cast<const char *>(buffer->data()), *size) !=
+                    self->stream_payloads_[index]) {
+                    self->finish("QUIC multiplexed stream echo mismatch");
+                    return;
+                }
+                self->stream_handles_[index]->close();
+                self->stream_handles_[index].reset();
+                ++self->streams_done_;
+                self->maybe_finish();
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const clash_native::core::Error &failure) {
+                    self->finish("QUIC multiplexed stream echo read failed: " + failure.context);
+                } catch (...) {
+                    self->finish("QUIC multiplexed stream echo read failed");
+                }
+            }
+            void set_stopped() && noexcept {
+                self->finish("QUIC multiplexed stream echo read stopped");
+            }
+        };
+        const auto self = shared_from_this();
+        auto buffer = std::make_shared<std::array<std::uint8_t, 128>>();
+        stream_buffers_[index] = buffer;
+        auto sender = stream_handles_[index]->async_read_some(boost::asio::buffer(*buffer));
+        clash_native::async::start_with_receiver(std::move(sender),
+                                                 ReadReceiver{self, index, buffer});
     }
 
     void maybe_finish() {
@@ -769,9 +827,8 @@ class RawQuicProbe final : public std::enable_shared_from_this<RawQuicProbe> {
     boost::asio::io_context &context_;
     boost::asio::steady_timer timeout_timer_;
     std::shared_ptr<clash_native::transport::QuicClientConnection> connection_;
-    std::unique_ptr<clash_native::core::DatagramHandle> datagram_;
-    // QUIC multiplexed streams stay on the core:: plane with the mux plane.
-    std::vector<std::unique_ptr<clash_native::core::StreamHandle>> stream_handles_;
+    std::unique_ptr<clash_native::io::DatagramHandle> datagram_;
+    std::vector<std::unique_ptr<clash_native::io::StreamHandle>> stream_handles_;
     std::vector<std::string> stream_payloads_;
     std::vector<std::shared_ptr<std::array<std::uint8_t, 128>>> stream_buffers_ =
         std::vector<std::shared_ptr<std::array<std::uint8_t, 128>>>(kStreamCount);

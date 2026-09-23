@@ -4,9 +4,9 @@
 #include <clash_native/io/exchange_body_stream.hpp>
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/io/exchange_tunnel_stream.hpp>
+#include <clash_native/io/multiplexed_session.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/net/datagram_handle_adapter.hpp>
-#include <clash_native/transport/multiplexed_session.hpp>
 #include <clash_native/transport/quic_client.hpp>
 
 #include <boost/asio/error.hpp>
@@ -114,7 +114,6 @@ using StreamingTerminal = core::Result<io::StreamingExchangeResponse>;
 using TunnelTerminal = core::Result<io::StreamUpgradeResponse>;
 
 class Http3ClientSession final : public io::ExchangeSession,
-                                 public MultiplexedSession,
                                  public std::enable_shared_from_this<Http3ClientSession> {
   public:
     Http3ClientSession(std::shared_ptr<QuicClientConnection> connection,
@@ -329,30 +328,16 @@ class Http3ClientSession final : public io::ExchangeSession,
     // streams migrate with it); the io:: view is intentionally null.
     io::MultiplexedSession *multiplexed_session() noexcept override { return nullptr; }
 
-    StreamId open_stream(MultiplexedStreamRequest, std::chrono::steady_clock::time_point,
-                         StreamHandler handler) override {
-        const auto stream_id = static_cast<StreamId>(next_exchange_id());
-        boost::asio::post(executor_, [handler = std::move(handler)]() mutable {
-            if (handler) {
-                handler(core::fail(
-                    core::Error{core::ErrorCode::unsupported,
-                                "HTTP/3 exposes logical streams through ExchangeSession requests",
-                                {}}));
-            }
-        });
-        return stream_id;
-    }
+    std::size_t active_streams() const noexcept { return pending_.size(); }
 
-    std::size_t active_streams() const noexcept override { return pending_.size(); }
-
-    std::optional<std::size_t> max_concurrent_streams() const noexcept override {
+    std::optional<std::size_t> max_concurrent_streams() const noexcept {
         return connection_->max_concurrent_streams();
     }
 
     // The datagram view stays on the core:: plane (QUIC DATAGRAM frames
     // migrate with the multiplexed plane); adapted at the edge.
     std::unique_ptr<io::DatagramHandle> open_datagram() override {
-        return net::adapt_core_to_io_datagram(connection_->open_datagram());
+        return connection_->open_datagram();
     }
 
     void cancel(ExchangeId exchange_id) noexcept override {

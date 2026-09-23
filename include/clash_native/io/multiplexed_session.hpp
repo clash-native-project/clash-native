@@ -19,8 +19,7 @@ struct MultiplexedStreamRequest {
     bool bidirectional = true;
 };
 
-// Sender-based counterpart of transport::MultiplexedSession: opens logical
-// bidirectional streams on an established carrier. open_stream completes
+// Opens logical bidirectional streams on an established carrier. open_stream completes
 // set_value(unique_ptr<StreamHandle>) with the new stream, or set_error on
 // failure (a failed open leaves the session usable unless it has also become
 // retired). Cancellation travels through the stop token; cancel(id) remains

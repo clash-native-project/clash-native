@@ -36,7 +36,7 @@ async_open_websocket_plugin(std::unique_ptr<io::StreamHandle> stream,
                             WebSocketPluginOptions options, WebSocketPluginHandler handler);
 
 using WebSocketPluginMuxHandler =
-    std::function<void(core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>)>;
+    std::function<void(core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>)>;
 
 // Establishes a WebSocket carrier and exposes the selected plugin mux as a
 // common MultiplexedSession. The caller owns the returned handshake operation
@@ -50,10 +50,8 @@ async_open_websocket_plugin_mux(std::unique_ptr<io::StreamHandle> stream,
 // protocols. If the carrier retires, the next request establishes a new one.
 class WebSocketPluginMuxPool final : public std::enable_shared_from_this<WebSocketPluginMuxPool> {
   public:
-    // The pool still deals core::StreamHandle: MultiplexedSession (QUIC/H2/H3
-    // included) is the sessions plane and flips separately. The carrier side
-    // below already runs on io:: (TcpStream is dual).
-    using StreamHandler = std::function<void(core::Result<std::unique_ptr<core::StreamHandle>>)>;
+    using StreamHandler =
+        std::function<void(core::Result<std::unique_ptr<clash_native::io::StreamHandle>>)>;
 
     explicit WebSocketPluginMuxPool(boost::asio::any_io_executor executor)
         : executor_(std::move(executor)) {}
@@ -77,7 +75,7 @@ class WebSocketPluginMuxPool final : public std::enable_shared_from_this<WebSock
     void fail_pending(core::Error error);
 
     boost::asio::any_io_executor executor_;
-    std::shared_ptr<clash_native::transport::MultiplexedSession> session_;
+    std::shared_ptr<clash_native::io::MultiplexedSession> session_;
     std::vector<PendingOpen> pending_;
     std::shared_ptr<boost::asio::ip::tcp::socket> connecting_socket_;
     bool opening_ = false;

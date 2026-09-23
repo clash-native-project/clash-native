@@ -2,7 +2,7 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
-#include <clash_native/transport/multiplexed_session.hpp>
+#include <clash_native/io/multiplexed_session.hpp>
 
 #include <boost/asio/any_io_executor.hpp>
 
@@ -58,7 +58,7 @@ struct QuicDatagramObserver {
     std::function<void()> closed;
 };
 
-class QuicClientConnection final : public MultiplexedSession,
+class QuicClientConnection final : public io::MultiplexedSession,
                                    public std::enable_shared_from_this<QuicClientConnection> {
   public:
     using ObserverId = std::uint64_t;
@@ -75,9 +75,9 @@ class QuicClientConnection final : public MultiplexedSession,
     void shutdown_stream(std::int64_t stream_id, std::uint64_t application_error) noexcept;
     core::Status extend_receive_credit(std::int64_t stream_id, std::size_t consumed);
 
-    StreamId open_stream(MultiplexedStreamRequest request,
-                         std::chrono::steady_clock::time_point deadline,
-                         StreamHandler handler) override;
+    io::AnySender<std::unique_ptr<io::StreamHandle>>
+    open_stream(io::MultiplexedStreamRequest request,
+                std::chrono::steady_clock::time_point deadline) override;
     void cancel(StreamId stream_id) noexcept override;
     std::size_t active_streams() const noexcept override;
     std::optional<std::size_t> max_concurrent_streams() const noexcept override;
@@ -88,7 +88,7 @@ class QuicClientConnection final : public MultiplexedSession,
     ObserverId observe_datagrams(QuicDatagramObserver observer);
     void remove_datagram_observer(ObserverId observer_id) noexcept;
     void async_send_datagram(std::vector<std::uint8_t> data, DatagramWriteHandler handler);
-    std::unique_ptr<core::DatagramHandle> open_datagram();
+    std::unique_ptr<io::DatagramHandle> open_datagram();
     std::size_t max_datagram_size() const noexcept;
     boost::asio::ip::udp::endpoint remote_endpoint() const noexcept;
     bool ready() const noexcept;

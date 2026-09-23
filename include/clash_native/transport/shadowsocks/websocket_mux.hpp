@@ -2,7 +2,8 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
-#include <clash_native/transport/multiplexed_session.hpp>
+#include <clash_native/io/multiplexed_session.hpp>
+#include <clash_native/io/stream_handle.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -34,14 +35,14 @@ class WebSocketMuxHandshake {
 };
 
 using WebSocketMuxHandler =
-    std::function<void(core::Result<std::shared_ptr<clash_native::transport::MultiplexedSession>>)>;
+    std::function<void(core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>)>;
 
 // Takes ownership of an established HTTP/1.1 WebSocket byte stream and adds
 // the selected plugin multiplexing protocol above it. The returned session
 // owns the WebSocket stream and exposes each plugin logical stream as the
 // common StreamHandle interface.
 std::shared_ptr<WebSocketMuxHandshake>
-async_open_websocket_mux(std::unique_ptr<core::StreamHandle> websocket, WebSocketMuxOptions options,
-                         WebSocketMuxHandler handler);
+async_open_websocket_mux(std::unique_ptr<clash_native::io::StreamHandle> websocket,
+                         WebSocketMuxOptions options, WebSocketMuxHandler handler);
 
 } // namespace clash_native::transport::shadowsocks
