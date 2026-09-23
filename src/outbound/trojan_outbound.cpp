@@ -371,10 +371,9 @@ io::AnySender<core::StreamOpenResult> TrojanOutbound::connect_stream(core::Strea
         });
 }
 
-void TrojanOutbound::open_datagram(core::DatagramRequest, core::DatagramOpenHandler handler) {
-    runtime_.scheduler().post([handler = std::move(handler)]() mutable {
-        handler(core::DatagramOpenResult::unsupported());
-    });
+io::AnySender<core::DatagramOpenResult> TrojanOutbound::open_datagram(core::DatagramRequest) {
+    return io::AnySender<core::DatagramOpenResult>{
+        stdexec::just(core::DatagramOpenResult::unsupported())};
 }
 
 } // namespace clash_native::outbound

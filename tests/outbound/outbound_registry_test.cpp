@@ -1,4 +1,6 @@
+#include <clash_native/io/datagram_handle.hpp>
 #include <clash_native/io/sender.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
 #include <clash_native/outbound/shadowsocks_outbound.hpp>
@@ -16,6 +18,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -39,9 +42,10 @@ class StubOutbound final : public clash_native::core::Outbound {
             stdexec::just(clash_native::core::StreamOpenResult::unsupported())};
     }
 
-    void open_datagram(clash_native::core::DatagramRequest,
-                       clash_native::core::DatagramOpenHandler handler) override {
-        handler(clash_native::core::DatagramOpenResult::unsupported());
+    clash_native::io::AnySender<clash_native::core::DatagramOpenResult>
+    open_datagram(clash_native::core::DatagramRequest) override {
+        return clash_native::io::AnySender<clash_native::core::DatagramOpenResult>{
+            stdexec::just(clash_native::core::DatagramOpenResult::unsupported())};
     }
 
   private:
@@ -137,15 +141,12 @@ TEST(DirectOutboundTest, OpensAnIpDatagramForDnsEgress) {
     const auto endpoint = receiver.local_endpoint();
     clash_native::outbound::DirectOutbound outbound(runtime);
 
-    std::unique_ptr<clash_native::core::DatagramHandle> handle;
-    clash_native::core::DatagramOpenResult result;
-    outbound.open_datagram(
-        {clash_native::core::Destination::address(endpoint.address(), endpoint.port())},
-        [&handle, &result](clash_native::core::DatagramOpenResult opened) {
-            result = std::move(opened);
-            handle = std::move(result.handle);
-        });
+    auto open_wait = stdexec::sync_wait(outbound.open_datagram(
+        {clash_native::core::Destination::address(endpoint.address(), endpoint.port())}));
+    ASSERT_TRUE(open_wait.has_value());
+    auto result = std::move(std::get<0>(*open_wait));
     ASSERT_EQ(result.status, clash_native::core::OpenStatus::opened);
+    auto handle = std::move(result.handle);
     ASSERT_NE(handle, nullptr);
     EXPECT_EQ(result.semantics, clash_native::core::DatagramSemantics::fixed_destination);
 
@@ -161,9 +162,10 @@ TEST(DirectOutboundTest, OpensAnIpDatagramForDnsEgress) {
     runtime.start();
 
     const std::string payload = "dns-egress";
-    handle->async_send_to(boost::asio::buffer(payload),
-                          clash_native::core::DatagramAddress::from_endpoint(endpoint),
-                          [](const boost::system::error_code &, std::size_t) {});
+    auto send_wait = stdexec::sync_wait(handle->async_send_to(
+        boost::asio::buffer(payload), clash_native::io::DatagramAddress::from_endpoint(endpoint)));
+    ASSERT_TRUE(send_wait.has_value());
+    EXPECT_EQ(std::get<0>(*send_wait), payload.size());
     ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_EQ(future.get(), payload.size());
 
@@ -194,14 +196,9 @@ TEST(ShadowsocksOutboundTest, RejectsEncryptedUdpDatagramsLargerThan1500Bytes) {
             runtime, {"test-shadowsocks", test_address.to_string(), server.local_endpoint().port(),
                       method.name, "test-password"});
 
-        auto opened_promise =
-            std::make_shared<std::promise<clash_native::core::DatagramOpenResult>>();
-        auto opened_future = opened_promise->get_future();
-        outbound.open_datagram({}, [opened_promise](clash_native::core::DatagramOpenResult result) {
-            opened_promise->set_value(std::move(result));
-        });
-        ASSERT_EQ(opened_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
-        auto opened = opened_future.get();
+        auto open_wait = stdexec::sync_wait(outbound.open_datagram({}));
+        ASSERT_TRUE(open_wait.has_value());
+        auto opened = std::move(std::get<0>(*open_wait));
         ASSERT_TRUE(opened.succeeded());
         auto handle = std::move(opened.handle);
 
@@ -220,34 +217,26 @@ TEST(ShadowsocksOutboundTest, RejectsEncryptedUdpDatagramsLargerThan1500Bytes) {
             });
 
         std::vector<std::uint8_t> payload(payload_at_limit, 0x5a);
-        auto send_promise =
-            std::make_shared<std::promise<std::pair<boost::system::error_code, std::size_t>>>();
-        auto send_future = send_promise->get_future();
-        handle->async_send_to(
-            boost::asio::buffer(payload),
-            clash_native::core::DatagramAddress::from_endpoint(destination),
-            [send_promise](const boost::system::error_code &error, std::size_t size) {
-                send_promise->set_value({error, size});
-            });
-        ASSERT_EQ(send_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
-        const auto [send_error, sent_size] = send_future.get();
-        EXPECT_FALSE(send_error);
-        EXPECT_EQ(sent_size, payload.size());
+        auto send_wait = stdexec::sync_wait(
+            handle->async_send_to(boost::asio::buffer(payload),
+                                  clash_native::io::DatagramAddress::from_endpoint(destination)));
+        ASSERT_TRUE(send_wait.has_value());
+        EXPECT_EQ(std::get<0>(*send_wait), payload.size());
         ASSERT_EQ(receive_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
         EXPECT_EQ(receive_future.get(), encrypted_limit);
 
         payload.push_back(0x5a);
-        auto oversized_promise =
-            std::make_shared<std::promise<std::pair<boost::system::error_code, std::size_t>>>();
-        auto oversized_future = oversized_promise->get_future();
-        handle->async_send_to(
-            boost::asio::buffer(payload),
-            clash_native::core::DatagramAddress::from_endpoint(destination),
-            [oversized_promise](const boost::system::error_code &error, std::size_t size) {
-                oversized_promise->set_value({error, size});
-            });
-        ASSERT_EQ(oversized_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
-        const auto [oversized_error, oversized_sent_size] = oversized_future.get();
+        boost::system::error_code oversized_error;
+        std::size_t oversized_sent_size = 0;
+        try {
+            const auto oversized_wait = stdexec::sync_wait(handle->async_send_to(
+                boost::asio::buffer(payload),
+                clash_native::io::DatagramAddress::from_endpoint(destination)));
+            ASSERT_TRUE(oversized_wait.has_value());
+            oversized_sent_size = std::get<0>(*oversized_wait);
+        } catch (...) {
+            oversized_error = clash_native::net::unpack_error(std::current_exception());
+        }
         EXPECT_EQ(oversized_error, boost::asio::error::message_size);
         EXPECT_EQ(oversized_sent_size, 0U);
 

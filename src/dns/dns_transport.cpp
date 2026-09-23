@@ -1,6 +1,7 @@
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
+#include <clash_native/net/datagram_handle_adapter.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
 
@@ -67,16 +68,14 @@ class PlannedDnsUpstreamDialer final : public DnsUpstreamDialer {
             stdexec::just(core::StreamOpenResult::failed(error))};
     }
 
-    void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) override {
+    io::AnySender<core::DatagramOpenResult> open_datagram(core::DatagramRequest request) override {
         if (endpoint_dialer_) {
-            endpoint_dialer_->open_datagram(std::move(request), std::move(handler));
-            return;
+            return endpoint_dialer_->open_datagram(std::move(request));
         }
         const auto error = plan_error_.value_or(
             core::Error{core::ErrorCode::configuration, "DNS endpoint dial plan is missing"});
-        runtime_.scheduler().post([handler = std::move(handler), error]() mutable {
-            handler(core::DatagramOpenResult::failed(error));
-        });
+        return io::AnySender<core::DatagramOpenResult>{
+            stdexec::just(core::DatagramOpenResult::failed(error))};
     }
 
   private:
@@ -106,30 +105,21 @@ class TrafficRulesDnsUpstreamDialer final : public DnsUpstreamDialer {
         return dialer.connect_stream(std::move(request));
     }
 
-    void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) override {
+    io::AnySender<core::DatagramOpenResult> open_datagram(core::DatagramRequest request) override {
+        using ResultSender = io::AnySender<core::DatagramOpenResult>;
         if (!request.initial_destination) {
-            post_datagram_error(
-                std::move(handler),
-                {core::ErrorCode::configuration, "DNS egress request has no destination", {}});
-            return;
+            return ResultSender{stdexec::just(core::DatagramOpenResult::failed(
+                {core::ErrorCode::configuration, "DNS egress request has no destination", {}}))};
         }
         const auto plan = make_plan(*request.initial_destination, core::Network::udp, std::nullopt);
         if (!plan) {
-            post_datagram_error(std::move(handler), plan.error());
-            return;
+            return ResultSender{stdexec::just(core::DatagramOpenResult::failed(plan.error()))};
         }
         transport::EndpointDialer dialer(runtime_.serialized_executor(), plan.value());
-        dialer.open_datagram(std::move(request), std::move(handler));
+        return dialer.open_datagram(std::move(request));
     }
 
   private:
-    void post_datagram_error(core::DatagramOpenHandler handler, core::Error error) const {
-        runtime_.scheduler().post(
-            [handler = std::move(handler), error = std::move(error)]() mutable {
-                handler(core::DatagramOpenResult::failed(std::move(error)));
-            });
-    }
-
     core::Result<transport::EndpointDialPlan>
     make_plan(const core::Destination &destination, core::Network network,
               std::optional<boost::asio::ip::address> resolved_address) const {
@@ -211,16 +201,14 @@ OutboundDnsUpstreamDialer::connect_stream(core::StreamRequest request) {
     return endpoint_dialer_->connect_stream(std::move(request));
 }
 
-void OutboundDnsUpstreamDialer::open_datagram(core::DatagramRequest request,
-                                              core::DatagramOpenHandler handler) {
+io::AnySender<core::DatagramOpenResult>
+OutboundDnsUpstreamDialer::open_datagram(core::DatagramRequest request) {
     if (plan_error_) {
         const auto error = *plan_error_;
-        runtime_.scheduler().post([handler = std::move(handler), error]() mutable {
-            handler(core::DatagramOpenResult::failed(error));
-        });
-        return;
+        return io::AnySender<core::DatagramOpenResult>{
+            stdexec::just(core::DatagramOpenResult::failed(error))};
     }
-    endpoint_dialer_->open_datagram(std::move(request), std::move(handler));
+    return endpoint_dialer_->open_datagram(std::move(request));
 }
 
 class AsioDnsTransport final : public DnsTransport {
@@ -672,24 +660,61 @@ class AsioDnsTransport::Operation final
                 {core::ErrorCode::configuration, "DNS upstream datagram dialer is not available"});
             return;
         }
-        owner_.config_.dialer->open_datagram(
-            {core::Destination::address(udp_endpoint_.address(), udp_endpoint_.port())},
-            [self, generation](core::DatagramOpenResult result) mutable {
-                if (generation != self->attempt_generation_ || self->completed_) {
+        struct ConnectReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<Operation> self;
+            std::uint64_t generation;
+
+            void set_value(core::DatagramOpenResult result) && noexcept {
+                auto operation = std::move(self);
+                if (generation != operation->attempt_generation_ || operation->completed_) {
                     if (result.handle) {
                         result.handle->close();
                     }
                     return;
                 }
                 if (!result.succeeded()) {
-                    self->retry_or_finish(result.error.value_or(
+                    operation->retry_or_finish(result.error.value_or(
                         core::Error{core::ErrorCode::endpoint_connection,
                                     "DNS upstream datagram dialer failed to open a handle"}));
                     return;
                 }
-                self->datagram_ = std::move(result.handle);
-                self->send_udp(generation);
-            });
+                // Datagram-handle-plane debt: the query operation still
+                // speaks core::; adapt the opened handle at the edge.
+                operation->datagram_ = net::adapt_io_to_core_datagram(std::move(result.handle));
+                operation->send_udp(generation);
+            }
+
+            void set_error(std::exception_ptr error) && noexcept {
+                auto operation = std::move(self);
+                if (generation != operation->attempt_generation_ || operation->completed_) {
+                    return;
+                }
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    operation->retry_or_finish(failure);
+                    return;
+                } catch (...) {
+                    operation->retry_or_finish(
+                        core::Error{core::ErrorCode::endpoint_connection,
+                                    "DNS upstream datagram dialer failed to open a handle"});
+                }
+            }
+
+            void set_stopped() && noexcept {
+                auto operation = std::move(self);
+                if (generation != operation->attempt_generation_ || operation->completed_) {
+                    return;
+                }
+                operation->retry_or_finish(core::Error{core::ErrorCode::cancelled,
+                                                       "DNS upstream datagram open was "
+                                                       "cancelled"});
+            }
+        };
+        async::start_with_receiver(owner_.config_.dialer->open_datagram({core::Destination::address(
+                                       udp_endpoint_.address(), udp_endpoint_.port())}),
+                                   ConnectReceiver{shared_from_this(), generation});
     }
 
     void send_udp(std::uint64_t generation) {

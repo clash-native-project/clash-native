@@ -33,7 +33,7 @@ class HttpProxyOutbound final : public core::Outbound {
     const core::OutboundDescriptor &descriptor() const noexcept override;
     core::OutboundCapabilities capabilities() const noexcept override;
     io::AnySender<core::StreamOpenResult> connect_stream(core::StreamRequest request) override;
-    void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) override;
+    io::AnySender<core::DatagramOpenResult> open_datagram(core::DatagramRequest request) override;
 
   private:
     runtime::AsioRuntime &runtime_;

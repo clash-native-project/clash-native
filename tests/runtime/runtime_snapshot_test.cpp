@@ -29,9 +29,10 @@ class StubOutbound final : public clash_native::core::Outbound {
             stdexec::just(clash_native::core::StreamOpenResult::unsupported())};
     }
 
-    void open_datagram(clash_native::core::DatagramRequest,
-                       clash_native::core::DatagramOpenHandler handler) override {
-        handler(clash_native::core::DatagramOpenResult::unsupported());
+    clash_native::io::AnySender<clash_native::core::DatagramOpenResult>
+    open_datagram(clash_native::core::DatagramRequest) override {
+        return clash_native::io::AnySender<clash_native::core::DatagramOpenResult>{
+            stdexec::just(clash_native::core::DatagramOpenResult::unsupported())};
     }
 
   private:

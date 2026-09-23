@@ -222,15 +222,13 @@ io::AnySender<core::StreamOpenResult> DirectOutbound::connect_stream(core::Strea
         });
 }
 
-void DirectOutbound::open_datagram(core::DatagramRequest request,
-                                   core::DatagramOpenHandler handler) {
+io::AnySender<core::DatagramOpenResult>
+DirectOutbound::open_datagram(core::DatagramRequest request) {
+    using ResultSender = io::AnySender<core::DatagramOpenResult>;
     if (!request.initial_destination || !request.initial_destination->is_address()) {
-        runtime_.scheduler().post([handler = std::move(handler)]() mutable {
-            handler(core::DatagramOpenResult::failed(
-                {core::ErrorCode::configuration,
-                 "direct outbound datagram dialing requires an IP address"}));
-        });
-        return;
+        return ResultSender{stdexec::just(core::DatagramOpenResult::failed(
+            {core::ErrorCode::configuration,
+             "direct outbound datagram dialing requires an IP address"}))};
     }
 
     const auto address = request.initial_destination->address();
@@ -244,15 +242,12 @@ void DirectOutbound::open_datagram(core::DatagramRequest request,
         socket->bind({local_address, 0}, error);
     }
     if (error) {
-        runtime_.scheduler().post([handler = std::move(handler), error]() mutable {
-            handler(core::DatagramOpenResult::failed(
-                {core::ErrorCode::transport_io, "failed to open direct outbound datagram", error}));
-        });
-        return;
+        return ResultSender{stdexec::just(core::DatagramOpenResult::failed(
+            {core::ErrorCode::transport_io, "failed to open direct outbound datagram", error}))};
     }
 
-    handler(core::DatagramOpenResult::opened(std::move(socket),
-                                             core::DatagramSemantics::fixed_destination));
+    return ResultSender{stdexec::just(core::DatagramOpenResult::opened(
+        std::move(socket), core::DatagramSemantics::fixed_destination))};
 }
 
 RejectOutbound::RejectOutbound(runtime::AsioRuntime &runtime) : runtime_(runtime) {}
@@ -265,10 +260,9 @@ io::AnySender<core::StreamOpenResult> RejectOutbound::connect_stream(core::Strea
     return io::AnySender<core::StreamOpenResult>{stdexec::just(rejected_stream())};
 }
 
-void RejectOutbound::open_datagram(core::DatagramRequest, core::DatagramOpenHandler handler) {
-    runtime_.scheduler().post([handler = std::move(handler)]() mutable {
-        handler(core::DatagramOpenResult::unsupported());
-    });
+io::AnySender<core::DatagramOpenResult> RejectOutbound::open_datagram(core::DatagramRequest) {
+    return io::AnySender<core::DatagramOpenResult>{
+        stdexec::just(core::DatagramOpenResult::unsupported())};
 }
 
 } // namespace clash_native::outbound

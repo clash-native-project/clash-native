@@ -277,9 +277,9 @@ class CountingDnsDialer final : public clash_native::dns::DnsUpstreamDialer {
         return delegate_->connect_stream(std::move(request));
     }
 
-    void open_datagram(clash_native::core::DatagramRequest request,
-                       clash_native::core::DatagramOpenHandler handler) override {
-        delegate_->open_datagram(std::move(request), std::move(handler));
+    clash_native::io::AnySender<clash_native::core::DatagramOpenResult>
+    open_datagram(clash_native::core::DatagramRequest request) override {
+        return delegate_->open_datagram(std::move(request));
     }
 
   private:

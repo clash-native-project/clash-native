@@ -435,10 +435,9 @@ HttpProxyOutbound::connect_stream(core::StreamRequest request) {
         });
 }
 
-void HttpProxyOutbound::open_datagram(core::DatagramRequest, core::DatagramOpenHandler handler) {
-    runtime_.scheduler().post([handler = std::move(handler)]() mutable {
-        handler(core::DatagramOpenResult::unsupported());
-    });
+io::AnySender<core::DatagramOpenResult> HttpProxyOutbound::open_datagram(core::DatagramRequest) {
+    return io::AnySender<core::DatagramOpenResult>{
+        stdexec::just(core::DatagramOpenResult::unsupported())};
 }
 
 } // namespace clash_native::outbound

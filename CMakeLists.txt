@@ -339,6 +339,7 @@ if(BUILD_TESTING)
         tests/runtime/asio_runtime_test.cpp
         tests/runtime/runtime_snapshot_test.cpp
         tests/transport/endpoint_dialer_test.cpp
+        tests/transport/http1_exchange_test.cpp
         tests/transport/kcp_client_test.cpp
         tests/transport/websocket_client_test.cpp
         tests/transport/udp_stream_test.cpp

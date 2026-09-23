@@ -199,11 +199,11 @@ struct StreamOpenResult {
 
 struct DatagramOpenResult {
     OpenStatus status = OpenStatus::failed;
-    std::unique_ptr<DatagramHandle> handle;
+    std::unique_ptr<io::DatagramHandle> handle;
     DatagramSemantics semantics = DatagramSemantics::unsupported;
     std::optional<Error> error;
 
-    static DatagramOpenResult opened(std::unique_ptr<DatagramHandle> value,
+    static DatagramOpenResult opened(std::unique_ptr<io::DatagramHandle> value,
                                      DatagramSemantics semantics) {
         return {OpenStatus::opened, std::move(value), semantics, std::nullopt};
     }
@@ -231,7 +231,7 @@ class Outbound {
     // Open senders complete exactly once (value, error, or stopped),
     // including for unsupported operations.
     virtual io::AnySender<StreamOpenResult> connect_stream(StreamRequest request) = 0;
-    virtual void open_datagram(DatagramRequest request, DatagramOpenHandler handler) = 0;
+    virtual io::AnySender<DatagramOpenResult> open_datagram(DatagramRequest request) = 0;
 
     virtual ~Outbound() = default;
 };

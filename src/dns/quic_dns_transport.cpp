@@ -1,5 +1,7 @@
 #include "quic_dns_transport_internal.hpp"
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
+#include <clash_native/net/datagram_handle_adapter.hpp>
 
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/dispatch.hpp>
@@ -110,13 +112,66 @@ void QuicDnsTransport::Operation::start_on_strand() {
     started_ = true;
     const auto self = shared_from_this();
     const auto destination = core::Destination::address(owner_.config_.endpoint.address(), port_);
-    owner_.config_.dialer->open_datagram(
-        {destination}, [self](core::DatagramOpenResult result) mutable {
-            boost::asio::dispatch(self->owner_.strand_,
-                                  [self, result = std::move(result)]() mutable {
-                                      self->datagram_opened(std::move(result));
-                                  });
-        });
+    // Sessions-plane debt: the QUIC plane still speaks core:: datagrams;
+    // adapt the sender-based open back into its callback shape at the edge.
+    struct OpenReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<Operation> self;
+
+        void set_value(core::DatagramOpenResult result) && noexcept {
+            auto operation = std::move(self);
+            std::unique_ptr<core::DatagramHandle> handle;
+            std::optional<core::Error> error = std::move(result.error);
+            if (result.succeeded()) {
+                handle = net::adapt_io_to_core_datagram(std::move(result.handle));
+                error.reset();
+            }
+            dispatch_opened(std::move(operation), std::move(handle), std::move(error));
+        }
+
+        void set_error(std::exception_ptr error) && noexcept {
+            auto operation = std::move(self);
+            std::optional<core::Error> failure =
+                core::Error{core::ErrorCode::endpoint_connection,
+                            "QUIC DNS datagram dialer failed to open a handle"};
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const core::Error &open_error) {
+                failure = open_error;
+            } catch (...) {
+            }
+            dispatch_opened(std::move(operation), nullptr, std::move(failure));
+        }
+
+        void set_stopped() && noexcept {
+            auto operation = std::move(self);
+            dispatch_opened(
+                std::move(operation), nullptr,
+                core::Error{core::ErrorCode::cancelled, "QUIC DNS datagram open was cancelled"});
+        }
+
+        // Copyable strand hop: ferrying move-only captures through
+        // asio::dispatch on this path proved unreliable, so the payload
+        // rides a shared state instead. Sessions-plane debt with the
+        // adapter above.
+        static void dispatch_opened(std::shared_ptr<Operation> operation,
+                                    std::unique_ptr<core::DatagramHandle> handle,
+                                    std::optional<core::Error> error) noexcept {
+            struct StrandState {
+                std::shared_ptr<Operation> operation;
+                std::unique_ptr<core::DatagramHandle> handle;
+                std::optional<core::Error> error;
+            };
+            auto state = std::make_shared<StrandState>(
+                StrandState{std::move(operation), std::move(handle), std::move(error)});
+            boost::asio::dispatch(state->operation->owner_.strand_, [state]() mutable {
+                state->operation->datagram_opened(std::move(state->handle),
+                                                  std::move(state->error));
+            });
+        }
+    };
+    async::start_with_receiver(owner_.config_.dialer->open_datagram({destination}),
+                               OpenReceiver{std::move(self)});
 }
 
 void QuicDnsTransport::Operation::add_exchange(ExchangeId id, DnsExchangeRequest request) {
@@ -192,21 +247,21 @@ void QuicDnsTransport::Operation::cancel_all() {
     }
 }
 
-void QuicDnsTransport::Operation::datagram_opened(core::DatagramOpenResult result) {
+void QuicDnsTransport::Operation::datagram_opened(std::unique_ptr<core::DatagramHandle> handle,
+                                                  std::optional<core::Error> error) {
     if (retired_ || exchanges_.empty()) {
-        if (result.handle) {
-            result.handle->close();
+        if (handle) {
+            handle->close();
         }
         if (!retired_) {
             retire_session();
         }
         return;
     }
-    if (!result.succeeded()) {
-        fail_session(
-            result.error.value_or(core::Error{core::ErrorCode::endpoint_connection,
-                                              "QUIC DNS datagram dialer failed to open a handle",
-                                              {}}));
+    if (!handle) {
+        fail_session(error.value_or(core::Error{core::ErrorCode::endpoint_connection,
+                                                "QUIC DNS datagram dialer failed to open a handle",
+                                                {}}));
         return;
     }
 
@@ -230,9 +285,8 @@ void QuicDnsTransport::Operation::datagram_opened(core::DatagramOpenResult resul
         events = make_doq_events();
     }
 
-    quic_ = transport::make_quic_client_connection(owner_.strand_, std::move(result.handle),
-                                                   remote_endpoint_, std::move(options),
-                                                   std::move(events));
+    quic_ = transport::make_quic_client_connection(
+        owner_.strand_, std::move(handle), remote_endpoint_, std::move(options), std::move(events));
     if (!quic_) {
         fail_session(core::Error{
             core::ErrorCode::configuration, "failed to create shared QUIC connection", {}});

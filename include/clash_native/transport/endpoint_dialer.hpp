@@ -54,7 +54,7 @@ class EndpointDialer final {
     EndpointDialer(boost::asio::any_io_executor executor, EndpointDialPlan plan);
 
     io::AnySender<core::StreamOpenResult> connect_stream(core::StreamRequest request) const;
-    void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) const;
+    io::AnySender<core::DatagramOpenResult> open_datagram(core::DatagramRequest request) const;
 
     std::string_view egress_identity() const noexcept { return plan_.egress_identity(); }
 

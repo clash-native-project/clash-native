@@ -23,8 +23,9 @@ class UnsupportedOutbound final : public core::Outbound {
             stdexec::just(core::StreamOpenResult::unsupported())};
     }
 
-    void open_datagram(core::DatagramRequest, core::DatagramOpenHandler handler) override {
-        handler(core::DatagramOpenResult::unsupported());
+    io::AnySender<core::DatagramOpenResult> open_datagram(core::DatagramRequest) override {
+        return io::AnySender<core::DatagramOpenResult>{
+            stdexec::just(core::DatagramOpenResult::unsupported())};
     }
 
   private:
@@ -49,14 +50,9 @@ inline void run_unsupported_outbound_conformance(core::Outbound &outbound) {
     ASSERT_TRUE(stream_result.error.has_value());
     EXPECT_EQ(stream_result.error->code, core::ErrorCode::unsupported);
 
-    int datagram_callbacks = 0;
-    core::DatagramOpenResult datagram_result;
-    outbound.open_datagram(
-        {}, [&datagram_callbacks, &datagram_result](core::DatagramOpenResult result) {
-            ++datagram_callbacks;
-            datagram_result = std::move(result);
-        });
-    EXPECT_EQ(datagram_callbacks, 1);
+    auto datagram_wait = stdexec::sync_wait(outbound.open_datagram({}));
+    ASSERT_TRUE(datagram_wait.has_value());
+    auto datagram_result = std::move(std::get<0>(*datagram_wait));
     EXPECT_EQ(datagram_result.status, core::OpenStatus::unsupported);
     EXPECT_FALSE(datagram_result.succeeded());
     ASSERT_TRUE(datagram_result.error.has_value());

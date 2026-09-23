@@ -1,7 +1,15 @@
 #include <clash_native/net/udp_stream.hpp>
 
+#include <clash_native/core/error.hpp>
+
+#include <exec/asio/use_sender.hpp>
+
 #include <boost/asio/post.hpp>
 #include <boost/asio/socket_base.hpp>
+
+#include <exception>
+#include <stdexec/execution.hpp>
+#include <system_error>
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -14,6 +22,15 @@
 #include <utility>
 
 namespace clash_native::net {
+namespace {
+
+// Asio system_errors surface as core::Error (preserving the code); aborts
+// are already translated to set_stopped() by use_sender itself.
+core::Error transport_error(const char *what, const boost::system::error_code &error) {
+    return core::Error{core::ErrorCode::transport_io, what, error};
+}
+
+} // namespace
 
 UdpStream::UdpStream(boost::asio::any_io_executor executor)
     : socket_(std::make_shared<boost::asio::ip::udp::socket>(std::move(executor))) {}
@@ -81,8 +98,49 @@ void UdpStream::set_dscp(int dscp, boost::system::error_code &error) {
     }
 }
 
+io::AnySender<std::size_t> UdpStream::async_send_to(boost::asio::const_buffer buffer,
+                                                    io::DatagramAddress destination) {
+    if (!destination.is_address()) {
+        const boost::system::error_code unsupported = boost::asio::error::operation_not_supported;
+        return io::AnySender<std::size_t>{stdexec::just_error(std::make_exception_ptr(
+            transport_error("udp send requires an IP destination", unsupported)))};
+    }
+    const auto endpoint = boost::asio::ip::udp::endpoint(destination.address(), destination.port());
+    return io::AnySender<std::size_t>{
+        socket_->async_send_to(buffer, endpoint, exec::asio::use_sender) |
+        stdexec::let_error([](std::exception_ptr error) -> decltype(stdexec::just(std::size_t(0))) {
+            try {
+                std::rethrow_exception(error);
+            } catch (const boost::system::system_error &failure) {
+                std::rethrow_exception(
+                    std::make_exception_ptr(transport_error("udp send", failure.code())));
+            }
+            std::rethrow_exception(error);
+        })};
+}
+
+io::AnySender<io::DatagramPacket>
+UdpStream::async_receive_from(boost::asio::mutable_buffer buffer) {
+    auto sender = std::make_shared<boost::asio::ip::udp::endpoint>();
+    return io::AnySender<io::DatagramPacket>{
+        socket_->async_receive_from(buffer, *sender, exec::asio::use_sender) |
+        stdexec::then([sender](std::size_t size) {
+            return io::DatagramPacket{size, io::DatagramAddress::from_endpoint(*sender)};
+        }) |
+        stdexec::let_error(
+            [](std::exception_ptr error) -> decltype(stdexec::just(io::DatagramPacket{})) {
+                try {
+                    std::rethrow_exception(error);
+                } catch (const boost::system::system_error &failure) {
+                    std::rethrow_exception(
+                        std::make_exception_ptr(transport_error("udp receive", failure.code())));
+                }
+                std::rethrow_exception(error);
+            })};
+}
+
 void UdpStream::async_send_to(boost::asio::const_buffer buffer, core::DatagramAddress destination,
-                              WriteHandler handler) {
+                              core::DatagramHandle::WriteHandler handler) {
     const auto socket = socket_;
     if (!destination.is_address()) {
         boost::asio::post(socket->get_executor(), [handler = std::move(handler)]() mutable {
@@ -97,7 +155,8 @@ void UdpStream::async_send_to(boost::asio::const_buffer buffer, core::DatagramAd
                                                std::size_t size) mutable { handler(error, size); });
 }
 
-void UdpStream::async_receive_from(boost::asio::mutable_buffer buffer, ReadHandler handler) {
+void UdpStream::async_receive_from(boost::asio::mutable_buffer buffer,
+                                   core::DatagramHandle::ReadHandler handler) {
     const auto socket = socket_;
     const auto sender = std::make_shared<boost::asio::ip::udp::endpoint>();
     socket->async_receive_from(

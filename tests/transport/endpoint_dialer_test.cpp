@@ -43,13 +43,14 @@ class RecordingOutbound final : public clash_native::core::Outbound {
             stdexec::just(clash_native::core::StreamOpenResult::unsupported())};
     }
 
-    void open_datagram(clash_native::core::DatagramRequest request,
-                       clash_native::core::DatagramOpenHandler handler) override {
+    clash_native::io::AnySender<clash_native::core::DatagramOpenResult>
+    open_datagram(clash_native::core::DatagramRequest request) override {
         ++datagram_calls;
         if (request.dial_trace) {
             datagram_trace = request.dial_trace->outbound_ids;
         }
-        handler(clash_native::core::DatagramOpenResult::unsupported());
+        return clash_native::io::AnySender<clash_native::core::DatagramOpenResult>{
+            stdexec::just(clash_native::core::DatagramOpenResult::unsupported())};
     }
 
     int stream_calls = 0;
@@ -121,15 +122,12 @@ TEST(EndpointDialerTest, ResolvesDnsTrafficRulesBeforeOpeningDatagramCarrier) {
     auto dialer = clash_native::dns::make_traffic_rules_dns_upstream_dialer(
         runtime, registry.snapshot(), router.snapshot(), "dns.example.net");
 
-    bool completed = false;
-    dialer->open_datagram({clash_native::core::Destination::address(
-                              boost::asio::ip::make_address("192.0.2.53"), 853)},
-                          [&completed](clash_native::core::DatagramOpenResult result) {
-                              completed = true;
-                              EXPECT_EQ(result.status, clash_native::core::OpenStatus::unsupported);
-                          });
+    auto wait = stdexec::sync_wait(dialer->open_datagram({clash_native::core::Destination::address(
+        boost::asio::ip::make_address("192.0.2.53"), 853)}));
+    ASSERT_TRUE(wait.has_value());
+    auto result = std::move(std::get<0>(*wait));
+    EXPECT_EQ(result.status, clash_native::core::OpenStatus::unsupported);
 
-    EXPECT_TRUE(completed);
     EXPECT_EQ(outbound->datagram_calls, 1);
     EXPECT_EQ(outbound->datagram_trace, (std::vector<std::string>{"resolver-proxy"}));
     runtime.stop();

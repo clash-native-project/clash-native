@@ -133,33 +133,23 @@ EndpointDialer::connect_stream(core::StreamRequest request) const {
     return outbound->connect_stream(std::move(request));
 }
 
-void EndpointDialer::open_datagram(core::DatagramRequest request,
-                                   core::DatagramOpenHandler handler) const {
+io::AnySender<core::DatagramOpenResult>
+EndpointDialer::open_datagram(core::DatagramRequest request) const {
+    using ResultSender = io::AnySender<core::DatagramOpenResult>;
     const auto selected = plan_.select_outbound();
     if (!selected) {
-        boost::asio::post(executor_,
-                          [handler = std::move(handler), error = selected.error()]() mutable {
-                              handler(core::DatagramOpenResult::failed(error));
-                          });
-        return;
+        return ResultSender{stdexec::just(core::DatagramOpenResult::failed(selected.error()))};
     }
     const auto outbound = selected.value();
     if (outbound->capabilities().datagram == core::DatagramSemantics::unsupported) {
-        boost::asio::post(executor_, [handler = std::move(handler)]() mutable {
-            handler(core::DatagramOpenResult::unsupported());
-        });
-        return;
+        return ResultSender{stdexec::just(core::DatagramOpenResult::unsupported())};
     }
     const auto trace = extend_trace(request.dial_trace, outbound->descriptor().id);
     if (!trace) {
-        boost::asio::post(executor_,
-                          [handler = std::move(handler), error = trace.error()]() mutable {
-                              handler(core::DatagramOpenResult::failed(error));
-                          });
-        return;
+        return ResultSender{stdexec::just(core::DatagramOpenResult::failed(trace.error()))};
     }
     request.dial_trace = trace.value();
-    outbound->open_datagram(std::move(request), std::move(handler));
+    return outbound->open_datagram(std::move(request));
 }
 
 } // namespace clash_native::transport

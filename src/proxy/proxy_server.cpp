@@ -756,10 +756,41 @@ void ProxyServer::route_datagram(runtime::RuntimeSnapshotPtr snapshot,
         }
         break;
     }
-    outbound->open_datagram(
-        request, [handler = std::move(handler), target](core::DatagramOpenResult result) mutable {
-            handler(std::move(result), target);
-        });
+    // Proxy-plane debt: drives a sender-based outbound open into the
+    // route handler. Delete when the datagram plane runs on senders.
+    struct RouteReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        DatagramRouteHandler handler;
+        boost::asio::ip::udp::endpoint target;
+
+        void set_value(core::DatagramOpenResult result) && noexcept {
+            auto callback = std::move(handler);
+            callback(std::move(result), target);
+        }
+
+        void set_error(std::exception_ptr error) && noexcept {
+            core::DatagramOpenResult result;
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const core::Error &failure) {
+                result = core::DatagramOpenResult::failed(failure);
+            } catch (...) {
+                result = core::DatagramOpenResult::failed(core::Error{
+                    core::ErrorCode::endpoint_connection, "proxy datagram open failed"});
+            }
+            auto callback = std::move(handler);
+            callback(std::move(result), target);
+        }
+
+        void set_stopped() && noexcept {
+            auto callback = std::move(handler);
+            callback(core::DatagramOpenResult::failed(core::Error{
+                         core::ErrorCode::cancelled, "proxy datagram open was cancelled"}),
+                     target);
+        }
+    };
+    async::start_with_receiver(outbound->open_datagram(std::move(request)),
+                               RouteReceiver{std::move(handler), target});
 }
 
 void ProxyServer::remove_session(const SessionPtr &session) noexcept {

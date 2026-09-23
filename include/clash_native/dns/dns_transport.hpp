@@ -38,8 +38,9 @@ struct DnsDialPolicy {
 class DnsUpstreamDialer {
   public:
     virtual io::AnySender<core::StreamOpenResult> connect_stream(core::StreamRequest request) = 0;
-    virtual void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) {
-        handler(core::DatagramOpenResult::unsupported());
+    virtual io::AnySender<core::DatagramOpenResult> open_datagram(core::DatagramRequest request) {
+        return io::AnySender<core::DatagramOpenResult>{
+            stdexec::just(core::DatagramOpenResult::unsupported())};
     }
     virtual ~DnsUpstreamDialer() = default;
 };
@@ -52,7 +53,7 @@ class OutboundDnsUpstreamDialer final : public DnsUpstreamDialer {
                               transport::EndpointDialRequirements requirements = {});
 
     io::AnySender<core::StreamOpenResult> connect_stream(core::StreamRequest request) override;
-    void open_datagram(core::DatagramRequest request, core::DatagramOpenHandler handler) override;
+    io::AnySender<core::DatagramOpenResult> open_datagram(core::DatagramRequest request) override;
 
   private:
     runtime::AsioRuntime &runtime_;

@@ -3,6 +3,7 @@
 #include "outbound/outbound_utils.hpp"
 #include "outbound/proxy_address.hpp"
 #include "socks5_udp_listener.hpp"
+#include <clash_native/net/datagram_handle_adapter.hpp>
 
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
@@ -488,8 +489,9 @@ void ProxySession::process_socks_udp_packet(std::size_t size) {
                              }
                              auto path = std::make_shared<UdpPath>();
                              path->key = key;
-                             path->handle =
-                                 std::shared_ptr<core::DatagramHandle>(std::move(result.handle));
+                             // Datagram-plane debt: the UDP relay still speaks core::.
+                             path->handle = std::shared_ptr<core::DatagramHandle>(
+                                 net::adapt_io_to_core_datagram(std::move(result.handle)));
                              path->target = target;
                              path->receive_buffer.resize(path->handle->max_datagram_size());
                              self->udp_paths_.emplace(key, path);

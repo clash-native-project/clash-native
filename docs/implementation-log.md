@@ -1738,3 +1738,87 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   instead of log bisection; verified with `pixi run lldb` driving a
   passing test to clean exit. Note: Release builds carry no PDBs, so
   rich symbolization still needs a debug-info build when the time comes.
+
+### 2026-09-23 — Coroutine-ize the Http1 buffered exchange path
+
+- Replaced `Http1ClientSession::read_response` plus its dispatch-side
+  write chain with a straight-line `exec::task` (`run_buffered`):
+  write request, read response, deliver or retire. Beast operations
+  are awaited through `async::callback_sender` with results kept in
+  band (Beast shape), so the spawned task always ends with a value;
+  initiation throws collapse into `retire_all`. The tunnel branch
+  keeps its existing chain untouched (it flips with the sessions
+  plane) and still shares the queue/active discipline.
+- Cancel/expire/stop semantics are unchanged: they retire the whole
+  connection, so no per-exchange stop wiring is needed — the
+  in-flight Beast op aborts on close and the task lands in the
+  idempotent retire paths. An `exec::async_scope` member owns spawned
+  tasks; like the relay, its token is never requested.
+- Validated with the Windows x64 Release clang-cl/MSVC build:
+  `ExchangeSessionTest` (queued reuse), all `HttpProxyTest`
+  cases (upgrade/tunnel and keep-alive reuse), DoH transports, and a
+  full run of 227 tests passed; `pixi run format`, `format-check`,
+  and `git diff --check` pass.
+
+### 2026-09-23 — Coroutine-ize the Http1 streaming and tunnel paths
+
+- Replaced the remaining hand-written chains in `Http1ClientSession`
+  with two straight-line tasks: `run_streaming` (header write, upload
+  loop, response header, backpressured download loop) and `run_tunnel`
+  (write, interim-response loop, handover or rejection body). Nine
+  methods are gone (`read_streaming_request_body`,
+  `probe_streaming_request_eof`, `handle_streaming_request_body`,
+  `finish_streaming_request_body`, `fail_streaming_request`,
+  `read_streaming_response_header`, `pump_streaming_response`,
+  `read_tunnel_response_header`, `read_tunnel_rejection`); sync
+  helpers (`finish_tunnel`, `fail_active`,
+  `fail_streaming_response`, drained/cancel entries) stay.
+- Beast operations are awaited through `async::callback_sender` with
+  results in band, so spawned tasks always end with a value; the
+  single-flight cancel/expire/stop semantics are unchanged (they
+  retire the whole connection). Download backpressure parks on a new
+  per-exchange `async::watch` space signal bumped by `consumed()` and
+  every terminal path instead of direct repump calls.
+- Added `tests/transport/http1_exchange_test.cpp` (registered in
+  `CMakeLists.txt`): chunked upload with trailers plus a 1 MiB
+  backpressured download with trailers, then connection reuse with a
+  content-length upload (probe path), against an in-process Beast
+  peer. Previously only the tunnel path had real coverage.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 228 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.
+
+## 2026-09-23
+
+- Migrated the datagram narrow waist to sender-native `io::` handles
+  (steps 1-7): `DatagramOpenResult::handle` is now
+  `unique_ptr<io::DatagramHandle>` and `Outbound::open_datagram`,
+  `EndpointDialer::open_datagram`, and
+  `DnsUpstreamDialer::open_datagram` return
+  `io::AnySender<DatagramOpenResult>`.
+- `Reject`, `HttpProxy`, and `Trojan` outbounds answer opens with
+  `stdexec::just`; `DirectOutbound` opens with `just` around a
+  dual-inheritance `net::UdpStream` (now `io::DatagramHandle` plus
+  `core::DatagramHandle`, with sender-based `async_send_to` /
+  `async_receive_from` next to the legacy callback overloads kept for
+  the unmigrated SOCKS5 UDP relay); `ShadowsocksOutbound` wraps its
+  existing callback internals in `async::bridge_sender` and adapts the
+  resulting core handles at the exit.
+- Added `net/datagram_handle_adapter.hpp` with `IoToCoreDatagram`
+  (io to core, for the DNS/QUIC edges) and `CoreToIoDatagram` (core
+  to io, for the Shadowsocks exit); both `close()` implementations
+  only close and never release the inner handle, following the
+  stream-plane TLS lesson.
+- DNS edges adapt at the boundary: query `Operation`s bridge the
+  sender back with `start_with_receiver` plus a generation check and
+  hand a core handle to the untouched sessions plane; the QUIC
+  transport's strand hop ferries the payload through a shared state
+  because dispatching a move-only lambda on the main-thread to strand
+  path segfaulted in this environment (direct call passed 5/5 but
+  would have broken strand safety).
+- Migrated the test doubles and the Direct/Shadowsocks UDP tests to
+  the sender shape (oversized-send assertion now unpacks the thrown
+  `core::Error` via `net::unpack_error`).
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 232 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.

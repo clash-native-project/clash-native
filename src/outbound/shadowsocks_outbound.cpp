@@ -2,6 +2,7 @@
 
 #include <clash_native/async/bridge.hpp>
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/net/datagram_handle_adapter.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
@@ -1647,106 +1648,121 @@ ShadowsocksOutbound::connect_stream(core::StreamRequest request) {
         });
 }
 
-void ShadowsocksOutbound::open_datagram(core::DatagramRequest request,
-                                        core::DatagramOpenHandler handler) {
+io::AnySender<core::DatagramOpenResult>
+ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
+    using ResultSender = io::AnySender<core::DatagramOpenResult>;
     if (const auto validation = validate(); !validation) {
-        runtime_.scheduler().post(
-            [handler = std::move(handler), error = validation.error()]() mutable {
-                handler(core::DatagramOpenResult::failed(std::move(error)));
-            });
-        return;
+        return ResultSender{stdexec::just(core::DatagramOpenResult::failed(validation.error()))};
     }
+    // The dial internals below still run on callbacks (resolve_host,
+    // connect operation); the bridge turns the single terminal delivery
+    // into a sender. Final core:: handles adapt at the edge; delete with
+    // the datagram-handle plane. Only values are captured: the outbound
+    // itself may die before the open completes.
+    return async::bridge_sender<
+        core::DatagramOpenResult>([runtime = &runtime_, resolver = resolver_,
+                                   kcptun_pool = kcptun_pool_,
+                                   websocket_mux_pool = websocket_mux_pool_, config = config_,
+                                   request = std::move(request)](
+                                      async::BridgeSender<core::DatagramOpenResult>::Handler
+                                          terminal) mutable {
+        auto handler = std::move(terminal);
+        if (config.udp_over_tcp || config.plugin == "kcptun") {
+            const auto version = config.udp_over_tcp_version;
+            const auto magic = version == 2 ? kUdpOverTcpV2MagicAddress : kUdpOverTcpMagicAddress;
+            core::StreamRequest stream_request{core::Destination::domain(std::string(magic), 0),
+                                               std::nullopt, request.dial_trace};
+            auto operation = std::make_shared<ShadowsocksConnectOperation>(
+                *runtime, resolver, kcptun_pool, websocket_mux_pool, config,
+                std::move(stream_request),
+                [handler = std::move(handler), initial_destination = request.initial_destination,
+                 version,
+                 executor = runtime->serialized_executor()](core::StreamOpenResult result) mutable {
+                    boost::asio::post(executor, [handler = std::move(handler), initial_destination,
+                                                 version, result = std::move(result)]() mutable {
+                        if (!result.succeeded()) {
+                            handler(core::DatagramOpenResult::failed(result.error.value_or(
+                                core::Error{core::ErrorCode::transport_io,
+                                            "failed to open Shadowsocks UoT stream"})));
+                            return;
+                        }
+                        const auto request_destination =
+                            version == 2 ? initial_destination : std::nullopt;
+                        // Datagram-plane debt: UDP-over-TCP still speaks core::.
+                        auto datagram = ss::make_udp_over_tcp_datagram_handle(
+                            net::adapt_io_to_core(std::move(result.handle)),
+                            {version == 2 ? ss::UdpOverTcpVersion::version2
+                                          : ss::UdpOverTcpVersion::legacy,
+                             request_destination});
+                        if (!datagram) {
+                            handler(core::DatagramOpenResult::failed(datagram.error()));
+                            return;
+                        }
+                        handler(core::DatagramOpenResult::opened(
+                            net::adapt_core_to_io_datagram(std::move(datagram.value())),
+                            core::DatagramSemantics::multi_destination));
+                    });
+                });
+            operation->start();
+            return async::BridgeSender<core::DatagramOpenResult>::AbortFn{};
+        }
 
-    if (config_.udp_over_tcp || config_.plugin == "kcptun") {
-        const auto version = config_.udp_over_tcp_version;
-        const auto magic = version == 2 ? kUdpOverTcpV2MagicAddress : kUdpOverTcpMagicAddress;
-        core::StreamRequest stream_request{core::Destination::domain(std::string(magic), 0),
-                                           std::nullopt, request.dial_trace};
-        auto operation = std::make_shared<ShadowsocksConnectOperation>(
-            runtime_, resolver_, kcptun_pool_, websocket_mux_pool_, config_,
-            std::move(stream_request),
-            [handler = std::move(handler), initial_destination = request.initial_destination,
-             version,
-             executor = runtime_.serialized_executor()](core::StreamOpenResult result) mutable {
-                boost::asio::post(executor, [handler = std::move(handler), initial_destination,
-                                             version, result = std::move(result)]() mutable {
-                    if (!result.succeeded()) {
-                        handler(core::DatagramOpenResult::failed(result.error.value_or(
-                            core::Error{core::ErrorCode::transport_io,
-                                        "failed to open Shadowsocks UoT stream"})));
-                        return;
-                    }
-                    const auto request_destination =
-                        version == 2 ? initial_destination : std::nullopt;
-                    // Datagram-plane debt: UDP-over-TCP still speaks core::.
-                    auto datagram = ss::make_udp_over_tcp_datagram_handle(
-                        net::adapt_io_to_core(std::move(result.handle)),
-                        {version == 2 ? ss::UdpOverTcpVersion::version2
-                                      : ss::UdpOverTcpVersion::legacy,
-                         request_destination});
-                    if (!datagram) {
-                        handler(core::DatagramOpenResult::failed(datagram.error()));
+        detail::resolve_host(
+            *runtime, resolver, config.server_host,
+            [runtime, config, resolver,
+             handler = std::move(handler)](core::Result<detail::AddressList> result) mutable {
+                if (!result || result.value().empty()) {
+                    handler(core::DatagramOpenResult::failed(
+                        result ? core::Error{core::ErrorCode::resolution,
+                                             "Shadowsocks server hostname resolved to no addresses"}
+                               : result.error()));
+                    return;
+                }
+                const auto server =
+                    boost::asio::ip::udp::endpoint(result.value().front(), config.server_port);
+                auto socket = std::make_shared<net::UdpStream>(runtime->serialized_executor());
+                boost::system::error_code error;
+                socket->open(server.protocol(), error);
+                if (!error) {
+                    socket->bind(
+                        {server.address().is_v4()
+                             ? boost::asio::ip::address(boost::asio::ip::address_v4::any())
+                             : boost::asio::ip::address(boost::asio::ip::address_v6::any()),
+                         0},
+                        error);
+                }
+                if (error) {
+                    handler(core::DatagramOpenResult::failed(
+                        {core::ErrorCode::transport_io, "failed to open Shadowsocks UDP socket",
+                         detail::to_std_error(error)}));
+                    return;
+                }
+                const auto method = ss::cipher_method(config.method);
+                if (!method) {
+                    handler(core::DatagramOpenResult::failed(method.error()));
+                    return;
+                }
+                if (method.value().kind == ss::CipherKind::stream) {
+                    auto handle = detail::make_legacy_shadowsocks_datagram_handle(
+                        std::move(socket), server, config.method, config.password);
+                    if (!handle) {
+                        handler(core::DatagramOpenResult::failed(handle.error()));
                         return;
                     }
                     handler(core::DatagramOpenResult::opened(
-                        std::move(datagram.value()), core::DatagramSemantics::multi_destination));
-                });
-            });
-        operation->start();
-        return;
-    }
-
-    detail::resolve_host(
-        runtime_, resolver_, config_.server_host,
-        [runtime = &runtime_, config = config_, resolver = resolver_,
-         handler = std::move(handler)](core::Result<detail::AddressList> result) mutable {
-            if (!result || result.value().empty()) {
-                handler(core::DatagramOpenResult::failed(
-                    result ? core::Error{core::ErrorCode::resolution,
-                                         "Shadowsocks server hostname resolved to no addresses"}
-                           : result.error()));
-                return;
-            }
-            const auto server =
-                boost::asio::ip::udp::endpoint(result.value().front(), config.server_port);
-            auto socket = std::make_shared<net::UdpStream>(runtime->serialized_executor());
-            boost::system::error_code error;
-            socket->open(server.protocol(), error);
-            if (!error) {
-                socket->bind({server.address().is_v4()
-                                  ? boost::asio::ip::address(boost::asio::ip::address_v4::any())
-                                  : boost::asio::ip::address(boost::asio::ip::address_v6::any()),
-                              0},
-                             error);
-            }
-            if (error) {
-                handler(core::DatagramOpenResult::failed({core::ErrorCode::transport_io,
-                                                          "failed to open Shadowsocks UDP socket",
-                                                          detail::to_std_error(error)}));
-                return;
-            }
-            const auto method = ss::cipher_method(config.method);
-            if (!method) {
-                handler(core::DatagramOpenResult::failed(method.error()));
-                return;
-            }
-            if (method.value().kind == ss::CipherKind::stream) {
-                auto handle = detail::make_legacy_shadowsocks_datagram_handle(
-                    std::move(socket), server, config.method, config.password);
-                if (!handle) {
-                    handler(core::DatagramOpenResult::failed(handle.error()));
+                        net::adapt_core_to_io_datagram(std::move(handle.value())),
+                        core::DatagramSemantics::multi_destination));
                     return;
                 }
+                auto state = std::make_shared<ShadowsocksDatagramHandle::State>(
+                    std::move(socket), server, config.method, config.password);
                 handler(core::DatagramOpenResult::opened(
-                    std::move(handle.value()), core::DatagramSemantics::multi_destination));
-                return;
-            }
-            auto state = std::make_shared<ShadowsocksDatagramHandle::State>(
-                std::move(socket), server, config.method, config.password);
-            handler(core::DatagramOpenResult::opened(
-                std::make_unique<ShadowsocksDatagramHandle>(std::move(state)),
-                core::DatagramSemantics::multi_destination));
-        });
+                    net::adapt_core_to_io_datagram(
+                        std::make_unique<ShadowsocksDatagramHandle>(std::move(state))),
+                    core::DatagramSemantics::multi_destination));
+            });
+        return async::BridgeSender<core::DatagramOpenResult>::AbortFn{};
+    });
 }
 
 } // namespace clash_native::outbound
