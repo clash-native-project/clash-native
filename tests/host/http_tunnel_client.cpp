@@ -840,20 +840,19 @@ int run_http2(const ServerAddress &server, const std::string &mode) {
     options.verify_peer = false;
     options.alpn_protocols = {"h2"};
     options.deadline = std::chrono::steady_clock::now() + 10s;
-    (void)clash_native::transport::async_tls_client_handshake(
-        connect_tcp(context, server), std::move(options),
-        [tunnel_probe, streaming_probe, fail_probe](
-            clash_native::core::Result<clash_native::transport::TlsClientConnection> result) {
-            if (!result) {
-                fail_probe("HTTP/2 TLS handshake failed: " + result.error().context);
-                return;
-            }
-            if (result->negotiated_alpn != "h2") {
+    struct TlsReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        using FailProbe = decltype(fail_probe);
+        std::shared_ptr<TunnelProbe> tunnel_probe;
+        std::shared_ptr<StreamingProbe> streaming_probe;
+        FailProbe fail_probe;
+        void set_value(clash_native::transport::TlsClientConnection connection) && noexcept {
+            if (connection.negotiated_alpn != "h2") {
                 fail_probe("TLS server did not negotiate HTTP/2");
                 return;
             }
             auto session =
-                clash_native::transport::make_http2_exchange_session(std::move(result->stream));
+                clash_native::transport::make_http2_exchange_session(std::move(connection.stream));
             if (!session) {
                 fail_probe("failed to create HTTP/2 client session");
                 return;
@@ -863,7 +862,22 @@ int run_http2(const ServerAddress &server, const std::string &mode) {
             } else {
                 tunnel_probe->start(std::move(session), 200);
             }
-        });
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const clash_native::core::Error &failure) {
+                fail_probe("HTTP/2 TLS handshake failed: " + failure.context);
+            } catch (...) {
+                fail_probe("HTTP/2 TLS handshake failed");
+            }
+        }
+        void set_stopped() && noexcept { fail_probe("HTTP/2 TLS handshake stopped"); }
+    };
+    clash_native::async::start_with_receiver(
+        clash_native::transport::async_tls_client_handshake(connect_tcp(context, server),
+                                                            std::move(options)),
+        TlsReceiver{tunnel_probe, streaming_probe, fail_probe});
     context.run();
     const auto success = streaming_probe ? streaming_probe->succeeded() : tunnel_probe->succeeded();
     if (!success) {

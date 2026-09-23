@@ -186,26 +186,50 @@ class DotDnsTransport::Session final
                 transport::TlsClientOptions options;
                 options.server_name = self->server_name_;
                 options.verify_peer = self->verify_peer_;
-                self->tls_handshake_ = transport::async_tls_client_handshake(
-                    std::move(result.handle), std::move(options),
-                    [self, generation](core::Result<transport::TlsClientConnection> tls) mutable {
-                        self->tls_handshake_.reset();
+                struct TlsReceiver {
+                    using receiver_concept = stdexec::receiver_tag;
+                    std::shared_ptr<Session> self;
+                    std::uint64_t generation;
+                    void set_value(transport::TlsClientConnection tls) && noexcept {
                         if (generation != self->connection_generation_ || self->stopped_) {
-                            if (tls && tls->stream) {
-                                tls->stream->close();
+                            if (tls.stream) {
+                                tls.stream->close();
                             }
                             return;
                         }
-                        if (!tls) {
-                            self->connection_failed(tls.error(), generation);
-                            return;
-                        }
-                        self->tls_stream_ = std::move(tls->stream);
+                        self->tls_stream_ = std::move(tls.stream);
                         self->connecting_ = false;
                         self->connected_ = true;
                         self->read_frame(generation);
                         self->flush_writes(generation);
-                    });
+                    }
+                    void set_error(std::exception_ptr error) && noexcept {
+                        if (generation != self->connection_generation_ || self->stopped_) {
+                            return;
+                        }
+                        try {
+                            std::rethrow_exception(std::move(error));
+                        } catch (const core::Error &failure) {
+                            self->connection_failed(failure, generation);
+                        } catch (...) {
+                            self->connection_failed(
+                                core::Error{core::ErrorCode::endpoint_connection,
+                                            "DoT TLS handshake failed"},
+                                generation);
+                        }
+                    }
+                    void set_stopped() && noexcept {
+                        if (generation != self->connection_generation_ || self->stopped_) {
+                            return;
+                        }
+                        self->connection_failed(cancelled_error(), generation);
+                    }
+                };
+                // No explicit cancel: the generation guard drops late
+                // terminals and the session teardown closes the stream.
+                async::start_with_receiver(transport::async_tls_client_handshake(
+                                               std::move(result.handle), std::move(options)),
+                                           TlsReceiver{self, generation});
             }
             void set_error(std::exception_ptr error) && noexcept {
                 if (generation != self->connection_generation_ || self->stopped_) {
@@ -417,10 +441,6 @@ class DotDnsTransport::Session final
         write_in_progress_ = false;
         read_in_progress_ = false;
         boost::system::error_code ignored;
-        if (tls_handshake_) {
-            tls_handshake_->cancel();
-            tls_handshake_.reset();
-        }
         if (tls_stream_) {
             tls_stream_->close();
             tls_stream_.reset();
@@ -432,7 +452,6 @@ class DotDnsTransport::Session final
     std::string server_name_;
     bool verify_peer_;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
-    std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
     std::unique_ptr<io::StreamHandle> tls_stream_;
     std::unordered_map<std::uint16_t, PendingPtr> pending_;
     std::deque<std::uint16_t> write_queue_;

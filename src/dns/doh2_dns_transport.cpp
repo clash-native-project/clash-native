@@ -189,10 +189,6 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         stopped_ = true;
         retired_ = true;
         ++connection_generation_;
-        if (tls_handshake_) {
-            tls_handshake_->cancel();
-            tls_handshake_.reset();
-        }
         if (http_session_) {
             auto session = std::move(http_session_);
             session->stop();
@@ -251,39 +247,59 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
                 options.server_name = self->server_name_;
                 options.verify_peer = self->verify_peer_;
                 options.alpn_protocols = {"h2"};
-                self->tls_handshake_ = transport::async_tls_client_handshake(
-                    std::move(result.handle), std::move(options),
-                    [self, generation](core::Result<transport::TlsClientConnection> tls) mutable {
-                        self->tls_handshake_.reset();
+                struct TlsReceiver {
+                    using receiver_concept = stdexec::receiver_tag;
+                    std::shared_ptr<Session> self;
+                    std::uint64_t generation;
+                    void set_value(transport::TlsClientConnection tls) && noexcept {
                         if (generation != self->connection_generation_ || self->stopped_) {
-                            if (tls && tls->stream) {
-                                tls->stream->close();
+                            if (tls.stream) {
+                                tls.stream->close();
                             }
                             return;
                         }
-                        if (!tls) {
-                            self->connection_failed(tls.error());
-                            return;
-                        }
-                        if (tls->negotiated_alpn != "h2") {
-                            tls->stream->close();
+                        if (tls.negotiated_alpn != "h2") {
+                            tls.stream->close();
                             self->connection_failed(
                                 {core::ErrorCode::carrier_handshake,
                                  "DoH2 upstream did not negotiate the h2 protocol"});
                             return;
                         }
                         self->connecting_ = false;
-                        // Exchange-plane debt: the HTTP/2 session still speaks
-                        // transport::; the adapter bridges it at the edge.
                         self->http_session_ =
-                            transport::make_http2_exchange_session(std::move(tls->stream));
+                            transport::make_http2_exchange_session(std::move(tls.stream));
                         if (!self->http_session_) {
                             self->connection_failed(
                                 protocol_error("failed to create an HTTP/2 client session"));
                             return;
                         }
                         self->submit_waiting();
-                    });
+                    }
+                    void set_error(std::exception_ptr error) && noexcept {
+                        if (generation != self->connection_generation_ || self->stopped_) {
+                            return;
+                        }
+                        try {
+                            std::rethrow_exception(std::move(error));
+                        } catch (const core::Error &failure) {
+                            self->connection_failed(failure);
+                        } catch (...) {
+                            self->connection_failed(core::Error{
+                                core::ErrorCode::endpoint_connection, "DoH2 TLS handshake failed"});
+                        }
+                    }
+                    void set_stopped() && noexcept {
+                        if (generation != self->connection_generation_ || self->stopped_) {
+                            return;
+                        }
+                        self->connection_failed(cancelled_error());
+                    }
+                };
+                // No explicit cancel: the generation guard drops late
+                // terminals and the request deadline bounds orphans.
+                async::start_with_receiver(transport::async_tls_client_handshake(
+                                               std::move(result.handle), std::move(options)),
+                                           TlsReceiver{self, generation});
             }
             void set_error(std::exception_ptr error) && noexcept {
                 if (generation != self->connection_generation_ || self->stopped_) {
@@ -415,10 +431,6 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         retired_ = true;
         connecting_ = false;
         ++connection_generation_;
-        if (tls_handshake_) {
-            tls_handshake_->cancel();
-            tls_handshake_.reset();
-        }
         if (http_session_) {
             auto session = std::move(http_session_);
             session->stop();
@@ -432,10 +444,6 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         }
         ++connection_generation_;
         connecting_ = false;
-        if (tls_handshake_) {
-            tls_handshake_->cancel();
-            tls_handshake_.reset();
-        }
     }
 
     runtime::AsioRuntime &runtime_;
@@ -445,7 +453,6 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     std::string path_;
     bool verify_peer_;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
-    std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
     std::shared_ptr<io::ExchangeSession> http_session_;
     std::unordered_map<std::uint16_t, std::shared_ptr<Pending>> pending_;
     std::uint64_t connection_generation_ = 0;

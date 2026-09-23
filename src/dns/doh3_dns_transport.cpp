@@ -40,8 +40,6 @@ void QuicDnsTransport::Operation::start_doh3_session() {
         if (const auto self = weak.lock())
             self->fail_session(std::move(error));
     };
-    // Exchange-plane debt: the HTTP/3 session still speaks transport::;
-    // the adapter bridges it into the io:: vocabulary at the edge.
     auto session = transport::make_http3_exchange_session(quic_, failure);
     if (retired_) {
         if (session)

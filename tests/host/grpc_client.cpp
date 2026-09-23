@@ -1,3 +1,4 @@
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/transport/grpc_client.hpp>
@@ -320,20 +321,32 @@ int run_probe(const ServerAddress &server, const std::string &mode) {
     options.trusted_ca_pem = ca_pem;
     options.alpn_protocols = {"h2"};
     options.deadline = std::chrono::steady_clock::now() + 10s;
-    (void)clash_native::transport::async_tls_client_handshake(
-        std::move(stream), std::move(options),
-        [probe](clash_native::core::Result<clash_native::transport::TlsClientConnection>
-                    result) mutable {
-            if (!result) {
-                return probe->fail("gRPC TLS handshake failed: " + result.error().context);
-            }
-            if (result->negotiated_alpn != "h2") {
-                return probe->fail("gRPC TLS server did not negotiate HTTP/2");
+    struct TlsReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<GrpcProbe> probe;
+        void set_value(clash_native::transport::TlsClientConnection connection) && noexcept {
+            if (connection.negotiated_alpn != "h2") {
+                probe->fail("gRPC TLS server did not negotiate HTTP/2");
+                return;
             }
             auto session =
-                clash_native::transport::make_http2_exchange_session(std::move(result->stream));
+                clash_native::transport::make_http2_exchange_session(std::move(connection.stream));
             probe->start(std::move(session));
-        });
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const clash_native::core::Error &failure) {
+                probe->fail("gRPC TLS handshake failed: " + failure.context);
+            } catch (...) {
+                probe->fail("gRPC TLS handshake failed");
+            }
+        }
+        void set_stopped() && noexcept { probe->fail("gRPC TLS handshake stopped"); }
+    };
+    clash_native::async::start_with_receiver(
+        clash_native::transport::async_tls_client_handshake(std::move(stream), std::move(options)),
+        TlsReceiver{probe});
     context.run();
     if (!probe->succeeded()) {
         spdlog::error("{}", probe->error());

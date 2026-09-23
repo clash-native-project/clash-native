@@ -318,8 +318,6 @@ void ProxySession::open_http_forward_target(core::Destination destination) {
 }
 
 void ProxySession::start_http_upgrade_exchange() {
-    // Exchange-plane debt: the tunnel runs on io:: through the adapter;
-    // the forward path still owns http_session_ until its upload body flips.
     http_tunnel_session_ = transport::make_http1_exchange_session(std::move(remote_));
     if (!http_tunnel_session_) {
         send_http_forward_response(502, "Bad Gateway");

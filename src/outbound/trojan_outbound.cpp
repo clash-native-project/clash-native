@@ -141,23 +141,45 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         auto self = shared_from_this();
         auto plain_stream = std::make_unique<net::TcpStream>(std::move(*socket_));
         socket_.reset();
-        tls_handshake_ = transport::async_tls_client_handshake(
-            std::move(plain_stream), std::move(options),
-            [self](core::Result<transport::TlsClientConnection> result) mutable {
-                self->tls_handshake_.reset();
+        struct TlsReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<TrojanConnectOperation> self;
+            void set_value(transport::TlsClientConnection connection) && noexcept {
                 if (self->completed_) {
-                    if (result && result->stream) {
-                        result->stream->close();
+                    if (connection.stream) {
+                        connection.stream->close();
                     }
                     return;
                 }
-                if (!result) {
-                    self->finish(core::StreamOpenResult::failed(result.error()));
+                self->transport_stream_ = std::move(connection.stream);
+                self->write_request_header();
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                if (self->completed_) {
                     return;
                 }
-                self->transport_stream_ = std::move(result->stream);
-                self->write_request_header();
-            });
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    self->finish(core::StreamOpenResult::failed(failure));
+                } catch (...) {
+                    self->finish(core::StreamOpenResult::failed(
+                        {core::ErrorCode::endpoint_connection, "Trojan TLS failed"}));
+                }
+            }
+            void set_stopped() && noexcept {
+                if (self->completed_) {
+                    return;
+                }
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "Trojan TLS was cancelled"}));
+            }
+        };
+        // No explicit cancel: completed_ drops late terminals and the
+        // operation deadline bounds orphans.
+        async::start_with_receiver(
+            transport::async_tls_client_handshake(std::move(plain_stream), std::move(options)),
+            TlsReceiver{self});
     }
 
     void start_websocket() {
@@ -267,9 +289,6 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 }
                 boost::system::error_code ignored;
                 self->cancel_timer();
-                if (self->tls_handshake_) {
-                    self->tls_handshake_->cancel();
-                }
                 if (self->websocket_handshake_) {
                     self->websocket_handshake_->cancel();
                 }
@@ -294,9 +313,6 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         cancel_timer();
         if (!result.succeeded()) {
             boost::system::error_code ignored;
-            if (tls_handshake_) {
-                tls_handshake_->cancel();
-            }
             if (websocket_handshake_) {
                 websocket_handshake_->cancel();
             }
@@ -317,7 +333,6 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     TrojanOutboundConfig config_;
     core::StreamRequest request_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
-    std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
     std::shared_ptr<transport::WebSocketClientHandshake> websocket_handshake_;
     std::unique_ptr<io::StreamHandle> transport_stream_;
     boost::asio::steady_timer timer_;

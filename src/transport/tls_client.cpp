@@ -1,3 +1,4 @@
+#include <clash_native/async/bridge.hpp>
 #include <clash_native/net/tls_stream.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
@@ -49,9 +50,10 @@ core::Error transport_error(std::string context, const boost::system::error_code
 
 namespace detail {
 
+using TlsClientHandler = std::function<void(core::Result<TlsClientConnection>)>;
+
 class TlsClientHandshakeOperationImpl final
-    : public TlsClientHandshake,
-      public std::enable_shared_from_this<TlsClientHandshakeOperationImpl> {
+    : public std::enable_shared_from_this<TlsClientHandshakeOperationImpl> {
   public:
     TlsClientHandshakeOperationImpl(std::unique_ptr<io::StreamHandle> stream,
                                     TlsClientOptions options, TlsClientHandler handler)
@@ -66,7 +68,7 @@ class TlsClientHandshakeOperationImpl final
         boost::asio::post(executor_, [self] { self->configure_and_handshake(); });
     }
 
-    void cancel() noexcept override {
+    void cancel() noexcept {
         try {
             const auto self = shared_from_this();
             boost::asio::dispatch(executor_,
@@ -238,23 +240,36 @@ class TlsClientHandshakeOperationImpl final
 
 } // namespace detail
 
-std::shared_ptr<TlsClientHandshake>
-async_tls_client_handshake(std::unique_ptr<io::StreamHandle> stream, TlsClientOptions options,
-                           TlsClientHandler handler) {
-    if (!stream || !handler) {
-        if (stream) {
-            stream->close();
-        }
-        if (handler) {
-            handler(core::fail(configuration_error(
-                "TLS client handshake requires a stream and completion handler")));
-        }
-        return {};
+io::AnySender<TlsClientConnection>
+async_tls_client_handshake(std::unique_ptr<io::StreamHandle> stream, TlsClientOptions options) {
+    if (!stream) {
+        return io::AnySender<TlsClientConnection>{stdexec::just_error(std::make_exception_ptr(
+            configuration_error("TLS client handshake requires a stream")))};
     }
-    auto operation = std::make_shared<detail::TlsClientHandshakeOperationImpl>(
-        std::move(stream), std::move(options), std::move(handler));
-    operation->start();
-    return operation;
+    // Shared: the bridge starter is a std::function and must be copyable;
+    // a second start after the move fails fast instead of hanging.
+    auto state = std::make_shared<std::pair<std::unique_ptr<io::StreamHandle>, TlsClientOptions>>(
+        std::move(stream), std::move(options));
+    auto bridged = async::bridge_sender<core::Result<TlsClientConnection>>(
+        [state](async::BridgeSender<core::Result<TlsClientConnection>>::Handler terminal) mutable {
+            if (!state->first) {
+                terminal(core::fail(
+                    configuration_error("TLS client handshake stream was already consumed")));
+                return async::BridgeSender<core::Result<TlsClientConnection>>::AbortFn{};
+            }
+            auto operation = std::make_shared<detail::TlsClientHandshakeOperationImpl>(
+                std::move(state->first), std::move(state->second), std::move(terminal));
+            operation->start();
+            using AbortFn = async::BridgeSender<core::Result<TlsClientConnection>>::AbortFn;
+            return AbortFn{[operation] { operation->cancel(); }};
+        });
+    auto sender = std::move(bridged) | stdexec::then([](core::Result<TlsClientConnection> result) {
+                      if (!result) {
+                          throw result.error();
+                      }
+                      return std::move(result.value());
+                  });
+    return io::AnySender<TlsClientConnection>{std::move(sender)};
 }
 
 } // namespace clash_native::transport

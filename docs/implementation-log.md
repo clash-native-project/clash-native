@@ -1975,3 +1975,24 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-23
+
+- Made the TLS client handshake sender-native:
+  `async_tls_client_handshake(stream, options)` now returns
+  `io::AnySender<TlsClientConnection>` (value on success,
+  `core::Error` on failure, stop aborts). The existing Asio
+  operation is bridged with `async::bridge_sender` plus an
+  unwrap-and-rethrow `then`; the starter state rides a shared_ptr
+  because the bridge starter must be copyable, and a second start
+  fails fast instead of hanging.
+- Migrated all nine call sites (DoH1/DoH2/DoT, HTTP proxy, Trojan,
+  shadow-TLS, WebSocket client, grpc/http-tunnel test hosts) to
+  start the sender with small terminal-mapping receivers.
+  `TlsClientHandshake` handles are gone: teardown relies on the
+  existing completed_/generation guards (closing strays) with
+  request deadlines bounding orphans, matching the exchange-plane
+  late-drop doctrine.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.

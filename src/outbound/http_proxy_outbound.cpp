@@ -207,22 +207,16 @@ class HttpProxyConnectOperation final
         options.trusted_ca_pem = config_.trusted_ca_pem;
         options.alpn_protocols = {"h2", "http/1.1"};
         options.deadline = deadline_;
-        auto self = shared_from_this();
-        tls_handshake_ = transport::async_tls_client_handshake(
-            std::move(stream), std::move(options),
-            [self](core::Result<transport::TlsClientConnection> result) mutable {
-                self->tls_handshake_.reset();
+        struct TlsReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<HttpProxyConnectOperation> self;
+            void set_value(transport::TlsClientConnection connection) && noexcept {
                 if (self->completed_) {
-                    if (result && result->stream) {
-                        result->stream->close();
+                    if (connection.stream) {
+                        connection.stream->close();
                     }
                     return;
                 }
-                if (!result) {
-                    self->finish(core::StreamOpenResult::failed(result.error()));
-                    return;
-                }
-                auto connection = std::move(result.value());
                 if (!connection.negotiated_alpn.empty() && connection.negotiated_alpn != "h2" &&
                     connection.negotiated_alpn != "http/1.1") {
                     connection.stream->close();
@@ -232,7 +226,34 @@ class HttpProxyConnectOperation final
                     return;
                 }
                 self->begin_http(std::move(connection.stream), connection.negotiated_alpn);
-            });
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                if (self->completed_) {
+                    return;
+                }
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    self->finish(core::StreamOpenResult::failed(failure));
+                } catch (...) {
+                    self->finish(core::StreamOpenResult::failed(
+                        {core::ErrorCode::endpoint_connection, "HTTP proxy TLS failed"}));
+                }
+            }
+            void set_stopped() && noexcept {
+                if (self->completed_) {
+                    return;
+                }
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "HTTP proxy TLS was cancelled"}));
+            }
+        };
+        auto self = shared_from_this();
+        // No explicit cancel: completed_ drops late terminals and the
+        // operation deadline bounds orphans.
+        async::start_with_receiver(
+            transport::async_tls_client_handshake(std::move(stream), std::move(options)),
+            TlsReceiver{self});
     }
 
     void begin_http(std::unique_ptr<io::StreamHandle> stream, std::string_view alpn) {
@@ -242,8 +263,6 @@ class HttpProxyConnectOperation final
             }
             return;
         }
-        // Exchange-plane debt: the HTTP sessions still speak transport::;
-        // the adapter bridges them into the io:: vocabulary at the edge.
         if (alpn == "h2") {
             session_ = transport::make_http2_exchange_session(std::move(stream));
         } else {
@@ -323,9 +342,6 @@ class HttpProxyConnectOperation final
                 }
                 boost::system::error_code ignored;
                 (void)self->timer_.cancel();
-                if (self->tls_handshake_) {
-                    self->tls_handshake_->cancel();
-                }
                 if (self->socket_) {
                     self->socket_->cancel(ignored);
                     self->socket_->close(ignored);
@@ -347,10 +363,6 @@ class HttpProxyConnectOperation final
         (void)timer_.cancel();
         if (!result.succeeded()) {
             boost::system::error_code ignored;
-            if (tls_handshake_) {
-                tls_handshake_->cancel();
-                tls_handshake_.reset();
-            }
             if (socket_) {
                 socket_->cancel(ignored);
                 socket_->close(ignored);
@@ -372,7 +384,6 @@ class HttpProxyConnectOperation final
     HttpProxyOutboundConfig config_;
     core::StreamRequest request_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
-    std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
     std::shared_ptr<io::ExchangeSession> session_;
     boost::asio::steady_timer timer_;
     core::StreamOpenHandler handler_;

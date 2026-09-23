@@ -217,33 +217,53 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
         options.verify_peer = owner_.config_.verify_peer;
         options.alpn_protocols = {"http/1.1"};
         options.deadline = request_.deadline;
-        const auto self = shared_from_this();
-        tls_handshake_ = transport::async_tls_client_handshake(
-            std::move(stream), std::move(options),
-            [self](core::Result<transport::TlsClientConnection> result) mutable {
-                self->tls_handshake_.reset();
+        struct TlsReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<Operation> self;
+            void set_value(transport::TlsClientConnection connection) && noexcept {
                 if (self->completed_) {
-                    if (result && result->stream) {
-                        result->stream->close();
+                    if (connection.stream) {
+                        connection.stream->close();
                     }
                     return;
                 }
-                if (!result) {
-                    self->finish(core::fail(result.error()));
-                    return;
-                }
-                if (!result->negotiated_alpn.empty() && result->negotiated_alpn != "http/1.1") {
+                if (!connection.negotiated_alpn.empty() &&
+                    connection.negotiated_alpn != "http/1.1") {
                     self->finish(core::fail({core::ErrorCode::carrier_handshake,
                                              "DoH upstream did not negotiate HTTP/1.1"}));
                     return;
                 }
-                self->start_http(std::move(result->stream));
-            });
+                self->start_http(std::move(connection.stream));
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                if (self->completed_) {
+                    return;
+                }
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    self->finish(core::fail(failure));
+                } catch (...) {
+                    self->finish(core::fail(core::Error{core::ErrorCode::endpoint_connection,
+                                                        "DoH/HTTP/1.1 TLS handshake failed"}));
+                }
+            }
+            void set_stopped() && noexcept {
+                if (self->completed_) {
+                    return;
+                }
+                self->finish(core::fail(cancelled_error()));
+            }
+        };
+        const auto self = shared_from_this();
+        // No explicit cancel: the completed_ guard drops late terminals
+        // (closing strays) and the request deadline bounds orphans.
+        async::start_with_receiver(
+            transport::async_tls_client_handshake(std::move(stream), std::move(options)),
+            TlsReceiver{self});
     }
 
     void start_http(std::unique_ptr<io::StreamHandle> stream) {
-        // Exchange-plane debt: the HTTP/1.1 session still speaks transport::;
-        // the adapter bridges it into the io:: vocabulary at the edge.
         http_session_ = transport::make_http1_exchange_session(std::move(stream));
         if (!http_session_) {
             finish(core::fail(
@@ -343,10 +363,6 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
         }
         completed_ = true;
         (void)timer_.cancel();
-        if (tls_handshake_) {
-            tls_handshake_->cancel();
-            tls_handshake_.reset();
-        }
         if (http_session_) {
             // Single-use session: stop() fails the in-flight exchange and
             // tears the session down; no per-exchange cancel is needed.
@@ -362,7 +378,6 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     DnsExchangeRequest request_;
     Handler handler_;
     boost::asio::steady_timer timer_;
-    std::shared_ptr<transport::TlsClientHandshake> tls_handshake_;
     std::shared_ptr<io::ExchangeSession> http_session_;
     std::string authority_;
     bool http_exchange_started_ = false;

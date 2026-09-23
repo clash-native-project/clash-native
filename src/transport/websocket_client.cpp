@@ -656,23 +656,45 @@ class WebSocketClientHandshakeOperation final
             tls_options.alpn_protocols = {"http/1.1"};
         }
         tls_options.deadline = options_.deadline;
+        struct TlsReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<WebSocketClientHandshakeOperation> self;
+            void set_value(TlsClientConnection connection) && noexcept {
+                if (self->completed_) {
+                    if (connection.stream) {
+                        connection.stream->close();
+                    }
+                    return;
+                }
+                self->stream_ = std::move(connection.stream);
+                self->start_websocket();
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                if (self->completed_) {
+                    return;
+                }
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    self->finish(core::fail(failure));
+                } catch (...) {
+                    self->finish(core::fail(
+                        core::Error{core::ErrorCode::endpoint_connection, "WebSocket TLS failed"}));
+                }
+            }
+            void set_stopped() && noexcept {
+                if (self->completed_) {
+                    return;
+                }
+                self->finish(core::fail(cancelled_error()));
+            }
+        };
         const auto self = shared_from_this();
-        tls_ = async_tls_client_handshake(std::move(stream_), std::move(tls_options),
-                                          [self](core::Result<TlsClientConnection> result) mutable {
-                                              self->tls_.reset();
-                                              if (self->completed_) {
-                                                  if (result && result->stream) {
-                                                      result->stream->close();
-                                                  }
-                                                  return;
-                                              }
-                                              if (!result) {
-                                                  self->finish(core::fail(result.error()));
-                                                  return;
-                                              }
-                                              self->stream_ = std::move(result.value().stream);
-                                              self->start_websocket();
-                                          });
+        // No explicit cancel: completed_ drops late terminals and the
+        // operation deadline bounds orphans.
+        async::start_with_receiver(
+            async_tls_client_handshake(std::move(stream_), std::move(tls_options)),
+            TlsReceiver{self});
     }
 
     void start_websocket() {
@@ -728,10 +750,6 @@ class WebSocketClientHandshakeOperation final
         completed_ = true;
         (void)timer_.cancel();
         if (!result) {
-            if (tls_) {
-                tls_->cancel();
-                tls_.reset();
-            }
             if (websocket_) {
                 websocket_->next_layer().close();
             }
@@ -753,7 +771,6 @@ class WebSocketClientHandshakeOperation final
     std::unique_ptr<io::StreamHandle> stream_;
     WebSocketClientOptions options_;
     WebSocketClientHandler handler_;
-    std::shared_ptr<TlsClientHandshake> tls_;
     std::shared_ptr<BeastWebSocket> websocket_;
     boost::asio::steady_timer timer_;
     bool completed_ = false;

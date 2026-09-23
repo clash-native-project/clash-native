@@ -2,9 +2,9 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
+#include <clash_native/io/sender.hpp>
 
 #include <chrono>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -27,18 +27,11 @@ struct TlsClientConnection {
     std::string negotiated_alpn;
 };
 
-class TlsClientHandshake {
-  public:
-    virtual void cancel() noexcept = 0;
-    virtual ~TlsClientHandshake() = default;
-};
-
-using TlsClientHandler = std::function<void(core::Result<TlsClientConnection>)>;
-
-// Completes a TLS client handshake over an already established project stream.
-// The completion runs on that stream's executor and is invoked exactly once.
-std::shared_ptr<TlsClientHandshake>
-async_tls_client_handshake(std::unique_ptr<io::StreamHandle> stream, TlsClientOptions options,
-                           TlsClientHandler handler);
+// Completes a TLS client handshake over an already established stream.
+// Completes set_value(TlsClientConnection) on success or
+// set_error(exception_ptr) carrying a core::Error on failure; downstream
+// stop aborts the handshake. The operation runs on the stream's executor.
+io::AnySender<TlsClientConnection>
+async_tls_client_handshake(std::unique_ptr<io::StreamHandle> stream, TlsClientOptions options);
 
 } // namespace clash_native::transport
