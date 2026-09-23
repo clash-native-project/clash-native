@@ -28,9 +28,12 @@
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
+
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/system/errc.hpp>
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include <algorithm>
 #include <array>
@@ -634,10 +637,176 @@ class ShadowsocksConnectOperation final
                     {core::ErrorCode::timeout, "timed out opening Shadowsocks TCP stream"}));
             }
         });
-        detail::resolve_host(runtime_, resolver_, config_.server_host,
-                             [self = shared_from_this()](core::Result<detail::AddressList> result) {
-                                 self->resolved(std::move(result));
-                             });
+        // The scope only owns this chain task; teardown stays
+        // guard-driven, so no stop is ever requested.
+        scope_.spawn(run(shared_from_this()));
+    }
+
+    // Straight-line connect chain: resolve, transport survivor
+    // (kcptun / mux pool / TCP plus plugin), cipher handshake. Every
+    // terminal funnels through finish(), so the spawned task always ends
+    // with a value.
+    static exec::task<void> run(std::shared_ptr<ShadowsocksConnectOperation> self) {
+        core::Result<detail::AddressList> resolved;
+        try {
+            resolved = co_await async::bridge_sender<core::Result<detail::AddressList>>(
+                [self](async::BridgeSender<core::Result<detail::AddressList>>::Handler done) {
+                    detail::resolve_host(self->runtime_, self->resolver_, self->config_.server_host,
+                                         [done](core::Result<detail::AddressList> result) mutable {
+                                             done(std::move(result));
+                                         });
+                    return [self] { self->abort(); };
+                });
+        } catch (...) {
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::resolution, "failed to resolve Shadowsocks server"}));
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        if (!resolved) {
+            self->finish(core::StreamOpenResult::failed(resolved.error()));
+            co_return;
+        }
+        if (self->kcptun_plugin()) {
+            if (resolved.value().empty()) {
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::resolution,
+                     "Shadowsocks kcptun server hostname resolved to no addresses",
+                     {}}));
+                co_return;
+            }
+            const auto endpoint =
+                boost::asio::ip::udp::endpoint(resolved.value().front(), self->config_.server_port);
+            if (!self->kcptun_pool_) {
+                auto options = self->config_.kcptun.value_or(ss::KcptunClientOptions{});
+                auto stream =
+                    ss::make_kcptun_client_stream(self->runtime_, endpoint, std::move(options));
+                if (!stream) {
+                    self->finish(core::StreamOpenResult::failed(stream.error()));
+                    co_return;
+                }
+                self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(stream.value()));
+                co_await send_initial_request(self);
+                co_return;
+            }
+            try {
+                auto stream = co_await self->kcptun_pool_->open_stream(endpoint);
+                if (self->completed_) {
+                    co_return;
+                }
+                self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(stream));
+            } catch (const core::Error &failure) {
+                self->finish(core::StreamOpenResult::failed(failure));
+                co_return;
+            } catch (...) {
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "kcptun pool open failed", {}}));
+                co_return;
+            }
+            co_await send_initial_request(self);
+            co_return;
+        }
+        auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
+        endpoints->reserve(resolved.value().size());
+        for (const auto &address : resolved.value()) {
+            endpoints->emplace_back(address, self->config_.server_port);
+        }
+        if (self->websocket_plugin() && self->config_.plugin_mux) {
+            if (!self->websocket_mux_pool_) {
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::configuration,
+                     "Shadowsocks WebSocket mux pool is not initialized",
+                     {}}));
+                co_return;
+            }
+            core::Result<std::unique_ptr<io::StreamHandle>> mux_stream;
+            try {
+                mux_stream =
+                    co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
+                        [self, endpoints](
+                            async::BridgeSender<
+                                core::Result<std::unique_ptr<io::StreamHandle>>>::Handler done) {
+                            self->websocket_mux_pool_->async_open_stream(
+                                std::move(*endpoints), self->websocket_options(),
+                                [done](core::Result<std::unique_ptr<io::StreamHandle>>
+                                           stream) mutable { done(std::move(stream)); });
+                            return [self] { self->abort(); };
+                        });
+            } catch (...) {
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "WebSocket mux pool open failed", {}}));
+                co_return;
+            }
+            if (self->completed_) {
+                co_return;
+            }
+            if (!mux_stream) {
+                self->finish(core::StreamOpenResult::failed(mux_stream.error()));
+                co_return;
+            }
+            self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(mux_stream.value()));
+            co_await send_initial_request(self);
+            co_return;
+        }
+        co_await self->connect_tcp(self, std::move(endpoints));
+    }
+
+    // TCP connect plus plugin/cipher tail, shared by run(). Throws
+    // core::Error on transport failures; finish() terminals stay inline.
+    static exec::task<void>
+    connect_tcp(std::shared_ptr<ShadowsocksConnectOperation> self,
+                std::shared_ptr<std::vector<boost::asio::ip::tcp::endpoint>> endpoints) {
+        using ConnectSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
+                                                           stdexec::set_error_t(std::exception_ptr),
+                                                           stdexec::set_stopped_t()>;
+        try {
+            try {
+                co_await async::callback_sender<ConnectSigs>(
+                    [self, endpoints](auto terminal) mutable {
+                        boost::asio::async_connect(*self->socket_, *endpoints, std::move(terminal));
+                    },
+                    [](auto receiver, const boost::system::error_code &error, auto) {
+                        if (error) {
+                            stdexec::set_error(std::move(receiver),
+                                               std::make_exception_ptr(core::Error{
+                                                   core::ErrorCode::endpoint_connection,
+                                                   "failed to connect to Shadowsocks server",
+                                                   detail::to_std_error(error)}));
+                            return;
+                        }
+                        stdexec::set_value(std::move(receiver), true);
+                    });
+            } catch (const core::Error &failure) {
+                self->finish(core::StreamOpenResult::failed(failure));
+                co_return;
+            } catch (...) {
+                self->finish(
+                    core::StreamOpenResult::failed({core::ErrorCode::endpoint_connection,
+                                                    "failed to connect to Shadowsocks server"}));
+                co_return;
+            }
+            if (self->completed_) {
+                co_return;
+            }
+            if (self->shadow_tls_plugin()) {
+                co_await open_shadow_tls(self);
+                co_return;
+            }
+            if (self->restls_plugin()) {
+                co_await open_restls(self);
+                co_return;
+            }
+            if (self->jls_plugin()) {
+                co_await open_jls(self);
+                co_return;
+            }
+            co_await send_initial_request(self);
+        } catch (...) {
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "Shadowsocks connect chain failed"}));
+        }
     }
 
   private:
@@ -800,482 +969,575 @@ class ShadowsocksConnectOperation final
         return options;
     }
 
-    void resolved(core::Result<detail::AddressList> result) {
-        if (completed_) {
-            return;
+    static exec::task<void> open_shadow_tls(std::shared_ptr<ShadowsocksConnectOperation> self) {
+        auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
+            std::make_unique<net::TcpStream>(std::move(*self->socket_)));
+        ss::ShadowTlsClientOptions options;
+        options.version = self->config_.plugin_version;
+        options.password = self->config_.plugin_password;
+        options.host = self->config_.plugin_host;
+        options.skip_cert_verify = self->config_.plugin_skip_cert_verify;
+        if (!self->config_.plugin_alpn.empty()) {
+            options.alpn_protocols = self->config_.plugin_alpn;
+        }
+        core::Result<std::unique_ptr<io::StreamHandle>> result;
+        try {
+            result = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
+                [self, stream = std::move(stream), options = std::move(options)](
+                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                        done) mutable {
+                    ss::async_open_shadow_tls(
+                        std::move(*stream), std::move(options),
+                        [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
+                            done(std::move(opened));
+                        });
+                    return [self] { self->abort(); };
+                });
+        } catch (...) {
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "Shadow-TLS open failed", {}}));
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
         }
         if (!result) {
-            finish(core::StreamOpenResult::failed(result.error()));
-            return;
+            self->finish(core::StreamOpenResult::failed(result.error()));
+            co_return;
         }
-        if (kcptun_plugin()) {
-            if (result.value().empty()) {
-                finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::resolution,
-                     "Shadowsocks kcptun server hostname resolved to no addresses",
-                     {}}));
-                return;
-            }
-            const auto endpoint =
-                boost::asio::ip::udp::endpoint(result.value().front(), config_.server_port);
-            if (!kcptun_pool_) {
-                auto options = config_.kcptun.value_or(ss::KcptunClientOptions{});
-                auto stream = ss::make_kcptun_client_stream(runtime_, endpoint, std::move(options));
-                if (!stream) {
-                    finish(core::StreamOpenResult::failed(stream.error()));
-                    return;
-                }
-                carrier_ = std::make_shared<ss::StreamCarrier>(std::move(stream.value()));
-                send_initial_request();
-                return;
-            }
-            auto self = shared_from_this();
-            struct PoolOpenReceiver {
-                using receiver_concept = stdexec::receiver_tag;
-                std::shared_ptr<ShadowsocksConnectOperation> self;
-                void set_value(std::unique_ptr<io::StreamHandle> stream) && noexcept {
-                    self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(stream));
-                    self->send_initial_request();
-                }
-                void set_error(std::exception_ptr error) && noexcept {
-                    try {
-                        std::rethrow_exception(std::move(error));
-                    } catch (const core::Error &failure) {
-                        self->finish(core::StreamOpenResult::failed(failure));
-                    } catch (...) {
-                        self->finish(core::StreamOpenResult::failed(
-                            {core::ErrorCode::transport_io, "kcptun pool open failed", {}}));
-                    }
-                }
-                void set_stopped() && noexcept {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::cancelled, "kcptun pool open stopped", {}}));
-                }
-            };
-            auto sender = kcptun_pool_->open_stream(endpoint);
-            async::start_with_receiver(std::move(sender), PoolOpenReceiver{self});
-            return;
-        }
-        auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
-        endpoints->reserve(result.value().size());
-        for (const auto &address : result.value()) {
-            endpoints->emplace_back(address, config_.server_port);
-        }
-        auto self = shared_from_this();
-        if (websocket_plugin() && config_.plugin_mux) {
-            if (!websocket_mux_pool_) {
-                finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::configuration,
-                     "Shadowsocks WebSocket mux pool is not initialized",
-                     {}}));
-                return;
-            }
-            websocket_mux_pool_->async_open_stream(
-                std::move(*endpoints), websocket_options(),
-                [self](core::Result<std::unique_ptr<io::StreamHandle>> stream) mutable {
-                    if (!stream) {
-                        self->finish(core::StreamOpenResult::failed(stream.error()));
-                        return;
-                    }
-                    self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(stream.value()));
-                    self->send_initial_request();
-                });
-            return;
-        }
-        boost::asio::async_connect(
-            *socket_, *endpoints,
-            [self, endpoints](const boost::system::error_code &error,
-                              const boost::asio::ip::tcp::endpoint &) {
-                if (error) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::endpoint_connection,
-                         "failed to connect to Shadowsocks server", detail::to_std_error(error)}));
-                    return;
-                }
-                if (self->shadow_tls_plugin()) {
-                    self->open_shadow_tls();
-                    return;
-                }
-                if (self->restls_plugin()) {
-                    self->open_restls();
-                    return;
-                }
-                if (self->jls_plugin()) {
-                    self->open_jls();
-                    return;
-                }
-                self->send_initial_request();
-            });
+        self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
+        co_await send_initial_request(self);
     }
 
-    void open_shadow_tls() {
-        auto self = shared_from_this();
-        auto stream = std::make_unique<net::TcpStream>(std::move(*socket_));
-        ss::ShadowTlsClientOptions options;
-        options.version = config_.plugin_version;
-        options.password = config_.plugin_password;
-        options.host = config_.plugin_host;
-        options.skip_cert_verify = config_.plugin_skip_cert_verify;
-        if (!config_.plugin_alpn.empty()) {
-            options.alpn_protocols = config_.plugin_alpn;
-        }
-        ss::async_open_shadow_tls(
-            std::move(stream), std::move(options),
-            [self](core::Result<std::unique_ptr<io::StreamHandle>> result) mutable {
-                if (!result) {
-                    self->finish(core::StreamOpenResult::failed(result.error()));
-                    return;
-                }
-                self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
-                self->send_initial_request();
-            });
-    }
-
-    void open_restls() {
-        auto self = shared_from_this();
-        auto stream = std::make_unique<net::TcpStream>(std::move(*socket_));
+    static exec::task<void> open_restls(std::shared_ptr<ShadowsocksConnectOperation> self) {
+        auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
+            std::make_unique<net::TcpStream>(std::move(*self->socket_)));
         ss::RestlsClientOptions options;
-        options.server_name = config_.plugin_host;
-        options.password = config_.plugin_password;
-        options.version_hint = config_.plugin_version_hint;
-        options.restls_script = config_.plugin_restls_script;
-        options.skip_cert_verify = config_.plugin_skip_cert_verify;
-        ss::async_open_restls(
-            std::move(stream), std::move(options),
-            [self](core::Result<std::unique_ptr<io::StreamHandle>> result) mutable {
-                if (!result) {
-                    self->finish(core::StreamOpenResult::failed(result.error()));
-                    return;
-                }
-                self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
-                self->send_initial_request();
-            });
+        options.server_name = self->config_.plugin_host;
+        options.password = self->config_.plugin_password;
+        options.version_hint = self->config_.plugin_version_hint;
+        options.restls_script = self->config_.plugin_restls_script;
+        options.skip_cert_verify = self->config_.plugin_skip_cert_verify;
+        core::Result<std::unique_ptr<io::StreamHandle>> result;
+        try {
+            result = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
+                [self, stream = std::move(stream), options = std::move(options)](
+                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                        done) mutable {
+                    ss::async_open_restls(
+                        std::move(*stream), std::move(options),
+                        [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
+                            done(std::move(opened));
+                        });
+                    return [self] { self->abort(); };
+                });
+        } catch (...) {
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "ResTLS open failed", {}}));
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        if (!result) {
+            self->finish(core::StreamOpenResult::failed(result.error()));
+            co_return;
+        }
+        self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
+        co_await send_initial_request(self);
     }
 
-    void open_jls() {
-        auto self = shared_from_this();
-        auto stream = std::make_unique<net::TcpStream>(std::move(*socket_));
+    static exec::task<void> open_jls(std::shared_ptr<ShadowsocksConnectOperation> self) {
+        auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
+            std::make_unique<net::TcpStream>(std::move(*self->socket_)));
         ss::JlsClientOptions options;
-        options.server_name = config_.plugin_host;
-        options.username = config_.plugin_username;
-        options.password = config_.plugin_password;
-        options.alpn = config_.plugin_alpn;
-        options.skip_cert_verify = config_.plugin_skip_cert_verify;
-        ss::async_open_jls(std::move(stream), std::move(options),
-                           [self](core::Result<std::unique_ptr<io::StreamHandle>> result) mutable {
-                               if (!result) {
-                                   self->finish(core::StreamOpenResult::failed(result.error()));
-                                   return;
-                               }
-                               self->carrier_ =
-                                   std::make_shared<ss::StreamCarrier>(std::move(result.value()));
-                               self->send_initial_request();
-                           });
+        options.server_name = self->config_.plugin_host;
+        options.username = self->config_.plugin_username;
+        options.password = self->config_.plugin_password;
+        options.alpn = self->config_.plugin_alpn;
+        options.skip_cert_verify = self->config_.plugin_skip_cert_verify;
+        core::Result<std::unique_ptr<io::StreamHandle>> result;
+        try {
+            result = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
+                [self, stream = std::move(stream), options = std::move(options)](
+                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                        done) mutable {
+                    ss::async_open_jls(
+                        std::move(*stream), std::move(options),
+                        [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
+                            done(std::move(opened));
+                        });
+                    return [self] { self->abort(); };
+                });
+        } catch (...) {
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "JLS open failed", {}}));
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        if (!result) {
+            self->finish(core::StreamOpenResult::failed(result.error()));
+            co_return;
+        }
+        self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
+        co_await send_initial_request(self);
     }
 
-    void send_initial_request() {
-        const auto method = ss::cipher_method(config_.method);
+    static exec::task<void>
+    send_initial_request(std::shared_ptr<ShadowsocksConnectOperation> self) {
+        const auto method = ss::cipher_method(self->config_.method);
         if (method.value().shadowsocks_2022) {
-            auto address = detail::encode_proxy_address(request_.destination);
+            auto address = detail::encode_proxy_address(self->request_.destination);
             if (!address) {
-                finish(core::StreamOpenResult::failed(address.error()));
-                return;
+                self->finish(core::StreamOpenResult::failed(address.error()));
+                co_return;
             }
-            if (websocket_plugin() && !config_.plugin_mux) {
-                open_websocket_2022(std::move(address.value()));
-                return;
+            if (self->websocket_plugin() && !self->config_.plugin_mux) {
+                co_await open_websocket_2022(self, std::move(address.value()));
+                co_return;
             }
-            auto self = shared_from_this();
-            if (self->carrier_) {
-                ss::async_open_shadowsocks_2022_stream(
-                    runtime_, self->carrier_, self->config_.method, self->config_.password,
-                    std::move(address.value()),
-                    [self](core::StreamOpenResult result) { self->finish(std::move(result)); });
-            } else {
-                ss::async_open_shadowsocks_2022_stream(
-                    runtime_, self->socket_, self->config_.method, self->config_.password,
-                    std::move(address.value()), self->obfs_options(),
-                    [self](core::StreamOpenResult result) { self->finish(std::move(result)); });
+            std::optional<core::StreamOpenResult> opened;
+            try {
+                if (self->carrier_) {
+                    opened = co_await async::bridge_sender<core::StreamOpenResult>(
+                        [self, destination = std::move(address.value())](
+                            async::BridgeSender<core::StreamOpenResult>::Handler done) mutable {
+                            ss::async_open_shadowsocks_2022_stream(
+                                self->runtime_, self->carrier_, self->config_.method,
+                                self->config_.password, std::move(destination),
+                                [done](core::StreamOpenResult result) mutable {
+                                    done(std::move(result));
+                                });
+                            return [self] { self->abort(); };
+                        });
+                } else {
+                    opened = co_await async::bridge_sender<core::StreamOpenResult>(
+                        [self, destination = std::move(address.value())](
+                            async::BridgeSender<core::StreamOpenResult>::Handler done) mutable {
+                            ss::async_open_shadowsocks_2022_stream(
+                                self->runtime_, self->socket_, self->config_.method,
+                                self->config_.password, std::move(destination),
+                                self->obfs_options(),
+                                [done](core::StreamOpenResult result) mutable {
+                                    done(std::move(result));
+                                });
+                            return [self] { self->abort(); };
+                        });
+                }
+            } catch (...) {
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "Shadowsocks 2022 open failed", {}}));
+                co_return;
             }
-            return;
+            self->finish(std::move(*opened));
+            co_return;
         }
         if (method.value().kind == ss::CipherKind::stream) {
-            send_legacy_initial_request(method.value());
-            return;
+            co_await send_legacy_initial_request(self, method.value());
+            co_return;
         }
         std::vector<std::uint8_t> salt(method.value().key_size);
         if (!ss::random_bytes(salt)) {
-            finish(core::StreamOpenResult::failed(
+            self->finish(core::StreamOpenResult::failed(
                 {core::ErrorCode::authentication, "failed to generate Shadowsocks salt"}));
-            return;
+            co_return;
         }
-        auto key = ss::derive_aead_subkey(config_.method, config_.password, salt);
-        auto address = detail::encode_proxy_address(request_.destination);
+        auto key = ss::derive_aead_subkey(self->config_.method, self->config_.password, salt);
+        auto address = detail::encode_proxy_address(self->request_.destination);
         if (!key || !address) {
-            finish(core::StreamOpenResult::failed(!key ? key.error() : address.error()));
-            return;
+            self->finish(core::StreamOpenResult::failed(!key ? key.error() : address.error()));
+            co_return;
         }
-        write_nonce_.assign(method.value().nonce_size, 0);
-        auto record = append_tcp_record(config_.method, key.value(), write_nonce_, address.value());
+        self->write_nonce_.assign(method.value().nonce_size, 0);
+        auto record = append_tcp_record(self->config_.method, key.value(), self->write_nonce_,
+                                        address.value());
         if (record.empty()) {
-            finish(core::StreamOpenResult::failed(
+            self->finish(core::StreamOpenResult::failed(
                 {core::ErrorCode::authentication, "failed to encrypt Shadowsocks destination"}));
-            return;
+            co_return;
         }
         salt.insert(salt.end(), record.begin(), record.end());
         auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(salt));
-        auto self = shared_from_this();
-        if (websocket_plugin() && !config_.plugin_mux) {
-            open_websocket_classic(std::move(*wire), std::move(key.value()));
-            return;
+        if (self->websocket_plugin() && !self->config_.plugin_mux) {
+            co_await open_websocket_classic(self, std::move(*wire), std::move(key.value()));
+            co_return;
         }
-        if (const auto obfs = obfs_options(); obfs) {
-            auto handler = [self, key = std::move(key.value()),
-                            mode = obfs->mode](core::Status result) mutable {
-                if (!result) {
-                    self->finish(core::StreamOpenResult::failed(result.error()));
-                    return;
+        if (const auto obfs = self->obfs_options(); obfs) {
+            core::Status obfs_result;
+            try {
+                if (obfs->mode == ss::ObfsMode::http) {
+                    obfs_result = co_await async::bridge_sender<core::Status>(
+                        [self, wire](async::BridgeSender<core::Status>::Handler done) mutable {
+                            const auto options = self->obfs_options();
+                            ss::async_write_http_obfs_request(
+                                self->socket_, std::move(*wire), {options->host, options->port},
+                                [done](core::Status result) mutable { done(std::move(result)); });
+                            return [self] { self->abort(); };
+                        });
+                } else {
+                    obfs_result = co_await async::bridge_sender<core::Status>(
+                        [self, wire](async::BridgeSender<core::Status>::Handler done) mutable {
+                            const auto options = self->obfs_options();
+                            ss::async_write_tls_obfs_request(
+                                self->socket_, std::move(*wire), options->host,
+                                [done](core::Status result) mutable { done(std::move(result)); });
+                            return [self] { self->abort(); };
+                        });
                 }
-                auto handler = std::move(self->handler_);
-                self->cancel_timer();
-                self->completed_ = true;
-                handler(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
-                    self->socket_, self->config_.method, self->config_.password, std::move(key),
-                    self->write_nonce_, std::vector<std::uint8_t>{}, mode)));
-            };
-            if (obfs->mode == ss::ObfsMode::http) {
-                ss::async_write_http_obfs_request(socket_, std::move(*wire),
-                                                  {obfs->host, obfs->port}, std::move(handler));
-            } else {
-                ss::async_write_tls_obfs_request(socket_, std::move(*wire), obfs->host,
-                                                 std::move(handler));
-            }
-            return;
-        }
-        StreamWriteHandler completion = [self, wire, key = std::move(key.value())](
-                                            const boost::system::error_code &error,
-                                            std::size_t) mutable {
-            if (error) {
+            } catch (...) {
                 self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::transport_io, "failed to write Shadowsocks TCP request",
-                     detail::to_std_error(error)}));
-                return;
+                    {core::ErrorCode::transport_io, "Shadowsocks obfs request failed", {}}));
+                co_return;
             }
-            auto handler = std::move(self->handler_);
-            self->cancel_timer();
-            self->completed_ = true;
+            if (self->completed_) {
+                co_return;
+            }
+            if (!obfs_result) {
+                self->finish(core::StreamOpenResult::failed(obfs_result.error()));
+                co_return;
+            }
+            self->finish(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
+                self->socket_, self->config_.method, self->config_.password, std::move(key.value()),
+                self->write_nonce_, std::vector<std::uint8_t>{}, obfs->mode)));
+            co_return;
+        }
+        try {
             if (self->carrier_) {
-                handler(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
-                    self->carrier_, self->config_.method, self->config_.password, std::move(key),
-                    self->write_nonce_)));
+                co_await self->carrier_->async_write(boost::asio::buffer(*wire));
             } else {
-                handler(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
-                    self->socket_, self->config_.method, self->config_.password, std::move(key),
-                    self->write_nonce_)));
+                using WriteSigs =
+                    stdexec::completion_signatures<stdexec::set_value_t(bool),
+                                                   stdexec::set_error_t(std::exception_ptr),
+                                                   stdexec::set_stopped_t()>;
+                co_await async::callback_sender<WriteSigs>(
+                    [self, wire](auto terminal) mutable {
+                        boost::asio::async_write(*self->socket_, boost::asio::buffer(*wire),
+                                                 std::move(terminal));
+                    },
+                    [](auto receiver, const boost::system::error_code &error, auto) {
+                        if (error) {
+                            stdexec::set_error(std::move(receiver),
+                                               std::make_exception_ptr(core::Error{
+                                                   core::ErrorCode::transport_io,
+                                                   "failed to write Shadowsocks TCP request",
+                                                   detail::to_std_error(error)}));
+                            return;
+                        }
+                        stdexec::set_value(std::move(receiver), true);
+                    });
             }
-        };
-        if (carrier_) {
-            // NOTE: name the sender first; argument order is unspecified.
-            auto sender = carrier_->async_write(boost::asio::buffer(*wire));
-            async::start_with_receiver(std::move(sender),
-                                       CarrierWriteBridge{std::move(completion)});
+        } catch (const core::Error &failure) {
+            self->finish(core::StreamOpenResult::failed(
+                {failure.code, "failed to write Shadowsocks TCP request", failure.cause}));
+            co_return;
+        } catch (...) {
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "failed to write Shadowsocks TCP request", {}}));
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        if (self->carrier_) {
+            self->finish(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
+                self->carrier_, self->config_.method, self->config_.password,
+                std::move(key.value()), self->write_nonce_)));
         } else {
-            boost::asio::async_write(*socket_, boost::asio::buffer(*wire), std::move(completion));
+            self->finish(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
+                self->socket_, self->config_.method, self->config_.password, std::move(key.value()),
+                self->write_nonce_)));
         }
     }
 
-    void open_websocket_classic(std::vector<std::uint8_t> wire, std::vector<std::uint8_t> key) {
-        auto self = shared_from_this();
-        auto stream = std::make_unique<net::TcpStream>(std::move(*socket_));
-        ss::async_open_websocket_plugin(
-            std::move(stream), websocket_options(),
-            [self, wire = std::make_shared<std::vector<std::uint8_t>>(std::move(wire)),
-             key = std::move(key)](core::Result<std::unique_ptr<io::StreamHandle>> result) mutable {
-                if (!result) {
-                    self->finish(core::StreamOpenResult::failed(result.error()));
-                    return;
-                }
-                self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
-                StreamWriteHandler completion = [self, wire, key = std::move(key)](
-                                                    const boost::system::error_code &error,
-                                                    std::size_t) mutable {
-                    if (error) {
-                        self->finish(core::StreamOpenResult::failed(
-                            {core::ErrorCode::transport_io,
-                             "failed to write Shadowsocks WebSocket request",
-                             detail::to_std_error(error)}));
-                        return;
-                    }
-                    auto handler = std::move(self->handler_);
-                    self->cancel_timer();
-                    self->completed_ = true;
-                    handler(
-                        core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
-                            self->carrier_, self->config_.method, self->config_.password,
-                            std::move(key), self->write_nonce_)));
-                };
-                // NOTE: name the sender first; argument order is unspecified.
-                auto sender = self->carrier_->async_write(boost::asio::buffer(*wire));
-                async::start_with_receiver(std::move(sender),
-                                           CarrierWriteBridge{std::move(completion)});
-            });
+    static exec::task<void>
+    open_websocket_classic(std::shared_ptr<ShadowsocksConnectOperation> self,
+                           std::vector<std::uint8_t> wire, std::vector<std::uint8_t> key) {
+        auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
+            std::make_unique<net::TcpStream>(std::move(*self->socket_)));
+        core::Result<std::unique_ptr<io::StreamHandle>> plugin;
+        try {
+            plugin = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
+                [self, stream = std::move(stream)](
+                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                        done) mutable {
+                    ss::async_open_websocket_plugin(
+                        std::move(*stream), self->websocket_options(),
+                        [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
+                            done(std::move(opened));
+                        });
+                    return [self] { self->abort(); };
+                });
+        } catch (...) {
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "WebSocket plugin open failed", {}}));
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        if (!plugin) {
+            self->finish(core::StreamOpenResult::failed(plugin.error()));
+            co_return;
+        }
+        self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(plugin.value()));
+        auto shared_wire = std::make_shared<std::vector<std::uint8_t>>(std::move(wire));
+        try {
+            co_await self->carrier_->async_write(boost::asio::buffer(*shared_wire));
+        } catch (const core::Error &failure) {
+            self->finish(core::StreamOpenResult::failed(
+                {failure.code, "failed to write Shadowsocks WebSocket request", failure.cause}));
+            co_return;
+        } catch (...) {
+            self->finish(
+                core::StreamOpenResult::failed({core::ErrorCode::transport_io,
+                                                "failed to write Shadowsocks WebSocket request",
+                                                {}}));
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        self->finish(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
+            self->carrier_, self->config_.method, self->config_.password, std::move(key),
+            self->write_nonce_)));
     }
 
-    void open_websocket_2022(std::vector<std::uint8_t> destination) {
-        auto self = shared_from_this();
-        auto stream = std::make_unique<net::TcpStream>(std::move(*socket_));
-        ss::async_open_websocket_plugin(
-            std::move(stream), websocket_options(),
-            [self, destination = std::move(destination)](
-                core::Result<std::unique_ptr<io::StreamHandle>> result) mutable {
-                if (!result) {
-                    self->finish(core::StreamOpenResult::failed(result.error()));
-                    return;
-                }
-                self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
-                ss::async_open_shadowsocks_2022_stream(
-                    self->runtime_, self->carrier_, self->config_.method, self->config_.password,
-                    std::move(destination),
-                    [self](core::StreamOpenResult opened) { self->finish(std::move(opened)); });
-            });
+    static exec::task<void> open_websocket_2022(std::shared_ptr<ShadowsocksConnectOperation> self,
+                                                std::vector<std::uint8_t> destination) {
+        auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
+            std::make_unique<net::TcpStream>(std::move(*self->socket_)));
+        core::Result<std::unique_ptr<io::StreamHandle>> plugin;
+        try {
+            plugin = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
+                [self, stream = std::move(stream)](
+                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                        done) mutable {
+                    ss::async_open_websocket_plugin(
+                        std::move(*stream), self->websocket_options(),
+                        [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
+                            done(std::move(opened));
+                        });
+                    return [self] { self->abort(); };
+                });
+        } catch (...) {
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "WebSocket plugin open failed", {}}));
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        if (!plugin) {
+            self->finish(core::StreamOpenResult::failed(plugin.error()));
+            co_return;
+        }
+        self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(plugin.value()));
+        core::StreamOpenResult opened;
+        try {
+            opened = co_await async::bridge_sender<core::StreamOpenResult>(
+                [self, destination = std::move(destination)](
+                    async::BridgeSender<core::StreamOpenResult>::Handler done) mutable {
+                    ss::async_open_shadowsocks_2022_stream(
+                        self->runtime_, self->carrier_, self->config_.method,
+                        self->config_.password, std::move(destination),
+                        [done](core::StreamOpenResult result) mutable { done(std::move(result)); });
+                    return [self] { self->abort(); };
+                });
+        } catch (...) {
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "Shadowsocks 2022 open failed", {}}));
+            co_return;
+        }
+        self->finish(std::move(opened));
     }
 
-    void send_legacy_initial_request(const ss::CipherMethod &method) {
+    static exec::task<void>
+    send_legacy_initial_request(std::shared_ptr<ShadowsocksConnectOperation> self,
+                                const ss::CipherMethod &method) {
         std::vector<std::uint8_t> iv(method.iv_size);
         if (!ss::random_bytes(iv)) {
-            finish(core::StreamOpenResult::failed(
+            self->finish(core::StreamOpenResult::failed(
                 {core::ErrorCode::authentication, "failed to generate Shadowsocks legacy IV"}));
-            return;
+            co_return;
         }
-        auto key = ss::derive_legacy_key(config_.method, config_.password, iv);
-        auto address = detail::encode_proxy_address(request_.destination);
+        auto key = ss::derive_legacy_key(self->config_.method, self->config_.password, iv);
+        auto address = detail::encode_proxy_address(self->request_.destination);
         if (!key || !address) {
-            finish(core::StreamOpenResult::failed(!key ? key.error() : address.error()));
-            return;
+            self->finish(core::StreamOpenResult::failed(!key ? key.error() : address.error()));
+            co_return;
         }
-        auto cipher = ss::LegacyStreamCipher::create(config_.method, key.value(), iv, true);
+        auto cipher = ss::LegacyStreamCipher::create(self->config_.method, key.value(), iv, true);
         if (!cipher) {
-            finish(core::StreamOpenResult::failed(cipher.error()));
-            return;
+            self->finish(core::StreamOpenResult::failed(cipher.error()));
+            co_return;
         }
         auto encrypted_address = std::move(address.value());
         if (const auto result = cipher.value().update(encrypted_address); !result) {
-            finish(core::StreamOpenResult::failed(result.error()));
-            return;
+            self->finish(core::StreamOpenResult::failed(result.error()));
+            co_return;
         }
         iv.insert(iv.end(), encrypted_address.begin(), encrypted_address.end());
         auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(iv));
-        auto self = shared_from_this();
-        if (websocket_plugin() && !config_.plugin_mux) {
-            open_websocket_legacy(std::move(*wire), std::move(cipher.value()));
-            return;
+        if (self->websocket_plugin() && !self->config_.plugin_mux) {
+            co_await open_websocket_legacy(self, std::move(*wire), std::move(cipher.value()));
+            co_return;
         }
-        if (const auto obfs = obfs_options(); obfs) {
+        if (const auto obfs = self->obfs_options(); obfs) {
             auto write_cipher = std::make_shared<ss::LegacyStreamCipher>(std::move(cipher.value()));
-            auto handler = [self, write_cipher, mode = obfs->mode](core::Status result) mutable {
-                if (!result) {
-                    self->finish(core::StreamOpenResult::failed(result.error()));
-                    return;
+            core::Status obfs_result;
+            try {
+                if (obfs->mode == ss::ObfsMode::http) {
+                    obfs_result = co_await async::bridge_sender<core::Status>(
+                        [self, wire,
+                         write_cipher](async::BridgeSender<core::Status>::Handler done) mutable {
+                            const auto options = self->obfs_options();
+                            ss::async_write_http_obfs_request(
+                                self->socket_, std::move(*wire), {options->host, options->port},
+                                [done](core::Status result) mutable { done(std::move(result)); });
+                            return [self] { self->abort(); };
+                        });
+                } else {
+                    obfs_result = co_await async::bridge_sender<core::Status>(
+                        [self, wire,
+                         write_cipher](async::BridgeSender<core::Status>::Handler done) mutable {
+                            const auto options = self->obfs_options();
+                            ss::async_write_tls_obfs_request(
+                                self->socket_, std::move(*wire), options->host,
+                                [done](core::Status result) mutable { done(std::move(result)); });
+                            return [self] { self->abort(); };
+                        });
                 }
-                auto handler = std::move(self->handler_);
-                self->cancel_timer();
-                self->completed_ = true;
-                auto stream = ss::make_legacy_stream_handle(self->socket_, self->config_.method,
-                                                            self->config_.password,
-                                                            std::move(*write_cipher), {}, mode);
-                if (!stream) {
-                    handler(core::StreamOpenResult::failed(stream.error()));
-                    return;
-                }
-                handler(core::StreamOpenResult::opened(std::move(stream.value())));
-            };
-            if (obfs->mode == ss::ObfsMode::http) {
-                ss::async_write_http_obfs_request(socket_, std::move(*wire),
-                                                  {obfs->host, obfs->port}, std::move(handler));
-            } else {
-                ss::async_write_tls_obfs_request(socket_, std::move(*wire), obfs->host,
-                                                 std::move(handler));
+            } catch (...) {
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "Shadowsocks obfs request failed", {}}));
+                co_return;
             }
-            return;
+            if (self->completed_) {
+                co_return;
+            }
+            if (!obfs_result) {
+                self->finish(core::StreamOpenResult::failed(obfs_result.error()));
+                co_return;
+            }
+            auto stream = ss::make_legacy_stream_handle(self->socket_, self->config_.method,
+                                                        self->config_.password,
+                                                        std::move(*write_cipher), {}, obfs->mode);
+            if (!stream) {
+                self->finish(core::StreamOpenResult::failed(stream.error()));
+                co_return;
+            }
+            self->finish(core::StreamOpenResult::opened(std::move(stream.value())));
+            co_return;
         }
         auto write_cipher = std::make_shared<ss::LegacyStreamCipher>(std::move(cipher.value()));
-        StreamWriteHandler completion = [self, wire,
-                                         write_cipher](const boost::system::error_code &error,
-                                                       std::size_t) mutable {
-            if (error) {
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::transport_io, "failed to write Shadowsocks legacy request",
-                     detail::to_std_error(error)}));
-                return;
+        try {
+            if (self->carrier_) {
+                co_await self->carrier_->async_write(boost::asio::buffer(*wire));
+            } else {
+                using WriteSigs =
+                    stdexec::completion_signatures<stdexec::set_value_t(bool),
+                                                   stdexec::set_error_t(std::exception_ptr),
+                                                   stdexec::set_stopped_t()>;
+                co_await async::callback_sender<WriteSigs>(
+                    [self, wire](auto terminal) mutable {
+                        boost::asio::async_write(*self->socket_, boost::asio::buffer(*wire),
+                                                 std::move(terminal));
+                    },
+                    [](auto receiver, const boost::system::error_code &error, auto) {
+                        if (error) {
+                            stdexec::set_error(std::move(receiver),
+                                               std::make_exception_ptr(core::Error{
+                                                   core::ErrorCode::transport_io,
+                                                   "failed to write Shadowsocks legacy request",
+                                                   detail::to_std_error(error)}));
+                            return;
+                        }
+                        stdexec::set_value(std::move(receiver), true);
+                    });
             }
-            auto handler = std::move(self->handler_);
-            self->cancel_timer();
-            self->completed_ = true;
-            auto stream = self->carrier_
-                              ? ss::make_legacy_stream_handle(self->carrier_, self->config_.method,
-                                                              self->config_.password,
-                                                              std::move(*write_cipher))
-                              : ss::make_legacy_stream_handle(self->socket_, self->config_.method,
-                                                              self->config_.password,
-                                                              std::move(*write_cipher));
-            if (!stream) {
-                handler(core::StreamOpenResult::failed(stream.error()));
-                return;
-            }
-            handler(core::StreamOpenResult::opened(std::move(stream.value())));
-        };
-        if (carrier_) {
-            // NOTE: name the sender first; argument order is unspecified.
-            auto sender = carrier_->async_write(boost::asio::buffer(*wire));
-            async::start_with_receiver(std::move(sender),
-                                       CarrierWriteBridge{std::move(completion)});
-        } else {
-            boost::asio::async_write(*socket_, boost::asio::buffer(*wire), std::move(completion));
+        } catch (const core::Error &failure) {
+            self->finish(core::StreamOpenResult::failed(
+                {failure.code, "failed to write Shadowsocks legacy request", failure.cause}));
+            co_return;
+        } catch (...) {
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "failed to write Shadowsocks legacy request", {}}));
+            co_return;
         }
+        if (self->completed_) {
+            co_return;
+        }
+        auto stream =
+            self->carrier_
+                ? ss::make_legacy_stream_handle(self->carrier_, self->config_.method,
+                                                self->config_.password, std::move(*write_cipher))
+                : ss::make_legacy_stream_handle(self->socket_, self->config_.method,
+                                                self->config_.password, std::move(*write_cipher));
+        if (!stream) {
+            self->finish(core::StreamOpenResult::failed(stream.error()));
+            co_return;
+        }
+        self->finish(core::StreamOpenResult::opened(std::move(stream.value())));
     }
 
-    void open_websocket_legacy(std::vector<std::uint8_t> wire,
-                               ss::LegacyStreamCipher write_cipher) {
-        auto self = shared_from_this();
+    static exec::task<void> open_websocket_legacy(std::shared_ptr<ShadowsocksConnectOperation> self,
+                                                  std::vector<std::uint8_t> wire,
+                                                  ss::LegacyStreamCipher write_cipher) {
         auto cipher = std::make_shared<ss::LegacyStreamCipher>(std::move(write_cipher));
-        auto stream = std::make_unique<net::TcpStream>(std::move(*socket_));
-        ss::async_open_websocket_plugin(
-            std::move(stream), websocket_options(),
-            [self, wire = std::make_shared<std::vector<std::uint8_t>>(std::move(wire)),
-             cipher = std::move(cipher)](
-                core::Result<std::unique_ptr<io::StreamHandle>> result) mutable {
-                if (!result) {
-                    self->finish(core::StreamOpenResult::failed(result.error()));
-                    return;
-                }
-                self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
-                StreamWriteHandler completion = [self, wire,
-                                                 cipher](const boost::system::error_code &error,
-                                                         std::size_t) mutable {
-                    if (error) {
-                        self->finish(core::StreamOpenResult::failed(
-                            {core::ErrorCode::transport_io,
-                             "failed to write Shadowsocks WebSocket request",
-                             detail::to_std_error(error)}));
-                        return;
-                    }
-                    auto handler = std::move(self->handler_);
-                    self->cancel_timer();
-                    self->completed_ = true;
-                    auto stream =
-                        ss::make_legacy_stream_handle(self->carrier_, self->config_.method,
-                                                      self->config_.password, std::move(*cipher));
-                    if (!stream) {
-                        handler(core::StreamOpenResult::failed(stream.error()));
-                        return;
-                    }
-                    handler(core::StreamOpenResult::opened(std::move(stream.value())));
-                };
-                // NOTE: name the sender first; argument order is unspecified.
-                auto sender = self->carrier_->async_write(boost::asio::buffer(*wire));
-                async::start_with_receiver(std::move(sender),
-                                           CarrierWriteBridge{std::move(completion)});
-            });
+        auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
+            std::make_unique<net::TcpStream>(std::move(*self->socket_)));
+        core::Result<std::unique_ptr<io::StreamHandle>> plugin;
+        try {
+            plugin = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
+                [self, stream = std::move(stream), cipher](
+                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                        done) mutable {
+                    ss::async_open_websocket_plugin(
+                        std::move(*stream), self->websocket_options(),
+                        [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
+                            done(std::move(opened));
+                        });
+                    return [self] { self->abort(); };
+                });
+        } catch (...) {
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "WebSocket plugin open failed", {}}));
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        if (!plugin) {
+            self->finish(core::StreamOpenResult::failed(plugin.error()));
+            co_return;
+        }
+        self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(plugin.value()));
+        auto shared_wire = std::make_shared<std::vector<std::uint8_t>>(std::move(wire));
+        try {
+            co_await self->carrier_->async_write(boost::asio::buffer(*shared_wire));
+        } catch (const core::Error &failure) {
+            self->finish(core::StreamOpenResult::failed(
+                {failure.code, "failed to write Shadowsocks WebSocket request", failure.cause}));
+            co_return;
+        } catch (...) {
+            self->finish(
+                core::StreamOpenResult::failed({core::ErrorCode::transport_io,
+                                                "failed to write Shadowsocks WebSocket request",
+                                                {}}));
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        auto stream_handle = ss::make_legacy_stream_handle(
+            self->carrier_, self->config_.method, self->config_.password, std::move(*cipher));
+        if (!stream_handle) {
+            self->finish(core::StreamOpenResult::failed(stream_handle.error()));
+            co_return;
+        }
+        self->finish(core::StreamOpenResult::opened(std::move(stream_handle.value())));
     }
 
     void cancel_timer() noexcept { timer_.cancel(); }
@@ -1340,6 +1602,7 @@ class ShadowsocksConnectOperation final
     std::vector<std::uint8_t> write_nonce_;
     std::optional<dns::ResolverService::RequestId> resolver_request_id_;
     bool completed_ = false;
+    exec::async_scope scope_;
 };
 
 class ShadowsocksDatagramHandle final : public io::DatagramHandle {

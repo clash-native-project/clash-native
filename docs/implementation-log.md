@@ -2145,3 +2145,16 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-24
+
+- Taskified `ShadowsocksConnectOperation`: the resolve / kcptun /
+  mux-pool / TCP-plus-plugin / cipher-handshake chain now runs as
+  `run()`/`connect_tcp()` coroutines over senders, with the remaining
+  callback steps (resolve, mux pool, shadow-tls/restls/jls, ss2022,
+  obfs writes) bridged per step and the timer/abort/completed_
+  machinery unchanged. Branch behavior and error contexts were
+  transliterated; the old step methods are deleted.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.
