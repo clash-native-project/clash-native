@@ -2022,3 +2022,18 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-23
+
+- Coroutine-ized the HTTP proxy and Trojan outbound connect chains
+  into per-operation tasks: resolve stays callback (foreign resolver
+  API), then TCP connect, TLS/websocket transport, and tunnel or
+  request write run straight-line with all terminals funneling
+  through finish(). Receivers and stage methods are deleted; abort()
+  marks completion so tasks bail at their next guard (the bridge
+  drops the late terminal as before). Note: neither connect path has
+  unit coverage (only registry validation), so both task bodies were
+  re-read against the old stage logic before submitting.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.

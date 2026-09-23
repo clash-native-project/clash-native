@@ -1,5 +1,5 @@
 #include <clash_native/async/bridge.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/core/base64.hpp>
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
@@ -15,6 +15,9 @@
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
+
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -161,6 +164,142 @@ class HttpProxyConnectOperation final
         return {};
     }
 
+    // Straight-line connect chain: TCP connect, optional TLS handshake,
+    // HTTP session, CONNECT tunnel. Every terminal funnels through finish(),
+    // so the spawned task always ends with a value.
+    static exec::task<void>
+    run(std::shared_ptr<HttpProxyConnectOperation> self,
+        std::shared_ptr<std::vector<boost::asio::ip::tcp::endpoint>> endpoints) {
+        using ConnectSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
+                                                           stdexec::set_error_t(std::exception_ptr),
+                                                           stdexec::set_stopped_t()>;
+        try {
+            try {
+                co_await async::callback_sender<ConnectSigs>(
+                    [self, endpoints](auto terminal) mutable {
+                        boost::asio::async_connect(*self->socket_, *endpoints, std::move(terminal));
+                    },
+                    [](auto receiver, const boost::system::error_code &error, auto) {
+                        if (error) {
+                            stdexec::set_error(std::move(receiver),
+                                               std::make_exception_ptr(core::Error{
+                                                   core::ErrorCode::endpoint_connection,
+                                                   "failed to connect to HTTP proxy server",
+                                                   to_std_error(error)}));
+                            return;
+                        }
+                        stdexec::set_value(std::move(receiver), true);
+                    });
+            } catch (const core::Error &failure) {
+                self->finish(core::StreamOpenResult::failed(failure));
+                co_return;
+            } catch (...) {
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::endpoint_connection, "failed to connect to HTTP proxy"}));
+                co_return;
+            }
+            if (self->completed_) {
+                co_return;
+            }
+            std::unique_ptr<io::StreamHandle> stream =
+                std::make_unique<net::TcpStream>(std::move(*self->socket_));
+            self->socket_.reset();
+            std::string alpn;
+            if (self->config_.tls) {
+                transport::TlsClientOptions options;
+                options.server_name = self->config_.server_name.empty() ? self->config_.server_host
+                                                                        : self->config_.server_name;
+                options.verify_peer = self->config_.verify_peer;
+                options.trusted_ca_pem = self->config_.trusted_ca_pem;
+                options.alpn_protocols = {"h2", "http/1.1"};
+                options.deadline = self->deadline_;
+                transport::TlsClientConnection connection;
+                try {
+                    connection = co_await transport::async_tls_client_handshake(std::move(stream),
+                                                                                std::move(options));
+                } catch (const core::Error &failure) {
+                    self->finish(core::StreamOpenResult::failed(failure));
+                    co_return;
+                } catch (...) {
+                    self->finish(core::StreamOpenResult::failed(
+                        {core::ErrorCode::endpoint_connection, "HTTP proxy TLS failed"}));
+                    co_return;
+                }
+                if (self->completed_) {
+                    if (connection.stream) {
+                        connection.stream->close();
+                    }
+                    co_return;
+                }
+                if (!connection.negotiated_alpn.empty() && connection.negotiated_alpn != "h2" &&
+                    connection.negotiated_alpn != "http/1.1") {
+                    connection.stream->close();
+                    self->finish(core::StreamOpenResult::failed(
+                        {core::ErrorCode::unsupported,
+                         "HTTP proxy negotiated an unsupported ALPN protocol"}));
+                    co_return;
+                }
+                alpn = std::move(connection.negotiated_alpn);
+                stream = std::move(connection.stream);
+            }
+            if (self->completed_) {
+                if (stream) {
+                    stream->close();
+                }
+                co_return;
+            }
+            if (alpn == "h2") {
+                self->session_ = transport::make_http2_exchange_session(std::move(stream));
+            } else {
+                self->session_ = transport::make_http1_exchange_session(std::move(stream));
+            }
+            if (!self->session_) {
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "failed to create HTTP proxy client session"}));
+                co_return;
+            }
+            io::StreamUpgradeRequest tunnel;
+            tunnel.authority = destination_authority(self->request_.destination);
+            if (!self->config_.username.empty()) {
+                tunnel.headers.push_back(
+                    {"proxy-authorization",
+                     "Basic " + core::base64_encode(self->config_.username + ':' +
+                                                    self->config_.password)});
+            }
+            io::StreamUpgradeResponse tunneled;
+            try {
+                tunneled = co_await self->session_->open_tunnel(std::move(tunnel), self->deadline_);
+            } catch (const core::Error &failure) {
+                self->finish(core::StreamOpenResult::failed(failure));
+                co_return;
+            } catch (...) {
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::endpoint_connection, "HTTP proxy tunnel failed"}));
+                co_return;
+            }
+            if (self->completed_) {
+                if (tunneled.stream) {
+                    tunneled.stream->close();
+                }
+                co_return;
+            }
+            if (!tunneled.stream) {
+                const auto status = tunneled.response.status;
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::rejected,
+                     "HTTP proxy rejected CONNECT with status " + std::to_string(status)}));
+                co_return;
+            }
+            auto tunnel_stream = std::make_unique<HttpProxyTunnelStream>(std::move(tunneled.stream),
+                                                                         std::move(self->session_));
+            self->finish(core::StreamOpenResult::opened(std::move(tunnel_stream)));
+        } catch (...) {
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "HTTP proxy connect failed"}));
+        }
+        co_return;
+    }
+
     void resolved(core::Result<detail::AddressList> result) {
         if (completed_) {
             return;
@@ -174,163 +313,15 @@ class HttpProxyConnectOperation final
         for (const auto &address : result.value()) {
             endpoints->emplace_back(address, config_.server_port);
         }
-        auto self = shared_from_this();
-        boost::asio::async_connect(
-            *socket_, *endpoints,
-            [self, endpoints](const boost::system::error_code &error,
-                              const boost::asio::ip::tcp::endpoint &) {
-                if (self->completed_) {
-                    return;
-                }
-                if (error) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::endpoint_connection,
-                         "failed to connect to HTTP proxy server", to_std_error(error)}));
-                    return;
-                }
-                self->connected();
-            });
-    }
-
-    void connected() {
-        auto stream = std::make_unique<net::TcpStream>(std::move(*socket_));
-        socket_.reset();
-        if (!config_.tls) {
-            begin_http(std::move(stream), {});
-            return;
-        }
-
-        transport::TlsClientOptions options;
-        options.server_name =
-            config_.server_name.empty() ? config_.server_host : config_.server_name;
-        options.verify_peer = config_.verify_peer;
-        options.trusted_ca_pem = config_.trusted_ca_pem;
-        options.alpn_protocols = {"h2", "http/1.1"};
-        options.deadline = deadline_;
-        struct TlsReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<HttpProxyConnectOperation> self;
-            void set_value(transport::TlsClientConnection connection) && noexcept {
-                if (self->completed_) {
-                    if (connection.stream) {
-                        connection.stream->close();
-                    }
-                    return;
-                }
-                if (!connection.negotiated_alpn.empty() && connection.negotiated_alpn != "h2" &&
-                    connection.negotiated_alpn != "http/1.1") {
-                    connection.stream->close();
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::unsupported,
-                         "HTTP proxy negotiated an unsupported ALPN protocol"}));
-                    return;
-                }
-                self->begin_http(std::move(connection.stream), connection.negotiated_alpn);
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                if (self->completed_) {
-                    return;
-                }
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->finish(core::StreamOpenResult::failed(failure));
-                } catch (...) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::endpoint_connection, "HTTP proxy TLS failed"}));
-                }
-            }
-            void set_stopped() && noexcept {
-                if (self->completed_) {
-                    return;
-                }
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::cancelled, "HTTP proxy TLS was cancelled"}));
-            }
-        };
-        auto self = shared_from_this();
-        // No explicit cancel: completed_ drops late terminals and the
-        // operation deadline bounds orphans.
-        async::start_with_receiver(
-            transport::async_tls_client_handshake(std::move(stream), std::move(options)),
-            TlsReceiver{self});
-    }
-
-    void begin_http(std::unique_ptr<io::StreamHandle> stream, std::string_view alpn) {
-        if (completed_) {
-            if (stream) {
-                stream->close();
-            }
-            return;
-        }
-        if (alpn == "h2") {
-            session_ = transport::make_http2_exchange_session(std::move(stream));
-        } else {
-            session_ = transport::make_http1_exchange_session(std::move(stream));
-        }
-        if (!session_) {
-            finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::transport_io, "failed to create HTTP proxy client session"}));
-            return;
-        }
-
-        io::StreamUpgradeRequest tunnel;
-        tunnel.authority = destination_authority(request_.destination);
-        if (!config_.username.empty()) {
-            tunnel.headers.push_back(
-                {"proxy-authorization",
-                 "Basic " + core::base64_encode(config_.username + ':' + config_.password)});
-        }
-        struct TunnelReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<HttpProxyConnectOperation> self;
-            void set_value(io::StreamUpgradeResponse result) && noexcept {
-                if (self->completed_) {
-                    if (result.stream) {
-                        result.stream->close();
-                    }
-                    return;
-                }
-                if (!result.stream) {
-                    const auto status = result.response.status;
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::rejected,
-                         "HTTP proxy rejected CONNECT with status " + std::to_string(status)}));
-                    return;
-                }
-                auto tunnel_stream = std::make_unique<HttpProxyTunnelStream>(
-                    std::move(result.stream), std::move(self->session_));
-                self->finish(core::StreamOpenResult::opened(std::move(tunnel_stream)));
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                if (self->completed_) {
-                    return;
-                }
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->finish(core::StreamOpenResult::failed(failure));
-                } catch (...) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::endpoint_connection, "HTTP proxy tunnel failed"}));
-                }
-            }
-            void set_stopped() && noexcept {
-                if (self->completed_) {
-                    return;
-                }
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::cancelled, "HTTP proxy tunnel was cancelled"}));
-            }
-        };
-        auto self = shared_from_this();
-        async::start_with_receiver(session_->open_tunnel(std::move(tunnel), deadline_),
-                                   TunnelReceiver{self});
+        // The scope only owns this chain task (merge-shaped usage);
+        // teardown stays guard-driven, so no stop is ever requested.
+        scope_.spawn(run(shared_from_this(), std::move(endpoints)));
     }
 
   public:
     // Abort for sender-driven cancellation: posted to the strand so it stays
-    // ordered with finish(). The bridge drops the late terminal.
+    // ordered with finish(). Marks completion so the chain task bails at its
+    // next guard; the bridge drops the late terminal.
     void abort() noexcept {
         auto self = shared_from_this();
         try {
@@ -340,6 +331,7 @@ class HttpProxyConnectOperation final
                 if (self->completed_) {
                     return;
                 }
+                self->completed_ = true;
                 boost::system::error_code ignored;
                 (void)self->timer_.cancel();
                 if (self->socket_) {
@@ -385,6 +377,8 @@ class HttpProxyConnectOperation final
     core::StreamRequest request_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
     std::shared_ptr<io::ExchangeSession> session_;
+    // Owns the single connect chain task, which always ends with a value.
+    exec::async_scope scope_;
     boost::asio::steady_timer timer_;
     core::StreamOpenHandler handler_;
     std::chrono::steady_clock::time_point deadline_{};

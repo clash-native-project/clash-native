@@ -1,5 +1,5 @@
 #include <clash_native/async/bridge.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/trojan_outbound.hpp>
 #include <clash_native/transport/tls_client.hpp>
@@ -12,6 +12,9 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/write.hpp>
+
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include <openssl/evp.h>
 
@@ -94,6 +97,162 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     }
 
   private:
+    // Straight-line connect chain: TCP connect, TLS or WebSocket transport,
+    // Trojan request write. Every terminal funnels through finish(), so the
+    // spawned task always ends with a value.
+    static exec::task<void>
+    run(std::shared_ptr<TrojanConnectOperation> self,
+        std::shared_ptr<std::vector<boost::asio::ip::tcp::endpoint>> endpoints) {
+        using ConnectSigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
+                                                           stdexec::set_error_t(std::exception_ptr),
+                                                           stdexec::set_stopped_t()>;
+        try {
+            try {
+                co_await async::callback_sender<ConnectSigs>(
+                    [self, endpoints](auto terminal) mutable {
+                        boost::asio::async_connect(*self->socket_, *endpoints, std::move(terminal));
+                    },
+                    [](auto receiver, const boost::system::error_code &error, auto) {
+                        if (error) {
+                            stdexec::set_error(std::move(receiver),
+                                               std::make_exception_ptr(
+                                                   core::Error{core::ErrorCode::endpoint_connection,
+                                                               "failed to connect to Trojan server",
+                                                               to_std_error(error)}));
+                            return;
+                        }
+                        stdexec::set_value(std::move(receiver), true);
+                    });
+            } catch (const core::Error &failure) {
+                self->finish(core::StreamOpenResult::failed(failure));
+                co_return;
+            } catch (...) {
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::endpoint_connection, "failed to connect to Trojan server"}));
+                co_return;
+            }
+            if (self->completed_) {
+                co_return;
+            }
+            if (self->config_.network == "ws" || self->config_.network == "wss") {
+                transport::WebSocketClientOptions ws_options;
+                ws_options.host =
+                    self->config_.websocket_host.empty()
+                        ? (self->config_.server_name.empty() ? self->config_.server_host
+                                                             : self->config_.server_name)
+                        : self->config_.websocket_host;
+                ws_options.target = self->config_.websocket_path;
+                ws_options.headers = self->config_.websocket_headers;
+                ws_options.tls = self->config_.network == "wss" || self->config_.websocket_tls;
+                ws_options.tls_server_name = self->config_.server_name.empty()
+                                                 ? self->config_.server_host
+                                                 : self->config_.server_name;
+                ws_options.tls_verify_peer = self->config_.verify_peer;
+                ws_options.tls_trusted_ca_pem = self->config_.trusted_ca_pem;
+                ws_options.tls_alpn_protocols = {"http/1.1"};
+                ws_options.deadline = self->deadline_;
+                auto plain_stream = std::make_unique<net::TcpStream>(std::move(*self->socket_));
+                self->socket_.reset();
+                using WsSigs = stdexec::completion_signatures<
+                    stdexec::set_value_t(core::Result<std::unique_ptr<io::StreamHandle>>),
+                    stdexec::set_error_t(std::exception_ptr), stdexec::set_stopped_t()>;
+                core::Result<std::unique_ptr<io::StreamHandle>> ws_result;
+                try {
+                    ws_result = co_await async::callback_sender<WsSigs>(
+                        [plain = std::move(plain_stream),
+                         ws_options = std::move(ws_options)](auto terminal) mutable {
+                            transport::async_websocket_client_handshake(
+                                std::move(plain), std::move(ws_options), std::move(terminal));
+                        },
+                        [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> result) {
+                            stdexec::set_value(std::move(receiver), std::move(result));
+                        });
+                } catch (const core::Error &failure) {
+                    self->finish(core::StreamOpenResult::failed(failure));
+                    co_return;
+                } catch (...) {
+                    self->finish(core::StreamOpenResult::failed(
+                        {core::ErrorCode::endpoint_connection, "Trojan WebSocket failed"}));
+                    co_return;
+                }
+                if (self->completed_) {
+                    if (ws_result && ws_result.value()) {
+                        ws_result.value()->close();
+                    }
+                    co_return;
+                }
+                if (!ws_result) {
+                    self->finish(core::StreamOpenResult::failed(ws_result.error()));
+                    co_return;
+                }
+                self->transport_stream_ = std::move(ws_result.value());
+            } else {
+                transport::TlsClientOptions tls_options;
+                tls_options.server_name = self->config_.server_name.empty()
+                                              ? self->config_.server_host
+                                              : self->config_.server_name;
+                tls_options.verify_peer = self->config_.verify_peer;
+                tls_options.trusted_ca_pem = self->config_.trusted_ca_pem;
+                tls_options.deadline = self->deadline_;
+                auto plain_stream = std::make_unique<net::TcpStream>(std::move(*self->socket_));
+                self->socket_.reset();
+                transport::TlsClientConnection connection;
+                try {
+                    connection = co_await transport::async_tls_client_handshake(
+                        std::move(plain_stream), std::move(tls_options));
+                } catch (const core::Error &failure) {
+                    self->finish(core::StreamOpenResult::failed(failure));
+                    co_return;
+                } catch (...) {
+                    self->finish(core::StreamOpenResult::failed(
+                        {core::ErrorCode::endpoint_connection, "Trojan TLS failed"}));
+                    co_return;
+                }
+                if (self->completed_) {
+                    if (connection.stream) {
+                        connection.stream->close();
+                    }
+                    co_return;
+                }
+                self->transport_stream_ = std::move(connection.stream);
+            }
+            const auto password_key = trojan_password_key(self->config_.password);
+            const auto address = detail::encode_proxy_address(self->request_.destination);
+            if (!password_key || !address) {
+                self->finish(core::StreamOpenResult::failed(!password_key ? password_key.error()
+                                                                          : address.error()));
+                co_return;
+            }
+            auto wire = std::make_shared<std::vector<std::uint8_t>>();
+            wire->reserve(password_key.value().size() + address.value().size() + 5);
+            wire->insert(wire->end(), password_key.value().begin(), password_key.value().end());
+            wire->push_back('\r');
+            wire->push_back('\n');
+            wire->push_back(0x01);
+            wire->insert(wire->end(), address.value().begin(), address.value().end());
+            wire->push_back('\r');
+            wire->push_back('\n');
+            try {
+                co_await self->transport_stream_->async_write(boost::asio::buffer(*wire));
+            } catch (const core::Error &failure) {
+                self->finish(core::StreamOpenResult::failed(failure));
+                co_return;
+            } catch (...) {
+                self->finish(core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "failed to write Trojan request"}));
+                co_return;
+            }
+            if (self->completed_) {
+                co_return;
+            }
+            self->finish(core::StreamOpenResult::opened(std::move(self->transport_stream_)));
+        } catch (...) {
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "Trojan connect failed"}));
+        }
+        co_return;
+    }
+
     void resolved(core::Result<detail::AddressList> result) {
         if (completed_) {
             return;
@@ -107,177 +266,17 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         for (const auto &address : result.value()) {
             endpoints->emplace_back(address, config_.server_port);
         }
-        auto self = shared_from_this();
-        boost::asio::async_connect(
-            *socket_, *endpoints,
-            [self, endpoints](const boost::system::error_code &error,
-                              const boost::asio::ip::tcp::endpoint &) {
-                if (error) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::endpoint_connection, "failed to connect to Trojan server",
-                         to_std_error(error)}));
-                    return;
-                }
-                self->start_transport();
-            });
-    }
-
-    void start_transport() {
-        if (config_.network == "ws" || config_.network == "wss") {
-            start_websocket();
-            return;
-        }
-        start_tls();
-    }
-
-    void start_tls() {
-        const auto server_name =
-            config_.server_name.empty() ? config_.server_host : config_.server_name;
-        transport::TlsClientOptions options;
-        options.server_name = server_name;
-        options.verify_peer = config_.verify_peer;
-        options.trusted_ca_pem = config_.trusted_ca_pem;
-        options.deadline = deadline_;
-        auto self = shared_from_this();
-        auto plain_stream = std::make_unique<net::TcpStream>(std::move(*socket_));
-        socket_.reset();
-        struct TlsReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<TrojanConnectOperation> self;
-            void set_value(transport::TlsClientConnection connection) && noexcept {
-                if (self->completed_) {
-                    if (connection.stream) {
-                        connection.stream->close();
-                    }
-                    return;
-                }
-                self->transport_stream_ = std::move(connection.stream);
-                self->write_request_header();
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                if (self->completed_) {
-                    return;
-                }
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->finish(core::StreamOpenResult::failed(failure));
-                } catch (...) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::endpoint_connection, "Trojan TLS failed"}));
-                }
-            }
-            void set_stopped() && noexcept {
-                if (self->completed_) {
-                    return;
-                }
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::cancelled, "Trojan TLS was cancelled"}));
-            }
-        };
-        // No explicit cancel: completed_ drops late terminals and the
-        // operation deadline bounds orphans.
-        async::start_with_receiver(
-            transport::async_tls_client_handshake(std::move(plain_stream), std::move(options)),
-            TlsReceiver{self});
-    }
-
-    void start_websocket() {
-        if (completed_ || !socket_) {
-            return;
-        }
-        const auto server_name =
-            config_.server_name.empty() ? config_.server_host : config_.server_name;
-        transport::WebSocketClientOptions options;
-        options.host =
-            config_.websocket_host.empty()
-                ? (config_.server_name.empty() ? config_.server_host : config_.server_name)
-                : config_.websocket_host;
-        options.target = config_.websocket_path;
-        options.headers = config_.websocket_headers;
-        options.tls = config_.network == "wss" || config_.websocket_tls;
-        options.tls_server_name = server_name;
-        options.tls_verify_peer = config_.verify_peer;
-        options.tls_trusted_ca_pem = config_.trusted_ca_pem;
-        options.tls_alpn_protocols = {"http/1.1"};
-        options.deadline = deadline_;
-
-        auto plain_stream = std::make_unique<net::TcpStream>(std::move(*socket_));
-        socket_.reset();
-        auto self = shared_from_this();
-        websocket_handshake_ = transport::async_websocket_client_handshake(
-            std::move(plain_stream), std::move(options),
-            [self](core::Result<std::unique_ptr<io::StreamHandle>> result) mutable {
-                self->websocket_handshake_.reset();
-                if (self->completed_) {
-                    if (result && result.value()) {
-                        result.value()->close();
-                    }
-                    return;
-                }
-                if (!result) {
-                    self->finish(core::StreamOpenResult::failed(result.error()));
-                    return;
-                }
-                self->transport_stream_ = std::move(result.value());
-                self->write_request_header();
-            });
-    }
-
-    void write_request_header() {
-        const auto password_key = trojan_password_key(config_.password);
-        const auto address = detail::encode_proxy_address(request_.destination);
-        if (!password_key || !address) {
-            finish(core::StreamOpenResult::failed(!password_key ? password_key.error()
-                                                                : address.error()));
-            return;
-        }
-        auto wire = std::make_shared<std::vector<std::uint8_t>>();
-        wire->reserve(password_key.value().size() + address.value().size() + 5);
-        wire->insert(wire->end(), password_key.value().begin(), password_key.value().end());
-        wire->push_back('\r');
-        wire->push_back('\n');
-        wire->push_back(0x01);
-        wire->insert(wire->end(), address.value().begin(), address.value().end());
-        wire->push_back('\r');
-        wire->push_back('\n');
-
-        auto self = shared_from_this();
-        struct WriteForwarder {
-            std::shared_ptr<TrojanConnectOperation> self;
-            std::shared_ptr<std::vector<std::uint8_t>> wire;
-            void set_value(std::size_t) noexcept {
-                self->completed_ = true;
-                self->cancel_timer();
-                auto handler = std::move(self->handler_);
-                handler(core::StreamOpenResult::opened(std::move(self->transport_stream_)));
-            }
-            void set_error(std::exception_ptr error) noexcept {
-                core::Error failure{
-                    core::ErrorCode::transport_io, "failed to write Trojan request", {}};
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &named) {
-                    failure = named;
-                } catch (...) {
-                }
-                self->finish(core::StreamOpenResult::failed(std::move(failure)));
-            }
-            void set_stopped() noexcept {
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::cancelled, "Trojan request write cancelled"}));
-            }
-        };
-        async::start_with_receiver(transport_stream_->async_write(boost::asio::buffer(*wire)),
-                                   WriteForwarder{self, wire});
+        // The scope only owns this chain task (merge-shaped usage);
+        // teardown stays guard-driven, so no stop is ever requested.
+        scope_.spawn(run(shared_from_this(), std::move(endpoints)));
     }
 
     void cancel_timer() noexcept { timer_.cancel(); }
 
   public:
-    // Abort for sender-driven cancellation: runs on any thread, mirrors the
-    // failure cleanup in finish() without completing (the bridge drops the
-    // late terminal through its settled flag).
+    // Abort for sender-driven cancellation: posted to the strand so it stays
+    // ordered with finish(). Marks completion so the chain task bails at its
+    // next guard; the bridge drops the late terminal.
     void abort() noexcept {
         auto self = shared_from_this();
         try {
@@ -287,17 +286,12 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 if (self->completed_) {
                     return;
                 }
+                self->completed_ = true;
                 boost::system::error_code ignored;
                 self->cancel_timer();
-                if (self->websocket_handshake_) {
-                    self->websocket_handshake_->cancel();
-                }
                 if (self->socket_) {
                     self->socket_->cancel(ignored);
                     self->socket_->close(ignored);
-                }
-                if (self->transport_stream_) {
-                    self->transport_stream_->close();
                 }
             });
         } catch (...) {
@@ -313,9 +307,6 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         cancel_timer();
         if (!result.succeeded()) {
             boost::system::error_code ignored;
-            if (websocket_handshake_) {
-                websocket_handshake_->cancel();
-            }
             if (socket_) {
                 socket_->cancel(ignored);
                 socket_->close(ignored);
@@ -333,11 +324,12 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     TrojanOutboundConfig config_;
     core::StreamRequest request_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
-    std::shared_ptr<transport::WebSocketClientHandshake> websocket_handshake_;
     std::unique_ptr<io::StreamHandle> transport_stream_;
     boost::asio::steady_timer timer_;
     core::StreamOpenHandler handler_;
     std::chrono::steady_clock::time_point deadline_{};
+    // Owns the single connect chain task, which always ends with a value.
+    exec::async_scope scope_;
     bool completed_ = false;
 };
 
