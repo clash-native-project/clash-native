@@ -2251,3 +2251,13 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-24
+
+- Synced `docs/architecture.md` with the migrated reality: `io::`
+  capability interfaces as the only async I/O bases, `io::AnySender`
+  outbound narrow waist, sender completion contract
+  (value/`core::Error`/stopped), actual `ErrorCode` vocabulary and
+  field order, exchange-ID DNS registry shape, owned (non-Dart)
+  channel primitives, no `request_stop` teardown flow, completed
+  Stage 2/3 and partial Stage 4 statuses.

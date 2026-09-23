@@ -10,13 +10,18 @@ of this project.
 This document defines the intended boundaries of the project before the
 protocol surface becomes large. It is a blueprint, not a claim that every
 described component is already implemented or production-ready. The current
-implementation includes SOCKS5 and HTTP/1.1 inbound entry paths, including
+implementation includes SOCKS4/5 and HTTP/1.1 inbound entry paths, including
 CONNECT, ordinary forwarding, HTTP/1.1 Upgrade forwarding, optional Basic
 authentication, and HTTP/1.1 keep-alive exchanges. It also includes
-stream/datagram outbound contracts,
-Direct, Reject, Shadowsocks, Trojan, and encrypted DNS transports. Current
-protocol code and tests remain the evidence for actual support; a planned
-boundary in this document is not implementation proof.
+sender-native stream/datagram outbound contracts,
+Direct, Reject, Shadowsocks (including kcptun and WebSocket mux), Trojan,
+and encrypted DNS transports (UDP/TCP, DoT, DoH/1/2, DoQ, DoH/3) over shared
+TLS, HTTP/1.1, HTTP/2, QUIC, and HTTP/3 carriers. Connect and handshake
+chains run as coroutines over senders; pumps run as re-armed receivers.
+Current protocol code and tests remain the evidence for actual support; a
+planned boundary in this document is not implementation proof. Per-change
+progress is recorded in `docs/implementation-log.md`, and the
+sender-migration rules of record live in `docs/async-pitfalls.md`.
 
 The current `ProxySession` integration path is transitional. Its server
 lifecycle, shared session state, HTTP handling, SOCKS5 handling, and local
@@ -221,10 +226,10 @@ class Outbound {
   virtual const OutboundDescriptor& descriptor() const noexcept = 0;
   virtual OutboundCapabilities capabilities() const noexcept = 0;
 
-  virtual stdexec::task<Result<StreamOpenResult>> connect_stream(
+  virtual io::AnySender<StreamOpenResult> connect_stream(
       StreamRequest request) = 0;
 
-  virtual stdexec::task<Result<DatagramOpenResult>> open_datagram(
+  virtual io::AnySender<DatagramOpenResult> open_datagram(
       DatagramRequest request) = 0;
 
   virtual ~Outbound() = default;
@@ -268,16 +273,18 @@ The request types do not expose raw configuration nodes. They refer only to
 validated runtime objects owned by the active snapshot.
 
 Successful operations return move-only established objects rather than raw
-Asio sockets:
+Asio sockets. The four handle/session contracts live in `io/` and are the
+only asynchronous I/O base classes; the old `core::`/`transport::` callback
+bases were removed after migration:
 
 | Type | Responsibility |
 | --- | --- |
 | `StreamOpenResult` | Established stream, selected chain, and first-payload commit state |
 | `DatagramOpenResult` | Established datagram handle, selected chain, and association semantics |
-| `StreamHandle` | Asynchronous read, write, half-close, cancellation, endpoints, and transport ownership |
-| `DatagramHandle` | Addressed send/receive, cancellation, association semantics, MTU information, and transport ownership |
-| `MultiplexedSession` | Logical stream allocation, cancellation, capacity, retirement, and session ownership for a multiplexed carrier |
-| `ExchangeSession` | Request/response heads, streaming bodies, cancellation, and stream-upgrade results over an HTTP-like exchange carrier |
+| `io::StreamHandle` | Sender-based async read, write, half-close, endpoints, and transport ownership |
+| `io::DatagramHandle` | Sender-based addressed send/receive, association semantics, MTU information, and transport ownership |
+| `io::MultiplexedSession` | Sender-based logical stream allocation, cancellation, capacity, retirement, and session ownership for a multiplexed carrier |
+| `io::ExchangeSession` | Sender-based request/response heads, streaming bodies, cancellation, and stream-upgrade results over an HTTP-like exchange carrier |
 | `ConnectionTrace` | Selected outbound/group chain and diagnostic annotations outside the I/O interface |
 
 An asynchronous buffer view must remain valid until its operation completes.
@@ -546,11 +553,13 @@ after all child handles and operations have released their ownership. New
 configuration never closes a shared QUIC or multiplexed session out from under
 an established flow.
 
-Every connect, handshake, datagram-open, read, and write operation receives the
-parent stop token. Cancellation must reach the lowest cancellable Asio or
-QUIC transport operation, and completion must be observed before its state is
-destroyed. Protocol implementations must not start detached cleanup or reader
-loops that escape their session scope.
+Every connect, handshake, datagram-open, read, and write operation is
+cancellable, and completion must be observed before its state is
+destroyed. Cancellation reaches the lowest cancellable Asio or QUIC
+transport operation. Scopes are never `request_stop()`ed; teardown flows
+through completion guards, generation counters, and deadlines, with late
+completions dropped. Protocol implementations must not start detached
+cleanup or reader loops that escape their session scope.
 
 Expected network failures use the project's typed error model. Cooperative
 cancellation remains `set_stopped`; it is not silently converted into a
@@ -671,28 +680,15 @@ concurrent child work.
 - Callback-based external APIs should be wrapped as senders at their adapter
   boundary instead of exposing callback state to business layers.
 
-### 9.2 Channel primitive
+### 9.2 Channel primitives
 
-The Tokio-style channel implementation from `dart_cpp_bridge` is a candidate
-for extraction into the core async module. It provides:
+The `async` module owns sender-native channel primitives (no Dart or
+Tokio heritage):
 
 - move-only `oneshot` request/result delivery;
-- cloneable-producer, single-consumer MPSC delivery;
-- bounded MPSC with asynchronous backpressure;
-- zero-capacity rendezvous channels;
-- close propagation;
-- stop-token-aware cancellation of parked sends and receives.
-
-The implementation may be reused, but it must be imported as an owned core
-component rather than retaining Dart-specific names or include paths. The
-import must also:
-
-- preserve the applicable MIT license notice and record its provenance;
-- port the existing channel concurrency and cancellation tests;
-- decide whether the generic stream-combinator dependency is needed by the
-  proxy core;
-- account for its stdexec and `rigtorp::MPMCQueue` dependencies;
-- use the project namespace and formatting rules.
+- single-consumer MPSC delivery;
+- `async_stream`, `broadcast`, and `watch` fan-out/state channels;
+- close propagation and cancellation of parked sends and receives.
 
 Recommended uses are:
 
@@ -737,26 +733,24 @@ The core uses one dependency-light project vocabulary for synchronous and
 domain-level asynchronous results. The intended shape is:
 
 ```cpp
-enum class ErrorCode : std::uint16_t {
-  invalid_argument,
-  invalid_configuration,
-  unsupported,
-  resolution_failed,
-  connection_failed,
-  handshake_failed,
-  authentication_failed,
-  protocol_error,
-  timed_out,
+enum class ErrorCode {
+  cancelled,
+  resolution,
+  endpoint_connection,
+  carrier_handshake,
+  authentication,
+  protocol_framing,
+  timeout,
   rejected,
-  transport_error,
-  resource_exhausted,
-  internal_error,
+  unsupported,
+  configuration,
+  transport_io,
 };
 
 struct Error {
   ErrorCode code;
-  std::error_code cause;
   std::string context;
+  std::error_code cause;
 };
 
 template <class T>
@@ -832,20 +826,23 @@ potentially invalid state.
 
 ### 10.4 stdexec mapping
 
-The core follows a Rust-like asynchronous result shape for expected domain
-failures:
+The core is sender-native. Leaf operations complete with a value on
+success, an `exception_ptr` carrying a `core::Error` on failure, and
+stopped on cancellation:
 
 ```text
-task<Result<T>>
-  set_value(Result<T>)        expected success or operational failure
-  set_stopped()               cooperative cancellation
-  set_error(exception_ptr)    unexpected C++ exception
+set_value(T)                  success; see each operation for T
+set_error(exception_ptr)      failure, carrying a core::Error whose cause
+                              preserves the underlying error_code
+set_stopped()                 cooperative cancellation (never an error)
 ```
 
-Expected failures carried by `Result<T>` are value completions from the
-sender's perspective. Generic `upon_error` does not see them. Retry, fallback,
-group selection, and protocol response logic must inspect the `Result`
-explicitly. A pipeline must never create `Result<Result<T>>`.
+Fallible synchronous and registry-style results still use `Result<T>`
+(`tl::expected`), including in-band open results such as
+`StreamOpenResult`/`DatagramOpenResult` and DNS exchange outcomes.
+Retry, fallback, group selection, and protocol response logic inspect
+those `Result`s explicitly. A pipeline must never create
+`Result<Result<T>>`.
 
 Asio adapters should use non-throwing `error_code` completion forms where
 available. They map successful completion to a successful result, cancellation
@@ -943,7 +940,7 @@ The intended engine shutdown sequence is:
 
 1. Reject new public operations and configuration changes.
 2. Stop accepting new sessions.
-3. Request stop on service and session scopes.
+3. Mark service and session scopes retired so late completions drop.
 4. Close control/work channels and cancel outstanding I/O.
 5. Drain all scopes while their worker event loops are still running.
 6. Release work guards after owned operations have completed.
@@ -1392,26 +1389,18 @@ returning a forwarded response.
 
 ### 14.6 Transport and carrier boundaries
 
-`DnsTransport` represents one logical query/response exchange. A conceptual
-callback-based shape is shown below; the exact asynchronous result form may
-later become a sender without changing the surrounding responsibilities:
+`DnsTransport` represents one logical query/response exchange over an
+upstream. Exchanges are registered by ID against a callback registry so
+concurrent queries, deadlines, and cancellation stay manageable:
 
 ```cpp
-struct DnsExchangeRequest {
-  DnsPacket query;
-  Deadline deadline;
-};
-
-struct DnsExchangeResponse {
-  DnsPacket response;
-  DnsTransportTrace trace;
-};
-
 class DnsTransport {
  public:
-  virtual ExchangeHandle exchange(
-      DnsExchangeRequest request,
-      std::function<void(Result<DnsExchangeResponse>)> handler) = 0;
+  using ExchangeId = std::uint64_t;
+  using Handler = std::function<void(core::Result<DnsPacket>)>;
+
+  virtual ExchangeId exchange(DnsExchangeRequest request, Handler handler) = 0;
+  virtual void cancel(ExchangeId exchange_id) noexcept = 0;
   virtual void stop() noexcept = 0;
   virtual ~DnsTransport() = default;
 };
@@ -1599,11 +1588,11 @@ but the current source placement is not the final reusable boundary:
 
 | Capability | Current implementation placement | Target ownership |
 | --- | --- | --- |
-| Stream and datagram I/O | Core handles plus `net` TCP/TLS implementations and DNS-local adapters | `net` handles and a plan-bound `EndpointDialer` |
-| TLS for encrypted DNS | Partly reusable `TlsStream`, with additional DNS-local stream and TLS setup | One injected-stream TLS client connector in `transport` |
-| HTTP/1.1 client | DoH/1 transport using Boost.Beast | Reusable HTTP/1.1 client session and pool |
-| HTTP/2 client | DoH/2 transport owning nghttp2, TLS, multiplexing, and DNS response state | Reusable HTTP/2 client session; DoH remains a consumer |
-| QUIC and HTTP/3 | One DNS transport owns ngtcp2, BoringSSL, nghttp3, UDP I/O, pooling, and DoQ/DoH3 state | QUIC connection engine, HTTP/3 session, and separate DNS adapters |
+| Stream and datagram I/O | `io::` handles, `net` TCP/UDP implementations, and a plan-bound `EndpointDialer` | Done (Stage 2) |
+| TLS for encrypted DNS | One injected-stream TLS client connector in `transport` | Done (Stage 2) |
+| HTTP/1.1 client | Reusable HTTP/1.1 client session and pool | Done (Stage 2) |
+| HTTP/2 client | Reusable HTTP/2 client session; DoH remains a consumer | Done (Stage 2) |
+| QUIC and HTTP/3 | QUIC connection engine, HTTP/3 session, and separate DNS adapters | Done (Stage 2) |
 | DNS wire behavior | `DnsTransport` implementations | Remains in `dns`; it is not a generic carrier API |
 
 This coupling is acceptable as an implementation milestone but becomes a
@@ -1676,8 +1665,9 @@ tests. The intended module split does not justify adding empty `transport`,
 ### 15.3 Capability interfaces
 
 The public capability interfaces have explicit ownership and cancellation
-boundaries. Their callback forms are asynchronous and must complete exactly
-once unless the surrounding API documents a stronger guarantee.
+boundaries. They are sender-based (`io::AnySender` completions: value /
+`core::Error` / stopped) and must complete exactly once unless the
+surrounding API documents a stronger guarantee.
 
 #### Endpoint dialing
 
@@ -1921,8 +1911,13 @@ would be reused.
 
 Extraction proceeds without a flag-day rewrite:
 
-Phases 1 through 4 are Stage 2 DNS migration work. Phase 5 is the Stage 4
-non-DNS generalization gate. Phase 6 is deferred beyond the current extraction.
+Phases 1 through 4 are Stage 2 DNS migration work and are complete:
+DNS no longer owns Beast, nghttp2, ngtcp2, BoringSSL, or nghttp3
+connection/session state. Phase 5 is the Stage 4 non-DNS
+generalization gate: the HTTP half is exercised by non-DNS consumers
+(Trojan, HTTP proxy, WebSocket mux), while a non-DNS QUIC proxy
+consumer is still open. Phase 6 is deferred beyond the current
+extraction.
 
 1. **Characterize the existing behavior.** Keep the current DNS and proxy
    interoperability tests green; add narrow seams around TLS, HTTP/2, QUIC,
@@ -1972,8 +1967,9 @@ Validation reports two completion levels for the current work.
 - DNS egress policy is frozen into a validated `EndpointDialPlan` before
   carrier construction, with dependency-cycle and runtime recursion guards.
 
-This milestone may be reported as DNS migration complete, but it does not yet
-prove that the extracted interfaces are suitable for general proxy traffic.
+This milestone is complete and may be reported as DNS migration complete,
+but it does not yet prove that the extracted interfaces are suitable for
+general proxy traffic.
 
 **The Stage 4 shared HTTP/QUIC generalization gate is complete** only when:
 
@@ -2229,7 +2225,7 @@ validated on Windows. Stages 5 and 6 begin only after the portable core gate.
 - C++ loopback integration tests plus Go-driven black-box and independent
   interoperability tests.
 
-### Stage 2: DNS and routing
+### Stage 2: DNS and routing (complete: the Section 15 DNS-decoupling gate holds)
 
 - resolver roles and bootstrap dependency validation;
 - unified outbound, group, chained-endpoint, and resolver dependency graph with
@@ -2264,16 +2260,17 @@ functional gate covers plain UDP/TCP, DoT, DoH/1, DoH/2, DoQ, and DoH/3.
 Stage 4 builds on this already extracted foundation; it does not postpone the
 DNS migration.
 
-### Stage 3: encrypted stream protocols
+### Stage 3: encrypted stream protocols (complete)
 
-- Shadowsocks;
+- Shadowsocks, including kcptun, WebSocket mux, and cipher/plugin opens;
 - Trojan;
 - protocol interoperability and failure-path tests.
 
-### Stage 4: QUIC-based protocols
+### Stage 4: QUIC-based protocols (HTTP half complete)
 
-- validate the shared carrier layer with at least one non-DNS HTTP consumer and
-  one selected non-DNS QUIC proxy protocol;
+- validate the shared carrier layer with at least one non-DNS HTTP consumer (done:
+  Trojan, HTTP proxy, WebSocket mux) and one selected non-DNS QUIC proxy
+  protocol (open);
 - extend and harden the already extracted Asio/ngtcp2/BoringSSL QUIC engine and
   nghttp3 HTTP/3 session for proxy stream/datagram requirements without forcing
   incompatible protocols to share live sessions;
