@@ -1996,3 +1996,17 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validated with the Windows x64 Release clang-cl/MSVC build: full
   run of 235 tests passed; `pixi run format`, `format-check`, and
   `git diff --check` pass.
+
+## 2026-09-23
+
+- Coroutine-ized the DoH1 exchange chain into a single `exec::task`:
+  dial, TLS handshake, HTTP/1.1 exchange, and response validation
+  run straight-line with all terminals funneling through `finish()`,
+  replacing the connect/TLS/exchange receivers and their methods.
+  The operation owns the task in an `async_scope` that is never
+  stop-requested (teardown stays guard-driven with the request
+  deadline bounding orphans); `http_response` now takes the response
+  value and the exchange-started flag is gone.
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.

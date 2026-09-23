@@ -1,4 +1,3 @@
-#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/io/exchange_session.hpp>
@@ -7,6 +6,9 @@
 
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
+
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -153,7 +155,10 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
                 self->finish(core::fail(timeout_error()));
             }
         });
-        connect();
+        // The scope only owns this exchange task (merge-shaped usage);
+        // teardown is guard-driven, so no stop is ever requested: the
+        // request deadline bounds any orphaned chain.
+        scope_.spawn(run(shared_from_this()));
     }
 
     void cancel() {
@@ -165,167 +170,105 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     Handler take_handler() { return std::move(handler_); }
 
   private:
-    void connect() {
-        const auto endpoint = owner_.config_.tcp_endpoint.value_or(boost::asio::ip::tcp::endpoint(
-            owner_.config_.endpoint.address(),
-            owner_.config_.endpoint.port() == 53 ? 443 : owner_.config_.endpoint.port()));
-        const auto self = shared_from_this();
-        struct ConnectReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<Operation> self;
-            void set_value(core::StreamOpenResult result) && noexcept {
-                if (self->completed_) {
-                    if (result.handle) {
-                        result.handle->close();
-                    }
-                    return;
+    // Straight-line exchange chain: dial, TLS handshake, HTTP exchange,
+    // response validation. Every terminal funnels through finish(), so the
+    // spawned task always ends with a value.
+    static exec::task<void> run(std::shared_ptr<Operation> self) {
+        try {
+            const auto endpoint = self->owner_.config_.tcp_endpoint.value_or(
+                boost::asio::ip::tcp::endpoint(self->owner_.config_.endpoint.address(),
+                                               self->owner_.config_.endpoint.port() == 53
+                                                   ? 443
+                                                   : self->owner_.config_.endpoint.port()));
+            auto opened = co_await self->owner_.config_.dialer->connect_stream(
+                {core::Destination::address(endpoint.address(), endpoint.port()), std::nullopt});
+            if (self->completed_) {
+                if (opened.handle) {
+                    opened.handle->close();
                 }
-                if (!result.succeeded()) {
-                    self->finish(core::fail(result.error.value_or(
-                        core::Error{core::ErrorCode::endpoint_connection,
-                                    "DoH/HTTP/1.1 dialer failed to open a stream"})));
-                    return;
-                }
-                self->start_tls(std::move(result.handle));
+                co_return;
             }
-            void set_error(std::exception_ptr error) && noexcept {
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->finish(core::fail(failure));
-                } catch (...) {
-                    self->finish(core::fail(core::Error{core::ErrorCode::endpoint_connection,
-                                                        "DoH/HTTP/1.1 dialer failed"}));
-                }
+            if (!opened.succeeded()) {
+                self->finish(core::fail(opened.error.value_or(
+                    core::Error{core::ErrorCode::endpoint_connection,
+                                "DoH/HTTP/1.1 dialer failed to open a stream"})));
+                co_return;
             }
-            void set_stopped() && noexcept {}
-        };
-        async::start_with_receiver(
-            owner_.config_.dialer->connect_stream(
-                {core::Destination::address(endpoint.address(), endpoint.port()), std::nullopt}),
-            ConnectReceiver{self});
-    }
 
-    void start_tls(std::unique_ptr<io::StreamHandle> stream) {
-        const auto server_name = !owner_.config_.server_name.empty()
-                                     ? owner_.config_.server_name
-                                     : (!owner_.config_.hostname.empty()
-                                            ? owner_.config_.hostname
-                                            : owner_.config_.endpoint.address().to_string());
-        transport::TlsClientOptions options;
-        options.server_name = server_name;
-        options.verify_peer = owner_.config_.verify_peer;
-        options.alpn_protocols = {"http/1.1"};
-        options.deadline = request_.deadline;
-        struct TlsReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<Operation> self;
-            void set_value(transport::TlsClientConnection connection) && noexcept {
-                if (self->completed_) {
-                    if (connection.stream) {
-                        connection.stream->close();
-                    }
-                    return;
-                }
-                if (!connection.negotiated_alpn.empty() &&
-                    connection.negotiated_alpn != "http/1.1") {
-                    self->finish(core::fail({core::ErrorCode::carrier_handshake,
-                                             "DoH upstream did not negotiate HTTP/1.1"}));
-                    return;
-                }
-                self->start_http(std::move(connection.stream));
+            const auto server_name = !self->owner_.config_.server_name.empty()
+                                         ? self->owner_.config_.server_name
+                                     : !self->owner_.config_.hostname.empty()
+                                         ? self->owner_.config_.hostname
+                                         : self->owner_.config_.endpoint.address().to_string();
+            transport::TlsClientOptions tls_options;
+            tls_options.server_name = server_name;
+            tls_options.verify_peer = self->owner_.config_.verify_peer;
+            tls_options.alpn_protocols = {"http/1.1"};
+            tls_options.deadline = self->request_.deadline;
+            transport::TlsClientConnection tls;
+            try {
+                tls = co_await transport::async_tls_client_handshake(std::move(opened.handle),
+                                                                     std::move(tls_options));
+            } catch (const core::Error &failure) {
+                self->finish(core::fail(failure));
+                co_return;
+            } catch (...) {
+                self->finish(core::fail(core::Error{core::ErrorCode::endpoint_connection,
+                                                    "DoH/HTTP/1.1 TLS handshake failed"}));
+                co_return;
             }
-            void set_error(std::exception_ptr error) && noexcept {
-                if (self->completed_) {
-                    return;
+            if (self->completed_) {
+                if (tls.stream) {
+                    tls.stream->close();
                 }
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->finish(core::fail(failure));
-                } catch (...) {
-                    self->finish(core::fail(core::Error{core::ErrorCode::endpoint_connection,
-                                                        "DoH/HTTP/1.1 TLS handshake failed"}));
-                }
+                co_return;
             }
-            void set_stopped() && noexcept {
-                if (self->completed_) {
-                    return;
-                }
-                self->finish(core::fail(cancelled_error()));
+            if (!tls.negotiated_alpn.empty() && tls.negotiated_alpn != "http/1.1") {
+                self->finish(core::fail({core::ErrorCode::carrier_handshake,
+                                         "DoH upstream did not negotiate HTTP/1.1"}));
+                co_return;
             }
-        };
-        const auto self = shared_from_this();
-        // No explicit cancel: the completed_ guard drops late terminals
-        // (closing strays) and the request deadline bounds orphans.
-        async::start_with_receiver(
-            transport::async_tls_client_handshake(std::move(stream), std::move(options)),
-            TlsReceiver{self});
-    }
 
-    void start_http(std::unique_ptr<io::StreamHandle> stream) {
-        http_session_ = transport::make_http1_exchange_session(std::move(stream));
-        if (!http_session_) {
-            finish(core::fail(
-                {core::ErrorCode::configuration, "failed to create an HTTP/1.1 client session"}));
-            return;
+            self->http_session_ = transport::make_http1_exchange_session(std::move(tls.stream));
+            if (!self->http_session_) {
+                self->finish(core::fail({core::ErrorCode::configuration,
+                                         "failed to create an HTTP/1.1 client session"}));
+                co_return;
+            }
+            io::ExchangeRequest request;
+            request.method = "POST";
+            request.scheme = "https";
+            request.authority = self->authority_;
+            request.target = self->owner_.config_.doh_path;
+            request.headers = {{"accept", "application/dns-message"},
+                               {"content-type", "application/dns-message"}};
+            request.body = self->request_.query.wire;
+            request.response_body_limit = 0xffff;
+            request.keep_alive = false;
+            io::ExchangeResponse response;
+            try {
+                response = co_await self->http_session_->exchange(std::move(request),
+                                                                  self->request_.deadline);
+            } catch (const core::Error &failure) {
+                self->finish(core::fail(failure));
+                co_return;
+            } catch (...) {
+                self->finish(core::fail(core::Error{core::ErrorCode::endpoint_connection,
+                                                    "DoH/HTTP/1.1 exchange failed"}));
+                co_return;
+            }
+            if (self->completed_) {
+                co_return;
+            }
+            self->http_response(std::move(response));
+        } catch (...) {
+            self->finish(core::fail(
+                core::Error{core::ErrorCode::transport_io, "DoH/HTTP/1.1 exchange failed"}));
         }
-
-        io::ExchangeRequest request;
-        request.method = "POST";
-        request.scheme = "https";
-        request.authority = authority_;
-        request.target = owner_.config_.doh_path;
-        request.headers = {{"accept", "application/dns-message"},
-                           {"content-type", "application/dns-message"}};
-        request.body = request_.query.wire;
-        request.response_body_limit = 0xffff;
-        request.keep_alive = false;
-
-        struct ExchangeReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<Operation> self;
-            void set_value(io::ExchangeResponse response) && noexcept {
-                self->http_exchange_started_ = false;
-                if (self->completed_) {
-                    return;
-                }
-                self->http_response(response);
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                self->http_exchange_started_ = false;
-                if (self->completed_) {
-                    return;
-                }
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->http_response(core::fail(failure));
-                } catch (...) {
-                    self->http_response(core::fail(core::Error{core::ErrorCode::endpoint_connection,
-                                                               "DoH/HTTP/1.1 exchange failed"}));
-                }
-            }
-            void set_stopped() && noexcept {
-                self->http_exchange_started_ = false;
-                if (self->completed_) {
-                    return;
-                }
-                self->http_response(core::fail(cancelled_error()));
-            }
-        };
-        const auto self = shared_from_this();
-        async::start_with_receiver(http_session_->exchange(std::move(request), request_.deadline),
-                                   ExchangeReceiver{self});
-        http_exchange_started_ = true;
+        co_return;
     }
 
-    void http_response(core::Result<io::ExchangeResponse> result) {
-        if (!result) {
-            finish(core::fail(result.error()));
-            return;
-        }
-        const auto &response = result.value();
+    void http_response(io::ExchangeResponse response) {
         if (response.version != 11 || response.status != 200) {
             finish(core::fail(protocol_error("DoH upstream returned an invalid HTTP response")));
             return;
@@ -368,7 +311,6 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
             // tears the session down; no per-exchange cancel is needed.
             http_session_->stop();
             http_session_.reset();
-            http_exchange_started_ = false;
         }
         owner_.complete(exchange_id_, std::move(result));
     }
@@ -380,7 +322,8 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     boost::asio::steady_timer timer_;
     std::shared_ptr<io::ExchangeSession> http_session_;
     std::string authority_;
-    bool http_exchange_started_ = false;
+    // Owns the single exchange chain task, which always ends with a value.
+    exec::async_scope scope_;
     bool completed_ = false;
 };
 
