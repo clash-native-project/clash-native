@@ -2,7 +2,7 @@
 
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/io/exchange_session.hpp>
-#include <clash_native/transport/exchange_session_adapter.hpp>
+#include <clash_native/transport/http_sessions.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -42,8 +42,7 @@ void QuicDnsTransport::Operation::start_doh3_session() {
     };
     // Exchange-plane debt: the HTTP/3 session still speaks transport::;
     // the adapter bridges it into the io:: vocabulary at the edge.
-    auto session =
-        transport::adapt_transport_session(transport::make_http3_exchange_session(quic_, failure));
+    auto session = transport::make_http3_exchange_session(quic_, failure);
     if (retired_) {
         if (session)
             session->stop();
@@ -94,7 +93,7 @@ void QuicDnsTransport::Operation::submit_http3_exchange(const std::shared_ptr<Ex
         ExchangeId exchange_id;
         void set_value(io::ExchangeResponse response) && noexcept {
             if (const auto self = weak.lock()) {
-                self->on_http3_result(exchange_id, transport::to_transport_response(response));
+                self->on_http3_result(exchange_id, response);
             }
         }
         void set_error(std::exception_ptr error) && noexcept {
@@ -121,8 +120,8 @@ void QuicDnsTransport::Operation::submit_http3_exchange(const std::shared_ptr<Ex
                                Http3Receiver{weak, id});
 }
 
-void QuicDnsTransport::Operation::on_http3_result(
-    ExchangeId id, core::Result<transport::ExchangeResponse> result) {
+void QuicDnsTransport::Operation::on_http3_result(ExchangeId id,
+                                                  core::Result<io::ExchangeResponse> result) {
     const auto found = exchanges_.find(id);
     if (found == exchanges_.end() || found->second->result) {
         return;
@@ -139,10 +138,9 @@ void QuicDnsTransport::Operation::on_http3_result(
         drain_exchange_results();
         return;
     }
-    const auto content_type = std::find_if(result->headers.begin(), result->headers.end(),
-                                           [](const transport::ExchangeField &header) {
-                                               return lower_copy(header.name) == "content-type";
-                                           });
+    const auto content_type = std::find_if(
+        result->headers.begin(), result->headers.end(),
+        [](const io::ExchangeField &header) { return lower_copy(header.name) == "content-type"; });
     if (content_type == result->headers.end() ||
         !is_dns_message_content_type(content_type->value)) {
         set_exchange_error(exchange,

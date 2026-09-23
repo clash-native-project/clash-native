@@ -1,26 +1,37 @@
 #pragma once
 
-#include <clash_native/core/outbound.hpp>
+// CONNECT/Upgrade tunnel stream shared by the HTTP/2 and HTTP/3 sessions:
+// the session feeds wire bytes through receive()/remote_close()/fail()
+// while the handed-over stream serves sender-native pulls. The parking
+// machinery underneath stays callback-based; each pull bridges once.
+
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/core/error.hpp>
+#include <clash_native/io/sender.hpp>
+#include <clash_native/io/stream_handle.hpp>
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
 
+#include <stdexec/execution.hpp>
+
 #include <algorithm>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
 
-namespace clash_native::transport::detail {
+namespace clash_native::io::detail {
 
 class HttpTunnelStreamState final : public std::enable_shared_from_this<HttpTunnelStreamState> {
   public:
     using Executor = boost::asio::any_io_executor;
-    using ReadHandler = core::StreamHandle::ReadHandler;
-    using WriteHandler = core::StreamHandle::WriteHandler;
+    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
     using WriteFunction = std::function<void(std::vector<std::uint8_t>, WriteHandler)>;
     using Action = std::function<void()>;
     using ConsumeFunction = std::function<void(std::size_t)>;
@@ -37,52 +48,55 @@ class HttpTunnelStreamState final : public std::enable_shared_from_this<HttpTunn
 
     boost::asio::any_io_executor executor() noexcept { return executor_; }
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) {
-        if (buffer.size() == 0) {
-            boost::asio::post(executor_,
-                              [handler = std::move(handler)]() mutable { handler({}, 0); });
-            return;
-        }
-        const auto self = shared_from_this();
-        boost::asio::dispatch(executor_, [self, buffer, handler = std::move(handler)]() mutable {
-            if (self->read_handler_) {
-                self->post_read(std::move(handler), boost::asio::error::already_started, 0);
-                return;
-            }
-            if (!self->incoming_.empty()) {
-                self->deliver_read(buffer, std::move(handler));
-                return;
-            }
-            if (self->read_closed_) {
-                self->post_read(std::move(handler), self->read_error_, 0);
-                return;
-            }
-            self->read_buffer_ = buffer;
-            self->read_handler_ = std::move(handler);
-        });
+    AnySender<std::optional<std::size_t>> async_read_some(boost::asio::mutable_buffer buffer) {
+        using Signatures =
+            stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                           stdexec::set_error_t(std::exception_ptr),
+                                           stdexec::set_stopped_t()>;
+        return AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
+            [self = shared_from_this(), buffer](auto terminal) mutable {
+                self->read_some(buffer, std::move(terminal));
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                if (!error) {
+                    stdexec::set_value(std::move(receiver), std::optional<std::size_t>{size});
+                    return;
+                }
+                if (error == boost::asio::error::eof) {
+                    stdexec::set_value(std::move(receiver), std::optional<std::size_t>{});
+                    return;
+                }
+                if (error == boost::asio::error::operation_aborted) {
+                    stdexec::set_stopped(std::move(receiver));
+                    return;
+                }
+                stdexec::set_error(std::move(receiver), std::make_exception_ptr(core::Error{
+                                                            core::ErrorCode::transport_io,
+                                                            "tunnel stream read failed", error}));
+            })};
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) {
-        std::vector<std::uint8_t> bytes(buffer.size());
-        boost::asio::buffer_copy(boost::asio::buffer(bytes), buffer);
-        const auto self = shared_from_this();
-        boost::asio::dispatch(
-            executor_, [self, bytes = std::move(bytes), handler = std::move(handler)]() mutable {
-                if (self->write_handler_ || self->local_closed_ || self->closed_) {
-                    self->post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
+    AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
+        return AnySender<std::size_t>{async::callback_sender<Signatures>(
+            [self = shared_from_this(), buffer](auto terminal) mutable {
+                self->write_some(buffer, std::move(terminal));
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                if (!error) {
+                    stdexec::set_value(std::move(receiver), size);
                     return;
                 }
-                if (bytes.empty()) {
-                    self->post_write(std::move(handler), {}, 0);
+                if (error == boost::asio::error::operation_aborted) {
+                    stdexec::set_stopped(std::move(receiver));
                     return;
                 }
-                self->write_size_ = bytes.size();
-                self->write_handler_ = std::move(handler);
-                self->write_(std::move(bytes),
-                             [self](const boost::system::error_code &error, std::size_t size) {
-                                 self->finish_write(error, size);
-                             });
-            });
+                stdexec::set_error(std::move(receiver), std::make_exception_ptr(core::Error{
+                                                            core::ErrorCode::transport_io,
+                                                            "tunnel stream write failed", error}));
+            })};
     }
 
     boost::asio::ip::tcp::endpoint local_endpoint(boost::system::error_code &error) const noexcept {
@@ -179,6 +193,54 @@ class HttpTunnelStreamState final : public std::enable_shared_from_this<HttpTunn
     }
 
   private:
+    void read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) {
+        if (buffer.size() == 0) {
+            boost::asio::post(executor_,
+                              [handler = std::move(handler)]() mutable { handler({}, 0); });
+            return;
+        }
+        const auto self = shared_from_this();
+        boost::asio::dispatch(executor_, [self, buffer, handler = std::move(handler)]() mutable {
+            if (self->read_handler_) {
+                self->post_read(std::move(handler), boost::asio::error::already_started, 0);
+                return;
+            }
+            if (!self->incoming_.empty()) {
+                self->deliver_read(buffer, std::move(handler));
+                return;
+            }
+            if (self->read_closed_) {
+                self->post_read(std::move(handler), self->read_error_, 0);
+                return;
+            }
+            self->read_buffer_ = buffer;
+            self->read_handler_ = std::move(handler);
+        });
+    }
+
+    void write_some(boost::asio::const_buffer buffer, WriteHandler handler) {
+        std::vector<std::uint8_t> bytes(buffer.size());
+        boost::asio::buffer_copy(boost::asio::buffer(bytes), buffer);
+        const auto self = shared_from_this();
+        boost::asio::dispatch(
+            executor_, [self, bytes = std::move(bytes), handler = std::move(handler)]() mutable {
+                if (self->write_handler_ || self->local_closed_ || self->closed_) {
+                    self->post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
+                    return;
+                }
+                if (bytes.empty()) {
+                    self->post_write(std::move(handler), {}, 0);
+                    return;
+                }
+                self->write_size_ = bytes.size();
+                self->write_handler_ = std::move(handler);
+                self->write_(std::move(bytes),
+                             [self](const boost::system::error_code &error, std::size_t size) {
+                                 self->finish_write(error, size);
+                             });
+            });
+    }
+
     void satisfy_read() {
         if (!read_handler_) {
             return;
@@ -273,17 +335,18 @@ class HttpTunnelStreamState final : public std::enable_shared_from_this<HttpTunn
     bool closed_ = false;
 };
 
-class HttpTunnelStream final : public core::StreamHandle {
+class HttpTunnelStream final : public StreamHandle {
   public:
     explicit HttpTunnelStream(std::shared_ptr<HttpTunnelStreamState> state)
         : state_(std::move(state)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        state_->async_read_some(buffer, std::move(handler));
+    AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        return state_->async_read_some(buffer);
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
-        state_->async_write(buffer, std::move(handler));
+    AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        return state_->async_write(buffer);
     }
 
     boost::asio::any_io_executor executor() noexcept override { return state_->executor(); }
@@ -303,9 +366,9 @@ class HttpTunnelStream final : public core::StreamHandle {
     std::shared_ptr<HttpTunnelStreamState> state_;
 };
 
-inline std::unique_ptr<core::StreamHandle>
+inline std::unique_ptr<StreamHandle>
 make_http_tunnel_stream(const std::shared_ptr<HttpTunnelStreamState> &state) {
     return std::make_unique<HttpTunnelStream>(state);
 }
 
-} // namespace clash_native::transport::detail
+} // namespace clash_native::io::detail

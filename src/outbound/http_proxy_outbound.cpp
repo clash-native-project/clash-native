@@ -5,8 +5,7 @@
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/http_proxy_outbound.hpp>
-#include <clash_native/transport/exchange_session.hpp>
-#include <clash_native/transport/exchange_session_adapter.hpp>
+#include <clash_native/transport/http_sessions.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include "outbound_utils.hpp"
@@ -246,11 +245,9 @@ class HttpProxyConnectOperation final
         // Exchange-plane debt: the HTTP sessions still speak transport::;
         // the adapter bridges them into the io:: vocabulary at the edge.
         if (alpn == "h2") {
-            session_ = transport::adapt_transport_session(
-                transport::make_http2_exchange_session(std::move(stream)));
+            session_ = transport::make_http2_exchange_session(std::move(stream));
         } else {
-            session_ = transport::adapt_transport_session(
-                transport::make_http1_exchange_session(std::move(stream)));
+            session_ = transport::make_http1_exchange_session(std::move(stream));
         }
         if (!session_) {
             finish(core::StreamOpenResult::failed(

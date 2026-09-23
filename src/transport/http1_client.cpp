@@ -1,9 +1,11 @@
-#include "http_body_stream.hpp"
-#include "http_tunnel_stream.hpp"
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/oneshot.hpp>
 #include <clash_native/async/watch.hpp>
+#include <clash_native/core/result.hpp>
+#include <clash_native/io/exchange_body_stream.hpp>
+#include <clash_native/io/exchange_session.hpp>
+#include <clash_native/io/sender.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
-#include <clash_native/transport/exchange_session.hpp>
 
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/async_result.hpp>
@@ -154,72 +156,79 @@ class Http1TunnelState final : public std::enable_shared_from_this<Http1TunnelSt
     Http1TunnelState(std::shared_ptr<io::StreamHandle> stream, std::vector<std::uint8_t> buffered)
         : stream_(std::move(stream)), buffered_(std::move(buffered)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer,
-                         core::StreamHandle::ReadHandler handler) {
-        const auto self = shared_from_this();
+    io::AnySender<std::optional<std::size_t>> async_read_some(boost::asio::mutable_buffer buffer) {
         if (buffer.size() == 0) {
-            post_read(std::move(handler), {}, 0);
-            return;
+            return io::AnySender<std::optional<std::size_t>>{
+                stdexec::just(std::optional<std::size_t>{0})};
         }
         if (closed_) {
-            post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
-            return;
+            return io::AnySender<std::optional<std::size_t>>{
+                stdexec::just_error(std::make_exception_ptr(
+                    core::Error{core::ErrorCode::cancelled, "HTTP/1.1 tunnel is closed"}))};
         }
         if (read_in_progress_) {
-            post_read(std::move(handler), boost::asio::error::already_started, 0);
-            return;
+            return io::AnySender<std::optional<std::size_t>>{
+                stdexec::just_error(std::make_exception_ptr(core::Error{
+                    core::ErrorCode::transport_io, "HTTP/1.1 tunnel read already started"}))};
         }
         if (buffered_offset_ < buffered_.size()) {
             const auto size = boost::asio::buffer_copy(
                 buffer, boost::asio::buffer(buffered_.data() + buffered_offset_,
                                             buffered_.size() - buffered_offset_));
             buffered_offset_ += size;
-            post_read(std::move(handler), {}, size);
-            return;
+            return io::AnySender<std::optional<std::size_t>>{
+                stdexec::just(std::optional<std::size_t>{size})};
         }
         read_in_progress_ = true;
-        net::start_read_for_handler(
-            stream_->async_read_some(buffer),
-            [self, handler = std::move(handler)](const boost::system::error_code &error,
-                                                 std::size_t size) mutable {
-                self->read_in_progress_ = false;
-                if (handler) {
-                    handler(error, size);
-                }
-            });
+        auto self = shared_from_this();
+        auto reset = [self] { self->read_in_progress_ = false; };
+        return io::AnySender<std::optional<std::size_t>>{
+            stream_->async_read_some(buffer) |
+            stdexec::then([reset](std::optional<std::size_t> size) {
+                reset();
+                return size;
+            }) |
+            stdexec::let_error([reset](std::exception_ptr error) {
+                reset();
+                return stdexec::just_error(std::move(error));
+            })};
     }
 
-    void async_write(boost::asio::const_buffer buffer, core::StreamHandle::WriteHandler handler) {
-        const auto self = shared_from_this();
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) {
         if (closed_ || local_closed_) {
-            post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
-            return;
+            return io::AnySender<std::size_t>{stdexec::just_error(std::make_exception_ptr(
+                core::Error{core::ErrorCode::cancelled, "HTTP/1.1 tunnel is closed"}))};
         }
         if (write_in_progress_) {
-            post_write(std::move(handler), boost::asio::error::already_started, 0);
-            return;
+            return io::AnySender<std::size_t>{
+                stdexec::just_error(std::make_exception_ptr(core::Error{
+                    core::ErrorCode::transport_io, "HTTP/1.1 tunnel write already started"}))};
         }
         if (buffer.size() == 0) {
-            post_write(std::move(handler), {}, 0);
-            return;
+            return io::AnySender<std::size_t>{stdexec::just(std::size_t{0})};
         }
         auto bytes = std::make_shared<std::vector<std::uint8_t>>(buffer.size());
         boost::asio::buffer_copy(boost::asio::buffer(*bytes), buffer);
         write_in_progress_ = true;
-        net::start_write_for_handler(
-            stream_->async_write(boost::asio::buffer(*bytes)),
-            [self, bytes, handler = std::move(handler)](const boost::system::error_code &error,
-                                                        std::size_t size) mutable {
-                (void)bytes;
+        auto self = shared_from_this();
+        auto finish = [self, bytes](std::size_t size) {
+            (void)bytes;
+            self->write_in_progress_ = false;
+            if (self->shutdown_requested_ && !self->closed_) {
+                self->shutdown_requested_ = false;
+                self->local_closed_ = true;
+                boost::system::error_code ignored;
+                self->stream_->shutdown_send(ignored);
+            }
+            return size;
+        };
+        return io::AnySender<std::size_t>{
+            stream_->async_write(boost::asio::buffer(*bytes)) |
+            stdexec::then([finish](std::size_t size) { return finish(size); }) |
+            stdexec::let_error([self](std::exception_ptr error) {
                 self->write_in_progress_ = false;
-                self->post_write(std::move(handler), error, size);
-                if (self->shutdown_requested_ && !self->closed_) {
-                    self->shutdown_requested_ = false;
-                    self->local_closed_ = true;
-                    boost::system::error_code ignored;
-                    self->stream_->shutdown_send(ignored);
-                }
-            });
+                return stdexec::just_error(std::move(error));
+            })};
     }
 
     boost::asio::any_io_executor executor() noexcept { return stream_->executor(); }
@@ -283,17 +292,18 @@ class Http1TunnelState final : public std::enable_shared_from_this<Http1TunnelSt
     bool closed_ = false;
 };
 
-class Http1TunnelStream final : public core::StreamHandle {
+class Http1TunnelStream final : public io::StreamHandle {
   public:
     explicit Http1TunnelStream(std::shared_ptr<Http1TunnelState> state)
         : state_(std::move(state)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        state_->async_read_some(buffer, std::move(handler));
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        return state_->async_read_some(buffer);
     }
 
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler) override {
-        state_->async_write(buffer, std::move(handler));
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        return state_->async_write(buffer);
     }
 
     boost::asio::any_io_executor executor() noexcept override { return state_->executor(); }
@@ -386,7 +396,7 @@ bool valid_trailer_declaration(std::string_view value) {
     }
 }
 
-core::Result<HttpMessage> make_message(const ExchangeRequest &request) {
+core::Result<HttpMessage> make_message(const io::ExchangeRequest &request) {
     if (!is_token(request.method) || request.target.empty() || has_uri_whitespace(request.target) ||
         has_uri_whitespace(request.authority)) {
         return core::fail(core::Error{core::ErrorCode::configuration,
@@ -415,7 +425,8 @@ core::Result<HttpMessage> make_message(const ExchangeRequest &request) {
     return message;
 }
 
-core::Result<HttpStreamingMessage> make_streaming_message(const StreamingExchangeRequest &request) {
+core::Result<HttpStreamingMessage>
+make_streaming_message(const io::StreamingExchangeRequest &request) {
     if (!is_token(request.request.method) || request.request.target.empty() ||
         has_uri_whitespace(request.request.target) ||
         has_uri_whitespace(request.request.authority)) {
@@ -478,12 +489,12 @@ core::Result<HttpStreamingMessage> make_streaming_message(const StreamingExchang
     return message;
 }
 
-core::Result<HttpTunnelMessage> make_tunnel_message(const StreamUpgradeRequest &request) {
+core::Result<HttpTunnelMessage> make_tunnel_message(const io::StreamUpgradeRequest &request) {
     if (request.authority.empty() || has_uri_whitespace(request.authority)) {
         return core::fail(
             core::Error{core::ErrorCode::configuration, "HTTP/1.1 tunnel authority is invalid"});
     }
-    if (request.mode == StreamUpgradeMode::upgrade &&
+    if (request.mode == io::StreamUpgradeMode::upgrade &&
         (request.target.empty() || has_uri_whitespace(request.target) ||
          !is_token(request.protocol))) {
         return core::fail(core::Error{core::ErrorCode::configuration,
@@ -491,9 +502,10 @@ core::Result<HttpTunnelMessage> make_tunnel_message(const StreamUpgradeRequest &
     }
 
     HttpTunnelMessage message;
-    message.method(request.mode == StreamUpgradeMode::connect ? http::verb::connect
-                                                              : http::verb::get);
-    message.target(request.mode == StreamUpgradeMode::connect ? request.authority : request.target);
+    message.method(request.mode == io::StreamUpgradeMode::connect ? http::verb::connect
+                                                                  : http::verb::get);
+    message.target(request.mode == io::StreamUpgradeMode::connect ? request.authority
+                                                                  : request.target);
     message.version(11);
 
     bool has_host = false;
@@ -527,14 +539,14 @@ core::Result<HttpTunnelMessage> make_tunnel_message(const StreamUpgradeRequest &
     if (!has_host) {
         message.set(http::field::host, request.authority);
     }
-    if (request.mode == StreamUpgradeMode::upgrade) {
+    if (request.mode == io::StreamUpgradeMode::upgrade) {
         message.set(http::field::connection, "Upgrade");
         message.set(http::field::upgrade, request.protocol);
     }
     return message;
 }
 
-const std::string *find_header(const ExchangeResponse &response, std::string_view name) {
+const std::string *find_header(const io::ExchangeResponse &response, std::string_view name) {
     for (const auto &header : response.headers) {
         if (header.name.size() == name.size() &&
             std::equal(header.name.begin(), header.name.end(), name.begin(),
@@ -571,8 +583,9 @@ bool contains_header_token(std::string_view value, std::string_view token) {
     return false;
 }
 
-bool tunnel_accepted(const StreamUpgradeRequest &request, const ExchangeResponse &response) {
-    if (request.mode == StreamUpgradeMode::connect) {
+bool tunnel_accepted(const io::StreamUpgradeRequest &request,
+                     const io::ExchangeResponse &response) {
+    if (request.mode == io::StreamUpgradeMode::connect) {
         return response.status >= 200 && response.status < 300;
     }
     const auto *upgrade = find_header(response, "upgrade");
@@ -582,8 +595,8 @@ bool tunnel_accepted(const StreamUpgradeRequest &request, const ExchangeResponse
            contains_header_token(*connection, "upgrade");
 }
 
-ExchangeResponse make_response(http::response<http::vector_body<std::uint8_t>> message) {
-    ExchangeResponse response;
+io::ExchangeResponse make_response(http::response<http::vector_body<std::uint8_t>> message) {
+    io::ExchangeResponse response;
     response.version = message.version();
     response.status = message.result_int();
     response.keep_alive = message.keep_alive();
@@ -600,36 +613,43 @@ bool is_http_framing_error(const boost::system::error_code &error) {
            error == http::error::bad_version;
 }
 
-class Http1ClientSession final : public ExchangeSession,
+// Terminals captured into a oneshot per exchange: success carries the io::
+// response, failure carries the core::Error in band. The entry wrapper
+// rethrows failures so the session honors the io:: sender contract.
+using BufferedTerminal = core::Result<io::ExchangeResponse>;
+using StreamingTerminal = core::Result<io::StreamingExchangeResponse>;
+using TunnelTerminal = core::Result<io::StreamUpgradeResponse>;
+
+class Http1ClientSession final : public io::ExchangeSession,
                                  public std::enable_shared_from_this<Http1ClientSession> {
   public:
     explicit Http1ClientSession(std::unique_ptr<io::StreamHandle> stream)
         : executor_(stream->executor()),
           stream_(std::make_unique<Http1StreamAdapter>(std::move(stream))) {}
 
-    ExchangeId exchange(ExchangeRequest request, std::chrono::steady_clock::time_point deadline,
-                        Handler handler) override {
+    io::AnySender<io::ExchangeResponse>
+    exchange(io::ExchangeRequest request, std::chrono::steady_clock::time_point deadline) override {
+        auto channel = async::oneshot::channel<BufferedTerminal>();
         const auto exchange_id = next_exchange_id();
         if (stopped_ || retired_) {
-            post_result(std::move(handler),
-                        core::fail(core::Error{core::ErrorCode::cancelled,
-                                               "HTTP/1.1 session is not accepting requests"}));
-            return exchange_id;
+            channel.sender.send(core::fail(core::Error{
+                core::ErrorCode::cancelled, "HTTP/1.1 session is not accepting requests"}));
+            return wrap_result(exchange_id, std::move(channel.receiver));
         }
         const auto message = make_message(request);
         if (!message) {
-            post_result(std::move(handler), core::fail(message.error()));
-            return exchange_id;
+            channel.sender.send(core::fail(message.error()));
+            return wrap_result(exchange_id, std::move(channel.receiver));
         }
         if (deadline <= std::chrono::steady_clock::now()) {
-            post_result(std::move(handler), core::fail(timeout_error()));
-            return exchange_id;
+            channel.sender.send(core::fail(timeout_error()));
+            return wrap_result(exchange_id, std::move(channel.receiver));
         }
 
         auto pending = std::make_shared<Pending>(executor_);
         pending->request = std::move(request);
         pending->message = std::move(message.value());
-        pending->handler = std::move(handler);
+        pending->handler = std::move(channel.sender);
         pending->timer.expires_at(deadline);
         const auto self = shared_from_this();
         pending->timer.async_wait([self, exchange_id](const boost::system::error_code &error) {
@@ -640,35 +660,34 @@ class Http1ClientSession final : public ExchangeSession,
         pending_.emplace(exchange_id, std::move(pending));
         queue_.push_back(exchange_id);
         start_next();
-        return exchange_id;
+        return wrap_result(exchange_id, std::move(channel.receiver));
     }
 
-    ExchangeId exchange_streaming(StreamingExchangeRequest request,
-                                  std::chrono::steady_clock::time_point deadline,
-                                  StreamingHandler handler) override {
+    io::AnySender<io::StreamingExchangeResponse>
+    exchange_streaming(io::StreamingExchangeRequest request,
+                       std::chrono::steady_clock::time_point deadline) override {
+        auto channel = async::oneshot::channel<StreamingTerminal>();
         const auto exchange_id = next_exchange_id();
         if (stopped_ || retired_) {
-            post_streaming_result(
-                std::move(handler),
-                core::fail(core::Error{core::ErrorCode::cancelled,
-                                       "HTTP/1.1 session is not accepting requests"}));
-            return exchange_id;
+            channel.sender.send(core::fail(core::Error{
+                core::ErrorCode::cancelled, "HTTP/1.1 session is not accepting requests"}));
+            return wrap_streaming(exchange_id, std::move(channel.receiver));
         }
         const auto message = make_streaming_message(request);
         if (!message) {
-            post_streaming_result(std::move(handler), core::fail(message.error()));
-            return exchange_id;
+            channel.sender.send(core::fail(message.error()));
+            return wrap_streaming(exchange_id, std::move(channel.receiver));
         }
         if (deadline <= std::chrono::steady_clock::now()) {
-            post_streaming_result(std::move(handler), core::fail(timeout_error()));
-            return exchange_id;
+            channel.sender.send(core::fail(timeout_error()));
+            return wrap_streaming(exchange_id, std::move(channel.receiver));
         }
 
         auto pending = std::make_shared<Pending>(executor_);
         pending->is_streaming = true;
         pending->streaming_request = std::move(request);
         pending->streaming_message = std::move(message.value());
-        pending->streaming_handler = std::move(handler);
+        pending->streaming_handler = std::move(channel.sender);
         pending->timer.expires_at(deadline);
         const auto self = shared_from_this();
         pending->timer.async_wait([self, exchange_id](const boost::system::error_code &error) {
@@ -679,35 +698,34 @@ class Http1ClientSession final : public ExchangeSession,
         pending_.emplace(exchange_id, std::move(pending));
         queue_.push_back(exchange_id);
         start_next();
-        return exchange_id;
+        return wrap_streaming(exchange_id, std::move(channel.receiver));
     }
 
-    ExchangeId open_tunnel(StreamUpgradeRequest request,
-                           std::chrono::steady_clock::time_point deadline,
-                           TunnelHandler handler) override {
+    io::AnySender<io::StreamUpgradeResponse>
+    open_tunnel(io::StreamUpgradeRequest request,
+                std::chrono::steady_clock::time_point deadline) override {
+        auto channel = async::oneshot::channel<TunnelTerminal>();
         const auto exchange_id = next_exchange_id();
         if (stopped_ || retired_) {
-            post_tunnel_result(
-                std::move(handler),
-                core::fail(core::Error{core::ErrorCode::cancelled,
-                                       "HTTP/1.1 session is not accepting requests"}));
-            return exchange_id;
+            channel.sender.send(core::fail(core::Error{
+                core::ErrorCode::cancelled, "HTTP/1.1 session is not accepting requests"}));
+            return wrap_tunnel(exchange_id, std::move(channel.receiver));
         }
         const auto message = make_tunnel_message(request);
         if (!message) {
-            post_tunnel_result(std::move(handler), core::fail(message.error()));
-            return exchange_id;
+            channel.sender.send(core::fail(message.error()));
+            return wrap_tunnel(exchange_id, std::move(channel.receiver));
         }
         if (deadline <= std::chrono::steady_clock::now()) {
-            post_tunnel_result(std::move(handler), core::fail(timeout_error()));
-            return exchange_id;
+            channel.sender.send(core::fail(timeout_error()));
+            return wrap_tunnel(exchange_id, std::move(channel.receiver));
         }
 
         auto pending = std::make_shared<Pending>(executor_);
         pending->is_tunnel = true;
         pending->tunnel_request = std::move(request);
         pending->message = std::move(message.value());
-        pending->tunnel_handler = std::move(handler);
+        pending->tunnel_handler = std::move(channel.sender);
         pending->timer.expires_at(deadline);
         const auto self = shared_from_this();
         pending->timer.async_wait([self, exchange_id](const boost::system::error_code &error) {
@@ -718,7 +736,7 @@ class Http1ClientSession final : public ExchangeSession,
         pending_.emplace(exchange_id, std::move(pending));
         queue_.push_back(exchange_id);
         start_next();
-        return exchange_id;
+        return wrap_tunnel(exchange_id, std::move(channel.receiver));
     }
 
     void cancel(ExchangeId exchange_id) noexcept override {
@@ -765,22 +783,25 @@ class Http1ClientSession final : public ExchangeSession,
         std::uint64_t streaming_request_written = 0;
         std::size_t streaming_response_queued = 0;
         std::size_t streaming_header_field_count = 0;
-        ExchangeRequest request;
-        StreamingExchangeRequest streaming_request;
-        StreamUpgradeRequest tunnel_request;
+        io::ExchangeRequest request;
+        io::StreamingExchangeRequest streaming_request;
+        io::StreamUpgradeRequest tunnel_request;
         std::variant<HttpMessage, HttpTunnelMessage> message;
         HttpStreamingMessage streaming_message;
         std::unique_ptr<http::request_serializer<http::empty_body>> streaming_serializer;
         std::unique_ptr<ExchangeResponseParser> parser;
         std::unique_ptr<StreamingExchangeResponseParser> streaming_parser;
-        std::shared_ptr<detail::QueuedExchangeBodyStream> streaming_response_body;
+        std::shared_ptr<io::detail::QueuedExchangeBodyStream> streaming_response_body;
         std::array<std::uint8_t, 16 * 1024> streaming_request_buffer{};
         std::array<std::uint8_t, 1> streaming_request_probe{};
         std::array<std::uint8_t, 16 * 1024> streaming_response_buffer{};
         async::watch::Channel<bool> space = async::watch::channel<bool>(false);
-        Handler handler;
-        StreamingHandler streaming_handler;
-        TunnelHandler tunnel_handler;
+        // Terminal fulfillers: each pending completes exactly once, so the
+        // move-only senders ride the shared pending and move out at
+        // completion.
+        async::oneshot::Sender<BufferedTerminal> handler;
+        async::oneshot::Sender<StreamingTerminal> streaming_handler;
+        async::oneshot::Sender<TunnelTerminal> tunnel_handler;
         boost::asio::steady_timer timer;
     };
 
@@ -792,32 +813,66 @@ class Http1ClientSession final : public ExchangeSession,
         return result;
     }
 
-    void post_result(Handler handler, core::Result<ExchangeResponse> result) {
+    void post_result(async::oneshot::Sender<BufferedTerminal> sender, BufferedTerminal result) {
         boost::asio::post(executor_,
-                          [handler = std::move(handler), result = std::move(result)]() mutable {
-                              if (handler) {
-                                  handler(std::move(result));
-                              }
+                          [sender = std::move(sender), result = std::move(result)]() mutable {
+                              sender.send(std::move(result));
                           });
     }
 
-    void post_tunnel_result(TunnelHandler handler, core::Result<StreamUpgradeResponse> result) {
+    void post_tunnel_result(async::oneshot::Sender<TunnelTerminal> sender, TunnelTerminal result) {
         boost::asio::post(executor_,
-                          [handler = std::move(handler), result = std::move(result)]() mutable {
-                              if (handler) {
-                                  handler(std::move(result));
-                              }
+                          [sender = std::move(sender), result = std::move(result)]() mutable {
+                              sender.send(std::move(result));
                           });
     }
 
-    void post_streaming_result(StreamingHandler handler,
-                               core::Result<StreamingExchangeResponse> result) {
+    void post_streaming_result(async::oneshot::Sender<StreamingTerminal> sender,
+                               StreamingTerminal result) {
         boost::asio::post(executor_,
-                          [handler = std::move(handler), result = std::move(result)]() mutable {
-                              if (handler) {
-                                  handler(std::move(result));
-                              }
+                          [sender = std::move(sender), result = std::move(result)]() mutable {
+                              sender.send(std::move(result));
                           });
+    }
+
+    template <typename Terminal>
+    io::AnySender<typename Terminal::value_type> wrap(io::ExchangeSession::ExchangeId exchange_id,
+                                                      async::oneshot::Receiver<Terminal> receiver) {
+        auto sender =
+            std::move(receiver) |
+            stdexec::then([](std::optional<Terminal> terminal) -> typename Terminal::value_type {
+                if (!terminal) {
+                    throw core::Error{core::ErrorCode::cancelled,
+                                      "HTTP/1.1 exchange was abandoned"};
+                }
+                if (!*terminal) {
+                    throw terminal->error();
+                }
+                return std::move(terminal->value());
+            }) |
+            stdexec::let_stopped([self = shared_from_this(), exchange_id] {
+                self->cancel(exchange_id);
+                return stdexec::just_stopped();
+            });
+        return io::AnySender<typename Terminal::value_type>{std::move(sender)};
+    }
+
+    io::AnySender<io::ExchangeResponse>
+    wrap_result(io::ExchangeSession::ExchangeId exchange_id,
+                async::oneshot::Receiver<BufferedTerminal> receiver) {
+        return wrap<BufferedTerminal>(exchange_id, std::move(receiver));
+    }
+
+    io::AnySender<io::StreamingExchangeResponse>
+    wrap_streaming(io::ExchangeSession::ExchangeId exchange_id,
+                   async::oneshot::Receiver<StreamingTerminal> receiver) {
+        return wrap<StreamingTerminal>(exchange_id, std::move(receiver));
+    }
+
+    io::AnySender<io::StreamUpgradeResponse>
+    wrap_tunnel(io::ExchangeSession::ExchangeId exchange_id,
+                async::oneshot::Receiver<TunnelTerminal> receiver) {
+        return wrap<TunnelTerminal>(exchange_id, std::move(receiver));
     }
 
     void start_next() {
@@ -916,23 +971,22 @@ class Http1ClientSession final : public ExchangeSession,
                             std::min<std::size_t>(pending->streaming_request_buffer.size(),
                                                   static_cast<std::size_t>(remaining)));
                     }
-                    const auto pulled = co_await async::callback_sender<HttpOpSigs>(
-                        [&](auto terminal) {
-                            pending->streaming_request.body->async_read_some(window,
-                                                                             std::move(terminal));
-                        },
-                        [](auto &&receiver, const boost::system::error_code &error,
-                           std::size_t size) {
-                            stdexec::set_value(std::move(receiver), HttpOpResult{error, size});
-                        });
-                    const auto &error = pulled.error;
-                    const auto size = pulled.size;
-                    if (error && error != boost::asio::error::eof) {
-                        fail_upload(io_error("failed to read HTTP/1.1 request body", error));
+                    std::size_t size = 0;
+                    bool saw_eof = false;
+                    try {
+                        const auto pulled =
+                            co_await pending->streaming_request.body->async_read_some(window);
+                        if (!pulled) {
+                            saw_eof = true;
+                        } else {
+                            size = *pulled;
+                        }
+                    } catch (const core::Error &failure) {
+                        fail_upload(failure);
                         co_return;
                     }
                     if (size == 0) {
-                        if (error == boost::asio::error::eof) {
+                        if (saw_eof) {
                             if (pending->streaming_request.content_length &&
                                 pending->streaming_request_written !=
                                     *pending->streaming_request.content_length) {
@@ -971,7 +1025,6 @@ class Http1ClientSession final : public ExchangeSession,
                     if (pending->streaming_request_chunked) {
                         wire->insert(wire->end(), {'\r', '\n'});
                     }
-                    const bool saw_eof = error == boost::asio::error::eof;
                     const auto body_written = co_await async::callback_sender<HttpOpSigs>(
                         [self, wire](auto terminal) {
                             boost::asio::async_write(*self->stream_, boost::asio::buffer(*wire),
@@ -999,17 +1052,15 @@ class Http1ClientSession final : public ExchangeSession,
                     }
                 }
                 if (need_probe) {
-                    const auto probed = co_await async::callback_sender<HttpOpSigs>(
-                        [&](auto terminal) {
-                            pending->streaming_request.body->async_read_some(
-                                boost::asio::buffer(pending->streaming_request_probe),
-                                std::move(terminal));
-                        },
-                        [](auto &&receiver, const boost::system::error_code &error,
-                           std::size_t size) {
-                            stdexec::set_value(std::move(receiver), HttpOpResult{error, size});
-                        });
-                    if (probed.error != boost::asio::error::eof || probed.size != 0) {
+                    std::optional<std::size_t> probed;
+                    try {
+                        probed = co_await pending->streaming_request.body->async_read_some(
+                            boost::asio::buffer(pending->streaming_request_probe));
+                    } catch (const core::Error &failure) {
+                        fail_upload(failure);
+                        co_return;
+                    }
+                    if (probed.has_value()) {
                         fail_upload(
                             protocol_error("HTTP/1.1 request body exceeded its content length"));
                         co_return;
@@ -1097,7 +1148,7 @@ class Http1ClientSession final : public ExchangeSession,
                 break;
             }
             auto &message = pending->streaming_parser->get();
-            StreamingExchangeResponse response;
+            io::StreamingExchangeResponse response;
             response.response.version = message.version();
             response.response.status = message.result_int();
             response.response.keep_alive = message.keep_alive();
@@ -1108,29 +1159,30 @@ class Http1ClientSession final : public ExchangeSession,
                     {std::string(field.name_string()), std::string(field.value())});
             }
             const auto weak = self->weak_from_this();
-            pending->streaming_response_body = std::make_shared<detail::QueuedExchangeBodyStream>(
-                self->executor_, 256 * 1024,
-                [weak, exchange_id](std::size_t size) {
-                    if (const auto owner = weak.lock()) {
-                        owner->streaming_response_consumed(exchange_id, size);
-                    }
-                },
-                [weak, exchange_id] {
-                    if (const auto owner = weak.lock()) {
-                        owner->cancel(exchange_id);
-                    }
-                },
-                [weak, exchange_id] {
-                    if (const auto owner = weak.lock()) {
-                        owner->streaming_response_drained(exchange_id);
-                    }
-                });
+            pending->streaming_response_body =
+                std::make_shared<io::detail::QueuedExchangeBodyStream>(
+                    self->executor_, 256 * 1024,
+                    [weak, exchange_id](std::size_t size) {
+                        if (const auto owner = weak.lock()) {
+                            owner->streaming_response_consumed(exchange_id, size);
+                        }
+                    },
+                    [weak, exchange_id] {
+                        if (const auto owner = weak.lock()) {
+                            owner->cancel(exchange_id);
+                        }
+                    },
+                    [weak, exchange_id] {
+                        if (const auto owner = weak.lock()) {
+                            owner->streaming_response_drained(exchange_id);
+                        }
+                    });
             response.body = pending->streaming_response_body;
             pending->streaming_headers_delivered = true;
             pending->streaming_response_done = pending->streaming_parser->is_done();
             auto streaming_handler = std::move(pending->streaming_handler);
             if (streaming_handler) {
-                streaming_handler(std::move(response));
+                streaming_handler.send(StreamingTerminal{std::move(response)});
             }
             if (pending->streaming_response_done) {
                 pending->streaming_response_body->finish({});
@@ -1180,7 +1232,7 @@ class Http1ClientSession final : public ExchangeSession,
                 }
                 if (pending->streaming_parser->is_done()) {
                     pending->streaming_response_done = true;
-                    std::vector<ExchangeField> trailers;
+                    std::vector<io::ExchangeField> trailers;
                     std::size_t index = 0;
                     for (const auto &field : pending->streaming_parser->get().base()) {
                         if (index++ >= pending->streaming_header_field_count) {
@@ -1207,7 +1259,7 @@ class Http1ClientSession final : public ExchangeSession,
     }
 
     core::Result<std::vector<std::uint8_t>>
-    make_last_chunk(const std::vector<ExchangeField> &trailers) const {
+    make_last_chunk(const std::vector<io::ExchangeField> &trailers) const {
         auto wire = std::make_shared<std::vector<std::uint8_t>>();
         const std::string_view end = "0\r\n";
         wire->insert(wire->end(), end.begin(), end.end());
@@ -1362,7 +1414,7 @@ class Http1ClientSession final : public ExchangeSession,
                     self->close_stream();
                 }
                 self->complete_tunnel(exchange_id,
-                                      StreamUpgradeResponse{std::move(rejection_response), {}});
+                                      io::StreamUpgradeResponse{std::move(rejection_response), {}});
                 if (reusable) {
                     self->start_next();
                 } else {
@@ -1378,7 +1430,7 @@ class Http1ClientSession final : public ExchangeSession,
     }
 
     void finish_tunnel(ExchangeId exchange_id, const std::shared_ptr<Pending> &pending,
-                       ExchangeResponse response) {
+                       io::ExchangeResponse response) {
         retired_ = true;
         active_id_.reset();
         std::vector<std::uint8_t> buffered(read_buffer_.size());
@@ -1402,7 +1454,8 @@ class Http1ClientSession final : public ExchangeSession,
         }
         auto state = std::make_shared<Http1TunnelState>(std::move(raw_stream), std::move(buffered));
         auto tunnel = std::make_unique<Http1TunnelStream>(std::move(state));
-        complete_tunnel(exchange_id, StreamUpgradeResponse{std::move(response), std::move(tunnel)});
+        complete_tunnel(exchange_id,
+                        io::StreamUpgradeResponse{std::move(response), std::move(tunnel)});
         retire_queued();
         (void)pending;
     }
@@ -1528,7 +1581,7 @@ class Http1ClientSession final : public ExchangeSession,
         queue_.clear();
     }
 
-    void complete(ExchangeId exchange_id, core::Result<ExchangeResponse> result) {
+    void complete(ExchangeId exchange_id, BufferedTerminal result) {
         const auto found = pending_.find(exchange_id);
         if (found == pending_.end()) {
             return;
@@ -1538,11 +1591,11 @@ class Http1ClientSession final : public ExchangeSession,
         (void)pending->timer.cancel();
         auto handler = std::move(pending->handler);
         if (handler) {
-            handler(std::move(result));
+            handler.send(std::move(result));
         }
     }
 
-    void complete_tunnel(ExchangeId exchange_id, core::Result<StreamUpgradeResponse> result) {
+    void complete_tunnel(ExchangeId exchange_id, TunnelTerminal result) {
         const auto found = pending_.find(exchange_id);
         if (found == pending_.end()) {
             return;
@@ -1552,7 +1605,7 @@ class Http1ClientSession final : public ExchangeSession,
         (void)pending->timer.cancel();
         auto handler = std::move(pending->tunnel_handler);
         if (handler) {
-            handler(std::move(result));
+            handler.send(std::move(result));
         }
     }
 
@@ -1590,7 +1643,7 @@ class Http1ClientSession final : public ExchangeSession,
         }
     }
 
-    void complete_all(const core::Result<ExchangeResponse> &result) {
+    void complete_all(const BufferedTerminal &result) {
         std::vector<ExchangeId> exchanges;
         exchanges.reserve(pending_.size());
         for (const auto &[exchange_id, pending] : pending_) {
@@ -1626,7 +1679,7 @@ class Http1ClientSession final : public ExchangeSession,
 
 } // namespace
 
-std::shared_ptr<ExchangeSession>
+std::shared_ptr<io::ExchangeSession>
 make_http1_exchange_session(std::unique_ptr<io::StreamHandle> stream) {
     if (!stream) {
         return {};

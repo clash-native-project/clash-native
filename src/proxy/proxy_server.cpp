@@ -3,7 +3,6 @@
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
 #include <clash_native/proxy/tcp_relay.hpp>
-#include <clash_native/transport/exchange_session.hpp>
 
 #include "outbound/outbound_utils.hpp"
 #include "outbound/proxy_address.hpp"

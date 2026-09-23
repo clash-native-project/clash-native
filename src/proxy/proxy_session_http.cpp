@@ -4,7 +4,7 @@
 
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
-#include <clash_native/transport/exchange_session_adapter.hpp>
+#include <clash_native/transport/http_sessions.hpp>
 
 #include <boost/asio/post.hpp>
 #include <boost/asio/write.hpp>
@@ -269,9 +269,7 @@ void ProxySession::begin_http_forward() {
         http_request_body_ = std::make_shared<ProxyRequestBodyStream>(
             client_, http_buffer_, http_request_parser_, header_count, std::move(declared_trailers),
             [this](std::size_t size) { http_forward_request_bytes_ += size; });
-        // Exchange-plane debt: the client-body producer still speaks
-        // transport::; it crosses into io:: here and back in the adapter.
-        http_forward_request_.body = transport::adapt_transport_body(http_request_body_);
+        http_forward_request_.body = http_request_body_;
     }
 
     for (const auto &field : request.base()) {
@@ -322,8 +320,7 @@ void ProxySession::open_http_forward_target(core::Destination destination) {
 void ProxySession::start_http_upgrade_exchange() {
     // Exchange-plane debt: the tunnel runs on io:: through the adapter;
     // the forward path still owns http_session_ until its upload body flips.
-    http_tunnel_session_ = transport::adapt_transport_session(
-        transport::make_http1_exchange_session(std::move(remote_)));
+    http_tunnel_session_ = transport::make_http1_exchange_session(std::move(remote_));
     if (!http_tunnel_session_) {
         send_http_forward_response(502, "Bad Gateway");
         return;
@@ -357,8 +354,7 @@ void ProxySession::start_http_upgrade_exchange() {
 }
 
 void ProxySession::start_http_forward_exchange() {
-    http_session_ = transport::adapt_transport_session(
-        transport::make_http1_exchange_session(std::move(remote_)));
+    http_session_ = transport::make_http1_exchange_session(std::move(remote_));
     if (!http_session_) {
         send_http_forward_response(502, "Bad Gateway");
         return;

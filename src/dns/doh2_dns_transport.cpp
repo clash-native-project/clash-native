@@ -2,8 +2,7 @@
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/io/exchange_session.hpp>
-#include <clash_native/transport/exchange_session.hpp>
-#include <clash_native/transport/exchange_session_adapter.hpp>
+#include <clash_native/transport/http_sessions.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include <boost/asio/post.hpp>
@@ -54,10 +53,10 @@ std::string_view trim_ascii(std::string_view value) {
     return value;
 }
 
-const std::string *find_header(const transport::ExchangeResponse &response, std::string_view name) {
+const std::string *find_header(const io::ExchangeResponse &response, std::string_view name) {
     const auto found = std::find_if(
         response.headers.begin(), response.headers.end(),
-        [name](const transport::ExchangeField &header) { return lower_copy(header.name) == name; });
+        [name](const io::ExchangeField &header) { return lower_copy(header.name) == name; });
     return found == response.headers.end() ? nullptr : &found->value;
 }
 
@@ -132,7 +131,7 @@ class Doh2DnsTransport final : public DnsTransport {
 // selected h2, all HTTP/2 framing and stream multiplexing belongs to transport.
 class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Session> {
   public:
-    using Handler = transport::ExchangeSession::Handler;
+    using Handler = std::function<void(core::Result<io::ExchangeResponse>)>;
 
     Session(runtime::AsioRuntime &runtime, boost::asio::ip::tcp::endpoint endpoint,
             std::string server_name, std::string authority, std::string path, bool verify_peer,
@@ -276,8 +275,8 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
                         self->connecting_ = false;
                         // Exchange-plane debt: the HTTP/2 session still speaks
                         // transport::; the adapter bridges it at the edge.
-                        self->http_session_ = transport::adapt_transport_session(
-                            transport::make_http2_exchange_session(std::move(tls->stream)));
+                        self->http_session_ =
+                            transport::make_http2_exchange_session(std::move(tls->stream));
                         if (!self->http_session_) {
                             self->connection_failed(
                                 protocol_error("failed to create an HTTP/2 client session"));
@@ -332,7 +331,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
             std::shared_ptr<Session> self;
             std::uint16_t query_id;
             void set_value(io::ExchangeResponse response) && noexcept {
-                self->finish_pending(query_id, transport::to_transport_response(response));
+                self->finish_pending(query_id, response);
             }
             void set_error(std::exception_ptr error) && noexcept {
                 try {
@@ -375,7 +374,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         abandon_connect_if_idle();
     }
 
-    void finish_pending(std::uint16_t query_id, core::Result<transport::ExchangeResponse> result) {
+    void finish_pending(std::uint16_t query_id, core::Result<io::ExchangeResponse> result) {
         const auto found = pending_.find(query_id);
         if (found == pending_.end()) {
             return;
@@ -513,7 +512,7 @@ class Doh2DnsTransport::Operation final
         request.response_body_limit = 0xffff;
         const auto self = shared_from_this();
         session_->exchange(query_id_, std::move(request), request_.deadline,
-                           [self](core::Result<transport::ExchangeResponse> result) mutable {
+                           [self](core::Result<io::ExchangeResponse> result) mutable {
                                self->session_finished(std::move(result));
                            });
         exchange_started_ = true;
@@ -532,7 +531,7 @@ class Doh2DnsTransport::Operation final
     std::uint16_t query_id() const noexcept { return query_id_; }
 
   private:
-    void session_finished(core::Result<transport::ExchangeResponse> result) {
+    void session_finished(core::Result<io::ExchangeResponse> result) {
         exchange_started_ = false;
         if (completed_) {
             return;

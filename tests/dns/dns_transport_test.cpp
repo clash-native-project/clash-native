@@ -1,13 +1,15 @@
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_policy_router.hpp>
 #include <clash_native/dns/dns_query_service.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/dns/resolver_service.hpp>
+#include <clash_native/io/exchange_session.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
-#include <clash_native/transport/exchange_session.hpp>
+#include <clash_native/transport/http_sessions.hpp>
 
 #include <gtest/gtest.h>
 
@@ -1908,20 +1910,40 @@ TEST(ExchangeSessionTest, ReusesHttp11ConnectionForQueuedExchanges) {
 
     auto session = clash_native::transport::make_http1_exchange_session(
         std::make_unique<clash_native::net::TcpStream>(std::move(client)));
-    std::array<std::optional<clash_native::core::Result<clash_native::transport::ExchangeResponse>>,
-               2>
+    std::array<std::optional<clash_native::core::Result<clash_native::io::ExchangeResponse>>, 2>
         results;
     for (std::size_t index = 0; index < results.size(); ++index) {
-        clash_native::transport::ExchangeRequest request;
+        clash_native::io::ExchangeRequest request;
         request.method = "POST";
         request.scheme = "http";
         request.authority = "localhost";
         request.target = index == 0 ? "/first" : "/second";
         request.keep_alive = true;
-        const auto exchange_id = session->exchange(
-            std::move(request), std::chrono::steady_clock::now() + std::chrono::seconds(5),
-            [&results, index](auto result) { results[index] = std::move(result); });
-        EXPECT_NE(exchange_id, 0U);
+        struct ExchangeReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::optional<clash_native::core::Result<clash_native::io::ExchangeResponse>> *slot;
+            void set_value(clash_native::io::ExchangeResponse response) && noexcept {
+                *slot = std::move(response);
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const clash_native::core::Error &failure) {
+                    *slot = clash_native::core::fail(failure);
+                } catch (...) {
+                    *slot = clash_native::core::fail(clash_native::core::Error{
+                        clash_native::core::ErrorCode::transport_io, "exchange failed"});
+                }
+            }
+            void set_stopped() && noexcept {
+                *slot = clash_native::core::fail(clash_native::core::Error{
+                    clash_native::core::ErrorCode::cancelled, "exchange stopped"});
+            }
+        };
+        clash_native::async::start_with_receiver(
+            session->exchange(std::move(request),
+                              std::chrono::steady_clock::now() + std::chrono::seconds(5)),
+            ExchangeReceiver{&results[index]});
     }
     context.run();
     session->stop();

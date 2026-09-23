@@ -1,8 +1,8 @@
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/core/base64.hpp>
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
-#include <clash_native/transport/exchange_session_adapter.hpp>
 #include <clash_native/transport/grpc_client.hpp>
 
 #include <boost/asio/dispatch.hpp>
@@ -213,13 +213,46 @@ core::Status validate_options(const GrpcCallOptions &options) {
 
 } // namespace
 
-class GrpcClientCall::RequestBody final : public ExchangeBodyStream,
+class GrpcClientCall::RequestBody final : public io::ExchangeBodyStream,
                                           public std::enable_shared_from_this<RequestBody> {
   public:
+    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+    using WriteHandler = std::function<void(core::Status)>;
+
     RequestBody(boost::asio::any_io_executor executor, std::size_t max_message_size)
         : executor_(std::move(executor)), max_message_size_(max_message_size) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        using Signatures =
+            stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                           stdexec::set_error_t(std::exception_ptr),
+                                           stdexec::set_stopped_t()>;
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
+            [self = shared_from_this(), buffer](auto terminal) mutable {
+                self->read_some(buffer, std::move(terminal));
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                if (!error) {
+                    stdexec::set_value(std::move(receiver), std::optional<std::size_t>{size});
+                    return;
+                }
+                if (error == boost::asio::error::eof) {
+                    stdexec::set_value(std::move(receiver), std::optional<std::size_t>{});
+                    return;
+                }
+                if (error == boost::asio::error::operation_aborted) {
+                    stdexec::set_stopped(std::move(receiver));
+                    return;
+                }
+                stdexec::set_error(
+                    std::move(receiver),
+                    std::make_exception_ptr(core::Error{core::ErrorCode::transport_io,
+                                                        "gRPC request body read failed", error}));
+            })};
+    }
+
+    void read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) {
         const auto self = shared_from_this();
         boost::asio::dispatch(executor_, [self, buffer, handler = std::move(handler)]() mutable {
             if (!handler) {
@@ -257,7 +290,7 @@ class GrpcClientCall::RequestBody final : public ExchangeBodyStream,
         });
     }
 
-    std::vector<ExchangeField> trailers() const override { return {}; }
+    std::vector<io::ExchangeField> trailers() const override { return {}; }
 
     void cancel() noexcept override {
         const auto self = shared_from_this();
@@ -446,9 +479,7 @@ void GrpcClientCall::start() {
             request.request.headers.push_back({"grpc-timeout", std::move(*timeout)});
         }
     }
-    // Exchange-plane debt: the framed producer still speaks transport::;
-    // it crosses into io:: here and back inside the session adapter.
-    request.body = adapt_transport_body(request_body_);
+    request.body = request_body_;
     const auto deadline = options_.deadline.value_or(std::chrono::steady_clock::time_point::max());
     struct ResponseReceiver {
         using receiver_concept = stdexec::receiver_tag;

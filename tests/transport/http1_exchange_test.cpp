@@ -1,7 +1,15 @@
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/core/result.hpp>
+#include <clash_native/io/exchange_body_stream.hpp>
+#include <clash_native/io/exchange_session.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
-#include <clash_native/transport/exchange_session.hpp>
+#include <clash_native/transport/http_sessions.hpp>
 
 #include <gtest/gtest.h>
+
+#include <stdexec/execution.hpp>
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/io_context.hpp>
@@ -15,11 +23,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <memory>
 #include <optional>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -27,20 +37,53 @@ namespace {
 
 namespace asio = boost::asio;
 namespace http = boost::beast::http;
-using clash_native::transport::ExchangeField;
+using clash_native::io::ExchangeField;
 
 // Request-body source for streaming uploads: serves payload_ in pulls,
 // then ends. All work posts to the executor so pulls complete even when
 // initiated off-thread.
-class TestUploadBody final : public clash_native::transport::ExchangeBodyStream,
+class TestUploadBody final : public clash_native::io::ExchangeBodyStream,
                              public std::enable_shared_from_this<TestUploadBody> {
   public:
+    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
     TestUploadBody(boost::asio::any_io_executor executor, std::vector<std::uint8_t> payload,
                    std::vector<ExchangeField> trailers)
         : executor_(std::move(executor)), payload_(std::move(payload)),
           trailers_(std::move(trailers)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+    clash_native::io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        using Signatures =
+            stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                           stdexec::set_error_t(std::exception_ptr),
+                                           stdexec::set_stopped_t()>;
+        return clash_native::io::AnySender<std::optional<std::size_t>>{
+            clash_native::async::callback_sender<Signatures>(
+                [self = shared_from_this(), buffer](auto terminal) mutable {
+                    self->read_some(buffer, std::move(terminal));
+                },
+                [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                    if (!error) {
+                        stdexec::set_value(std::move(receiver), std::optional<std::size_t>{size});
+                        return;
+                    }
+                    if (error == boost::asio::error::eof) {
+                        stdexec::set_value(std::move(receiver), std::optional<std::size_t>{});
+                        return;
+                    }
+                    if (error == boost::asio::error::operation_aborted) {
+                        stdexec::set_stopped(std::move(receiver));
+                        return;
+                    }
+                    stdexec::set_error(std::move(receiver),
+                                       std::make_exception_ptr(clash_native::core::Error{
+                                           clash_native::core::ErrorCode::transport_io,
+                                           "test upload body read failed", error}));
+                })};
+    }
+
+    void read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) {
         const auto self = shared_from_this();
         boost::asio::post(executor_, [self, buffer, handler = std::move(handler)]() mutable {
             if (self->cancelled_) {
@@ -72,23 +115,25 @@ class TestUploadBody final : public clash_native::transport::ExchangeBodyStream,
 // Reads a response body stream to EOF on the calling thread. The session
 // lives on `context`, so completions post there while this blocks.
 std::pair<boost::system::error_code, std::size_t>
-pull_once(const std::shared_ptr<clash_native::transport::ExchangeBodyStream> &body,
+pull_once(const std::shared_ptr<clash_native::io::ExchangeBodyStream> &body,
           boost::asio::mutable_buffer buffer) {
-    auto done = std::make_shared<std::promise<std::pair<boost::system::error_code, std::size_t>>>();
-    auto future = done->get_future();
-    body->async_read_some(buffer,
-                          [done](const boost::system::error_code &error, std::size_t size) mutable {
-                              done->set_value({error, size});
-                          });
-    if (future.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
-        ADD_FAILURE() << "timed out waiting for a body pull";
-        return {boost::asio::error::timed_out, 0};
+    try {
+        auto wait = stdexec::sync_wait(body->async_read_some(buffer));
+        if (!wait.has_value()) {
+            return {boost::asio::error::operation_aborted, 0};
+        }
+        const auto size = std::get<0>(*wait);
+        if (!size) {
+            return {boost::asio::error::eof, 0};
+        }
+        return {{}, *size};
+    } catch (...) {
+        return {clash_native::net::unpack_error(std::current_exception()), 0};
     }
-    return future.get();
 }
 
 std::vector<std::uint8_t>
-read_body_to_end(const std::shared_ptr<clash_native::transport::ExchangeBodyStream> &body) {
+read_body_to_end(const std::shared_ptr<clash_native::io::ExchangeBodyStream> &body) {
     std::vector<std::uint8_t> out;
     std::array<std::uint8_t, 16 * 1024> chunk{};
     while (true) {
@@ -204,7 +249,7 @@ TEST(Http1ExchangeTest, StreamsChunkedUploadAndBackpressuredDownload) {
 
     // Exchange 1: chunked upload with a trailer, then a delayed 1 MiB
     // download that must park the receive queue on its space signal.
-    clash_native::transport::StreamingExchangeRequest streaming;
+    clash_native::io::StreamingExchangeRequest streaming;
     streaming.request.method = "POST";
     streaming.request.scheme = "http";
     streaming.request.authority = "localhost";
@@ -215,15 +260,36 @@ TEST(Http1ExchangeTest, StreamsChunkedUploadAndBackpressuredDownload) {
         context.get_executor(), upload, std::vector<ExchangeField>{{"X-Req-Trailer", "done"}});
     streaming.body = upload_body;
 
-    auto headers_done = std::make_shared<std::promise<
-        clash_native::core::Result<clash_native::transport::StreamingExchangeResponse>>>();
+    auto headers_done = std::make_shared<
+        std::promise<clash_native::core::Result<clash_native::io::StreamingExchangeResponse>>>();
     auto headers_future = headers_done->get_future();
-    const auto first_id = session->exchange_streaming(
-        std::move(streaming), std::chrono::steady_clock::now() + std::chrono::seconds(60),
-        [headers_done](
-            clash_native::core::Result<clash_native::transport::StreamingExchangeResponse>
-                result) mutable { headers_done->set_value(std::move(result)); });
-    EXPECT_NE(first_id, 0U);
+    struct HeadersReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<
+            std::promise<clash_native::core::Result<clash_native::io::StreamingExchangeResponse>>>
+            done;
+        void set_value(clash_native::io::StreamingExchangeResponse response) && noexcept {
+            done->set_value(std::move(response));
+        }
+        void set_error(std::exception_ptr error) && noexcept {
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const clash_native::core::Error &failure) {
+                done->set_value(clash_native::core::fail(failure));
+            } catch (...) {
+                done->set_value(clash_native::core::fail(clash_native::core::Error{
+                    clash_native::core::ErrorCode::transport_io, "exchange failed"}));
+            }
+        }
+        void set_stopped() && noexcept {
+            done->set_value(clash_native::core::fail(clash_native::core::Error{
+                clash_native::core::ErrorCode::cancelled, "exchange stopped"}));
+        }
+    };
+    clash_native::async::start_with_receiver(
+        session->exchange_streaming(std::move(streaming),
+                                    std::chrono::steady_clock::now() + std::chrono::seconds(60)),
+        HeadersReceiver{headers_done});
     auto first = wait_value(headers_future);
     ASSERT_TRUE(first.has_value());
     ASSERT_TRUE(*first) << (*first).error().context;
@@ -243,7 +309,7 @@ TEST(Http1ExchangeTest, StreamsChunkedUploadAndBackpressuredDownload) {
     // Exchange 2 reuses the connection: content-length upload exercises
     // the probe path, content-length download the plain path.
     const std::string second_upload = "second-upload";
-    clash_native::transport::StreamingExchangeRequest second;
+    clash_native::io::StreamingExchangeRequest second;
     second.request.method = "POST";
     second.request.scheme = "http";
     second.request.authority = "localhost";
@@ -254,14 +320,13 @@ TEST(Http1ExchangeTest, StreamsChunkedUploadAndBackpressuredDownload) {
         context.get_executor(),
         std::vector<std::uint8_t>(second_upload.begin(), second_upload.end()),
         std::vector<ExchangeField>{});
-    auto second_done = std::make_shared<std::promise<
-        clash_native::core::Result<clash_native::transport::StreamingExchangeResponse>>>();
+    auto second_done = std::make_shared<
+        std::promise<clash_native::core::Result<clash_native::io::StreamingExchangeResponse>>>();
     auto second_future = second_done->get_future();
-    const auto second_id = session->exchange_streaming(
-        std::move(second), std::chrono::steady_clock::now() + std::chrono::seconds(60),
-        [second_done](clash_native::core::Result<clash_native::transport::StreamingExchangeResponse>
-                          result) mutable { second_done->set_value(std::move(result)); });
-    EXPECT_NE(second_id, 0U);
+    clash_native::async::start_with_receiver(
+        session->exchange_streaming(std::move(second),
+                                    std::chrono::steady_clock::now() + std::chrono::seconds(60)),
+        HeadersReceiver{second_done});
     auto second_response = wait_value(second_future);
     ASSERT_TRUE(second_response.has_value());
     ASSERT_TRUE(*second_response) << (*second_response).error().context;

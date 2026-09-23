@@ -1915,3 +1915,40 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   run of 235 tests passed (including the SOCKS5/Stage1/proxy-server
   combination that caught the teardown race); `pixi run format`,
   `format-check`, and `git diff --check` pass.
+
+## 2026-09-23
+
+- Finished the ExchangeSession plane (part 3): the HTTP/1, HTTP/2,
+  and HTTP/3 sessions natively implement io::ExchangeSession, and
+  transport::ExchangeSession, transport::ExchangeBodyStream, the
+  exchange adapter header, the old http_client.hpp alias header, and
+  the shared transport body/tunnel stream headers are deleted.
+- Sessions enqueue pendings with oneshot terminal fulfillers
+  (success carries the io:: response, failure the core::Error in
+  band); entries wrap the receiver with unwrap-and-rethrow plus
+  stop-to-cancel, so per-exchange ids only survive inside the
+  sessions. HTTP/1 upload pulls now co_await io:: body senders; the
+  HTTP/2 and HTTP/3 nghttp callback chains drive io:: uploads through
+  a small terminal-mapping receiver into the unchanged resume logic.
+- Shared infrastructure moved to io/: QueuedExchangeBodyStream (io::
+  pulls over the same dispatch-queue core) and the HTTP CONNECT/
+  Upgrade tunnel state/stream pair (sender-native, replacing the
+  callback bridges). The HTTP/1 tunnel state/stream pair went the
+  same way. Factories now return io:: sessions from the new
+  transport/http_sessions.hpp.
+- Upload producers (gRPC RequestBody, proxy client-body Beast
+  parser, test bodies) implement io::ExchangeBodyStream; DNS/proxy/
+  gRPC/test validations run directly on io:: responses with no
+  converters left. The HTTP/2 and HTTP/3 io:: multiplexed views stay
+  null (raw logical streams migrate with the multiplexed plane), and
+  the HTTP/3 datagram view adapts the QUIC core handle at the edge.
+- WebSocket handshake header vocabulary (websocket_client options,
+  trojan config) moved to io::ExchangeField with the plane.
+- Traps (same classes as before): base-class injected names shadow
+  namespace vocabulary (explicit transport:: qualification for the
+  remaining mux bases), transport Handler is std::function so
+  oneshot senders were already shared, and base header removal drops
+  transitive core/result.hpp includes (now explicit).
+- Validated with the Windows x64 Release clang-cl/MSVC build: full
+  run of 235 tests passed; `pixi run format`, `format-check`, and
+  `git diff --check` pass.

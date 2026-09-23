@@ -2,6 +2,7 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/dns/resolver_service.hpp>
+#include <clash_native/io/exchange_session.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 #include <clash_native/transport/websocket_client.hpp>
 
@@ -25,7 +26,7 @@ struct TrojanOutboundConfig {
     std::string network = "tcp";
     std::string websocket_host;
     std::string websocket_path = "/";
-    std::vector<transport::ExchangeField> websocket_headers;
+    std::vector<io::ExchangeField> websocket_headers;
     bool websocket_tls = false;
 };
 

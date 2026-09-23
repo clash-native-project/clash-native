@@ -91,8 +91,7 @@ struct StreamUpgradeResponse {
     std::unique_ptr<StreamHandle> stream;
 };
 
-// Sender-based counterpart of transport::ExchangeSession: HTTP-style
-// request/response exchanges over any carrier. Each operation completes
+// HTTP-style request/response exchanges over any carrier. Each operation completes
 // set_value(Response) on success or set_error(exception_ptr) carrying a
 // core::Error on failure; cancellation travels through the stop token, with
 // cancel(id) retained for session-side aborts.

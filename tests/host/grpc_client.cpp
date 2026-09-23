@@ -1,8 +1,7 @@
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/net/tcp_stream.hpp>
-#include <clash_native/transport/exchange_session.hpp>
-#include <clash_native/transport/exchange_session_adapter.hpp>
 #include <clash_native/transport/grpc_client.hpp>
+#include <clash_native/transport/http_sessions.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include <google/protobuf/wrappers.pb.h>
@@ -331,8 +330,8 @@ int run_probe(const ServerAddress &server, const std::string &mode) {
             if (result->negotiated_alpn != "h2") {
                 return probe->fail("gRPC TLS server did not negotiate HTTP/2");
             }
-            auto session = clash_native::transport::adapt_transport_session(
-                clash_native::transport::make_http2_exchange_session(std::move(result->stream)));
+            auto session =
+                clash_native::transport::make_http2_exchange_session(std::move(result->stream));
             probe->start(std::move(session));
         });
     context.run();

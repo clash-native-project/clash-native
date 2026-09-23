@@ -1,24 +1,34 @@
 #pragma once
 
-#include <clash_native/transport/exchange_session.hpp>
+// Shared response-body queue for the HTTP sessions: buffers DATA until the
+// consumer pulls it. HTTP/2 and HTTP/3 wire flow-control credit is returned
+// by on_consume, so a slow consumer also applies backpressure to the peer.
+// Pulls are sender-native (empty means EOF, trailers() is then valid);
+// the parking machinery underneath stays callback-based.
+
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/core/error.hpp>
+#include <clash_native/io/exchange_session.hpp>
+#include <clash_native/io/sender.hpp>
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
 
+#include <stdexec/execution.hpp>
+
 #include <algorithm>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <utility>
 #include <vector>
 
-namespace clash_native::transport::detail {
+namespace clash_native::io::detail {
 
-// Buffers response DATA only until the consumer reads it. HTTP/2 and HTTP/3
-// wire flow-control credit is returned by on_consume, so a slow consumer also
-// applies backpressure to the peer.
 class QueuedExchangeBodyStream final
     : public ExchangeBodyStream,
       public std::enable_shared_from_this<QueuedExchangeBodyStream> {
@@ -26,37 +36,40 @@ class QueuedExchangeBodyStream final
     using Executor = boost::asio::any_io_executor;
     using Action = std::function<void()>;
     using ConsumeHandler = std::function<void(std::size_t)>;
+    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
 
     QueuedExchangeBodyStream(Executor executor, std::size_t capacity, ConsumeHandler on_consume,
                              Action on_cancel, Action on_drained)
         : executor_(std::move(executor)), capacity_(capacity), on_consume_(std::move(on_consume)),
           on_cancel_(std::move(on_cancel)), on_drained_(std::move(on_drained)) {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
-        const auto self = shared_from_this();
-        boost::asio::dispatch(executor_, [self, buffer, handler = std::move(handler)]() mutable {
-            if (!handler) {
-                return;
-            }
-            if (buffer.size() == 0) {
-                self->post_read(std::move(handler), {}, 0);
-                return;
-            }
-            if (self->read_handler_) {
-                self->post_read(std::move(handler), boost::asio::error::already_started, 0);
-                return;
-            }
-            if (!self->chunks_.empty()) {
-                self->deliver(buffer, std::move(handler));
-                return;
-            }
-            if (self->terminal_) {
-                self->finish_read(std::move(handler));
-                return;
-            }
-            self->read_buffer_ = buffer;
-            self->read_handler_ = std::move(handler);
-        });
+    AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        using Signatures =
+            stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                           stdexec::set_error_t(std::exception_ptr),
+                                           stdexec::set_stopped_t()>;
+        return AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
+            [self = shared_from_this(), buffer](auto terminal) mutable {
+                self->read_some(buffer, std::move(terminal));
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                if (!error) {
+                    stdexec::set_value(std::move(receiver), std::optional<std::size_t>{size});
+                    return;
+                }
+                if (error == boost::asio::error::eof) {
+                    stdexec::set_value(std::move(receiver), std::optional<std::size_t>{});
+                    return;
+                }
+                if (error == boost::asio::error::operation_aborted) {
+                    stdexec::set_stopped(std::move(receiver));
+                    return;
+                }
+                stdexec::set_error(std::move(receiver), std::make_exception_ptr(core::Error{
+                                                            core::ErrorCode::transport_io,
+                                                            "exchange body read failed", error}));
+            })};
     }
 
     std::vector<ExchangeField> trailers() const override {
@@ -139,6 +152,33 @@ class QueuedExchangeBodyStream final
     }
 
   private:
+    void read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) {
+        const auto self = shared_from_this();
+        boost::asio::dispatch(executor_, [self, buffer, handler = std::move(handler)]() mutable {
+            if (!handler) {
+                return;
+            }
+            if (buffer.size() == 0) {
+                self->post_read(std::move(handler), {}, 0);
+                return;
+            }
+            if (self->read_handler_) {
+                self->post_read(std::move(handler), boost::asio::error::already_started, 0);
+                return;
+            }
+            if (!self->chunks_.empty()) {
+                self->deliver(buffer, std::move(handler));
+                return;
+            }
+            if (self->terminal_) {
+                self->finish_read(std::move(handler));
+                return;
+            }
+            self->read_buffer_ = buffer;
+            self->read_handler_ = std::move(handler);
+        });
+    }
+
     void deliver(boost::asio::mutable_buffer buffer, ReadHandler handler) {
         if (chunks_.empty()) {
             finish_read(std::move(handler));
@@ -209,4 +249,4 @@ class QueuedExchangeBodyStream final
     std::vector<ExchangeField> trailers_;
 };
 
-} // namespace clash_native::transport::detail
+} // namespace clash_native::io::detail

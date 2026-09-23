@@ -2,8 +2,8 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
+#include <clash_native/io/exchange_session.hpp>
 #include <clash_native/io/stream_handle.hpp>
-#include <clash_native/transport/exchange_session.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -22,7 +22,7 @@ struct WebSocketClientOptions {
     std::string target;
     // Additional handshake headers. Connection, Upgrade, Host, and
     // Sec-WebSocket-* framing headers are managed by the client.
-    std::vector<ExchangeField> headers;
+    std::vector<io::ExchangeField> headers;
     std::size_t max_message_size = 16 * 1024 * 1024;
     // When enabled, perform a TLS handshake before the HTTP/1.1 Upgrade.
     bool tls = false;

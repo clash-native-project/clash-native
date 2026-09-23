@@ -1,7 +1,11 @@
+#include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/io/exchange_session.hpp>
 #include <clash_native/io/stream_handle.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
-#include <clash_native/transport/exchange_session.hpp>
+#include <clash_native/transport/http_sessions.hpp>
 #include <clash_native/transport/quic_client.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
@@ -37,11 +41,11 @@
 namespace {
 
 using namespace std::chrono_literals;
-using clash_native::core::StreamHandle;
-using clash_native::transport::ExchangeField;
-using clash_native::transport::ExchangeSession;
-using clash_native::transport::StreamingExchangeRequest;
-using clash_native::transport::StreamingExchangeResponse;
+using clash_native::io::ExchangeField;
+using clash_native::io::ExchangeSession;
+using clash_native::io::StreamHandle;
+using clash_native::io::StreamingExchangeRequest;
+using clash_native::io::StreamingExchangeResponse;
 
 constexpr std::size_t kStreamingBodySize = 2 * 1024 * 1024;
 constexpr std::size_t kStreamingReadSize = 32 * 1024;
@@ -56,15 +60,48 @@ std::vector<std::uint8_t> make_streaming_payload(std::string_view marker, unsign
     return payload;
 }
 
-class TestBodyStream final : public clash_native::transport::ExchangeBodyStream,
+class TestBodyStream final : public clash_native::io::ExchangeBodyStream,
                              public std::enable_shared_from_this<TestBodyStream> {
   public:
+    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+
     TestBodyStream(boost::asio::any_io_executor executor, std::vector<std::uint8_t> payload,
                    std::string trailer_value)
         : executor_(std::move(executor)), payload_(std::move(payload)),
           trailers_{{"X-Request-Trailer", std::move(trailer_value)}} {}
 
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override {
+    clash_native::io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        using Signatures =
+            stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                           stdexec::set_error_t(std::exception_ptr),
+                                           stdexec::set_stopped_t()>;
+        return clash_native::io::AnySender<std::optional<std::size_t>>{
+            clash_native::async::callback_sender<Signatures>(
+                [self = shared_from_this(), buffer](auto terminal) mutable {
+                    self->read_some(buffer, std::move(terminal));
+                },
+                [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                    if (!error) {
+                        stdexec::set_value(std::move(receiver), std::optional<std::size_t>{size});
+                        return;
+                    }
+                    if (error == boost::asio::error::eof) {
+                        stdexec::set_value(std::move(receiver), std::optional<std::size_t>{});
+                        return;
+                    }
+                    if (error == boost::asio::error::operation_aborted) {
+                        stdexec::set_stopped(std::move(receiver));
+                        return;
+                    }
+                    stdexec::set_error(std::move(receiver),
+                                       std::make_exception_ptr(clash_native::core::Error{
+                                           clash_native::core::ErrorCode::transport_io,
+                                           "test body read failed", error}));
+                })};
+    }
+
+    void read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) {
         const auto self = shared_from_this();
         boost::asio::post(executor_, [self, buffer, handler = std::move(handler)]() mutable {
             if (self->cancelled_.load()) {
@@ -145,10 +182,10 @@ class TunnelProbe final : public std::enable_shared_from_this<TunnelProbe> {
                 self->finish("HTTP tunnel probe timed out");
             }
         });
-        clash_native::transport::StreamUpgradeRequest request;
+        clash_native::io::StreamUpgradeRequest request;
         request.authority = "tunnel.test:443";
         if (mode_ == "upgrade") {
-            request.mode = clash_native::transport::StreamUpgradeMode::upgrade;
+            request.mode = clash_native::io::StreamUpgradeMode::upgrade;
             request.scheme = "http";
             request.target = "/ws";
             request.protocol = "websocket";
@@ -157,27 +194,40 @@ class TunnelProbe final : public std::enable_shared_from_this<TunnelProbe> {
                                {"x-test-extended-connect", "1"}};
         }
         const auto deadline = std::chrono::steady_clock::now() + 10s;
-        session_->open_tunnel(
-            std::move(request), deadline,
-            [self](
-                clash_native::core::Result<clash_native::transport::StreamUpgradeResponse> result) {
-                if (!result) {
-                    self->finish("open_tunnel failed: " + result.error().context);
-                    return;
+        struct TunnelReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<TunnelProbe> self;
+            void set_value(clash_native::io::StreamUpgradeResponse result) && noexcept {
+                self->on_tunnel(std::move(result));
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const clash_native::core::Error &failure) {
+                    self->finish("open_tunnel failed: " + failure.context);
+                } catch (...) {
+                    self->finish("open_tunnel failed");
                 }
-                if (!result->stream) {
-                    self->finish("server rejected the HTTP tunnel with status " +
-                                 std::to_string(result->response.status));
-                    return;
-                }
-                if (result->response.status != self->expected_status_) {
-                    self->finish("unexpected HTTP tunnel response status " +
-                                 std::to_string(result->response.status));
-                    return;
-                }
-                self->stream_ = std::move(result->stream);
-                self->write_payload();
-            });
+            }
+            void set_stopped() && noexcept { self->finish("open_tunnel stopped"); }
+        };
+        clash_native::async::start_with_receiver(
+            session_->open_tunnel(std::move(request), deadline), TunnelReceiver{self});
+    }
+
+    void on_tunnel(clash_native::io::StreamUpgradeResponse result) {
+        if (!result.stream) {
+            finish("server rejected the HTTP tunnel with status " +
+                   std::to_string(result.response.status));
+            return;
+        }
+        if (result.response.status != expected_status_) {
+            finish("unexpected HTTP tunnel response status " +
+                   std::to_string(result.response.status));
+            return;
+        }
+        stream_ = std::move(result.stream);
+        write_payload();
     }
 
     bool succeeded() const noexcept { return error_.empty(); }
@@ -186,55 +236,81 @@ class TunnelProbe final : public std::enable_shared_from_this<TunnelProbe> {
 
   private:
     void write_payload() {
+        struct WriteReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<TunnelProbe> self;
+            void set_value(std::size_t size) && noexcept {
+                if (size != self->payload_.size()) {
+                    self->finish("failed to write the tunnel payload");
+                    return;
+                }
+                self->read_payload();
+            }
+            void set_error(std::exception_ptr) && noexcept {
+                self->finish("failed to write the tunnel payload");
+            }
+            void set_stopped() && noexcept { self->finish("tunnel write stopped"); }
+        };
         const auto self = shared_from_this();
-        stream_->async_write(boost::asio::buffer(payload_),
-                             [self](const boost::system::error_code &error, std::size_t size) {
-                                 if (error || size != self->payload_.size()) {
-                                     self->finish("failed to write the tunnel payload");
-                                     return;
-                                 }
-                                 self->read_payload();
-                             });
+        auto sender = stream_->async_write(boost::asio::buffer(payload_));
+        clash_native::async::start_with_receiver(std::move(sender), WriteReceiver{self});
     }
 
     void read_payload() {
+        struct ReadReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<TunnelProbe> self;
+            void set_value(std::optional<std::size_t> size) && noexcept {
+                self->on_tunnel_read(size ? boost::system::error_code{} : boost::asio::error::eof,
+                                     size.value_or(0));
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                self->on_tunnel_read(clash_native::net::unpack_error(std::move(error)), 0);
+            }
+            void set_stopped() && noexcept {
+                self->on_tunnel_read(boost::asio::error::operation_aborted, 0);
+            }
+        };
         const auto self = shared_from_this();
-        stream_->async_read_some(
-            boost::asio::buffer(read_buffer_),
-            [self](const boost::system::error_code &error, std::size_t size) {
-                if (size != 0) {
-                    if (size > self->payload_.size() - self->received_.size()) {
-                        self->finish("tunnel echoed more bytes than were written");
-                        return;
-                    }
-                    self->received_.append(
-                        reinterpret_cast<const char *>(self->read_buffer_.data()), size);
-                    if (self->received_.size() == self->payload_.size() &&
-                        !self->send_half_closed_) {
-                        boost::system::error_code shutdown_error;
-                        self->stream_->shutdown_send(shutdown_error);
-                        if (shutdown_error) {
-                            self->finish("failed to half-close the tunnel send side");
-                            return;
-                        }
-                        self->send_half_closed_ = true;
-                    }
-                }
-                if (error) {
-                    if (error == boost::asio::error::eof && self->send_half_closed_ &&
-                        self->received_ == self->payload_) {
-                        self->finish({});
-                    } else {
-                        self->finish("tunnel read failed: " + error.message());
-                    }
+        auto sender = stream_->async_read_some(boost::asio::buffer(read_buffer_));
+        clash_native::async::start_with_receiver(std::move(sender), ReadReceiver{self});
+    }
+
+    void on_tunnel_read(const boost::system::error_code &error, std::size_t size) {
+        const auto self = shared_from_this();
+        {
+            if (size != 0) {
+                if (size > self->payload_.size() - self->received_.size()) {
+                    self->finish("tunnel echoed more bytes than were written");
                     return;
                 }
-                if (self->send_half_closed_) {
-                    self->read_payload();
-                } else if (self->received_ != self->payload_) {
-                    self->read_payload();
+                self->received_.append(reinterpret_cast<const char *>(self->read_buffer_.data()),
+                                       size);
+                if (self->received_.size() == self->payload_.size() && !self->send_half_closed_) {
+                    boost::system::error_code shutdown_error;
+                    self->stream_->shutdown_send(shutdown_error);
+                    if (shutdown_error) {
+                        self->finish("failed to half-close the tunnel send side");
+                        return;
+                    }
+                    self->send_half_closed_ = true;
                 }
-            });
+            }
+            if (error) {
+                if (error == boost::asio::error::eof && self->send_half_closed_ &&
+                    self->received_ == self->payload_) {
+                    self->finish({});
+                } else {
+                    self->finish("tunnel read failed: " + error.message());
+                }
+                return;
+            }
+            if (self->send_half_closed_) {
+                self->read_payload();
+            } else if (self->received_ != self->payload_) {
+                self->read_payload();
+            }
+        }
     }
 
     void finish(std::string error) {
@@ -288,12 +364,34 @@ class StreamingProbe final : public std::enable_shared_from_this<StreamingProbe>
 
         for (std::size_t index = 0; index < exchanges_.size(); ++index) {
             auto request = make_request(index);
-            session_->exchange_streaming(
-                std::move(request), std::chrono::steady_clock::now() + 40s,
-                [self,
-                 index](clash_native::core::Result<StreamingExchangeResponse> result) mutable {
+            struct StreamingReceiver {
+                using receiver_concept = stdexec::receiver_tag;
+                std::shared_ptr<StreamingProbe> self;
+                std::size_t index;
+                void set_value(StreamingExchangeResponse result) && noexcept {
                     self->on_response(index, std::move(result));
-                });
+                }
+                void set_error(std::exception_ptr error) && noexcept {
+                    try {
+                        std::rethrow_exception(std::move(error));
+                    } catch (const clash_native::core::Error &failure) {
+                        self->on_response(index, clash_native::core::fail(failure));
+                    } catch (...) {
+                        self->on_response(index, clash_native::core::fail(clash_native::core::Error{
+                                                     clash_native::core::ErrorCode::transport_io,
+                                                     "exchange failed"}));
+                    }
+                }
+                void set_stopped() && noexcept {
+                    self->on_response(
+                        index, clash_native::core::fail(clash_native::core::Error{
+                                   clash_native::core::ErrorCode::cancelled, "exchange stopped"}));
+                }
+            };
+            auto sender = session_->exchange_streaming(std::move(request),
+                                                       std::chrono::steady_clock::now() + 40s);
+            clash_native::async::start_with_receiver(std::move(sender),
+                                                     StreamingReceiver{self, index});
         }
     }
 
@@ -304,8 +402,8 @@ class StreamingProbe final : public std::enable_shared_from_this<StreamingProbe>
   private:
     struct Exchange {
         std::string id;
-        std::shared_ptr<clash_native::transport::ExchangeBodyStream> request_body;
-        std::shared_ptr<clash_native::transport::ExchangeBodyStream> response_body;
+        std::shared_ptr<clash_native::io::ExchangeBodyStream> request_body;
+        std::shared_ptr<clash_native::io::ExchangeBodyStream> response_body;
         std::vector<std::uint8_t> received;
         std::array<std::uint8_t, kStreamingReadSize> read_buffer{};
         bool response_ready = false;
@@ -354,8 +452,9 @@ class StreamingProbe final : public std::enable_shared_from_this<StreamingProbe>
         return {};
     }
 
-    void on_response(std::size_t index,
-                     clash_native::core::Result<StreamingExchangeResponse> result) {
+    void
+    on_response(std::size_t index,
+                clash_native::core::Result<clash_native::io::StreamingExchangeResponse> result) {
         if (finished_) {
             return;
         }
@@ -405,12 +504,28 @@ class StreamingProbe final : public std::enable_shared_from_this<StreamingProbe>
             return;
         }
         exchange.reading = true;
+        struct BodyReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<StreamingProbe> self;
+            std::size_t index;
+            void set_value(std::optional<std::size_t> size) && noexcept {
+                if (size) {
+                    self->on_body_read(index, {}, *size);
+                } else {
+                    self->on_body_read(index, boost::asio::error::eof, 0);
+                }
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                self->on_body_read(index, clash_native::net::unpack_error(std::move(error)), 0);
+            }
+            void set_stopped() && noexcept {
+                self->on_body_read(index, boost::asio::error::operation_aborted, 0);
+            }
+        };
         const auto self = shared_from_this();
-        exchange.response_body->async_read_some(
-            boost::asio::buffer(exchange.read_buffer),
-            [self, index](const boost::system::error_code &error, std::size_t size) {
-                self->on_body_read(index, error, size);
-            });
+        auto sender =
+            exchange.response_body->async_read_some(boost::asio::buffer(exchange.read_buffer));
+        clash_native::async::start_with_receiver(std::move(sender), BodyReceiver{self, index});
     }
 
     void on_body_read(std::size_t index, const boost::system::error_code &error, std::size_t size) {
@@ -567,7 +682,9 @@ class RawQuicProbe final : public std::enable_shared_from_this<RawQuicProbe> {
             clash_native::transport::MultiplexedStreamRequest request;
             connection_->open_stream(
                 request, std::chrono::steady_clock::now() + 10s,
-                [self, index](clash_native::core::Result<std::unique_ptr<StreamHandle>> result) {
+                [self, index](
+                    clash_native::core::Result<std::unique_ptr<clash_native::core::StreamHandle>>
+                        result) {
                     if (!result) {
                         self->finish("QUIC multiplexed stream open failed: " +
                                      result.error().context);
@@ -653,7 +770,8 @@ class RawQuicProbe final : public std::enable_shared_from_this<RawQuicProbe> {
     boost::asio::steady_timer timeout_timer_;
     std::shared_ptr<clash_native::transport::QuicClientConnection> connection_;
     std::unique_ptr<clash_native::core::DatagramHandle> datagram_;
-    std::vector<std::unique_ptr<StreamHandle>> stream_handles_;
+    // QUIC multiplexed streams stay on the core:: plane with the mux plane.
+    std::vector<std::unique_ptr<clash_native::core::StreamHandle>> stream_handles_;
     std::vector<std::string> stream_payloads_;
     std::vector<std::shared_ptr<std::array<std::uint8_t, 128>>> stream_buffers_ =
         std::vector<std::shared_ptr<std::array<std::uint8_t, 128>>>(kStreamCount);

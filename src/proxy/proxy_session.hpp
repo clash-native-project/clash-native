@@ -6,7 +6,6 @@
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
 #include <clash_native/proxy/tcp_relay.hpp>
-#include <clash_native/transport/exchange_session.hpp>
 
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/context.hpp>
@@ -108,21 +107,24 @@ class ProxyStream : public core::StreamHandle {
     bool detached_ = false;
 };
 
-class ProxyRequestBodyStream final : public transport::ExchangeBodyStream,
+class ProxyRequestBodyStream final : public io::ExchangeBodyStream,
                                      public std::enable_shared_from_this<ProxyRequestBodyStream> {
   public:
     using Parser = boost::beast::http::request_parser<boost::beast::http::buffer_body>;
     using ByteHandler = std::function<void(std::size_t)>;
+    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
 
     ProxyRequestBodyStream(ProxyStream &socket, boost::beast::flat_buffer &buffer,
                            std::shared_ptr<Parser> parser, std::size_t initial_header_count,
                            std::unordered_set<std::string> declared_trailers,
                            ByteHandler byte_handler);
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) override;
-    std::vector<transport::ExchangeField> trailers() const override;
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override;
+    std::vector<io::ExchangeField> trailers() const override;
     void cancel() noexcept override;
 
   private:
+    void read_some(boost::asio::mutable_buffer buffer, ReadHandler handler);
     void retry_read(boost::asio::mutable_buffer buffer, ReadHandler handler);
     void post_read(ReadHandler handler, boost::system::error_code error, std::size_t size);
 

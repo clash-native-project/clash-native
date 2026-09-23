@@ -2,6 +2,8 @@
 
 #include "http_proxy_utils.hpp"
 
+#include <clash_native/async/callback_sender.hpp>
+
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
@@ -142,8 +144,37 @@ ProxyRequestBodyStream::ProxyRequestBodyStream(ProxyStream &socket,
       executor_(socket_.get_executor()), initial_header_count_(initial_header_count),
       declared_trailers_(std::move(declared_trailers)), byte_handler_(std::move(byte_handler)) {}
 
-void ProxyRequestBodyStream::async_read_some(boost::asio::mutable_buffer buffer,
-                                             ReadHandler handler) {
+io::AnySender<std::optional<std::size_t>>
+ProxyRequestBodyStream::async_read_some(boost::asio::mutable_buffer buffer) {
+    using Signatures =
+        stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
+    return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
+        [self = shared_from_this(), buffer](auto terminal) mutable {
+            self->read_some(buffer, std::move(terminal));
+        },
+        [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+            if (!error) {
+                stdexec::set_value(std::move(receiver), std::optional<std::size_t>{size});
+                return;
+            }
+            if (error == boost::asio::error::eof) {
+                stdexec::set_value(std::move(receiver), std::optional<std::size_t>{});
+                return;
+            }
+            if (error == boost::asio::error::operation_aborted) {
+                stdexec::set_stopped(std::move(receiver));
+                return;
+            }
+            stdexec::set_error(std::move(receiver),
+                               std::make_exception_ptr(
+                                   core::Error{core::ErrorCode::transport_io,
+                                               "HTTP forward request body read failed", error}));
+        })};
+}
+
+void ProxyRequestBodyStream::read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) {
     const auto self = shared_from_this();
     boost::asio::dispatch(executor_, [self, buffer, handler = std::move(handler)]() mutable {
         if (self->cancelled_) {
@@ -198,8 +229,8 @@ void ProxyRequestBodyStream::async_read_some(boost::asio::mutable_buffer buffer,
     });
 }
 
-std::vector<transport::ExchangeField> ProxyRequestBodyStream::trailers() const {
-    std::vector<transport::ExchangeField> result;
+std::vector<io::ExchangeField> ProxyRequestBodyStream::trailers() const {
+    std::vector<io::ExchangeField> result;
     if (!parser_->is_done()) {
         return result;
     }
@@ -236,7 +267,7 @@ void ProxyRequestBodyStream::cancel() noexcept {
 void ProxyRequestBodyStream::retry_read(boost::asio::mutable_buffer buffer, ReadHandler handler) {
     auto self = shared_from_this();
     boost::asio::post(executor_, [self, buffer, handler = std::move(handler)]() mutable {
-        self->async_read_some(buffer, std::move(handler));
+        self->read_some(buffer, std::move(handler));
     });
 }
 

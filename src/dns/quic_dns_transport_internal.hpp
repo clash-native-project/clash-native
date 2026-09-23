@@ -2,7 +2,6 @@
 
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/io/exchange_session.hpp>
-#include <clash_native/transport/exchange_session.hpp>
 #include <clash_native/transport/quic_client.hpp>
 
 #include <boost/asio/ip/udp.hpp>
@@ -123,7 +122,7 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
 
     void open_pending_http3_exchanges();
     void submit_http3_exchange(const std::shared_ptr<Exchange> &exchange);
-    void on_http3_result(ExchangeId id, core::Result<transport::ExchangeResponse> result);
+    void on_http3_result(ExchangeId id, core::Result<io::ExchangeResponse> result);
 
     void decode_dns_response(Exchange &exchange, std::span<const std::uint8_t> wire);
     void set_exchange_error(Exchange &exchange, core::Error error);

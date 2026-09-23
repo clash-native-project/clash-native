@@ -2,8 +2,7 @@
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/io/exchange_session.hpp>
-#include <clash_native/transport/exchange_session.hpp>
-#include <clash_native/transport/exchange_session_adapter.hpp>
+#include <clash_native/transport/http_sessions.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include <boost/asio/post.hpp>
@@ -65,11 +64,10 @@ bool matches_question(const DnsPacket &response, const DnsPacket &query) {
                       });
 }
 
-const std::string *find_header(const transport::ExchangeResponse &response, std::string_view name) {
-    const auto found = std::find_if(response.headers.begin(), response.headers.end(),
-                                    [name](const transport::ExchangeField &header) {
-                                        return lower_trimmed(header.name) == name;
-                                    });
+const std::string *find_header(const io::ExchangeResponse &response, std::string_view name) {
+    const auto found = std::find_if(
+        response.headers.begin(), response.headers.end(),
+        [name](const io::ExchangeField &header) { return lower_trimmed(header.name) == name; });
     return found == response.headers.end() ? nullptr : &found->value;
 }
 
@@ -246,8 +244,7 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     void start_http(std::unique_ptr<io::StreamHandle> stream) {
         // Exchange-plane debt: the HTTP/1.1 session still speaks transport::;
         // the adapter bridges it into the io:: vocabulary at the edge.
-        http_session_ = transport::adapt_transport_session(
-            transport::make_http1_exchange_session(std::move(stream)));
+        http_session_ = transport::make_http1_exchange_session(std::move(stream));
         if (!http_session_) {
             finish(core::fail(
                 {core::ErrorCode::configuration, "failed to create an HTTP/1.1 client session"}));
@@ -273,7 +270,7 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
                 if (self->completed_) {
                     return;
                 }
-                self->http_response(transport::to_transport_response(response));
+                self->http_response(response);
             }
             void set_error(std::exception_ptr error) && noexcept {
                 self->http_exchange_started_ = false;
@@ -303,7 +300,7 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
         http_exchange_started_ = true;
     }
 
-    void http_response(core::Result<transport::ExchangeResponse> result) {
+    void http_response(core::Result<io::ExchangeResponse> result) {
         if (!result) {
             finish(core::fail(result.error()));
             return;
