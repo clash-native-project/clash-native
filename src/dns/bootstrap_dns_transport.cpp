@@ -1,4 +1,5 @@
 #include <clash_native/async/bridge.hpp>
+#include <clash_native/async/held_operation.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/bootstrap_resolver.hpp>
 #include <clash_native/dns/dns_transport.hpp>
@@ -149,18 +150,9 @@ class BootstrapDnsTransport final : public DnsTransport,
             }
         }
     };
-    // Connected inner op. any_sender op states are immovable, so the
-    // holder constructs it in place (guaranteed prvalue elision into the
-    // member) and is itself heap-held and never moved. Destroying it
+    // Connected inner op, heap-held and never moved; destroying it
     // aborts the inner exchange.
-    struct InnerDrive {
-        using Op = decltype(stdexec::connect(std::declval<io::AnySender<DnsExchangeResult>>(),
-                                             std::declval<InnerReceiver>()));
-        template <typename Sender>
-        InnerDrive(Sender &&sender, InnerReceiver receiver)
-            : op(static_cast<Sender &&>(sender).connect(std::move(receiver))) {}
-        Op op;
-    };
+    using InnerDrive = async::HeldOperation<io::AnySender<DnsExchangeResult>, InnerReceiver>;
 
     struct Pending {
         DnsExchangeRequest request;
@@ -243,10 +235,9 @@ class BootstrapDnsTransport final : public DnsTransport,
         const auto self = shared_from_this();
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = inner_->exchange(std::move(pending->request));
-        auto drive =
-            std::make_shared<InnerDrive>(std::move(sender), InnerReceiver{self, exchange_id});
+        auto drive = async::hold_operation(std::move(sender), InnerReceiver{self, exchange_id});
         inner_ops_.emplace(exchange_id, std::move(drive));
-        stdexec::start(inner_ops_[exchange_id]->op);
+        inner_ops_[exchange_id]->start();
     }
 
     void complete(DnsExchangeId exchange_id, core::Result<DnsPacket> result) {

@@ -2374,3 +2374,12 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   `DnsUpstream` drives transport senders behind its id interface with
   held op states. Direct transport tests drive senders now. Full
   suite: 258 passed.
+
+## 2026-09-24
+
+- Phase 2b: sender-based DNS upstream, group, and query layers.
+  Upstream/group expose `AnySender<DnsExchangeResult>` (retry and
+  coalescing preserved; per-attempt abort via held op drives).
+  New `async/held_operation.hpp` holds immovable any-sender ops for
+  abort-on-destroy. Resolver top keeps resolve/cancel(RequestId) as
+  the management plane. Full suite: 258 passed.

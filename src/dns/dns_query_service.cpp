@@ -1,5 +1,7 @@
+#include <clash_native/async/held_operation.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_query_service.hpp>
+#include <clash_native/io/sender.hpp>
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
@@ -134,19 +136,45 @@ class DnsQueryService::Operation final
 
     std::vector<Waiter> take_waiters() { return std::move(waiters_); }
 
+    struct UpstreamReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<Operation> operation;
+        void set_value(DnsExchangeResult result) noexcept {
+            auto self = std::move(operation);
+            self->owner_.runtime_.scheduler().post(
+                [self, result = std::move(result)]() mutable { self->finish(std::move(result)); });
+        }
+        void set_error(std::exception_ptr error) noexcept {
+            auto self = std::move(operation);
+            DnsExchangeResult result;
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const core::Error &failure) {
+                result = core::fail(failure);
+            } catch (...) {
+                result = core::fail(
+                    core::Error{core::ErrorCode::transport_io, "DNS query exchange failed"});
+            }
+            self->owner_.runtime_.scheduler().post(
+                [self, result = std::move(result)]() mutable { self->finish(std::move(result)); });
+        }
+        void set_stopped() noexcept {
+            auto self = std::move(operation);
+            self->owner_.runtime_.scheduler().post(
+                [self]() mutable { self->finish(core::fail(cancelled_error())); });
+        }
+    };
+
     void start() {
         auto self = shared_from_this();
         const auto deadline = std::chrono::steady_clock::now() + upstream_->timeout();
-        exchange_id_ =
-            upstream_->exchange(packet_, deadline, [self](core::Result<DnsPacket> result) {
-                self->owner_.runtime_.scheduler().post(
-                    [self, result = std::move(result)]() mutable {
-                        self->finish(std::move(result));
-                    });
-            });
+        // NOTE: name the sender first; argument order is unspecified.
+        auto sender = upstream_->exchange(packet_, deadline);
+        drive_ = async::hold_operation(std::move(sender), UpstreamReceiver{self});
+        drive_->start();
         exchange_started_ = true;
         if (completed_) {
-            upstream_->cancel(exchange_id_);
+            drive_.reset();
         }
     }
 
@@ -155,9 +183,9 @@ class DnsQueryService::Operation final
             return;
         }
         completed_ = true;
-        if (upstream_ && exchange_started_) {
-            upstream_->cancel(exchange_id_);
-        }
+        // Destroying the drive aborts exactly this group exchange; the
+        // late terminal drops on the completed_ guard.
+        drive_.reset();
         owner_.complete(shared_from_this(), core::fail(cancelled_error()));
     }
 
@@ -167,6 +195,7 @@ class DnsQueryService::Operation final
             return;
         }
         completed_ = true;
+        drive_.reset();
         owner_.complete(shared_from_this(), std::move(result));
     }
 
@@ -174,7 +203,8 @@ class DnsQueryService::Operation final
     std::string key_;
     DnsPacket packet_;
     std::shared_ptr<DnsUpstreamGroup> upstream_;
-    DnsUpstream::ExchangeId exchange_id_ = 0;
+    std::shared_ptr<async::HeldOperation<io::AnySender<DnsExchangeResult>, UpstreamReceiver>>
+        drive_;
     std::vector<Waiter> waiters_;
     bool exchange_started_ = false;
     bool completed_ = false;

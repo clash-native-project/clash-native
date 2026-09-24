@@ -1,4 +1,9 @@
+#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/held_operation.hpp>
 #include <clash_native/dns/dns_upstream.hpp>
+#include <clash_native/io/sender.hpp>
+
+#include <stdexec/execution.hpp>
 
 #include <boost/asio/post.hpp>
 
@@ -34,124 +39,71 @@ std::chrono::milliseconds DnsUpstream::timeout() const noexcept { return timeout
 
 DnsUpstream::~DnsUpstream() { stop(); }
 
-// Drives one transport sender behind the legacy id interface. The op
-// entry must outlive its own terminal (destroying it inline would run
-// the rest of the terminal on a dead op state), so terminals only mark
-// delivered and post both the erase and the delivery; cancel erases
-// synchronously, which destroys the op and aborts exactly this
-// transport exchange.
-struct DnsUpstream::DrivenExchange {
-    struct DrivenReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        DnsUpstream *upstream;
-        ExchangeId exchange_id;
-        void set_value(DnsExchangeResult result) noexcept { finish(std::move(result)); }
-        void set_error(std::exception_ptr error) noexcept {
-            try {
-                std::rethrow_exception(std::move(error));
-            } catch (const core::Error &failure) {
-                finish(core::fail(failure));
-                return;
-            } catch (...) {
-            }
-            finish(core::fail(
-                core::Error{core::ErrorCode::transport_io, "DNS upstream exchange failed"}));
+// Drives one transport sender behind the upstream sender edge, hopping
+// the terminal onto the runtime scheduler like the old contract. The
+// held drive is destroyed on abort, cancelling exactly this exchange.
+struct DriveReceiver {
+    using receiver_concept = stdexec::receiver_tag;
+    runtime::AsioRuntime *runtime;
+    async::BridgeSender<DnsExchangeResult>::Handler done;
+    void set_value(DnsExchangeResult result) noexcept {
+        auto terminal = std::move(done);
+        runtime->scheduler().post(
+            [terminal = std::move(terminal), result = std::move(result)]() mutable {
+                terminal(std::move(result));
+            });
+    }
+    void set_error(std::exception_ptr error) noexcept {
+        auto terminal = std::move(done);
+        DnsExchangeResult result;
+        try {
+            std::rethrow_exception(std::move(error));
+        } catch (const core::Error &failure) {
+            result = core::fail(failure);
+        } catch (...) {
+            result = core::fail(
+                core::Error{core::ErrorCode::transport_io, "DNS upstream exchange failed"});
         }
-        void set_stopped() noexcept {
-            finish(core::fail(
+        runtime->scheduler().post(
+            [terminal = std::move(terminal), result = std::move(result)]() mutable {
+                terminal(std::move(result));
+            });
+    }
+    void set_stopped() noexcept {
+        auto terminal = std::move(done);
+        runtime->scheduler().post([terminal = std::move(terminal)]() mutable {
+            terminal(core::fail(
                 core::Error{core::ErrorCode::cancelled, "DNS upstream exchange cancelled"}));
-        }
-        void finish(DnsExchangeResult result) noexcept {
-            auto *owner = upstream;
-            const auto id = exchange_id;
-            const auto found = owner->driven_.find(id);
-            if (found == owner->driven_.end() || found->second->delivered) {
-                return;
-            }
-            found->second->delivered = true;
-            auto handler = std::move(found->second->handler);
-            // Erase before delivery: a reentrant cancel from the user
-            // handler then finds nothing and drops.
-            owner->runtime_.scheduler().post([owner, id] { owner->driven_.erase(id); });
-            if (!handler) {
-                return;
-            }
-            owner->runtime_.scheduler().post(
-                [handler = std::move(handler), result = std::move(result)]() mutable {
-                    handler(std::move(result));
-                });
-        }
-    };
-    Handler handler;
-    // Connected transport op. any_sender op states are immovable, so
-    // the drive holder constructs it in place (guaranteed prvalue
-    // elision) and is heap-held, never moved. Destroying it aborts
-    // exactly this exchange.
-    struct Drive {
-        using Op = decltype(stdexec::connect(std::declval<io::AnySender<DnsExchangeResult>>(),
-                                             std::declval<DrivenReceiver>()));
-        template <typename Sender>
-        Drive(Sender &&sender, DrivenReceiver receiver)
-            : op(static_cast<Sender &&>(sender).connect(std::move(receiver))) {}
-        Op op;
-    };
-    std::shared_ptr<Drive> drive;
-    bool delivered = false;
+        });
+    }
 };
 
-DnsUpstream::ExchangeId DnsUpstream::exchange(DnsPacket query,
-                                              std::chrono::steady_clock::time_point deadline,
-                                              DnsUpstream::Handler handler) {
-    const auto exchange_id = next_exchange_id_++;
+io::AnySender<DnsExchangeResult>
+DnsUpstream::exchange(DnsPacket query, std::chrono::steady_clock::time_point deadline) {
     if (!transport_) {
-        runtime_.scheduler().post([handler = std::move(handler)]() mutable {
-            handler(core::fail(configuration_error()));
+        return io::AnySender<DnsExchangeResult>{stdexec::just(core::fail(configuration_error()))};
+    }
+    struct Shared {
+        std::shared_ptr<async::HeldOperation<io::AnySender<DnsExchangeResult>, DriveReceiver>>
+            drive;
+    };
+    auto shared = std::make_shared<Shared>();
+    auto transport = transport_;
+    auto *runtime = &runtime_;
+    return async::bridge_sender<DnsExchangeResult>(
+        [shared, transport, runtime, query = std::move(query),
+         deadline](async::BridgeSender<DnsExchangeResult>::Handler done) mutable {
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = transport->exchange({std::move(query), deadline});
+            shared->drive =
+                async::hold_operation(std::move(sender), DriveReceiver{runtime, std::move(done)});
+            shared->drive->start();
+            using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
+            return AbortFn{[shared] { shared->drive.reset(); }};
         });
-        return exchange_id;
-    }
-    auto driven = std::make_shared<DrivenExchange>();
-    driven->handler = std::move(handler);
-    driven_.emplace(exchange_id, driven);
-    // NOTE: name the sender first; argument order is unspecified.
-    auto sender = transport_->exchange({std::move(query), deadline});
-    driven->drive = std::make_shared<DrivenExchange::Drive>(
-        std::move(sender), DrivenExchange::DrivenReceiver{this, exchange_id});
-    stdexec::start(driven->drive->op);
-    return exchange_id;
-}
-
-void DnsUpstream::cancel(DnsUpstream::ExchangeId exchange_id) noexcept {
-    const auto found = driven_.find(exchange_id);
-    if (found == driven_.end()) {
-        return;
-    }
-    // Destroying the op state runs the bridge aborter, which cancels
-    // exactly this transport exchange; the late terminal then drops by
-    // map lookup. Deliver cancelled inline like the old contract.
-    auto driven = std::move(found->second);
-    driven_.erase(found);
-    driven->drive.reset();
-    if (driven->handler) {
-        auto handler = std::move(driven->handler);
-        runtime_.scheduler().post([handler = std::move(handler)]() mutable {
-            handler(core::fail(
-                core::Error{core::ErrorCode::cancelled, "DNS upstream exchange cancelled"}));
-        });
-    }
 }
 
 void DnsUpstream::stop() noexcept {
-    // Abort driven exchanges first so their late terminals drop, then
-    // tear down the transport session.
-    std::vector<ExchangeId> ids;
-    ids.reserve(driven_.size());
-    for (const auto &[id, driven] : driven_) {
-        (void)driven;
-        ids.push_back(id);
-    }
-    for (const auto id : ids) {
-        cancel(id);
-    }
     if (transport_) {
         transport_->stop();
     }
@@ -160,9 +112,39 @@ void DnsUpstream::stop() noexcept {
 class DnsUpstreamGroup::Operation final
     : public std::enable_shared_from_this<DnsUpstreamGroup::Operation> {
   public:
-    Operation(DnsUpstreamGroup &owner, DnsUpstream::ExchangeId exchange_id, DnsPacket query,
-              std::chrono::steady_clock::time_point deadline, DnsUpstream::Handler handler)
-        : owner_(owner), exchange_id_(exchange_id), query_(std::move(query)), deadline_(deadline),
+    using MemberTerminal = async::BridgeSender<DnsExchangeResult>::Handler;
+    struct MemberReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::shared_ptr<Operation> operation;
+        std::size_t member_index;
+        void set_value(DnsExchangeResult result) noexcept {
+            auto self = std::move(operation);
+            self->member_finished(member_index, std::move(result));
+        }
+        void set_error(std::exception_ptr error) noexcept {
+            auto self = std::move(operation);
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const core::Error &failure) {
+                self->member_finished(member_index, core::fail(failure));
+                return;
+            } catch (...) {
+            }
+            self->member_finished(member_index,
+                                  core::fail(core::Error{core::ErrorCode::transport_io,
+                                                         "DNS group member exchange failed"}));
+        }
+        void set_stopped() noexcept {
+            auto self = std::move(operation);
+            self->member_finished(member_index,
+                                  core::fail(core::Error{core::ErrorCode::cancelled,
+                                                         "DNS group member exchange cancelled"}));
+        }
+    };
+    using MemberDrive = async::HeldOperation<io::AnySender<DnsExchangeResult>, MemberReceiver>;
+    Operation(DnsUpstreamGroup &owner, DnsPacket query,
+              std::chrono::steady_clock::time_point deadline, MemberTerminal handler)
+        : owner_(owner), query_(std::move(query)), deadline_(deadline),
           handler_(std::move(handler)) {}
 
     void start() {
@@ -179,15 +161,14 @@ class DnsUpstreamGroup::Operation final
         if (completed_) {
             return;
         }
-        completed_ = true;
-        if (current_member_ && current_exchange_started_) {
-            current_member_->cancel(current_exchange_id_);
-        }
-        owner_.complete(exchange_id_, core::fail({core::ErrorCode::cancelled,
-                                                  "DNS upstream group exchange was cancelled"}));
+        // Destroying the drive aborts exactly the in-flight member
+        // exchange; its late terminal drops on the completed_ guard.
+        // finish() below marks completed, leaves the set, and delivers.
+        drive_.reset();
+        current_member_.reset();
+        finish(
+            core::fail({core::ErrorCode::cancelled, "DNS upstream group exchange was cancelled"}));
     }
-
-    DnsUpstream::Handler take_handler() { return std::move(handler_); }
 
   private:
     void start_member(std::size_t index) {
@@ -223,14 +204,13 @@ class DnsUpstreamGroup::Operation final
             member_deadline = now + remaining / remaining_attempts;
         }
         auto self = shared_from_this();
-        current_exchange_id_ = current_member_->exchange(
-            query_, member_deadline,
-            [self, member_index = current_index_](core::Result<DnsPacket> result) {
-                self->member_finished(member_index, std::move(result));
-            });
+        // NOTE: name the sender first; argument order is unspecified.
+        auto sender = current_member_->exchange(query_, member_deadline);
+        drive_ = async::hold_operation(std::move(sender), MemberReceiver{self, current_index_});
+        drive_->start();
         current_exchange_started_ = true;
         if (completed_) {
-            current_member_->cancel(current_exchange_id_);
+            drive_.reset();
         }
     }
 
@@ -275,16 +255,23 @@ class DnsUpstreamGroup::Operation final
             return;
         }
         completed_ = true;
-        owner_.complete(exchange_id_, std::move(result));
+        // Drop the member drive first so no late terminal can reenter,
+        // then leave the owner set and deliver.
+        drive_.reset();
+        current_member_.reset();
+        auto handler = std::move(handler_);
+        owner_.forget(this);
+        if (handler) {
+            handler(std::move(result));
+        }
     }
 
     DnsUpstreamGroup &owner_;
-    DnsUpstream::ExchangeId exchange_id_;
     DnsPacket query_;
     std::chrono::steady_clock::time_point deadline_;
-    DnsUpstream::Handler handler_;
+    MemberTerminal handler_;
     std::shared_ptr<DnsUpstream> current_member_;
-    DnsUpstream::ExchangeId current_exchange_id_ = 0;
+    std::shared_ptr<MemberDrive> drive_;
     std::size_t current_index_ = 0;
     bool current_exchange_started_ = false;
     bool completed_ = false;
@@ -396,25 +383,34 @@ void DnsUpstreamGroup::record_success(std::size_t member_index) noexcept {
     member_health_[member_index] = {};
 }
 
-DnsUpstream::ExchangeId DnsUpstreamGroup::exchange(DnsPacket query,
-                                                   std::chrono::steady_clock::time_point deadline,
-                                                   DnsUpstream::Handler handler) {
-    const auto exchange_id = next_exchange_id_++;
-    auto operation = std::make_shared<Operation>(*this, exchange_id, std::move(query), deadline,
-                                                 std::move(handler));
-    operations_.emplace(exchange_id, operation);
-    if (stopped_) {
-        operation->cancel();
-    } else {
-        operation->start();
-    }
-    return exchange_id;
+io::AnySender<DnsExchangeResult>
+DnsUpstreamGroup::exchange(DnsPacket query, std::chrono::steady_clock::time_point deadline) {
+    auto self = shared_from_this();
+    return async::bridge_sender<DnsExchangeResult>(
+        [self, query = std::move(query),
+         deadline](async::BridgeSender<DnsExchangeResult>::Handler done) mutable {
+            auto operation =
+                std::make_shared<Operation>(*self, std::move(query), deadline, std::move(done));
+            self->operations_.insert(operation);
+            if (self->stopped_) {
+                operation->cancel();
+            } else {
+                operation->start();
+            }
+            using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
+            return AbortFn{[self, operation] {
+                self->operations_.erase(operation);
+                operation->cancel();
+            }};
+        });
 }
 
-void DnsUpstreamGroup::cancel(DnsUpstream::ExchangeId exchange_id) noexcept {
-    const auto operation = operations_.find(exchange_id);
-    if (operation != operations_.end()) {
-        operation->second->cancel();
+void DnsUpstreamGroup::forget(Operation *operation) noexcept {
+    for (auto it = operations_.begin(); it != operations_.end(); ++it) {
+        if (it->get() == operation) {
+            operations_.erase(it);
+            return;
+        }
     }
 }
 
@@ -423,25 +419,17 @@ void DnsUpstreamGroup::stop() noexcept {
         return;
     }
     stopped_ = true;
-    while (!operations_.empty()) {
-        operations_.begin()->second->cancel();
+    std::vector<std::shared_ptr<Operation>> operations;
+    operations.reserve(operations_.size());
+    for (const auto &operation : operations_) {
+        operations.push_back(operation);
+    }
+    operations_.clear();
+    for (const auto &operation : operations) {
+        operation->cancel();
     }
     for (const auto &member : members_) {
         member->stop();
-    }
-}
-
-void DnsUpstreamGroup::complete(DnsUpstream::ExchangeId exchange_id,
-                                core::Result<DnsPacket> result) {
-    const auto operation = operations_.find(exchange_id);
-    if (operation == operations_.end()) {
-        return;
-    }
-    auto current = std::move(operation->second);
-    operations_.erase(operation);
-    auto handler = current->take_handler();
-    if (handler) {
-        handler(std::move(result));
     }
 }
 
