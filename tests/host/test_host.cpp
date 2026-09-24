@@ -323,6 +323,10 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_GRPC_SERVICE").value_or("");
         trojan_config.grpc_user_agent =
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_GRPC_USER_AGENT").value_or("");
+        if (const auto ping =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_GRPC_PING_INTERVAL")) {
+            trojan_config.grpc_ping_interval = std::chrono::seconds(std::stoi(*ping));
+        }
         auto outbound = std::make_shared<clash_native::outbound::TrojanOutbound>(
             runtime, std::move(trojan_config), std::move(resolver));
         if (const auto result = outbound->validate(); !result) {

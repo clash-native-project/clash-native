@@ -7,6 +7,7 @@
 #include <clash_native/io/multiplexed_session.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
+#include <clash_native/transport/http_sessions.hpp>
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/error.hpp>
@@ -115,9 +116,11 @@ using TunnelTerminal = core::Result<io::StreamUpgradeResponse>;
 class Http2ClientSession final : public io::ExchangeSession,
                                  public std::enable_shared_from_this<Http2ClientSession> {
   public:
-    explicit Http2ClientSession(std::unique_ptr<io::StreamHandle> stream)
+    explicit Http2ClientSession(std::unique_ptr<io::StreamHandle> stream,
+                                Http2SessionOptions options = {})
         : executor_(stream->executor()),
-          stream_(std::make_unique<net::StreamHandleAdapter>(std::move(stream))) {}
+          stream_(std::make_unique<net::StreamHandleAdapter>(std::move(stream))),
+          ping_interval_(options.ping_interval), ping_timer_(executor_) {}
 
     ~Http2ClientSession() { close_http2(); }
 
@@ -157,6 +160,51 @@ class Http2ClientSession final : public io::ExchangeSession,
     void start() {
         send_pending();
         read_response();
+        arm_ping();
+    }
+
+    // PING keepalive: every interval without an ack counts a miss; two
+    // consecutive misses fail the connection so dead peers cannot hold
+    // multiplexed streams hostage.
+    void arm_ping() {
+        if (ping_interval_.count() <= 0 || stopped_ || retired_ || !http2_session_) {
+            return;
+        }
+        const auto self = weak_from_this();
+        ping_timer_.expires_after(ping_interval_);
+        ping_timer_.async_wait([self](const boost::system::error_code &error) {
+            const auto locked = self.lock();
+            if (!locked || error) {
+                return;
+            }
+            locked->ping_tick();
+        });
+    }
+
+    void ping_tick() {
+        if (stopped_ || retired_ || http2_session_ == nullptr) {
+            return;
+        }
+        if (ping_pending_) {
+            if (++ping_misses_ >= 2) {
+                connection_failed(protocol_error("HTTP/2 PING keepalive went unanswered"));
+                return;
+            }
+        } else {
+            ping_misses_ = 0;
+        }
+        if (nghttp2_submit_ping(http2_session_, NGHTTP2_FLAG_NONE, nullptr) != 0) {
+            connection_failed(protocol_error("failed to submit HTTP/2 PING"));
+            return;
+        }
+        ping_pending_ = true;
+        send_pending();
+        arm_ping();
+    }
+
+    void on_ping_ack() noexcept {
+        ping_pending_ = false;
+        ping_misses_ = 0;
     }
 
     io::AnySender<io::ExchangeResponse>
@@ -879,6 +927,10 @@ class Http2ClientSession final : public io::ExchangeSession,
 
     static int on_frame_received(nghttp2_session *, const nghttp2_frame *frame, void *user_data) {
         auto *self = static_cast<Http2ClientSession *>(user_data);
+        if (frame->hd.type == NGHTTP2_PING && (frame->hd.flags & NGHTTP2_FLAG_ACK) != 0) {
+            self->on_ping_ack();
+            return 0;
+        }
         if (frame->hd.type == NGHTTP2_GOAWAY) {
             self->handle_goaway(frame->goaway.last_stream_id);
             return 0;
@@ -1566,6 +1618,10 @@ class Http2ClientSession final : public io::ExchangeSession,
     }
 
     void close_http2() noexcept {
+        boost::system::error_code ignored;
+        (void)ignored;
+        (void)ping_timer_.cancel();
+        ping_pending_ = false;
         if (http2_session_) {
             nghttp2_session_del(http2_session_);
             http2_session_ = nullptr;
@@ -1589,6 +1645,10 @@ class Http2ClientSession final : public io::ExchangeSession,
     boost::asio::any_io_executor executor_;
     std::unique_ptr<net::StreamHandleAdapter> stream_;
     nghttp2_session *http2_session_ = nullptr;
+    std::chrono::milliseconds ping_interval_{0};
+    boost::asio::steady_timer ping_timer_;
+    bool ping_pending_ = false;
+    unsigned ping_misses_ = 0;
     std::optional<core::Error> initialization_error_;
     std::unordered_map<ExchangeId, PendingPtr> pending_;
     std::unordered_map<std::int32_t, ExchangeId> stream_ids_;
@@ -1611,11 +1671,11 @@ class Http2ClientSession final : public io::ExchangeSession,
 } // namespace
 
 std::shared_ptr<io::ExchangeSession>
-make_http2_exchange_session(std::unique_ptr<io::StreamHandle> stream) {
+make_http2_exchange_session(std::unique_ptr<io::StreamHandle> stream, Http2SessionOptions options) {
     if (!stream) {
         return {};
     }
-    auto session = std::make_shared<Http2ClientSession>(std::move(stream));
+    auto session = std::make_shared<Http2ClientSession>(std::move(stream), std::move(options));
     if (!session->initialize()) {
         session->stop();
         return {};

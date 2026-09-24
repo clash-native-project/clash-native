@@ -39,6 +39,7 @@ struct H2Server {
     std::atomic<int> requests{0};
     std::atomic<std::int32_t> rst_stream{-1};
     std::promise<void> rst_seen;
+    std::atomic<int> ping_count{0};
     std::map<std::int32_t, std::string> paths;
     std::string body = "sibling-body";
     nghttp2_data_provider2 end_provider{};
@@ -94,6 +95,8 @@ struct H2Server {
             if (submitted != 0) {
                 return NGHTTP2_ERR_CALLBACK_FAILURE;
             }
+        } else if (frame->hd.type == NGHTTP2_PING && (frame->hd.flags & NGHTTP2_FLAG_ACK) == 0) {
+            self->ping_count.fetch_add(1);
         } else if (frame->hd.type == NGHTTP2_RST_STREAM) {
             self->rst_stream.store(frame->hd.stream_id);
             try {
@@ -352,6 +355,51 @@ TEST(Http2StreamingTest, AbortingOneExchangeLeavesSiblingFlowing) {
     const auto body = read_all(second_response.body);
     EXPECT_EQ(std::string(body.begin(), body.end()), "sibling-body");
 
+    server.done = true;
+    server_thread.join();
+    context.stop();
+    worker.join();
+}
+
+TEST(Http2StreamingTest, PingKeepaliveFiresOnSchedule) {
+    boost::asio::io_context context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{
+        context.get_executor()};
+    boost::asio::ip::tcp::acceptor acceptor(context, {boost::asio::ip::address_v4::loopback(), 0});
+    boost::asio::ip::tcp::socket server_side(context);
+    std::thread worker([&] { context.run(); });
+    boost::asio::ip::tcp::socket client_side(context);
+    client_side.connect(
+        {boost::asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()});
+    acceptor.accept(server_side);
+
+    H2Server server(std::move(server_side));
+    std::thread server_thread([&] { server.pump_until_done(std::chrono::seconds(15)); });
+
+    auto stream = std::make_unique<clash_native::net::TcpStream>(std::move(client_side));
+    clash_native::transport::Http2SessionOptions session_options;
+    session_options.ping_interval = std::chrono::milliseconds(50);
+    auto session =
+        clash_native::transport::make_http2_exchange_session(std::move(stream), session_options);
+    ASSERT_TRUE(session);
+    // nghttp2 auto-answers PINGs; ~400ms at 50ms intervals must show
+    // several while the session stays usable.
+    const auto start = std::chrono::steady_clock::now();
+    while (server.ping_count.load() < 3 &&
+           std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_GE(server.ping_count.load(), 3);
+    // The session still serves exchanges with keepalive running.
+    clash_native::io::ExchangeRequest probe;
+    probe.method = "GET";
+    probe.scheme = "http";
+    probe.authority = "localhost";
+    probe.target = "/probe";
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto completed = stdexec::sync_wait(session->exchange(std::move(probe), deadline));
+    ASSERT_TRUE(completed.has_value());
+    EXPECT_EQ(std::get<0>(std::move(*completed)).status, 200U);
     server.done = true;
     server_thread.join();
     context.stop();

@@ -10,6 +10,7 @@
 #include <clash_native/transport/proxy/shadow_tls.hpp>
 #include <clash_native/transport/websocket_client.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -58,6 +59,8 @@ struct TrojanOutboundConfig {
     // "GunService", matching Mihomo.
     std::string grpc_service_name;
     std::string grpc_user_agent;
+    // h2 PING keepalive for pooled grpc sessions, zero disables.
+    std::chrono::seconds grpc_ping_interval{0};
     int grpc_max_connections = 0;
     int grpc_min_streams = 0;
     int grpc_max_streams = 0;

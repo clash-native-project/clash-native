@@ -176,7 +176,11 @@ struct GrpcSessionOpen {
                 {core::ErrorCode::carrier_handshake, "Trojan gRPC server did not negotiate h2"}));
             co_return;
         }
-        finish(SessionResult{transport::make_http2_exchange_session(std::move(tls.stream))});
+        transport::Http2SessionOptions http2_options;
+        http2_options.ping_interval =
+            std::chrono::duration_cast<std::chrono::milliseconds>(config.grpc_ping_interval);
+        finish(SessionResult{transport::make_http2_exchange_session(std::move(tls.stream),
+                                                                    std::move(http2_options))});
     }
 };
 
@@ -382,7 +386,12 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                         : self->config_.websocket_host;
                 ws_options.target = self->config_.websocket_path;
                 ws_options.headers = self->config_.websocket_headers;
-                ws_options.tls = self->config_.network == "wss" || self->config_.websocket_tls;
+                // With a security overlay the camouflage replaces the
+                // WS-underlying TLS (matching Mihomo); otherwise the ws
+                // client owns its TLS handshake.
+                const bool overlayed = !self->config_.security_mode.empty();
+                ws_options.tls =
+                    !overlayed && (self->config_.network == "wss" || self->config_.websocket_tls);
                 ws_options.tls_server_name = self->config_.server_name.empty()
                                                  ? self->config_.server_host
                                                  : self->config_.server_name;
@@ -408,8 +417,22 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                     ws_options.initial_payload = std::move(header.value());
                     header_sent = true;
                 }
-                auto plain_stream = std::make_unique<net::TcpStream>(std::move(*self->socket_));
+                std::unique_ptr<io::StreamHandle> ws_base =
+                    std::make_unique<net::TcpStream>(std::move(*self->socket_));
                 self->socket_.reset();
+                if (overlayed) {
+                    auto overlay = co_await open_security_overlay(self, std::move(ws_base));
+                    if (!overlay) {
+                        self->finish(core::StreamOpenResult::failed(overlay.error()));
+                        co_return;
+                    }
+                    if (self->completed_) {
+                        overlay.value()->close();
+                        co_return;
+                    }
+                    ws_base = std::move(overlay.value());
+                }
+                auto plain_stream = std::move(ws_base);
                 using WsSigs = stdexec::completion_signatures<
                     stdexec::set_value_t(core::Result<std::unique_ptr<io::StreamHandle>>),
                     stdexec::set_error_t(std::exception_ptr), stdexec::set_stopped_t()>;

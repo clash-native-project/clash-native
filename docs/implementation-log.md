@@ -2418,3 +2418,10 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   v2ray-http-upgrade raw tunnels in the shared WS client; trojan
   header rides the handshake for non-SS WS modes. New loopback
   tests cover both. Full suite: 265 passed.
+
+## 2026-09-24
+
+- Trojan parity batch 3: h2 PING keepalive (interval + double-miss
+  failure) plumbed to grpc sessions, and security overlays under
+  WS/WSS (camouflage replaces WS TLS, matching Mihomo). New
+  WS-shadow-tls interop case passes. Full suite: 266 passed.
