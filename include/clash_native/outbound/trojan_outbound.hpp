@@ -35,6 +35,9 @@ struct TrojanOutboundConfig {
     std::string websocket_path = "/";
     std::vector<io::ExchangeField> websocket_headers;
     bool websocket_tls = false;
+    std::size_t websocket_max_early_data = 0;
+    std::string websocket_early_data_header;
+    bool websocket_v2ray_http_upgrade = false;
     // Empty means Mihomo defaults: {"h2", "http/1.1"} for TCP,
     // {"http/1.1"} for WebSocket.
     std::vector<std::string> alpn_protocols;

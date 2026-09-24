@@ -23,6 +23,18 @@ struct WebSocketClientOptions {
     // Additional handshake headers. Connection, Upgrade, Host, and
     // Sec-WebSocket-* framing headers are managed by the client.
     std::vector<io::ExchangeField> headers;
+    // First payload bytes carried by the handshake (Mihomo early-data
+    // semantics): min(size, max_early_data) base64url-encoded into the
+    // request path (or early_data_header_name when set); the remainder
+    // is sent as the first post-handshake message(s) by the handshake
+    // operation. A `?ed=N` target query auto-configures max_early_data
+    // with Sec-WebSocket-Protocol, matching Mihomo.
+    std::vector<std::uint8_t> initial_payload;
+    std::size_t max_early_data = 0;
+    std::string early_data_header_name;
+    // v2ray-http-upgrade: plain HTTP Upgrade tunnel without WebSocket
+    // framing; initial_payload is written raw after the 101.
+    bool v2ray_http_upgrade = false;
     std::size_t max_message_size = 16 * 1024 * 1024;
     // When enabled, perform a TLS handshake before the HTTP/1.1 Upgrade.
     bool tls = false;

@@ -271,6 +271,15 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_PATH").value_or("/");
         trojan_config.websocket_tls =
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_TLS").value_or("0") != "0";
+        if (const auto early_data =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_MAX_EARLY_DATA")) {
+            trojan_config.websocket_max_early_data = std::stoul(*early_data);
+        }
+        trojan_config.websocket_early_data_header =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_EARLY_DATA_HEADER")
+                .value_or("");
+        trojan_config.websocket_v2ray_http_upgrade =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_UPGRADE").value_or("0") != "0";
         trojan_config.ss_enabled =
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SS_ENABLED").value_or("0") != "0";
         trojan_config.ss_method = environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SS_METHOD")

@@ -18,11 +18,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -231,6 +233,88 @@ bool is_managed_header(std::string_view name) {
            lower == "content-length" || lower == "transfer-encoding" ||
            lower == "sec-websocket-key" || lower == "sec-websocket-version" ||
            lower == "sec-websocket-accept" || lower == "sec-websocket-extensions";
+}
+
+// Base64URL without padding (Mihomo early-data encoding).
+std::string base64url_encode(std::span<const std::uint8_t> input) {
+    static constexpr char digits[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string output;
+    output.reserve(((input.size() + 2) / 3) * 4);
+    for (std::size_t index = 0; index < input.size(); index += 3) {
+        const std::uint32_t chunk =
+            static_cast<std::uint32_t>(input[index]) << 16 |
+            (index + 1 < input.size() ? static_cast<std::uint32_t>(input[index + 1]) << 8 : 0) |
+            (index + 2 < input.size() ? static_cast<std::uint32_t>(input[index + 2]) : 0);
+        output.push_back(digits[(chunk >> 18) & 0x3f]);
+        output.push_back(digits[(chunk >> 12) & 0x3f]);
+        if (index + 1 < input.size()) {
+            output.push_back(digits[(chunk >> 6) & 0x3f]);
+        }
+        if (index + 2 < input.size()) {
+            output.push_back(digits[chunk & 0x3f]);
+        }
+    }
+    return output;
+}
+
+struct EarlyDataSplit {
+    std::string target;
+    std::optional<io::ExchangeField> header;
+    std::vector<std::uint8_t> remainder;
+};
+
+// Splits the initial payload into handshake-embedded early data and the
+// post-handshake remainder, honouring `?ed=N` auto-configuration.
+EarlyDataSplit split_early_data(const WebSocketClientOptions &options) {
+    auto target = options.target;
+    auto max_early_data = options.max_early_data;
+    auto header_name = options.early_data_header_name;
+    if (max_early_data == 0) {
+        const auto query = target.find('?');
+        if (query != std::string::npos) {
+            auto query_string = target.substr(query + 1);
+            std::size_t position = 0;
+            while (position <= query_string.size()) {
+                const auto next = query_string.find('&', position);
+                const auto pair = query_string.substr(
+                    position, next == std::string::npos ? next : next - position);
+                const auto equals = pair.find('=');
+                if (equals != std::string::npos && pair.substr(0, equals) == "ed") {
+                    std::size_t parsed = 0;
+                    const auto digits = std::from_chars(pair.data() + equals + 1,
+                                                        pair.data() + pair.size(), parsed);
+                    if (digits.ec == std::errc{} && digits.ptr == pair.data() + pair.size()) {
+                        max_early_data = parsed;
+                        header_name = "Sec-WebSocket-Protocol";
+                    }
+                    const auto stripped =
+                        target.substr(0, query) +
+                        (next == std::string::npos ? "" : "?" + query_string.substr(next + 1));
+                    target = stripped.empty() ? "/" : stripped;
+                    break;
+                }
+                if (next == std::string::npos) {
+                    break;
+                }
+                position = next + 1;
+            }
+        }
+    }
+    EarlyDataSplit split{std::move(target), std::nullopt, {}};
+    const auto early_size = std::min(options.initial_payload.size(), max_early_data);
+    if (early_size > 0) {
+        const auto encoded = base64url_encode(
+            std::span<const std::uint8_t>(options.initial_payload.data(), early_size));
+        if (!header_name.empty()) {
+            split.header = io::ExchangeField{header_name, encoded};
+        } else {
+            split.target += encoded;
+        }
+    }
+    split.remainder.assign(options.initial_payload.begin() + early_size,
+                           options.initial_payload.end());
+    return split;
 }
 
 std::optional<core::Error> validate_options(const WebSocketClientOptions &options) {
@@ -607,6 +691,90 @@ class WebSocketClientHandshakeOperation final
         boost::asio::post(executor_, [self] { self->scope_.spawn(run_open(self)); });
     }
 
+    // v2ray-http-upgrade: plain HTTP Upgrade tunnel without WebSocket
+    // framing. Sends the GET (with early data), validates the 101 with
+    // upgrade headers, writes the remainder raw, and delivers the inner
+    // stream directly.
+    static exec::task<void> run_raw_upgrade(std::shared_ptr<WebSocketClientHandshakeOperation> self,
+                                            EarlyDataSplit early) {
+        std::string request = "GET " + early.target + " HTTP/1.1\r\nHost: " + self->options_.host +
+                              "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n";
+        for (const auto &header : self->options_.headers) {
+            request += header.name + ": " + header.value + "\r\n";
+        }
+        if (early.header) {
+            request += early.header->name + ": " + early.header->value + "\r\n";
+        }
+        request += "\r\n";
+        try {
+            co_await self->stream_->async_write(boost::asio::buffer(request));
+        } catch (const core::Error &failure) {
+            self->finish(core::fail(failure));
+            co_return;
+        } catch (...) {
+            self->finish(core::fail(handshake_error(boost::asio::error::fault)));
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        std::string head;
+        head.reserve(1024);
+        bool headed = false;
+        for (int guard = 0; guard < 64 && !headed; ++guard) {
+            std::array<std::uint8_t, 1024> chunk{};
+            std::optional<std::size_t> got;
+            try {
+                got = co_await self->stream_->async_read_some(boost::asio::buffer(chunk));
+            } catch (const core::Error &failure) {
+                self->finish(core::fail(failure));
+                co_return;
+            } catch (...) {
+                self->finish(core::fail(handshake_error(boost::asio::error::fault)));
+                co_return;
+            }
+            if (self->completed_) {
+                co_return;
+            }
+            if (!got) {
+                self->finish(core::fail(handshake_error(boost::asio::error::eof)));
+                co_return;
+            }
+            head.append(reinterpret_cast<const char *>(chunk.data()), *got);
+            headed = head.find("\r\n\r\n") != std::string::npos;
+        }
+        if (!headed) {
+            self->finish(core::fail(handshake_error(boost::asio::error::message_size)));
+            co_return;
+        }
+        const auto status_line = head.substr(0, head.find("\r\n"));
+        auto lower_head = lower_copy(head);
+        const bool accepted = status_line.size() >= 12 && status_line.substr(9, 3) == "101" &&
+                              lower_head.find("\nconnection:") != std::string::npos &&
+                              lower_head.find("upgrade") != std::string::npos &&
+                              lower_head.find("\nupgrade:") != std::string::npos &&
+                              lower_head.find("websocket") != std::string::npos;
+        if (!accepted) {
+            self->finish(core::fail(handshake_error(boost::asio::error::fault)));
+            co_return;
+        }
+        if (!early.remainder.empty()) {
+            try {
+                co_await self->stream_->async_write(boost::asio::buffer(early.remainder));
+            } catch (const core::Error &failure) {
+                self->finish(core::fail(failure));
+                co_return;
+            } catch (...) {
+                self->finish(core::fail(handshake_error(boost::asio::error::fault)));
+                co_return;
+            }
+            if (self->completed_) {
+                co_return;
+            }
+        }
+        self->finish(std::unique_ptr<io::StreamHandle>(std::move(self->stream_)));
+    }
+
     static exec::task<void> run_open(std::shared_ptr<WebSocketClientHandshakeOperation> self) {
         if (const auto error = validate_options(self->options_)) {
             self->finish(core::fail(*error));
@@ -663,13 +831,22 @@ class WebSocketClientHandshakeOperation final
         if (self->completed_ || !self->stream_) {
             co_return;
         }
+        const auto early = split_early_data(self->options_);
+        if (self->options_.v2ray_http_upgrade) {
+            co_await run_raw_upgrade(self, early);
+            co_return;
+        }
         self->websocket_ =
             std::make_shared<BeastWebSocket>(WebSocketStreamAdapter(std::move(self->stream_)));
         self->websocket_->set_option(
             websocket::stream_base::timeout::suggested(boost::beast::role_type::client));
         self->websocket_->read_message_max(self->options_.max_message_size);
         self->websocket_->auto_fragment(true);
-        const auto headers = self->options_.headers;
+        auto headers = self->options_.headers;
+        if (early.header) {
+            headers.push_back(*early.header);
+        }
+        const auto target = early.target;
         self->websocket_->set_option(
             websocket::stream_base::decorator([headers](websocket::request_type &request) {
                 for (const auto &header : headers) {
@@ -682,8 +859,8 @@ class WebSocketClientHandshakeOperation final
                                            stdexec::set_stopped_t()>;
         try {
             co_await async::callback_sender<HandshakeSigs>(
-                [self](auto terminal) mutable {
-                    self->websocket_->async_handshake(self->options_.host, self->options_.target,
+                [self, target](auto terminal) mutable {
+                    self->websocket_->async_handshake(self->options_.host, target,
                                                       std::move(terminal));
                 },
                 [](auto receiver, const boost::system::error_code &error) {
@@ -699,6 +876,49 @@ class WebSocketClientHandshakeOperation final
             co_return;
         } catch (...) {
             self->finish(core::fail(handshake_error(boost::asio::error::fault)));
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        // Flush the post-handshake remainder as the first message(s)
+        // before delivering the stream.
+        if (!early.remainder.empty()) {
+            auto state = std::make_shared<WebSocketStreamState>(self->websocket_,
+                                                                self->options_.max_message_size);
+            self->websocket_.reset();
+            using WriteSigs =
+                stdexec::completion_signatures<stdexec::set_value_t(),
+                                               stdexec::set_error_t(std::exception_ptr),
+                                               stdexec::set_stopped_t()>;
+            try {
+                co_await async::callback_sender<WriteSigs>(
+                    [state, remainder = early.remainder](auto terminal) mutable {
+                        state->async_write(boost::asio::buffer(remainder),
+                                           [terminal = std::move(terminal)](
+                                               const boost::system::error_code &error,
+                                               std::size_t) mutable { terminal(error); });
+                    },
+                    [](auto receiver, const boost::system::error_code &error) {
+                        if (error) {
+                            stdexec::set_error(std::move(receiver),
+                                               std::make_exception_ptr(handshake_error(error)));
+                            return;
+                        }
+                        stdexec::set_value(std::move(receiver));
+                    });
+            } catch (const core::Error &failure) {
+                self->finish(core::fail(failure));
+                co_return;
+            } catch (...) {
+                self->finish(core::fail(handshake_error(boost::asio::error::fault)));
+                co_return;
+            }
+            if (self->completed_) {
+                co_return;
+            }
+            auto stream = std::make_unique<WebSocketStream>(std::move(state));
+            self->finish(std::unique_ptr<io::StreamHandle>(std::move(stream)));
             co_return;
         }
         boost::asio::post(self->executor_, [self] { self->complete_success(); });

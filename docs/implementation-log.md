@@ -2410,3 +2410,11 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   plumbed through Trojan TCP/WS/gRPC and the WS client.
   New `tls_client_test` covers malformed/mismatched credentials.
   Full suite: 263 passed.
+
+## 2026-09-24
+
+- Trojan parity batch 2: WebSocket early-data (path/header
+  embedding with `?ed=` auto-config, remainder flush) and
+  v2ray-http-upgrade raw tunnels in the shared WS client; trojan
+  header rides the handshake for non-SS WS modes. New loopback
+  tests cover both. Full suite: 265 passed.

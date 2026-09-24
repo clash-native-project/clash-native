@@ -63,6 +63,26 @@ std::error_code to_std_error(const boost::system::error_code &error) {
     return {error.value(), std::system_category()};
 }
 
+core::Result<std::vector<std::uint8_t>> build_request_header(const TrojanOutboundConfig &config,
+                                                             const core::Destination &destination,
+                                                             std::uint8_t command) {
+    const auto password_key = trojan_password_key(config.password);
+    const auto address = detail::encode_proxy_address(destination);
+    if (!password_key || !address) {
+        return core::fail(!password_key ? password_key.error() : address.error());
+    }
+    std::vector<std::uint8_t> wire;
+    wire.reserve(password_key.value().size() + address.value().size() + 5);
+    wire.insert(wire.end(), password_key.value().begin(), password_key.value().end());
+    wire.push_back('\r');
+    wire.push_back('\n');
+    wire.push_back(command);
+    wire.insert(wire.end(), address.value().begin(), address.value().end());
+    wire.push_back('\r');
+    wire.push_back('\n');
+    return wire;
+}
+
 // gRPC Transport session: resolve, TCP connect, TLS with enforced h2 ALPN,
 // then an HTTP/2 exchange session. Named-function task spawned directly
 // into a scope (the run() shape); every terminal funnels through done.
@@ -326,6 +346,10 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
             if (self->completed_) {
                 co_return;
             }
+            // Without the ss layer the WS handshake carries the request
+            // header (early data or first message) and no post-write is
+            // needed below.
+            bool header_sent = false;
             if (self->config_.network == "grpc") {
                 const auto gun_pool = self->gun_pool_;
                 if (!gun_pool) {
@@ -370,7 +394,20 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 ws_options.tls_alpn_protocols = self->config_.alpn_protocols.empty()
                                                     ? std::vector<std::string>{"http/1.1"}
                                                     : self->config_.alpn_protocols;
+                ws_options.max_early_data = self->config_.websocket_max_early_data;
+                ws_options.early_data_header_name = self->config_.websocket_early_data_header;
+                ws_options.v2ray_http_upgrade = self->config_.websocket_v2ray_http_upgrade;
                 ws_options.deadline = self->deadline_;
+                if (!self->config_.ss_enabled) {
+                    auto header = build_request_header(self->config_, self->request_.destination,
+                                                       self->command_);
+                    if (!header) {
+                        self->finish(core::StreamOpenResult::failed(header.error()));
+                        co_return;
+                    }
+                    ws_options.initial_payload = std::move(header.value());
+                    header_sent = true;
+                }
                 auto plain_stream = std::make_unique<net::TcpStream>(std::move(*self->socket_));
                 self->socket_.reset();
                 using WsSigs = stdexec::completion_signatures<
@@ -471,31 +508,24 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 }
                 self->transport_stream_ = std::move(ss_stream.value());
             }
-            const auto password_key = trojan_password_key(self->config_.password);
-            const auto address = detail::encode_proxy_address(self->request_.destination);
-            if (!password_key || !address) {
-                self->finish(core::StreamOpenResult::failed(!password_key ? password_key.error()
-                                                                          : address.error()));
-                co_return;
-            }
-            auto wire = std::make_shared<std::vector<std::uint8_t>>();
-            wire->reserve(password_key.value().size() + address.value().size() + 5);
-            wire->insert(wire->end(), password_key.value().begin(), password_key.value().end());
-            wire->push_back('\r');
-            wire->push_back('\n');
-            wire->push_back(self->command_);
-            wire->insert(wire->end(), address.value().begin(), address.value().end());
-            wire->push_back('\r');
-            wire->push_back('\n');
-            try {
-                co_await self->transport_stream_->async_write(boost::asio::buffer(*wire));
-            } catch (const core::Error &failure) {
-                self->finish(core::StreamOpenResult::failed(failure));
-                co_return;
-            } catch (...) {
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::transport_io, "failed to write Trojan request"}));
-                co_return;
+            if (!header_sent) {
+                const auto header =
+                    build_request_header(self->config_, self->request_.destination, self->command_);
+                if (!header) {
+                    self->finish(core::StreamOpenResult::failed(header.error()));
+                    co_return;
+                }
+                auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(header.value()));
+                try {
+                    co_await self->transport_stream_->async_write(boost::asio::buffer(*wire));
+                } catch (const core::Error &failure) {
+                    self->finish(core::StreamOpenResult::failed(failure));
+                    co_return;
+                } catch (...) {
+                    self->finish(core::StreamOpenResult::failed(
+                        {core::ErrorCode::transport_io, "failed to write Trojan request"}));
+                    co_return;
+                }
             }
             if (self->completed_) {
                 co_return;
