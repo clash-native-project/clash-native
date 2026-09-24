@@ -8,14 +8,22 @@
 
 #include <gtest/gtest.h>
 
+#include <openssl/aead.h>
+#include <openssl/asn1.h>
+#include <openssl/bio.h>
+#include <openssl/curve25519.h>
+#include <openssl/evp.h>
+#include <openssl/hkdf.h>
+#include <openssl/hmac.h>
 #include <openssl/ssl.h>
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/read.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <future>
 #include <memory>
 #include <optional>
@@ -24,6 +32,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -183,4 +192,1004 @@ TEST(TlsClientTest, OverlayBoringsslMarkerIsPresent) {
     // Proves the overlay-port patch pipeline end to end: this symbol only
     // exists in BoringSSL built from third_party/vcpkg/ports/boringssl.
     EXPECT_EQ(CLASH_NATIVE_overlay_marker(), 1);
+}
+namespace {
+
+// Minimal ClientHello parser for the Chrome-profile test. All offsets are
+// bounds-checked; any truncation fails the test at the offending offset.
+struct Cursor {
+    const uint8_t *data = nullptr;
+    std::size_t size = 0;
+
+    bool take8(uint8_t &out) {
+        if (size < 1) {
+            return false;
+        }
+        out = data[0];
+        data += 1;
+        size -= 1;
+        return true;
+    }
+
+    bool take16(uint16_t &out) {
+        if (size < 2) {
+            return false;
+        }
+        out = static_cast<uint16_t>((static_cast<uint16_t>(data[0]) << 8) | data[1]);
+        data += 2;
+        size -= 2;
+        return true;
+    }
+
+    bool take24(uint32_t &out) {
+        if (size < 3) {
+            return false;
+        }
+        out = (static_cast<uint32_t>(data[0]) << 16) | (static_cast<uint32_t>(data[1]) << 8) |
+              data[2];
+        data += 3;
+        size -= 3;
+        return true;
+    }
+
+    bool take_bytes(std::size_t count, const uint8_t *&out) {
+        if (size < count) {
+            return false;
+        }
+        out = data;
+        data += count;
+        size -= count;
+        return true;
+    }
+
+    bool skip(std::size_t count) {
+        const uint8_t *ignored = nullptr;
+        return take_bytes(count, ignored);
+    }
+};
+
+bool is_grease(uint16_t value) {
+    return (value & 0x0f0f) == 0x0a0a && ((value >> 8) & 0x0f) == (value & 0x0f);
+}
+
+struct KeyShareEntry {
+    uint16_t group = 0;
+    std::vector<uint8_t> key;
+};
+
+struct ClientHello {
+    std::vector<uint16_t> ciphers;
+    std::vector<uint16_t> extension_types;
+    std::vector<uint8_t> random;
+    std::vector<uint8_t> session_id;
+    std::vector<KeyShareEntry> key_shares;
+    std::vector<uint16_t> groups;
+    std::vector<uint16_t> key_share_groups;
+    std::vector<uint16_t> signature_algorithms;
+    std::vector<uint16_t> versions;
+    std::vector<std::string> alpn;
+    std::string server_name;
+    bool has_alps = false;
+    bool has_ech = false;
+    bool has_compress_brotli = false;
+};
+
+bool parse_client_hello(const std::vector<uint8_t> &record, ClientHello &hello) {
+    Cursor record_cursor{record.data(), record.size()};
+    uint8_t record_type = 0;
+    uint16_t record_version = 0;
+    uint16_t record_length = 0;
+    if (!record_cursor.take8(record_type) || !record_cursor.take16(record_version) ||
+        !record_cursor.take16(record_length) || record_type != 22 ||
+        record_cursor.size < record_length) {
+        return false;
+    }
+    Cursor cursor{record_cursor.data, record_length};
+    uint8_t handshake_type = 0;
+    uint32_t handshake_length = 0;
+    if (!cursor.take8(handshake_type) || !cursor.take24(handshake_length) || handshake_type != 1 ||
+        cursor.size < handshake_length) {
+        return false;
+    }
+    Cursor body{cursor.data, handshake_length};
+    uint16_t legacy_version = 0;
+    const uint8_t *random = nullptr;
+    if (!body.take16(legacy_version) || legacy_version != 0x0303 || !body.take_bytes(32, random)) {
+        return false;
+    }
+    hello.random.assign(random, random + 32);
+    uint8_t session_id_length = 0;
+    const uint8_t *session_id = nullptr;
+    if (!body.take8(session_id_length) || !body.take_bytes(session_id_length, session_id)) {
+        return false;
+    }
+    hello.session_id.assign(session_id, session_id + session_id_length);
+    uint16_t cipher_length = 0;
+    if (!body.take16(cipher_length) || (cipher_length % 2) != 0) {
+        return false;
+    }
+    for (uint16_t left = cipher_length; left > 0; left -= 2) {
+        uint16_t cipher = 0;
+        if (!body.take16(cipher)) {
+            return false;
+        }
+        hello.ciphers.push_back(cipher);
+    }
+    uint8_t compression_length = 0;
+    if (!body.take8(compression_length) || !body.skip(compression_length)) {
+        return false;
+    }
+    uint16_t extensions_length = 0;
+    if (!body.take16(extensions_length) || body.size < extensions_length) {
+        return false;
+    }
+    Cursor extensions{body.data, extensions_length};
+    while (extensions.size > 0) {
+        uint16_t type = 0;
+        uint16_t length = 0;
+        const uint8_t *value = nullptr;
+        if (!extensions.take16(type) || !extensions.take16(length) ||
+            !extensions.take_bytes(length, value)) {
+            return false;
+        }
+        hello.extension_types.push_back(type);
+        Cursor ext{value, length};
+        if (type == 0) {
+            uint16_t list_length = 0;
+            uint8_t name_type = 0;
+            uint16_t name_length = 0;
+            const uint8_t *name = nullptr;
+            if (!ext.take16(list_length) || !ext.take8(name_type) || !ext.take16(name_length) ||
+                !ext.take_bytes(name_length, name)) {
+                return false;
+            }
+            hello.server_name.assign(reinterpret_cast<const char *>(name), name_length);
+        } else if (type == 10) {
+            uint16_t list_length = 0;
+            if (!ext.take16(list_length) || (list_length % 2) != 0) {
+                return false;
+            }
+            for (uint16_t left = list_length; left > 0; left -= 2) {
+                uint16_t group = 0;
+                if (!ext.take16(group)) {
+                    return false;
+                }
+                hello.groups.push_back(group);
+            }
+        } else if (type == 13) {
+            uint16_t list_length = 0;
+            if (!ext.take16(list_length) || (list_length % 2) != 0) {
+                return false;
+            }
+            for (uint16_t left = list_length; left > 0; left -= 2) {
+                uint16_t scheme = 0;
+                if (!ext.take16(scheme)) {
+                    return false;
+                }
+                hello.signature_algorithms.push_back(scheme);
+            }
+        } else if (type == 16) {
+            uint16_t list_length = 0;
+            if (!ext.take16(list_length) || ext.size < list_length) {
+                return false;
+            }
+            Cursor protocols{ext.data, list_length};
+            while (protocols.size > 0) {
+                uint8_t name_length = 0;
+                const uint8_t *name = nullptr;
+                if (!protocols.take8(name_length) || !protocols.take_bytes(name_length, name)) {
+                    return false;
+                }
+                hello.alpn.emplace_back(reinterpret_cast<const char *>(name), name_length);
+            }
+        } else if (type == 27) {
+            uint8_t list_length = 0;
+            if (!ext.take8(list_length) || (list_length % 2) != 0) {
+                return false;
+            }
+            for (uint8_t left = list_length; left > 0; left -= 2) {
+                uint16_t alg = 0;
+                if (!ext.take16(alg)) {
+                    return false;
+                }
+                hello.has_compress_brotli = hello.has_compress_brotli || alg == 2;
+            }
+        } else if (type == 43) {
+            uint8_t list_length = 0;
+            if (!ext.take8(list_length) || (list_length % 2) != 0) {
+                return false;
+            }
+            for (uint8_t left = list_length; left > 0; left -= 2) {
+                uint16_t version = 0;
+                if (!ext.take16(version)) {
+                    return false;
+                }
+                hello.versions.push_back(version);
+            }
+        } else if (type == 51) {
+            uint16_t list_length = 0;
+            if (!ext.take16(list_length) || ext.size < list_length) {
+                return false;
+            }
+            Cursor shares{ext.data, list_length};
+            while (shares.size > 0) {
+                uint16_t group = 0;
+                uint16_t share_length = 0;
+                const uint8_t *share = nullptr;
+                if (!shares.take16(group) || !shares.take16(share_length) ||
+                    !shares.take_bytes(share_length, share)) {
+                    return false;
+                }
+                hello.key_share_groups.push_back(group);
+                KeyShareEntry entry;
+                entry.group = group;
+                entry.key.assign(share, share + share_length);
+                hello.key_shares.push_back(std::move(entry));
+            }
+        } else if (type == 17613) {
+            hello.has_alps = true;
+        } else if (type == 65037) {
+            hello.has_ech = true;
+        }
+    }
+    return true;
+}
+
+std::vector<uint8_t> read_tls_record(boost::asio::io_context &context,
+                                     boost::asio::ip::tcp::socket &server) {
+    auto header = std::make_shared<std::vector<uint8_t>>(5);
+    auto record = std::make_shared<std::vector<uint8_t>>();
+    std::promise<std::vector<uint8_t>> captured;
+    auto captured_future = captured.get_future();
+    boost::asio::async_read(
+        server, boost::asio::buffer(*header),
+        [&, header, record, promise = std::move(captured)](const boost::system::error_code &error,
+                                                           std::size_t) mutable {
+            if (error) {
+                promise.set_value({});
+                return;
+            }
+            const auto length =
+                static_cast<std::size_t>((static_cast<uint16_t>((*header)[3]) << 8) | (*header)[4]);
+            record->reserve(5 + length);
+            record->insert(record->end(), header->begin(), header->end());
+            record->resize(5 + length);
+            boost::asio::async_read(
+                server, boost::asio::buffer(record->data() + 5, length),
+                [record, promise = std::move(promise)](const boost::system::error_code &body_error,
+                                                       std::size_t) mutable {
+                    promise.set_value(body_error ? std::vector<uint8_t>{} : *record);
+                });
+        });
+    if (captured_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        context.stop();
+        throw std::runtime_error("TLS record read timed out");
+    }
+    return captured_future.get();
+}
+
+} // namespace
+
+TEST(TlsClientTest, RejectsUnknownFingerprint) {
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "example.com";
+    options.fingerprint = "firefox-esr-1952";
+    const auto failure = handshake_error(std::move(options));
+    EXPECT_EQ(failure.code, clash_native::core::ErrorCode::configuration);
+}
+
+TEST(TlsClientTest, ChromeFingerprintMatchesChromeClientHello) {
+    using boost::asio::ip::tcp;
+    boost::asio::io_context context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{
+        context.get_executor()};
+    std::thread runner([&] { context.run(); });
+
+    tcp::acceptor acceptor(context, tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+    tcp::socket server(context);
+    std::promise<void> accepted;
+    auto accepted_future = accepted.get_future();
+    acceptor.async_accept(server, [&](const boost::system::error_code &error) {
+        EXPECT_FALSE(error);
+        accepted.set_value();
+    });
+
+    tcp::socket peer(context);
+    peer.connect(
+        tcp::endpoint(boost::asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()));
+    ASSERT_EQ(accepted_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto stream = std::make_unique<clash_native::net::TcpStream>(std::move(peer));
+
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "example.com";
+    options.alpn_protocols = {"h2", "http/1.1"};
+    options.fingerprint = "chrome";
+    options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto sender =
+        clash_native::transport::async_tls_client_handshake(std::move(stream), std::move(options));
+    HandshakeReceiver receiver;
+    auto completed = receiver.done.get_future();
+    auto op = stdexec::connect(std::move(sender), std::move(receiver));
+    stdexec::start(op);
+
+    // The peer never answers, so the client must emit the ClientHello and
+    // then fail. Capture the first flight straight off the socket.
+    const auto record = read_tls_record(context, server);
+    server.close();
+    ASSERT_TRUE(completed.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    const auto failure = completed.get();
+    EXPECT_NE(failure.code, clash_native::core::ErrorCode::configuration);
+
+    ClientHello hello;
+    ASSERT_TRUE(parse_client_hello(record, hello));
+    EXPECT_EQ(hello.session_id.size(), 32u);
+    EXPECT_EQ(hello.server_name, "example.com");
+    EXPECT_EQ(hello.alpn, (std::vector<std::string>{"h2", "http/1.1"}));
+
+    const std::vector<uint16_t> expected_ciphers = {0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f,
+                                                    0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013,
+                                                    0xc014, 0x009c, 0x009d, 0x002f, 0x0035};
+    ASSERT_EQ(hello.ciphers.size(), expected_ciphers.size() + 1);
+    EXPECT_TRUE(is_grease(hello.ciphers[0]));
+    EXPECT_EQ(std::vector<uint16_t>(hello.ciphers.begin() + 1, hello.ciphers.end()),
+              expected_ciphers);
+
+    // Extension order is shuffled (like Chrome); compare as a multiset with
+    // GREASE values normalized.
+    std::vector<uint16_t> normalized;
+    std::size_t grease_count = 0;
+    for (const auto type : hello.extension_types) {
+        if (is_grease(type)) {
+            grease_count += 1;
+            continue;
+        }
+        normalized.push_back(type);
+    }
+    std::sort(normalized.begin(), normalized.end());
+    // 17613 is the new ALPS codepoint (RFC 9460); Chrome offers ALPS with it.
+    const std::vector<uint16_t> expected_extensions = {0,  5,  10, 11, 13, 16,    18,    23,
+                                                       27, 35, 43, 45, 51, 17613, 65037, 65281};
+    EXPECT_EQ(grease_count, 2u);
+    EXPECT_EQ(normalized, expected_extensions);
+
+    ASSERT_EQ(hello.groups.size(), 5u);
+    EXPECT_TRUE(is_grease(hello.groups[0]));
+    EXPECT_EQ(std::vector<uint16_t>(hello.groups.begin() + 1, hello.groups.end()),
+              (std::vector<uint16_t>{0x11ec, 0x001d, 0x0017, 0x0018}));
+
+    ASSERT_EQ(hello.key_share_groups.size(), 3u);
+    EXPECT_TRUE(is_grease(hello.key_share_groups[0]));
+    EXPECT_EQ(hello.key_share_groups[1], 0x11ec);
+    EXPECT_EQ(hello.key_share_groups[2], 0x001d);
+
+    // Chrome's eight plus Ed25519 (0x0807): required for REALITY because
+    // REALITY certificates are Ed25519 and BoringSSL enforces that the peer
+    // scheme was offered. Documented on kChromeSignatureAlgorithms.
+    EXPECT_EQ(hello.signature_algorithms,
+              (std::vector<uint16_t>{0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+                                     0x0807}));
+
+    ASSERT_EQ(hello.versions.size(), 3u);
+    EXPECT_TRUE(is_grease(hello.versions[0]));
+    EXPECT_EQ(hello.versions[1], 0x0304);
+    EXPECT_EQ(hello.versions[2], 0x0303);
+
+    EXPECT_TRUE(hello.has_alps);
+    EXPECT_TRUE(hello.has_ech);
+    EXPECT_TRUE(hello.has_compress_brotli);
+
+    context.stop();
+    runner.join();
+}
+
+namespace {
+
+std::string test_base64url_encode(const uint8_t *data, std::size_t length) {
+    static constexpr char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    uint32_t bits = 0;
+    int width = 0;
+    for (std::size_t i = 0; i < length; ++i) {
+        bits = (bits << 8) | data[i];
+        width += 8;
+        while (width >= 6) {
+            width -= 6;
+            out.push_back(kAlphabet[(bits >> width) & 63]);
+        }
+    }
+    if (width > 0) {
+        out.push_back(kAlphabet[(bits << (6 - width)) & 63]);
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(TlsClientTest, RejectsRealityWithoutFingerprint) {
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "example.com";
+    options.reality = clash_native::transport::TlsRealityOptions{
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "deadbeef"};
+    const auto failure = handshake_error(std::move(options));
+    EXPECT_EQ(failure.code, clash_native::core::ErrorCode::configuration);
+}
+
+TEST(TlsClientTest, RejectsRealityWithBadKeys) {
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "example.com";
+    options.fingerprint = "chrome";
+    options.reality = clash_native::transport::TlsRealityOptions{"not-a-key", "deadbeef"};
+    EXPECT_EQ(handshake_error(options).code, clash_native::core::ErrorCode::configuration);
+    options.reality = clash_native::transport::TlsRealityOptions{
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "xyz"};
+    EXPECT_EQ(handshake_error(options).code, clash_native::core::ErrorCode::configuration);
+    options.reality = clash_native::transport::TlsRealityOptions{
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "deadbeef"};
+    options.maximum_tls_version = 0x0303;
+    EXPECT_EQ(handshake_error(std::move(options)).code,
+              clash_native::core::ErrorCode::configuration);
+}
+
+TEST(TlsClientTest, RealityTicketVerifiesAgainstLoopbackServer) {
+    using boost::asio::ip::tcp;
+    uint8_t server_public[32] = {0};
+    uint8_t server_private[32] = {0};
+    X25519_keypair(server_public, server_private);
+
+    boost::asio::io_context context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{
+        context.get_executor()};
+    std::thread runner([&] { context.run(); });
+
+    tcp::acceptor acceptor(context, tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+    tcp::socket server(context);
+    std::promise<void> accepted;
+    auto accepted_future = accepted.get_future();
+    acceptor.async_accept(server, [&](const boost::system::error_code &error) {
+        EXPECT_FALSE(error);
+        accepted.set_value();
+    });
+
+    tcp::socket peer(context);
+    peer.connect(
+        tcp::endpoint(boost::asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()));
+    ASSERT_EQ(accepted_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto stream = std::make_unique<clash_native::net::TcpStream>(std::move(peer));
+
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "example.com";
+    options.alpn_protocols = {"h2", "http/1.1"};
+    options.fingerprint = "chrome";
+    options.reality = clash_native::transport::TlsRealityOptions{
+        test_base64url_encode(server_public, sizeof(server_public)), "deadbeef"};
+    options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto sender =
+        clash_native::transport::async_tls_client_handshake(std::move(stream), std::move(options));
+    HandshakeReceiver receiver;
+    auto completed = receiver.done.get_future();
+    auto op = stdexec::connect(std::move(sender), std::move(receiver));
+    stdexec::start(op);
+
+    const auto record = read_tls_record(context, server);
+    server.close();
+    ASSERT_TRUE(completed.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    EXPECT_NE(completed.get().code, clash_native::core::ErrorCode::configuration);
+
+    ClientHello hello;
+    ASSERT_TRUE(parse_client_hello(record, hello));
+    // The ticket replaced the random compatibility-mode session ID.
+    ASSERT_EQ(hello.session_id.size(), 32u);
+    ASSERT_EQ(hello.random.size(), 32u);
+
+    const KeyShareEntry *x25519 = nullptr;
+    for (const auto &share : hello.key_shares) {
+        if (share.group == 0x001d && share.key.size() == 32) {
+            x25519 = &share;
+        }
+    }
+    ASSERT_NE(x25519, nullptr);
+
+    // Server side: ECDH(server_private, client share) then HKDF, mirroring
+    // the REALITY authentication check.
+    uint8_t secret[32] = {0};
+    ASSERT_EQ(X25519(secret, server_private, x25519->key.data()), 1);
+    uint8_t auth_key[32] = {0};
+    ASSERT_EQ(HKDF(auth_key, sizeof(auth_key), EVP_sha256(), secret, sizeof(secret),
+                   hello.random.data(), 20, reinterpret_cast<const uint8_t *>("REALITY"), 7),
+              1);
+
+    // AAD is the handshake message with the sealed session ID zeroed.
+    ASSERT_GE(record.size(), 5u + 39u + 32u);
+    std::vector<uint8_t> aad(record.begin() + 5, record.end());
+    std::fill(aad.begin() + 39, aad.begin() + 39 + 32, 0);
+    uint8_t plaintext[16] = {0};
+    EVP_AEAD_CTX aead;
+    EVP_AEAD_CTX_zero(&aead);
+    ASSERT_TRUE(EVP_AEAD_CTX_init(&aead, EVP_aead_aes_256_gcm(), auth_key, sizeof(auth_key),
+                                  EVP_AEAD_DEFAULT_TAG_LENGTH, nullptr));
+    const bool opened = EVP_AEAD_CTX_open_gather(
+                            &aead, plaintext, hello.random.data() + 20, 12, hello.session_id.data(),
+                            16, hello.session_id.data() + 16, 16, aad.data(), aad.size()) == 1;
+    EVP_AEAD_CTX_cleanup(&aead);
+    ASSERT_TRUE(opened);
+    EXPECT_EQ(plaintext[0], 1);
+    EXPECT_EQ(plaintext[1], 8);
+    EXPECT_EQ(plaintext[2], 2);
+    EXPECT_EQ(std::vector<uint8_t>(plaintext + 8, plaintext + 12),
+              (std::vector<uint8_t>{0xde, 0xad, 0xbe, 0xef}));
+    uint64_t ticket_time = 0;
+    for (int i = 3; i < 8; ++i) {
+        ticket_time = (ticket_time << 8) | plaintext[i];
+    }
+    const auto now = static_cast<uint64_t>(std::chrono::system_clock::now().time_since_epoch() /
+                                           std::chrono::seconds(1));
+    EXPECT_LE(ticket_time <= now ? now - ticket_time : ticket_time - now, 120u);
+
+    context.stop();
+    runner.join();
+}
+namespace {
+
+// Prefix BIO state: serves an initial memory buffer, then delegates to a
+// socket BIO. Lets a test server inspect the ClientHello before BoringSSL
+// parses it (a plain BIO chain reports EOF once the memory part drains).
+struct PrefixBioState {
+    const uint8_t *data = nullptr;
+    std::size_t length = 0;
+    std::size_t position = 0;
+    BIO *next = nullptr;
+};
+
+int prefix_bio_create(BIO *bio) {
+    BIO_set_init(bio, 1);
+    BIO_set_data(bio, nullptr);
+    return 1;
+}
+
+int prefix_bio_destroy(BIO *bio) {
+    delete static_cast<PrefixBioState *>(BIO_get_data(bio));
+    BIO_set_data(bio, nullptr);
+    return 1;
+}
+
+int prefix_bio_read(BIO *bio, char *out, int length) {
+    auto *state = static_cast<PrefixBioState *>(BIO_get_data(bio));
+    if (state == nullptr || state->next == nullptr) {
+        return 0;
+    }
+    if (state->position < state->length) {
+        const std::size_t available = state->length - state->position;
+        const std::size_t count = std::min<std::size_t>(available, static_cast<size_t>(length));
+        std::memcpy(out, state->data + state->position, count);
+        state->position += count;
+        return static_cast<int>(count);
+    }
+    return BIO_read(state->next, out, length);
+}
+
+int prefix_bio_write(BIO *bio, const char *in, int length) {
+    auto *state = static_cast<PrefixBioState *>(BIO_get_data(bio));
+    if (state == nullptr || state->next == nullptr) {
+        return 0;
+    }
+    return BIO_write(state->next, in, length);
+}
+
+long prefix_bio_ctrl(BIO *bio, int cmd, long num, void *ptr) {
+    auto *state = static_cast<PrefixBioState *>(BIO_get_data(bio));
+    if (state == nullptr || state->next == nullptr) {
+        return 0;
+    }
+    return BIO_ctrl(state->next, cmd, num, ptr);
+}
+
+BIO *make_prefix_bio(const std::vector<uint8_t> &prefix, BIO *next) {
+    static BIO_METHOD *method = nullptr;
+    if (method == nullptr) {
+        method = BIO_meth_new(BIO_TYPE_SOURCE_SINK | 0x10, "prefix");
+        BIO_meth_set_write(method, prefix_bio_write);
+        BIO_meth_set_read(method, prefix_bio_read);
+        BIO_meth_set_ctrl(method, prefix_bio_ctrl);
+        BIO_meth_set_create(method, prefix_bio_create);
+        BIO_meth_set_destroy(method, prefix_bio_destroy);
+    }
+    BIO *bio = BIO_new(method);
+    auto *state = new PrefixBioState{prefix.data(), prefix.size(), 0, next};
+    BIO_set_data(bio, state);
+    return bio;
+}
+
+X509 *forge_reality_certificate(EVP_PKEY *ed_key, const uint8_t auth_key[32]) {
+    // A self-signed Ed25519 certificate whose signature bytes are replaced
+    // with HMAC-SHA512(auth_key, raw public key), exactly what a REALITY
+    // server presents. Test-only forgery: the signature is meaningless as a
+    // real signature; only the byte comparison matters.
+    uint8_t raw[32] = {0};
+    size_t raw_length = sizeof(raw);
+    if (EVP_PKEY_get_raw_public_key(ed_key, raw, &raw_length) != 1 || raw_length != sizeof(raw)) {
+        return nullptr;
+    }
+    uint8_t mac[64] = {0};
+    unsigned int mac_length = 0;
+    if (HMAC(EVP_sha512(), auth_key, 32, raw, sizeof(raw), mac, &mac_length) == nullptr ||
+        mac_length != sizeof(mac)) {
+        return nullptr;
+    }
+    bssl::UniquePtr<X509> cert(X509_new());
+    bssl::UniquePtr<X509_NAME> name(X509_NAME_new());
+    if (!cert || !name ||
+        !X509_NAME_add_entry_by_txt(name.get(), "CN", MBSTRING_ASC,
+                                    reinterpret_cast<const uint8_t *>("localhos"
+                                                                      "t"),
+                                    -1, -1, 0) ||
+        !X509_set_version(cert.get(), 2) ||
+        !ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), 1) ||
+        !X509_set_issuer_name(cert.get(), name.get()) ||
+        !X509_set_subject_name(cert.get(), name.get()) || !X509_set_pubkey(cert.get(), ed_key) ||
+        !X509_gmtime_adj(X509_getm_notBefore(cert.get()), -3600) ||
+        !X509_gmtime_adj(X509_getm_notAfter(cert.get()), 3600) ||
+        !X509_sign(cert.get(), ed_key, nullptr)) {
+        return nullptr;
+    }
+    const ASN1_BIT_STRING *signature = nullptr;
+    X509_get0_signature(&signature, nullptr, cert.get());
+    if (signature == nullptr) {
+        return nullptr;
+    }
+    if (!ASN1_STRING_set(const_cast<ASN1_BIT_STRING *>(signature), mac, sizeof(mac))) {
+        return nullptr;
+    }
+    return cert.release();
+}
+
+struct SuccessReceiver {
+    using receiver_concept = stdexec::receiver_tag;
+    // Keeps the established connection alive: dropping it would close the
+    // socket under a concurrently blocked server accept.
+    std::promise<std::optional<clash_native::transport::TlsClientConnection>> done;
+    void set_value(clash_native::transport::TlsClientConnection connection) noexcept {
+        done.set_value(std::move(connection));
+    }
+    void set_error(std::exception_ptr) noexcept { done.set_value(std::nullopt); }
+    void set_stopped() noexcept { done.set_value(std::nullopt); }
+};
+
+} // namespace
+
+TEST(TlsClientTest, RealitySpkiVerifyCompletesHandshake) {
+    using boost::asio::ip::tcp;
+    // Ticket keys (X25519) are independent from the certificate keys
+    // (Ed25519), exactly like a REALITY deployment.
+    uint8_t server_public[32] = {0};
+    uint8_t server_private[32] = {0};
+    X25519_keypair(server_public, server_private);
+    uint8_t ed_public[32] = {0};
+    uint8_t ed_private[64] = {0};
+    ED25519_keypair(ed_public, ed_private);
+    // The raw private form is the 32-byte seed (first half of the 64-byte
+    // ED25519_keypair output).
+    bssl::UniquePtr<EVP_PKEY> ed_key(
+        EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, nullptr, ed_private, 32));
+    ASSERT_TRUE(ed_key);
+
+    boost::asio::io_context context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{
+        context.get_executor()};
+    std::thread runner([&] { context.run(); });
+
+    tcp::acceptor acceptor(context, tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+    tcp::socket server(context);
+    std::promise<void> accepted;
+    auto accepted_future = accepted.get_future();
+    acceptor.async_accept(server, [&](const boost::system::error_code &error) {
+        EXPECT_FALSE(error);
+        accepted.set_value();
+    });
+
+    tcp::socket peer(context);
+    peer.connect(
+        tcp::endpoint(boost::asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()));
+    ASSERT_EQ(accepted_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto stream = std::make_unique<clash_native::net::TcpStream>(std::move(peer));
+
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = true;
+    options.server_name = "localhost";
+    options.fingerprint = "chrome";
+    options.reality = clash_native::transport::TlsRealityOptions{
+        test_base64url_encode(server_public, sizeof(server_public)), "deadbeef"};
+    options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto sender =
+        clash_native::transport::async_tls_client_handshake(std::move(stream), std::move(options));
+    SuccessReceiver receiver;
+    auto completed = receiver.done.get_future();
+    auto op = stdexec::connect(std::move(sender), std::move(receiver));
+    stdexec::start(op);
+
+    // Minimal REALITY server: read the hello, derive the auth key like
+    // Mihomo does, forge the certificate, then serve BoringSSL over a BIO
+    // chain that replays the consumed hello bytes first.
+    const auto record = read_tls_record(context, server);
+    ASSERT_GE(record.size(), 5u + 39u + 32u);
+    ClientHello hello;
+    ASSERT_TRUE(parse_client_hello(record, hello));
+    const KeyShareEntry *x25519 = nullptr;
+    for (const auto &share : hello.key_shares) {
+        if (share.group == 0x001d && share.key.size() == 32) {
+            x25519 = &share;
+        }
+    }
+    ASSERT_NE(x25519, nullptr);
+    uint8_t secret[32] = {0};
+    ASSERT_EQ(X25519(secret, server_private, x25519->key.data()), 1);
+    uint8_t auth_key[32] = {0};
+    ASSERT_EQ(HKDF(auth_key, sizeof(auth_key), EVP_sha256(), secret, sizeof(secret),
+                   hello.random.data(), 20, reinterpret_cast<const uint8_t *>("REALITY"), 7),
+              1);
+    X509 *certificate = forge_reality_certificate(ed_key.get(), auth_key);
+    ASSERT_NE(certificate, nullptr);
+    // The forged signature bytes must not corrupt the DER structure.
+    int forged_length = i2d_X509(certificate, nullptr);
+    ASSERT_GT(forged_length, 0);
+    std::vector<uint8_t> forged_der(static_cast<size_t>(forged_length));
+    uint8_t *der_cursor = forged_der.data();
+    ASSERT_EQ(i2d_X509(certificate, &der_cursor), forged_length);
+    const uint8_t *parse_cursor = forged_der.data();
+    bssl::UniquePtr<X509> reparsed(d2i_X509(nullptr, &parse_cursor, forged_length));
+    ASSERT_TRUE(reparsed);
+
+    bssl::UniquePtr<SSL_CTX> server_context(SSL_CTX_new(TLS_server_method()));
+    ASSERT_TRUE(server_context);
+    ASSERT_EQ(SSL_CTX_use_certificate(server_context.get(), certificate), 1);
+    ASSERT_EQ(SSL_CTX_use_PrivateKey(server_context.get(), ed_key.get()), 1);
+    X509_free(certificate);
+    bssl::UniquePtr<SSL> server_ssl(SSL_new(server_context.get()));
+    ASSERT_TRUE(server_ssl);
+    BIO *socket_bio = BIO_new_socket(server.native_handle(), BIO_NOCLOSE);
+    ASSERT_NE(socket_bio, nullptr);
+    // The prefix BIO replays the consumed record (header included: the
+    // server record layer parses framing itself), then delegates to the
+    // socket. A plain BIO chain would report EOF once memory drains.
+    BIO *prefix = make_prefix_bio(record, socket_bio);
+    ASSERT_NE(prefix, nullptr);
+    SSL_set_bio(server_ssl.get(), prefix, socket_bio);
+    EXPECT_EQ(SSL_accept(server_ssl.get()), 1);
+    server.close();
+
+    ASSERT_TRUE(completed.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    auto established = completed.get();
+    EXPECT_TRUE(established.has_value());
+
+    context.stop();
+    runner.join();
+}
+
+TEST(TlsClientTest, ChromeProfileCompletesAgainstBoringsslServer) {
+    using boost::asio::ip::tcp;
+    // Bisects DECODE_ERROR seen with the REALITY test server: stock Chrome
+    // profile (no ticket mutation) against a stock BoringSSL server.
+    boost::asio::io_context context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{
+        context.get_executor()};
+    std::thread runner([&] { context.run(); });
+
+    tcp::acceptor acceptor(context, tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+    tcp::socket server(context);
+    std::promise<void> accepted;
+    auto accepted_future = accepted.get_future();
+    acceptor.async_accept(server, [&](const boost::system::error_code &error) {
+        EXPECT_FALSE(error);
+        accepted.set_value();
+    });
+
+    tcp::socket peer(context);
+    peer.connect(
+        tcp::endpoint(boost::asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()));
+    ASSERT_EQ(accepted_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto stream = std::make_unique<clash_native::net::TcpStream>(std::move(peer));
+
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "localhost";
+    options.fingerprint = "chrome";
+    options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto sender =
+        clash_native::transport::async_tls_client_handshake(std::move(stream), std::move(options));
+    SuccessReceiver receiver;
+    auto completed = receiver.done.get_future();
+    auto op = stdexec::connect(std::move(sender), std::move(receiver));
+    stdexec::start(op);
+
+    bssl::UniquePtr<SSL_CTX> server_context(SSL_CTX_new(TLS_server_method()));
+    ASSERT_TRUE(server_context);
+    bssl::UniquePtr<BIO> cert_bio(
+        BIO_new_mem_buf(kCertificate.data(), static_cast<int>(kCertificate.size())));
+    bssl::UniquePtr<X509> certificate(PEM_read_bio_X509(cert_bio.get(), nullptr, nullptr, nullptr));
+    ASSERT_TRUE(certificate);
+    ASSERT_EQ(SSL_CTX_use_certificate(server_context.get(), certificate.get()), 1);
+    bssl::UniquePtr<BIO> key_bio(
+        BIO_new_mem_buf(kPrivateKey.data(), static_cast<int>(kPrivateKey.size())));
+    bssl::UniquePtr<EVP_PKEY> private_key(
+        PEM_read_bio_PrivateKey(key_bio.get(), nullptr, nullptr, nullptr));
+    ASSERT_TRUE(private_key);
+    ASSERT_EQ(SSL_CTX_use_PrivateKey(server_context.get(), private_key.get()), 1);
+    bssl::UniquePtr<SSL> server_ssl(SSL_new(server_context.get()));
+    ASSERT_TRUE(server_ssl);
+    BIO *socket_bio = BIO_new_socket(server.native_handle(), BIO_NOCLOSE);
+    ASSERT_NE(socket_bio, nullptr);
+    SSL_set_bio(server_ssl.get(), socket_bio, socket_bio);
+    EXPECT_EQ(SSL_accept(server_ssl.get()), 1);
+    server.close();
+
+    ASSERT_TRUE(completed.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    auto established = completed.get();
+    EXPECT_TRUE(established.has_value());
+
+    context.stop();
+    runner.join();
+}
+
+TEST(TlsClientTest, ChromeProfileParsesEd25519Certificate) {
+    using boost::asio::ip::tcp;
+    // Bisects the REALITY DECODE_ERROR: stock Chrome profile (no ticket
+    // mutation, no custom verify) against a stock BoringSSL server
+    // presenting a self-signed Ed25519 certificate.
+    uint8_t ed_public[32] = {0};
+    uint8_t ed_private[64] = {0};
+    ED25519_keypair(ed_public, ed_private);
+    bssl::UniquePtr<EVP_PKEY> ed_key(
+        EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, nullptr, ed_private, 32));
+    ASSERT_TRUE(ed_key);
+    bssl::UniquePtr<X509> certificate(X509_new());
+    bssl::UniquePtr<X509_NAME> name(X509_NAME_new());
+    ASSERT_TRUE(certificate && name);
+    ASSERT_TRUE(X509_NAME_add_entry_by_txt(
+        name.get(), "CN", MBSTRING_ASC, reinterpret_cast<const uint8_t *>("localhost"), -1, -1, 0));
+    ASSERT_TRUE(X509_set_version(certificate.get(), 2));
+    ASSERT_TRUE(ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), 1));
+    ASSERT_TRUE(X509_set_issuer_name(certificate.get(), name.get()));
+    ASSERT_TRUE(X509_set_subject_name(certificate.get(), name.get()));
+    ASSERT_TRUE(X509_set_pubkey(certificate.get(), ed_key.get()));
+    ASSERT_TRUE(X509_gmtime_adj(X509_getm_notBefore(certificate.get()), -3600));
+    ASSERT_TRUE(X509_gmtime_adj(X509_getm_notAfter(certificate.get()), 3600));
+    // X509_sign returns the signature length (64 for Ed25519) on success.
+    ASSERT_GT(X509_sign(certificate.get(), ed_key.get(), nullptr), 0);
+
+    boost::asio::io_context context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{
+        context.get_executor()};
+    std::thread runner([&] { context.run(); });
+
+    tcp::acceptor acceptor(context, tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+    tcp::socket server(context);
+    std::promise<void> accepted;
+    auto accepted_future = accepted.get_future();
+    acceptor.async_accept(server, [&](const boost::system::error_code &error) {
+        EXPECT_FALSE(error);
+        accepted.set_value();
+    });
+
+    tcp::socket peer(context);
+    peer.connect(
+        tcp::endpoint(boost::asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()));
+    ASSERT_EQ(accepted_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto stream = std::make_unique<clash_native::net::TcpStream>(std::move(peer));
+
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "localhost";
+    options.fingerprint = "chrome";
+    options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto sender =
+        clash_native::transport::async_tls_client_handshake(std::move(stream), std::move(options));
+    SuccessReceiver receiver;
+    auto completed = receiver.done.get_future();
+    auto op = stdexec::connect(std::move(sender), std::move(receiver));
+    stdexec::start(op);
+
+    bssl::UniquePtr<SSL_CTX> server_context(SSL_CTX_new(TLS_server_method()));
+    ASSERT_TRUE(server_context);
+    ASSERT_EQ(SSL_CTX_use_certificate(server_context.get(), certificate.get()), 1);
+    ASSERT_EQ(SSL_CTX_use_PrivateKey(server_context.get(), ed_key.get()), 1);
+    bssl::UniquePtr<SSL> server_ssl(SSL_new(server_context.get()));
+    ASSERT_TRUE(server_ssl);
+    BIO *socket_bio = BIO_new_socket(server.native_handle(), BIO_NOCLOSE);
+    ASSERT_NE(socket_bio, nullptr);
+    SSL_set_bio(server_ssl.get(), socket_bio, socket_bio);
+    EXPECT_EQ(SSL_accept(server_ssl.get()), 1);
+    server.close();
+
+    ASSERT_TRUE(completed.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    auto established = completed.get();
+    EXPECT_TRUE(established.has_value());
+
+    context.stop();
+    runner.join();
+}
+TEST(TlsClientTest, RealityTicketInteroperatesWithBoringsslServer) {
+    using boost::asio::ip::tcp;
+    // Bisects the REALITY DECODE_ERROR: sealed ticket, but no custom verify
+    // callback (verify_peer=false) and a normally-signed Ed25519 server
+    // certificate. A pass isolates the trigger to the verify path.
+    uint8_t server_public[32] = {0};
+    uint8_t server_private[32] = {0};
+    X25519_keypair(server_public, server_private);
+    uint8_t ed_public[32] = {0};
+    uint8_t ed_private[64] = {0};
+    ED25519_keypair(ed_public, ed_private);
+    bssl::UniquePtr<EVP_PKEY> ed_key(
+        EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, nullptr, ed_private, 32));
+    ASSERT_TRUE(ed_key);
+    bssl::UniquePtr<X509> certificate(X509_new());
+    bssl::UniquePtr<X509_NAME> name(X509_NAME_new());
+    ASSERT_TRUE(certificate && name);
+    ASSERT_TRUE(X509_NAME_add_entry_by_txt(
+        name.get(), "CN", MBSTRING_ASC, reinterpret_cast<const uint8_t *>("localhost"), -1, -1, 0));
+    ASSERT_TRUE(X509_set_version(certificate.get(), 2));
+    ASSERT_TRUE(ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), 1));
+    ASSERT_TRUE(X509_set_issuer_name(certificate.get(), name.get()));
+    ASSERT_TRUE(X509_set_subject_name(certificate.get(), name.get()));
+    ASSERT_TRUE(X509_set_pubkey(certificate.get(), ed_key.get()));
+    ASSERT_TRUE(X509_gmtime_adj(X509_getm_notBefore(certificate.get()), -3600));
+    ASSERT_TRUE(X509_gmtime_adj(X509_getm_notAfter(certificate.get()), 3600));
+    ASSERT_GT(X509_sign(certificate.get(), ed_key.get(), nullptr), 0);
+
+    boost::asio::io_context context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{
+        context.get_executor()};
+    std::thread runner([&] { context.run(); });
+
+    tcp::acceptor acceptor(context, tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+    tcp::socket server(context);
+    std::promise<void> accepted;
+    auto accepted_future = accepted.get_future();
+    acceptor.async_accept(server, [&](const boost::system::error_code &error) {
+        EXPECT_FALSE(error);
+        accepted.set_value();
+    });
+
+    tcp::socket peer(context);
+    peer.connect(
+        tcp::endpoint(boost::asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()));
+    ASSERT_EQ(accepted_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto stream = std::make_unique<clash_native::net::TcpStream>(std::move(peer));
+
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "localhost";
+    options.fingerprint = "chrome";
+    options.reality = clash_native::transport::TlsRealityOptions{
+        test_base64url_encode(server_public, sizeof(server_public)), "deadbeef"};
+    options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto sender =
+        clash_native::transport::async_tls_client_handshake(std::move(stream), std::move(options));
+    SuccessReceiver receiver;
+    auto completed = receiver.done.get_future();
+    auto op = stdexec::connect(std::move(sender), std::move(receiver));
+    stdexec::start(op);
+
+    bssl::UniquePtr<SSL_CTX> server_context(SSL_CTX_new(TLS_server_method()));
+    ASSERT_TRUE(server_context);
+    ASSERT_EQ(SSL_CTX_use_certificate(server_context.get(), certificate.get()), 1);
+    ASSERT_EQ(SSL_CTX_use_PrivateKey(server_context.get(), ed_key.get()), 1);
+    bssl::UniquePtr<SSL> server_ssl(SSL_new(server_context.get()));
+    ASSERT_TRUE(server_ssl);
+    BIO *socket_bio = BIO_new_socket(server.native_handle(), BIO_NOCLOSE);
+    ASSERT_NE(socket_bio, nullptr);
+    SSL_set_bio(server_ssl.get(), socket_bio, socket_bio);
+    EXPECT_EQ(SSL_accept(server_ssl.get()), 1);
+    server.close();
+
+    ASSERT_TRUE(completed.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    auto established = completed.get();
+    EXPECT_TRUE(established.has_value());
+
+    context.stop();
+    runner.join();
 }

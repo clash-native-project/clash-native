@@ -12,6 +12,17 @@
 
 namespace clash_native::transport {
 
+// REALITY handshake parameters (Mihomo reality-opts). When set, the TLS
+// handshake carries a REALITY authentication ticket in the session ID and
+// the peer is authenticated either by its REALITY identity or, as a
+// camouflage fallback, by normal certificate verification.
+struct TlsRealityOptions {
+    // Base64url-encoded 32-byte X25519 server public key.
+    std::string public_key_base64url;
+    // Hex-encoded short ID, up to 8 bytes (zero-padded).
+    std::string short_id_hex;
+};
+
 struct TlsClientOptions {
     std::string server_name;
     bool verify_peer = true;
@@ -24,6 +35,11 @@ struct TlsClientOptions {
     std::string client_certificate_pem;
     std::string client_private_key_pem;
     std::vector<std::string> alpn_protocols;
+    // ClientHello camouflage profile (Mihomo fingerprint). Empty means the
+    // default BoringSSL emission; "chrome" selects the Chrome profile.
+    // Required when reality is set, matching Mihomo.
+    std::string fingerprint;
+    std::optional<TlsRealityOptions> reality;
     bool handoff_raw_transport = false;
     std::optional<int> maximum_tls_version;
     std::optional<std::chrono::steady_clock::time_point> deadline;

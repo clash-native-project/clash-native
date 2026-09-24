@@ -806,6 +806,8 @@ class WebSocketClientHandshakeOperation final
             if (tls_options.alpn_protocols.empty()) {
                 tls_options.alpn_protocols = {"http/1.1"};
             }
+            tls_options.fingerprint = self->options_.tls_fingerprint;
+            tls_options.reality = self->options_.tls_reality;
             tls_options.deadline = self->options_.deadline;
             try {
                 // No explicit cancel: completed_ drops late terminals and

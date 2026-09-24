@@ -42,6 +42,9 @@ struct TrojanOutboundConfig {
     // Empty means Mihomo defaults: {"h2", "http/1.1"} for TCP,
     // {"http/1.1"} for WebSocket.
     std::vector<std::string> alpn_protocols;
+    // ClientHello camouflage profile (Mihomo fingerprint). Empty means the
+    // default BoringSSL emission; "chrome" selects the Chrome profile.
+    std::string fingerprint;
     // Trojan-SS (ss-opts): when enabled, the transport stream is wrapped
     // in classic Shadowsocks AEAD framing before the Trojan header is
     // written. Empty method means AES-128-GCM, matching Mihomo.
@@ -52,6 +55,10 @@ struct TrojanOutboundConfig {
     // exclusive shadow-tls/restls/jls options. Empty means direct TLS.
     // (Not applied under WebSocket TLS: the ws client owns its handshake.)
     std::string security_mode;
+    // REALITY handshake (Mihomo reality-opts), mutually exclusive with
+    // security_mode. Empty public key disables it.
+    std::string reality_public_key;
+    std::string reality_short_id;
     transport::proxy::ShadowTlsClientOptions shadow_tls_options;
     transport::proxy::RestlsClientOptions restls_options;
     transport::proxy::JlsClientOptions jls_options;

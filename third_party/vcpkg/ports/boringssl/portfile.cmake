@@ -23,6 +23,8 @@ vcpkg_from_github(
   PATCHES
     0001-remove-WX-Werror.patch
     0002-clash-native-overlay-marker.patch
+    0003-chrome-client-hello-profile.patch
+    0004-client-hello-mutator.patch
 )
 
 set(BORINGSSL_OPTIONS

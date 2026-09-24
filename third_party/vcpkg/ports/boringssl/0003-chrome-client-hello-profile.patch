@@ -1,0 +1,219 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 3b48c2a..78b1bb5 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -5569,6 +5569,22 @@ OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
+ // permute extensions. For now, this is only implemented for the ClientHello.
+ OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
+ 
++// CLASH_NATIVE_CLIENT_HELLO_DEFAULT selects the default ClientHello emission.
++#define CLASH_NATIVE_CLIENT_HELLO_DEFAULT 0
++// CLASH_NATIVE_CLIENT_HELLO_CHROME selects the Chrome ClientHello emission
++// profile: TLS 1.3 cipher suites in Chrome's fixed order and legacy cipher
++// suites in Chrome's fixed order. All other ClientHello aspects (extensions,
++// groups, GREASE) are controlled through the regular configuration APIs.
++#define CLASH_NATIVE_CLIENT_HELLO_CHROME 1
++
++// SSL_CTX_set_client_hello_profile configures the ClientHello emission
++// profile for `ctx`. Returns 1 on success and 0 on unknown `profile`.
++OPENSSL_EXPORT int SSL_CTX_set_client_hello_profile(SSL_CTX *ctx, int profile);
++
++// SSL_set_client_hello_profile configures the ClientHello emission profile
++// for `ssl`. Returns 1 on success and 0 on unknown `profile`.
++OPENSSL_EXPORT int SSL_set_client_hello_profile(SSL *ssl, int profile);
++
+ // SSL_max_seal_overhead returns the maximum overhead, in bytes, of sealing a
+ // record with `ssl`.
+ OPENSSL_EXPORT size_t SSL_max_seal_overhead(const SSL *ssl);
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+index a4a53cd..4261735 100644
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -91,6 +91,36 @@ static bool ssl_add_tls13_cipher(CBB *cbb, uint16_t cipher_id,
+   return true;
+ }
+ 
++// kChromeLegacyCiphers lists the TLS 1.2 cipher suites in the order emitted
++// by Chrome, matching the Chrome ClientHello profile.
++static const uint16_t kChromeLegacyCiphers[] = {
++    SSL_CIPHER_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
++    SSL_CIPHER_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
++    SSL_CIPHER_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
++    SSL_CIPHER_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
++    SSL_CIPHER_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
++    SSL_CIPHER_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
++    SSL_CIPHER_ECDHE_RSA_WITH_AES_128_CBC_SHA,
++    SSL_CIPHER_ECDHE_RSA_WITH_AES_256_CBC_SHA,
++    SSL_CIPHER_RSA_WITH_AES_128_GCM_SHA256,
++    SSL_CIPHER_RSA_WITH_AES_256_GCM_SHA384,
++    SSL_CIPHER_RSA_WITH_AES_128_CBC_SHA,
++    SSL_CIPHER_RSA_WITH_AES_256_CBC_SHA,
++};
++
++// is_cipher_selected reports whether `cipher` is in the configured cipher
++// list of `ssl`.
++static bool is_cipher_selected(const SSL *ssl, const SSL_CIPHER *cipher) {
++  const uint16_t id = SSL_CIPHER_get_protocol_id(cipher);
++  const STACK_OF(SSL_CIPHER) *configured = SSL_get_ciphers(ssl);
++  for (size_t i = 0; i < sk_SSL_CIPHER_num(configured); i++) {
++    if (SSL_CIPHER_get_protocol_id(sk_SSL_CIPHER_value(configured, i)) == id) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+                                          ssl_client_hello_type_t type) {
+   const SSLImpl *const ssl = hs->ssl;
+@@ -130,11 +160,22 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+     const bool has_aes_hw = ssl->config->aes_hw_override
+                                 ? ssl->config->aes_hw_override_value
+                                 : EVP_has_aes_hardware();
++    // The Chrome profile emits the TLS 1.3 cipher suites in Chrome's fixed
++    // order, independent of AES hardware support.
++    static const uint16_t kCiphersChrome[] = {
++        SSL_CIPHER_AES_128_GCM_SHA256,
++        SSL_CIPHER_AES_256_GCM_SHA384,
++        SSL_CIPHER_CHACHA20_POLY1305_SHA256,
++    };
+     const bssl::Span<const uint16_t> ciphers =
+-        ssl->config->compliance_policy == ssl_compliance_policy_cnsa_202407
+-            ? bssl::Span<const uint16_t>(kCiphersCNSA)
+-            : (has_aes_hw ? bssl::Span<const uint16_t>(kCiphersAESHardware)
+-                          : bssl::Span<const uint16_t>(kCiphersNoAESHardware));
++        ssl->config->client_hello_profile == CLASH_NATIVE_CLIENT_HELLO_CHROME
++            ? bssl::Span<const uint16_t>(kCiphersChrome)
++            : (ssl->config->compliance_policy ==
++                       ssl_compliance_policy_cnsa_202407
++                   ? bssl::Span<const uint16_t>(kCiphersCNSA)
++                   : (has_aes_hw
++                          ? bssl::Span<const uint16_t>(kCiphersAESHardware)
++                          : bssl::Span<const uint16_t>(kCiphersNoAESHardware)));
+ 
+     for (auto cipher : ciphers) {
+       if (!ssl_add_tls13_cipher(&child, cipher,
+@@ -146,19 +187,44 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+ 
+   if (hs->min_version < TLS1_3_VERSION && type != ssl_client_hello_inner) {
+     bool any_enabled = false;
+-    for (const SSL_CIPHER *cipher : SSL_get_ciphers(ssl)) {
+-      // Skip disabled ciphers
+-      if ((cipher->algorithm_mkey & mask_k) ||
+-          (cipher->algorithm_auth & mask_a)) {
+-        continue;
++    if (ssl->config->client_hello_profile ==
++        CLASH_NATIVE_CLIENT_HELLO_CHROME) {
++      // Emit the legacy cipher suites in Chrome's fixed order, restricted to
++      // the configured cipher list.
++      for (uint16_t id : kChromeLegacyCiphers) {
++        const SSL_CIPHER *cipher = SSL_get_cipher_by_value(id);
++        if (cipher == nullptr || !is_cipher_selected(ssl, cipher)) {
++          continue;
++        }
++        // Skip disabled ciphers
++        if ((cipher->algorithm_mkey & mask_k) ||
++            (cipher->algorithm_auth & mask_a)) {
++          continue;
++        }
++        if (SSL_CIPHER_get_min_version(cipher) > hs->max_version ||
++            SSL_CIPHER_get_max_version(cipher) < hs->min_version) {
++          continue;
++        }
++        any_enabled = true;
++        if (!CBB_add_u16(&child, SSL_CIPHER_get_protocol_id(cipher))) {
++          return false;
++        }
+       }
+-      if (SSL_CIPHER_get_min_version(cipher) > hs->max_version ||
+-          SSL_CIPHER_get_max_version(cipher) < hs->min_version) {
+-        continue;
+-      }
+-      any_enabled = true;
+-      if (!CBB_add_u16(&child, SSL_CIPHER_get_protocol_id(cipher))) {
+-        return false;
++    } else {
++      for (const SSL_CIPHER *cipher : SSL_get_ciphers(ssl)) {
++        // Skip disabled ciphers
++        if ((cipher->algorithm_mkey & mask_k) ||
++            (cipher->algorithm_auth & mask_a)) {
++          continue;
++        }
++        if (SSL_CIPHER_get_min_version(cipher) > hs->max_version ||
++            SSL_CIPHER_get_max_version(cipher) < hs->min_version) {
++          continue;
++        }
++        any_enabled = true;
++        if (!CBB_add_u16(&child, SSL_CIPHER_get_protocol_id(cipher))) {
++          return false;
++        }
+       }
+     }
+ 
+diff --git a/ssl/internal.h b/ssl/internal.h
+index 96f6d3d..d4d589f 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -3580,6 +3580,10 @@ struct SSL_CONFIG {
+   // permute_extensions is whether to permute extensions when sending messages.
+   bool permute_extensions : 1;
+ 
++  // client_hello_profile selects the ClientHello emission profile. See
++  // CLASH_NATIVE_CLIENT_HELLO_* in <openssl/ssl.h>.
++  int client_hello_profile = CLASH_NATIVE_CLIENT_HELLO_DEFAULT;
++
+   // aes_hw_override if set indicates we should override checking for aes
+   // hardware support, and use the value in aes_hw_override_value instead.
+   bool aes_hw_override : 1;
+@@ -4232,6 +4236,10 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+   // permute_extensions is whether to permute extensions when sending messages.
+   bool permute_extensions : 1;
+ 
++  // client_hello_profile selects the ClientHello emission profile. See
++  // CLASH_NATIVE_CLIENT_HELLO_* in <openssl/ssl.h>.
++  int client_hello_profile = CLASH_NATIVE_CLIENT_HELLO_DEFAULT;
++
+   // allow_unknown_alpn_protos is whether the client allows unsolicited ALPN
+   // protocols from the peer.
+   bool allow_unknown_alpn_protos : 1;
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index a0c746b..23e340b 100644
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -527,6 +527,7 @@ SSL *SSL_new(SSL_CTX *ctx) {
+   ssl->config->retain_only_sha256_of_client_certs =
+       ctx_impl->retain_only_sha256_of_client_certs;
+   ssl->config->permute_extensions = ctx_impl->permute_extensions;
++  ssl->config->client_hello_profile = ctx_impl->client_hello_profile;
+   ssl->config->aes_hw_override = ctx_impl->aes_hw_override;
+   ssl->config->aes_hw_override_value = ctx_impl->aes_hw_override_value;
+   ssl->config->compliance_policy = ctx_impl->compliance_policy;
+@@ -3292,6 +3293,28 @@ void SSL_set_permute_extensions(SSL *ssl, int enabled) {
+   ssl_impl->config->permute_extensions = !!enabled;
+ }
+ 
++int SSL_CTX_set_client_hello_profile(SSL_CTX *ctx, int profile) {
++  if (profile != CLASH_NATIVE_CLIENT_HELLO_DEFAULT &&
++      profile != CLASH_NATIVE_CLIENT_HELLO_CHROME) {
++    return 0;
++  }
++  FromOpaque(ctx)->client_hello_profile = profile;
++  return 1;
++}
++
++int SSL_set_client_hello_profile(SSL *ssl, int profile) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config) {
++    return 0;
++  }
++  if (profile != CLASH_NATIVE_CLIENT_HELLO_DEFAULT &&
++      profile != CLASH_NATIVE_CLIENT_HELLO_CHROME) {
++    return 0;
++  }
++  ssl_impl->config->client_hello_profile = profile;
++  return 1;
++}
++
+ int32_t SSL_get_ticket_age_skew(const SSL *ssl) {
+   return FromOpaque(ssl)->s3->ticket_age_skew;
+ }

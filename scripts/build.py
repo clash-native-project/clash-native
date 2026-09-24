@@ -181,6 +181,8 @@ def prepare_vcpkg_ports() -> Path:
         "usage",
         "0001-remove-WX-Werror.patch",
         "0002-clash-native-overlay-marker.patch",
+        "0003-chrome-client-hello-profile.patch",
+        "0004-client-hello-mutator.patch",
     )
     missing = [name for name in required_files if not (boringssl_port / name).is_file()]
     if missing:

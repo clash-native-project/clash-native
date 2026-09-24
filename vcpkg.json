@@ -37,6 +37,10 @@
       "name": "boringssl"
     },
     {
+      "name": "brotli",
+      "version>=": "1.2.0"
+    },
+    {
       "name": "botan",
       "version>=": "3.12.0"
     },

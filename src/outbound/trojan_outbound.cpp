@@ -157,6 +157,11 @@ struct GrpcSessionOpen {
         tls_options.client_certificate_pem = config.certificate;
         tls_options.client_private_key_pem = config.private_key;
         tls_options.alpn_protocols = {"h2"};
+        tls_options.fingerprint = config.fingerprint;
+        if (!config.reality_public_key.empty()) {
+            tls_options.reality =
+                transport::TlsRealityOptions{config.reality_public_key, config.reality_short_id};
+        }
         tls_options.deadline = deadline;
         auto plain = std::make_unique<net::TcpStream>(std::move(*socket));
         transport::TlsClientConnection tls;
@@ -235,6 +240,12 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
             finish(core::StreamOpenResult::failed(
                 {core::ErrorCode::configuration,
                  "Trojan outbound network must be tcp, ws, wss, or grpc"}));
+            return;
+        }
+        if (!config_.reality_public_key.empty() && !config_.security_mode.empty()) {
+            finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::configuration,
+                 "Trojan REALITY and security overlays are mutually exclusive"}));
             return;
         }
         if (config_.security_mode != "" && config_.security_mode != "shadow-tls" &&
@@ -403,6 +414,11 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 ws_options.tls_alpn_protocols = self->config_.alpn_protocols.empty()
                                                     ? std::vector<std::string>{"http/1.1"}
                                                     : self->config_.alpn_protocols;
+                ws_options.tls_fingerprint = self->config_.fingerprint;
+                if (!self->config_.reality_public_key.empty()) {
+                    ws_options.tls_reality = transport::TlsRealityOptions{
+                        self->config_.reality_public_key, self->config_.reality_short_id};
+                }
                 ws_options.max_early_data = self->config_.websocket_max_early_data;
                 ws_options.early_data_header_name = self->config_.websocket_early_data_header;
                 ws_options.v2ray_http_upgrade = self->config_.websocket_v2ray_http_upgrade;
@@ -479,6 +495,11 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 tls_options.alpn_protocols = self->config_.alpn_protocols.empty()
                                                  ? std::vector<std::string>{"h2", "http/1.1"}
                                                  : self->config_.alpn_protocols;
+                tls_options.fingerprint = self->config_.fingerprint;
+                if (!self->config_.reality_public_key.empty()) {
+                    tls_options.reality = transport::TlsRealityOptions{
+                        self->config_.reality_public_key, self->config_.reality_short_id};
+                }
                 tls_options.deadline = self->deadline_;
                 auto plain_stream = std::make_unique<net::TcpStream>(std::move(*self->socket_));
                 self->socket_.reset();

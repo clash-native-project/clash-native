@@ -22,6 +22,10 @@ find_package(nghttp3 CONFIG REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(Snappy CONFIG REQUIRED)
+# Brotli decoder only: supplies the certificate-compression decompressor
+# offered by the Chrome ClientHello profile (TLS cert compression). Added
+# with the uTLS fingerprint work; no other component uses it.
+find_package(unofficial-brotli CONFIG REQUIRED)
 find_package(STDEXEC CONFIG REQUIRED)
 find_package(tl-expected CONFIG REQUIRED)
 find_package(Threads REQUIRED)
@@ -223,6 +227,7 @@ target_link_libraries(clash-native-core
         $<IF:$<TARGET_EXISTS:nghttp3::nghttp3>,nghttp3::nghttp3,nghttp3::nghttp3_static>
         fmt::fmt
         spdlog::spdlog_header_only
+        unofficial::brotli::brotlidec
 )
 
 if(WIN32)

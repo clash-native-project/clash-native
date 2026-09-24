@@ -2432,3 +2432,32 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   (`third_party/vcpkg/ports/boringssl`, validated by build.py)
   with a marker patch proving end-to-end patched builds; marker
   symbol pinned by a unit test. Full suite: 267 passed.
+
+## 2026-09-24
+
+- uTLS R2: Chrome ClientHello profile end to end. New BoringSSL overlay
+  patch (client-hello profile API plus Chrome TLS 1.3/legacy cipher order;
+  groups, GREASE, key shares, ECH grease, extension shuffle already match
+  Chrome stock) with a byte-level JA3 capture test (16 ciphers, 18
+  extensions, groups, key shares, sigalgs, versions, ALPS, SCT, OCSP,
+  brotli compress_certificate all Chrome-exact). Added brotli (BSD,
+  decoder only for cert compression) with the reason recorded in
+  CMakeLists. Trojans fingerprint option plumbed through TCP/WS/gRPC, and
+  a chrome-fingerprint interop case passes against real Mihomo.
+  Full suite: 269 passed.
+
+## 2026-09-24
+
+- uTLS R3: REALITY handshake end to end. New BoringSSL overlay patch
+  (client-hello mutator hook with X25519 share export, plus
+  middlebox-compat echo acceptance for the rewritten session ID, which
+  stock BoringSSL rejects as DECODE_ERROR). tls_client seals the
+  REALITY ticket (X25519/HKDF/AES-256-GCM, all BoringSSL EVP) and
+  authenticates the peer by Ed25519 SPKI HMAC with chain fallback,
+  mirroring Mihomo reality.go. Chrome sigalgs gain Ed25519 (required
+  because REALITY certificates are Ed25519 and BoringSSL enforces the
+  offer on both ends). Trojan reality options plumbed through
+  TCP/WS/gRPC with overlay mutual exclusion. New tests: ticket
+  round-trip, SPKI full handshake, BoringSSL-server interop, JA3
+  updates. Trojan/reality interop passes against real Mihomo.
+  Full suite: 276 passed.

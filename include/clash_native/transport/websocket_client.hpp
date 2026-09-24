@@ -4,6 +4,7 @@
 #include <clash_native/core/result.hpp>
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/io/stream_handle.hpp>
+#include <clash_native/transport/tls_client.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -45,6 +46,9 @@ struct WebSocketClientOptions {
     std::string tls_client_certificate_pem;
     std::string tls_client_private_key_pem;
     std::vector<std::string> tls_alpn_protocols;
+    // ClientHello camouflage profile, forwarded to the TLS client.
+    std::string tls_fingerprint;
+    std::optional<TlsRealityOptions> tls_reality;
     std::optional<std::chrono::steady_clock::time_point> deadline;
 };
 
