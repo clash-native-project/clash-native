@@ -808,6 +808,7 @@ class WebSocketClientHandshakeOperation final
             }
             tls_options.fingerprint = self->options_.tls_fingerprint;
             tls_options.reality = self->options_.tls_reality;
+            tls_options.ech_config_list = self->options_.tls_ech_config_list;
             tls_options.deadline = self->options_.deadline;
             try {
                 // No explicit cancel: completed_ drops late terminals and

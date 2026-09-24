@@ -2461,3 +2461,43 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   round-trip, SPKI full handshake, BoringSSL-server interop, JA3
   updates. Trojan/reality interop passes against real Mihomo.
   Full suite: 276 passed.
+
+## 2026-09-24
+
+- uTLS Firefox profile end to end. New BoringSSL overlay patch (Firefox
+  TLS 1.3/legacy cipher order, fixed extension permutation, delegated
+  credentials and record_size_limit emission, FFDHE group append;
+  GREASE/padding behavior comes from stock knobs). tls_client applies
+  the Firefox knob set (no GREASE except ECH, X25519+P-256 shares,
+  11-scheme sigalgs, TLS 1.2 minimum). JA3 test pins the exact
+  extension order, FFDHE groups, and Firefox-only extensions.
+  Trojan/firefox-fingerprint interop passes against real Mihomo.
+  Full suite: 278 passed.
+
+## 2026-09-24
+
+- uTLS Safari profile end to end. New BoringSSL overlay patch (Safari
+  cipher order with trailing 3DES suites as raw IDs, fixed extension
+  permutation). tls_client applies the Safari knob set (GREASE on,
+  no ticket, TLS 1.0 minimum, X25519-only share, zlib cert
+  compression). Added zlib (permissive license, decoder only) with the
+  reason recorded in CMakeLists. Two deliberate deltas: the duplicated
+  PSS-SHA384 sigalg is dropped (BoringSSL rejects duplicate prefs;
+  outside JA3) and 3DES server negotiation cannot complete (no modern
+  server selects it). JA3 test pins ciphers, extension order, and
+  versions. Trojan/safari-fingerprint interop passes against real
+  Mihomo. Full suite: 280 passed.
+
+## 2026-09-24
+
+- ECH end to end. DNS codec decodes SVCB/HTTPS RDATA (priority, target,
+  SvcParams as generic options) via c-ares; new async_query_ech_config
+  helper resolves HTTPS records to ech bytes (direct answers only).
+  tls_client offers ECH from static ECHConfigList bytes; trojan
+  ech-opts (enable, static base64 config, query-server-name override)
+  plumbed through TCP/WS/gRPC with fail-closed DNS. BoringSSL
+  BoringSSL-to-BoringSSL loopback proves the handshake plus SNI hiding
+  (outer carries the public name). ECH rejection fails the handshake
+  (no backup-config retry in this version); outbound chains stay
+  untested live per discipline (no ECH-capable test server exists).
+  Full suite: 284 passed.

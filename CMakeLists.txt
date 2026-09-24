@@ -26,6 +26,10 @@ find_package(Snappy CONFIG REQUIRED)
 # offered by the Chrome ClientHello profile (TLS cert compression). Added
 # with the uTLS fingerprint work; no other component uses it.
 find_package(unofficial-brotli CONFIG REQUIRED)
+# System zlib: supplies the certificate-compression decompressor offered by
+# the Safari ClientHello profile (TLS cert compression). Added with the
+# uTLS fingerprint work; no other component uses it.
+find_package(ZLIB REQUIRED)
 find_package(STDEXEC CONFIG REQUIRED)
 find_package(tl-expected CONFIG REQUIRED)
 find_package(Threads REQUIRED)
@@ -122,6 +126,7 @@ add_library(clash-native-core STATIC
     src/dns/dns_query_service.cpp
     src/dns/dns_upstream.cpp
     src/dns/address_resolver.cpp
+    src/dns/ech_resolver.cpp
     src/dns/bootstrap_resolver.cpp
     src/dns/bootstrap_dns_transport.cpp
     src/dns/resolver_service.cpp
@@ -228,6 +233,7 @@ target_link_libraries(clash-native-core
         fmt::fmt
         spdlog::spdlog_header_only
         unofficial::brotli::brotlidec
+        ZLIB::ZLIB
 )
 
 if(WIN32)

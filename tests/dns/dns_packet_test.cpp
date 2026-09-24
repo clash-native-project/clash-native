@@ -292,6 +292,51 @@ TEST(DnsPacketTest, ParsesHttpsQuestionsAndGenericServiceBindingFieldsWithCares)
     EXPECT_EQ(parameters[1].data, (std::vector<std::uint8_t>{1, 187}));
 }
 
+TEST(DnsPacketTest, ParsesHttpsTypedServiceBindingWithEchParam) {
+    const clash_native::dns::DnsQuestion question{
+        "resolver.example", clash_native::dns::dns_record_type_from_code(65), 1};
+    auto wire = clash_native::dns::DnsMessageCodec::encode_query_packet(question, 0x4568).value();
+    wire[2] = 0x81;
+    wire[3] = 0x80;
+    wire[6] = 0;
+    wire[7] = 1;
+
+    // priority 1, target svc.example, alpn h2, port 443, ech opaque bytes.
+    const std::vector<std::uint8_t> ech_config{0x00, 0x0a, 0x0d, 0x14};
+    std::vector<std::uint8_t> rdata;
+    append_u16(rdata, 1);
+    append_name(rdata, "svc.example");
+    append_u16(rdata, 1);
+    append_u16(rdata, 3);
+    rdata.insert(rdata.end(), {2, 'h', '2'});
+    append_u16(rdata, 3);
+    append_u16(rdata, 2);
+    rdata.insert(rdata.end(), {1, 187});
+    append_u16(rdata, 5);
+    append_u16(rdata, static_cast<std::uint16_t>(ech_config.size()));
+    rdata.insert(rdata.end(), ech_config.begin(), ech_config.end());
+
+    wire.insert(wire.end(), {0xc0, 0x0c});
+    append_u16(wire, 65);
+    append_u16(wire, 1);
+    append_u32(wire, 60);
+    append_u16(wire, static_cast<std::uint16_t>(rdata.size()));
+    wire.insert(wire.end(), rdata.begin(), rdata.end());
+
+    const auto packet = clash_native::dns::DnsMessageCodec::decode_packet(wire, 0x4568);
+    ASSERT_TRUE(packet) << (packet ? "" : packet.error().context);
+    ASSERT_EQ(packet.value().answers.size(), 1U);
+    const auto &sxb = packet.value().answers.front().svcb;
+    ASSERT_TRUE(sxb.has_value());
+    EXPECT_EQ(sxb->priority, 1U);
+    EXPECT_EQ(sxb->target, "svc.example");
+    ASSERT_EQ(sxb->params.size(), 3U);
+    EXPECT_EQ(sxb->params[0].code, 1U);
+    EXPECT_EQ(sxb->params[1].code, 3U);
+    EXPECT_EQ(sxb->params[2].code, 5U);
+    EXPECT_EQ(sxb->params[2].data, ech_config);
+}
+
 TEST(DnsPacketTest, ParsesCaaFieldsWithCares) {
     const clash_native::dns::DnsQuestion question{"example", clash_native::dns::DnsRecordType::caa,
                                                   1};

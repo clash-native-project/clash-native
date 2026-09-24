@@ -22,6 +22,7 @@
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <zlib.h>
 
 #include <brotli/decode.h>
 
@@ -74,6 +75,162 @@ constexpr uint16_t kChromeSignatureAlgorithms[] = {
     SSL_SIGN_ECDSA_SECP384R1_SHA384, SSL_SIGN_RSA_PSS_RSAE_SHA384, SSL_SIGN_RSA_PKCS1_SHA384,
     SSL_SIGN_RSA_PSS_RSAE_SHA512,    SSL_SIGN_RSA_PKCS1_SHA512,    SSL_SIGN_ED25519,
 };
+
+// Firefox ClientHello signature algorithms, in Firefox's fixed order.
+constexpr uint16_t kFirefoxSignatureAlgorithms[] = {
+    SSL_SIGN_ECDSA_SECP256R1_SHA256, SSL_SIGN_ECDSA_SECP384R1_SHA384,
+    SSL_SIGN_ECDSA_SECP521R1_SHA512, SSL_SIGN_RSA_PSS_RSAE_SHA256,
+    SSL_SIGN_RSA_PSS_RSAE_SHA384,    SSL_SIGN_RSA_PSS_RSAE_SHA512,
+    SSL_SIGN_RSA_PKCS1_SHA256,       SSL_SIGN_RSA_PKCS1_SHA384,
+    SSL_SIGN_RSA_PKCS1_SHA512,       SSL_SIGN_ECDSA_SHA1,
+    SSL_SIGN_RSA_PKCS1_SHA1,
+};
+
+// Firefox ClientHello legacy cipher suites as a BoringSSL cipher rule string.
+constexpr char kFirefoxCipherRule[] = "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:"
+                                      "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:"
+                                      "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:"
+                                      "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:"
+                                      "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:"
+                                      "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:"
+                                      "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:"
+                                      "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA:"
+                                      "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA:"
+                                      "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:"
+                                      "TLS_RSA_WITH_AES_128_GCM_SHA256:"
+                                      "TLS_RSA_WITH_AES_256_GCM_SHA384:"
+                                      "TLS_RSA_WITH_AES_128_CBC_SHA:"
+                                      "TLS_RSA_WITH_AES_256_CBC_SHA";
+
+// Applies the Firefox ClientHello profile: fixed extension order without
+// GREASE (except ECH), Firefox-only extensions from the overlay patch,
+// X25519+P-256 key shares, and FFDHE groups appended by the patch.
+core::Status apply_firefox_profile(SSL_CTX *context, SSL *session) {
+    if (SSL_set_client_hello_profile(session, CLASH_NATIVE_CLIENT_HELLO_FIREFOX) != 1) {
+        return core::fail(configuration_error("failed to select Firefox TLS profile"));
+    }
+    SSL_CTX_set_grease_enabled(context, 0);
+    SSL_CTX_set_permute_extensions(context, 0);
+    SSL_set_enable_ech_grease(session, 1);
+    SSL_set_tlsext_status_type(session, TLSEXT_STATUSTYPE_ocsp);
+    if (SSL_set_verify_algorithm_prefs(session, kFirefoxSignatureAlgorithms,
+                                       std::size(kFirefoxSignatureAlgorithms)) != 1) {
+        return core::fail(
+            configuration_error("failed to configure Firefox TLS signature algorithms"));
+    }
+    if (SSL_set_strict_cipher_list(session, kFirefoxCipherRule) != 1) {
+        return core::fail(configuration_error("failed to configure Firefox TLS cipher list"));
+    }
+    if (SSL_set_min_proto_version(session, TLS1_2_VERSION) != 1) {
+        return core::fail(configuration_error("failed to configure Firefox TLS minimum version"));
+    }
+    static constexpr int kFirefoxGroups[] = {NID_X25519, NID_X9_62_prime256v1, NID_secp384r1,
+                                             NID_secp521r1};
+    if (SSL_set1_groups(session, kFirefoxGroups, std::size(kFirefoxGroups)) != 1) {
+        return core::fail(configuration_error("failed to configure Firefox TLS groups"));
+    }
+    static constexpr uint16_t kFirefoxKeyShares[] = {SSL_GROUP_X25519, SSL_GROUP_SECP256R1};
+    if (SSL_set1_client_key_shares(session, kFirefoxKeyShares, std::size(kFirefoxKeyShares)) != 1) {
+        return core::fail(configuration_error("failed to configure Firefox TLS key shares"));
+    }
+    return {};
+}
+
+// Safari ClientHello signature algorithms, in Safari's fixed order. Safari
+// repeats PSS-SHA384 on the wire, but BoringSSL rejects duplicate prefs, so
+// the duplicate is dropped (signature algorithms are outside JA3 and the
+// duplicate carries no negotiation meaning).
+constexpr uint16_t kSafariSignatureAlgorithms[] = {
+    SSL_SIGN_ECDSA_SECP256R1_SHA256, SSL_SIGN_RSA_PSS_RSAE_SHA256, SSL_SIGN_RSA_PKCS1_SHA256,
+    SSL_SIGN_ECDSA_SECP384R1_SHA384, SSL_SIGN_ECDSA_SHA1,          SSL_SIGN_RSA_PSS_RSAE_SHA384,
+    SSL_SIGN_RSA_PKCS1_SHA384,       SSL_SIGN_RSA_PSS_RSAE_SHA512, SSL_SIGN_RSA_PKCS1_SHA512,
+    SSL_SIGN_RSA_PKCS1_SHA1,
+};
+
+// Safari ClientHello legacy cipher suites as a BoringSSL cipher rule string
+// (no 3DES tokens: BoringSSL implements no 3DES key exchange, so the
+// trailing 3DES suites are emitted as raw IDs by the overlay patch).
+constexpr char kSafariCipherRule[] = "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:"
+                                     "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:"
+                                     "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:"
+                                     "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:"
+                                     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:"
+                                     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:"
+                                     "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:"
+                                     "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA:"
+                                     "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:"
+                                     "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA:"
+                                     "TLS_RSA_WITH_AES_256_GCM_SHA384:"
+                                     "TLS_RSA_WITH_AES_128_GCM_SHA256:"
+                                     "TLS_RSA_WITH_AES_256_CBC_SHA:"
+                                     "TLS_RSA_WITH_AES_128_CBC_SHA";
+
+// Decompresses a zlib-compressed certificate for the Safari profile's
+// compress_certificate extension.
+int safari_zlib_decompress(SSL * /*ssl*/, CRYPTO_BUFFER **out, size_t uncompressed_len,
+                           const uint8_t *in, size_t in_len) {
+    constexpr size_t kMaxCertificateSize = 4u * 1024u * 1024u;
+    if (uncompressed_len == 0 || uncompressed_len > kMaxCertificateSize) {
+        return 0;
+    }
+    uint8_t *buffer = static_cast<uint8_t *>(OPENSSL_malloc(uncompressed_len));
+    if (buffer == nullptr) {
+        return 0;
+    }
+    uLongf decoded_len = static_cast<uLongf>(uncompressed_len);
+    if (uncompress(buffer, &decoded_len, in, static_cast<uLong>(in_len)) != Z_OK ||
+        decoded_len != uncompressed_len) {
+        OPENSSL_free(buffer);
+        return 0;
+    }
+    CRYPTO_BUFFER *result = CRYPTO_BUFFER_new(buffer, decoded_len, nullptr);
+    OPENSSL_free(buffer);
+    if (result == nullptr) {
+        return 0;
+    }
+    *out = result;
+    return 1;
+}
+
+// Applies the Safari ClientHello profile through the overlay BoringSSL
+// profile API plus the public configuration knobs Safari enables.
+core::Status apply_safari_profile(SSL_CTX *context, SSL *session) {
+    if (SSL_set_client_hello_profile(session, CLASH_NATIVE_CLIENT_HELLO_SAFARI) != 1) {
+        return core::fail(configuration_error("failed to select Safari TLS profile"));
+    }
+    SSL_CTX_set_grease_enabled(context, 1);
+    SSL_CTX_set_permute_extensions(context, 0);
+    SSL_enable_signed_cert_timestamps(session);
+    SSL_set_tlsext_status_type(session, TLSEXT_STATUSTYPE_ocsp);
+    // Safari sends no session ticket extension.
+    SSL_set_options(session, SSL_OP_NO_TICKET);
+    if (SSL_set_verify_algorithm_prefs(session, kSafariSignatureAlgorithms,
+                                       std::size(kSafariSignatureAlgorithms)) != 1) {
+        return core::fail(
+            configuration_error("failed to configure Safari TLS signature algorithms"));
+    }
+    if (SSL_set_strict_cipher_list(session, kSafariCipherRule) != 1) {
+        return core::fail(configuration_error("failed to configure Safari TLS cipher list"));
+    }
+    if (SSL_set_min_proto_version(session, TLS1_VERSION) != 1) {
+        return core::fail(configuration_error("failed to configure Safari TLS minimum version"));
+    }
+    static constexpr int kSafariGroups[] = {NID_X25519, NID_X9_62_prime256v1, NID_secp384r1,
+                                            NID_secp521r1};
+    if (SSL_set1_groups(session, kSafariGroups, std::size(kSafariGroups)) != 1) {
+        return core::fail(configuration_error("failed to configure Safari TLS groups"));
+    }
+    static constexpr uint16_t kSafariKeyShares[] = {SSL_GROUP_X25519};
+    if (SSL_set1_client_key_shares(session, kSafariKeyShares, std::size(kSafariKeyShares)) != 1) {
+        return core::fail(configuration_error("failed to configure Safari TLS key shares"));
+    }
+    // TLS_CertCompressionZlib (1).
+    if (SSL_CTX_add_cert_compression_alg(context, 1, nullptr, safari_zlib_decompress) != 1) {
+        return core::fail(
+            configuration_error("failed to configure Safari TLS certificate compression"));
+    }
+    return {};
+}
 
 // Chrome ClientHello legacy cipher suites as a BoringSSL cipher rule string.
 constexpr char kChromeCipherRule[] = "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:"
@@ -409,13 +566,22 @@ class TlsClientHandshakeOperationImpl final
             }
         }
 
-        if (!options_.fingerprint.empty() && options_.fingerprint != "chrome") {
+        if (!options_.fingerprint.empty() && options_.fingerprint != "chrome" &&
+            options_.fingerprint != "firefox" && options_.fingerprint != "safari") {
             return core::fail(
                 configuration_error("unsupported TLS fingerprint: " + options_.fingerprint));
         }
-        if (options_.fingerprint == "chrome") {
-            const auto profile =
-                apply_chrome_profile(context_->native_handle(), stream_->stream_->native_handle());
+        if (!options_.fingerprint.empty()) {
+            auto *native_context = context_->native_handle();
+            auto *native_session = stream_->stream_->native_handle();
+            core::Status profile = {};
+            if (options_.fingerprint == "chrome") {
+                profile = apply_chrome_profile(native_context, native_session);
+            } else if (options_.fingerprint == "firefox") {
+                profile = apply_firefox_profile(native_context, native_session);
+            } else {
+                profile = apply_safari_profile(native_context, native_session);
+            }
             if (!profile) {
                 return profile;
             }
@@ -476,6 +642,13 @@ class TlsClientHandshakeOperationImpl final
             if (SSL_set_alpn_protos(stream_->stream_->native_handle(), wire.data(),
                                     static_cast<unsigned int>(wire.size())) != 0) {
                 return core::fail(configuration_error("failed to configure TLS ALPN"));
+            }
+        }
+        if (options_.ech_config_list && !options_.ech_config_list->empty()) {
+            if (SSL_set1_ech_config_list(stream_->stream_->native_handle(),
+                                         options_.ech_config_list->data(),
+                                         options_.ech_config_list->size()) != 1) {
+                return core::fail(configuration_error("failed to configure TLS ECH"));
             }
         }
         return {};

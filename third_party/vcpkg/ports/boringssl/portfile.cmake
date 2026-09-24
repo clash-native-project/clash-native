@@ -25,6 +25,8 @@ vcpkg_from_github(
     0002-clash-native-overlay-marker.patch
     0003-chrome-client-hello-profile.patch
     0004-client-hello-mutator.patch
+    0005-firefox-client-hello-profile.patch
+    0006-safari-client-hello-profile.patch
 )
 
 set(BORINGSSL_OPTIONS

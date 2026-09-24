@@ -49,6 +49,7 @@ struct WebSocketClientOptions {
     // ClientHello camouflage profile, forwarded to the TLS client.
     std::string tls_fingerprint;
     std::optional<TlsRealityOptions> tls_reality;
+    std::optional<std::vector<std::uint8_t>> tls_ech_config_list;
     std::optional<std::chrono::steady_clock::time_point> deadline;
 };
 

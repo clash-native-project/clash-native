@@ -2,6 +2,8 @@
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 
+#include <clash_native/core/base64.hpp>
+#include <clash_native/dns/ech_resolver.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/trojan_outbound.hpp>
 #include <clash_native/transport/http_sessions.hpp>
@@ -40,6 +42,44 @@ namespace clash_native::outbound {
 namespace {
 
 constexpr auto kConnectTimeout = std::chrono::seconds(15);
+
+// Resolves ECH configs for the TLS handshake (Mihomo ech-opts): a static
+// base64 ECHConfigList, or an HTTPS-record lookup with an optional
+// query-server-name override. DNS failure fails closed: silently dropping
+// ECH would leak the SNI the user asked to encrypt.
+// NOTE: named function per the coroutine creation rules; never an
+// immediately-invoked capturing lambda.
+exec::task<core::Result<std::vector<std::uint8_t>>>
+fetch_trojan_ech_config(std::shared_ptr<dns::ResolverService> resolver,
+                        const TrojanOutboundConfig &config, const std::string &server_name) {
+    if (!config.ech_config.empty()) {
+        const auto decoded = core::base64_decode(config.ech_config);
+        if (!decoded || decoded->empty()) {
+            co_return core::fail(core::Error{core::ErrorCode::configuration,
+                                             "Trojan ECH config is not valid base64"});
+        }
+        co_return core::Result<std::vector<std::uint8_t>>{
+            std::vector<std::uint8_t>(decoded->begin(), decoded->end())};
+    }
+    std::optional<std::string> query_name;
+    if (!config.ech_query_server_name.empty()) {
+        query_name = config.ech_query_server_name;
+    }
+    core::Result<std::vector<std::uint8_t>> ech;
+    try {
+        ech = co_await dns::async_query_ech_config(resolver->query_service(), server_name,
+                                                   std::move(query_name));
+    } catch (const core::Error &failure) {
+        co_return core::fail(failure);
+    } catch (...) {
+        co_return core::fail(core::Error{core::ErrorCode::endpoint_connection,
+                                         "failed to resolve Trojan ECH config"});
+    }
+    if (!ech) {
+        co_return core::fail(ech.error());
+    }
+    co_return core::Result<std::vector<std::uint8_t>>{std::move(ech.value())};
+}
 
 core::Result<std::string> trojan_password_key(std::string_view password) {
     std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
@@ -161,6 +201,14 @@ struct GrpcSessionOpen {
         if (!config.reality_public_key.empty()) {
             tls_options.reality =
                 transport::TlsRealityOptions{config.reality_public_key, config.reality_short_id};
+        }
+        if (config.ech_enabled) {
+            auto ech = co_await fetch_trojan_ech_config(resolver, config, tls_options.server_name);
+            if (!ech) {
+                finish(core::fail(ech.error()));
+                co_return;
+            }
+            tls_options.ech_config_list = std::move(ech.value());
         }
         tls_options.deadline = deadline;
         auto plain = std::make_unique<net::TcpStream>(std::move(*socket));
@@ -406,6 +454,15 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 ws_options.tls_server_name = self->config_.server_name.empty()
                                                  ? self->config_.server_host
                                                  : self->config_.server_name;
+                if (self->config_.ech_enabled) {
+                    auto ech = co_await fetch_trojan_ech_config(self->resolver_, self->config_,
+                                                                ws_options.tls_server_name);
+                    if (!ech) {
+                        self->finish(core::StreamOpenResult::failed(ech.error()));
+                        co_return;
+                    }
+                    ws_options.tls_ech_config_list = std::move(ech.value());
+                }
                 ws_options.tls_verify_peer = self->config_.verify_peer;
                 ws_options.tls_trusted_ca_pem = self->config_.trusted_ca_pem;
                 ws_options.tls_verify_hostname = self->config_.name_cert_verify;
@@ -499,6 +556,15 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 if (!self->config_.reality_public_key.empty()) {
                     tls_options.reality = transport::TlsRealityOptions{
                         self->config_.reality_public_key, self->config_.reality_short_id};
+                }
+                if (self->config_.ech_enabled) {
+                    auto ech = co_await fetch_trojan_ech_config(self->resolver_, self->config_,
+                                                                tls_options.server_name);
+                    if (!ech) {
+                        self->finish(core::StreamOpenResult::failed(ech.error()));
+                        co_return;
+                    }
+                    tls_options.ech_config_list = std::move(ech.value());
                 }
                 tls_options.deadline = self->deadline_;
                 auto plain_stream = std::make_unique<net::TcpStream>(std::move(*self->socket_));

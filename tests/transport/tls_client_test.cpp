@@ -15,6 +15,7 @@
 #include <openssl/evp.h>
 #include <openssl/hkdf.h>
 #include <openssl/hmac.h>
+#include <openssl/hpke.h>
 #include <openssl/ssl.h>
 
 #include <boost/asio/buffer.hpp>
@@ -272,6 +273,10 @@ struct ClientHello {
     bool has_alps = false;
     bool has_ech = false;
     bool has_compress_brotli = false;
+    bool has_compress_zlib = false;
+    std::vector<uint16_t> delegated_credential_sigalgs;
+    uint16_t record_size_limit = 0;
+    bool has_padding = false;
 };
 
 bool parse_client_hello(const std::vector<uint8_t> &record, ClientHello &hello) {
@@ -393,6 +398,7 @@ bool parse_client_hello(const std::vector<uint8_t> &record, ClientHello &hello) 
                     return false;
                 }
                 hello.has_compress_brotli = hello.has_compress_brotli || alg == 2;
+                hello.has_compress_zlib = hello.has_compress_zlib || alg == 1;
             }
         } else if (type == 43) {
             uint8_t list_length = 0;
@@ -430,6 +436,26 @@ bool parse_client_hello(const std::vector<uint8_t> &record, ClientHello &hello) 
             hello.has_alps = true;
         } else if (type == 65037) {
             hello.has_ech = true;
+        } else if (type == 34) {
+            uint16_t list_length = 0;
+            if (!ext.take16(list_length) || (list_length % 2) != 0) {
+                return false;
+            }
+            for (uint16_t left = list_length; left > 0; left -= 2) {
+                uint16_t scheme = 0;
+                if (!ext.take16(scheme)) {
+                    return false;
+                }
+                hello.delegated_credential_sigalgs.push_back(scheme);
+            }
+        } else if (type == 28) {
+            uint16_t limit = 0;
+            if (!ext.take16(limit) || ext.size != 0) {
+                return false;
+            }
+            hello.record_size_limit = limit;
+        } else if (type == 21) {
+            hello.has_padding = true;
         }
     }
     return true;
@@ -1189,6 +1215,382 @@ TEST(TlsClientTest, RealityTicketInteroperatesWithBoringsslServer) {
     ASSERT_TRUE(completed.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
     auto established = completed.get();
     EXPECT_TRUE(established.has_value());
+
+    context.stop();
+    runner.join();
+}
+
+TEST(TlsClientTest, RejectsUnknownFirefoxVariant) {
+    // Only the bare profile names are accepted; versioned utls IDs are not.
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "example.com";
+    options.fingerprint = "firefox-120";
+    const auto failure = handshake_error(std::move(options));
+    EXPECT_EQ(failure.code, clash_native::core::ErrorCode::configuration);
+}
+
+TEST(TlsClientTest, FirefoxFingerprintMatchesFirefoxClientHello) {
+    using boost::asio::ip::tcp;
+    boost::asio::io_context context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{
+        context.get_executor()};
+    std::thread runner([&] { context.run(); });
+
+    tcp::acceptor acceptor(context, tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+    tcp::socket server(context);
+    std::promise<void> accepted;
+    auto accepted_future = accepted.get_future();
+    acceptor.async_accept(server, [&](const boost::system::error_code &error) {
+        EXPECT_FALSE(error);
+        accepted.set_value();
+    });
+
+    tcp::socket peer(context);
+    peer.connect(
+        tcp::endpoint(boost::asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()));
+    ASSERT_EQ(accepted_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto stream = std::make_unique<clash_native::net::TcpStream>(std::move(peer));
+
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "example.com";
+    options.alpn_protocols = {"h2", "http/1.1"};
+    options.fingerprint = "firefox";
+    options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto sender =
+        clash_native::transport::async_tls_client_handshake(std::move(stream), std::move(options));
+    HandshakeReceiver receiver;
+    auto completed = receiver.done.get_future();
+    auto op = stdexec::connect(std::move(sender), std::move(receiver));
+    stdexec::start(op);
+
+    const auto record = read_tls_record(context, server);
+    server.close();
+    ASSERT_TRUE(completed.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    EXPECT_NE(completed.get().code, clash_native::core::ErrorCode::configuration);
+
+    ClientHello hello;
+    ASSERT_TRUE(parse_client_hello(record, hello));
+    EXPECT_EQ(hello.session_id.size(), 32u);
+    EXPECT_EQ(hello.server_name, "example.com");
+    EXPECT_EQ(hello.alpn, (std::vector<std::string>{"h2", "http/1.1"}));
+
+    // Firefox emits no GREASE cipher and its own fixed order.
+    const std::vector<uint16_t> expected_ciphers = {0x1301, 0x1303, 0x1302, 0xc02b, 0xc02f, 0xcca9,
+                                                    0xcca8, 0xc02c, 0xc030, 0xc00a, 0xc009, 0xc013,
+                                                    0xc014, 0x009c, 0x009d, 0x002f, 0x0035};
+    EXPECT_EQ(hello.ciphers, expected_ciphers);
+    for (const auto cipher : hello.ciphers) {
+        EXPECT_FALSE(is_grease(cipher));
+    }
+
+    // Firefox extension order is fixed (unlike Chrome's shuffle); padding,
+    // when the record would otherwise land under 512 bytes, comes last.
+    std::vector<uint16_t> extensions = hello.extension_types;
+    if (!extensions.empty() && extensions.back() == 21) {
+        EXPECT_TRUE(hello.has_padding);
+        // BoringPaddingStyle pads the handshake body to 512 bytes, so the
+        // record totals 5 + 512.
+        EXPECT_EQ(record.size(), 517u);
+        extensions.pop_back();
+    } else {
+        EXPECT_FALSE(hello.has_padding);
+    }
+    const std::vector<uint16_t> expected_extensions = {0,  23, 65281, 10, 11, 35, 16,   5,
+                                                       34, 51, 43,    13, 45, 28, 65037};
+    EXPECT_EQ(extensions, expected_extensions);
+    for (const auto type : hello.extension_types) {
+        EXPECT_FALSE(is_grease(type));
+    }
+
+    EXPECT_EQ(hello.groups, (std::vector<uint16_t>{0x001d, 0x0017, 0x0018, 0x0019, 256, 257}));
+    EXPECT_EQ(hello.key_share_groups, (std::vector<uint16_t>{0x001d, 0x0017}));
+
+    EXPECT_EQ(hello.signature_algorithms,
+              (std::vector<uint16_t>{0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501,
+                                     0x0601, 0x0203, 0x0201}));
+    EXPECT_EQ(hello.versions, (std::vector<uint16_t>{0x0304, 0x0303}));
+
+    EXPECT_EQ(hello.delegated_credential_sigalgs,
+              (std::vector<uint16_t>{0x0403, 0x0503, 0x0603, 0x0203}));
+    EXPECT_EQ(hello.record_size_limit, 0x4001);
+    EXPECT_FALSE(hello.has_alps);
+    EXPECT_FALSE(hello.has_compress_brotli);
+    EXPECT_TRUE(hello.has_ech);
+
+    context.stop();
+    runner.join();
+}
+
+TEST(TlsClientTest, RejectsUnknownSafariVariant) {
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "example.com";
+    options.fingerprint = "safari-16";
+    const auto failure = handshake_error(std::move(options));
+    EXPECT_EQ(failure.code, clash_native::core::ErrorCode::configuration);
+}
+
+TEST(TlsClientTest, SafariFingerprintMatchesSafariClientHello) {
+    using boost::asio::ip::tcp;
+    boost::asio::io_context context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{
+        context.get_executor()};
+    std::thread runner([&] { context.run(); });
+
+    tcp::acceptor acceptor(context, tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+    tcp::socket server(context);
+    std::promise<void> accepted;
+    auto accepted_future = accepted.get_future();
+    acceptor.async_accept(server, [&](const boost::system::error_code &error) {
+        EXPECT_FALSE(error);
+        accepted.set_value();
+    });
+
+    tcp::socket peer(context);
+    peer.connect(
+        tcp::endpoint(boost::asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()));
+    ASSERT_EQ(accepted_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto stream = std::make_unique<clash_native::net::TcpStream>(std::move(peer));
+
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "example.com";
+    options.alpn_protocols = {"h2", "http/1.1"};
+    options.fingerprint = "safari";
+    options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto sender =
+        clash_native::transport::async_tls_client_handshake(std::move(stream), std::move(options));
+    HandshakeReceiver receiver;
+    auto completed = receiver.done.get_future();
+    auto op = stdexec::connect(std::move(sender), std::move(receiver));
+    stdexec::start(op);
+
+    const auto record = read_tls_record(context, server);
+    server.close();
+    ASSERT_TRUE(completed.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    EXPECT_NE(completed.get().code, clash_native::core::ErrorCode::configuration);
+
+    ClientHello hello;
+    ASSERT_TRUE(parse_client_hello(record, hello));
+    EXPECT_EQ(hello.session_id.size(), 32u);
+    EXPECT_EQ(hello.server_name, "example.com");
+    EXPECT_EQ(hello.alpn, (std::vector<std::string>{"h2", "http/1.1"}));
+
+    // Safari emits GREASE first and 3DES suites (raw IDs) last.
+    const std::vector<uint16_t> expected_ciphers = {
+        0x1301, 0x1302, 0x1303, 0xc02c, 0xc02b, 0xcca9, 0xc030, 0xc02f, 0xcca8, 0xc00a,
+        0xc009, 0xc014, 0xc013, 0x009d, 0x009c, 0x0035, 0x002f, 0xc008, 0xc012, 0x000a};
+    ASSERT_EQ(hello.ciphers.size(), expected_ciphers.size() + 1);
+    EXPECT_TRUE(is_grease(hello.ciphers[0]));
+    EXPECT_EQ(std::vector<uint16_t>(hello.ciphers.begin() + 1, hello.ciphers.end()),
+              expected_ciphers);
+
+    // Safari extension order is fixed; padding, when the record would
+    // otherwise land under 512 bytes, comes last.
+    std::vector<uint16_t> extensions = hello.extension_types;
+    if (!extensions.empty() && extensions.back() == 21) {
+        EXPECT_TRUE(hello.has_padding);
+        // BoringPaddingStyle pads the handshake body to 512 bytes, so the
+        // record totals 5 + 512.
+        EXPECT_EQ(record.size(), 517u);
+        extensions.pop_back();
+    } else {
+        EXPECT_FALSE(hello.has_padding);
+    }
+    std::vector<uint16_t> normalized;
+    std::size_t grease_count = 0;
+    for (const auto type : extensions) {
+        if (is_grease(type)) {
+            grease_count += 1;
+            continue;
+        }
+        normalized.push_back(type);
+    }
+    const std::vector<uint16_t> expected_extensions = {0,  23, 65281, 10, 11, 16, 5,
+                                                       13, 18, 51,    45, 43, 27};
+    EXPECT_EQ(grease_count, 2u);
+    EXPECT_EQ(normalized, expected_extensions);
+
+    ASSERT_EQ(hello.groups.size(), 5u);
+    EXPECT_TRUE(is_grease(hello.groups[0]));
+    EXPECT_EQ(std::vector<uint16_t>(hello.groups.begin() + 1, hello.groups.end()),
+              (std::vector<uint16_t>{0x001d, 0x0017, 0x0018, 0x0019}));
+
+    ASSERT_EQ(hello.key_share_groups.size(), 2u);
+    EXPECT_TRUE(is_grease(hello.key_share_groups[0]));
+    EXPECT_EQ(hello.key_share_groups[1], 0x001d);
+
+    // Safari repeats PSS-SHA384 on the wire; BoringSSL rejects duplicate
+    // prefs so the duplicate is dropped (documented on
+    // kSafariSignatureAlgorithms).
+    EXPECT_EQ(hello.signature_algorithms,
+              (std::vector<uint16_t>{0x0403, 0x0804, 0x0401, 0x0503, 0x0203, 0x0805, 0x0501, 0x0806,
+                                     0x0601, 0x0201}));
+
+    ASSERT_EQ(hello.versions.size(), 5u);
+    EXPECT_TRUE(is_grease(hello.versions[0]));
+    EXPECT_EQ(std::vector<uint16_t>(hello.versions.begin() + 1, hello.versions.end()),
+              (std::vector<uint16_t>{0x0304, 0x0303, 0x0302, 0x0301}));
+
+    EXPECT_TRUE(hello.has_compress_zlib);
+    EXPECT_FALSE(hello.has_compress_brotli);
+    EXPECT_FALSE(hello.has_alps);
+    EXPECT_FALSE(hello.has_ech);
+
+    context.stop();
+    runner.join();
+}
+namespace {
+
+void append_u16(std::vector<uint8_t> &out, uint16_t value) {
+    out.push_back(static_cast<uint8_t>(value >> 8));
+    out.push_back(static_cast<uint8_t>(value & 0xff));
+}
+
+// Builds a minimal ECHConfigList (RFC 9849) for public_name backed by key.
+// config_id 7, X25519 KEM, HKDF-SHA256/AES-128-GCM, no extensions.
+bool build_ech_config_list(std::vector<uint8_t> &out, const EVP_HPKE_KEY *key,
+                           std::string_view public_name) {
+    uint8_t raw_public[EVP_HPKE_MAX_PUBLIC_KEY_LENGTH] = {0};
+    size_t raw_length = 0;
+    if (EVP_HPKE_KEY_public_key(key, raw_public, &raw_length, sizeof(raw_public)) != 1) {
+        return false;
+    }
+    std::vector<uint8_t> config;
+    append_u16(config, 0xfe0d);
+    std::vector<uint8_t> contents;
+    contents.push_back(7);
+    append_u16(contents, 0x0020);
+    append_u16(contents, static_cast<uint16_t>(raw_length));
+    contents.insert(contents.end(), raw_public, raw_public + raw_length);
+    append_u16(contents, 4);
+    append_u16(contents, 0x0001);
+    append_u16(contents, 0x0001);
+    contents.push_back(64);
+    contents.push_back(static_cast<uint8_t>(public_name.size()));
+    contents.insert(contents.end(), public_name.begin(), public_name.end());
+    append_u16(contents, 0);
+    append_u16(config, static_cast<uint16_t>(contents.size()));
+    config.insert(config.end(), contents.begin(), contents.end());
+    append_u16(out, static_cast<uint16_t>(config.size()));
+    out.insert(out.end(), config.begin(), config.end());
+    return true;
+}
+
+struct OuterHelloCapture {
+    std::vector<uint8_t> bytes;
+};
+
+void ech_outer_hello_callback(int write_p, int version, int content_type, const void *data,
+                              size_t length, SSL *, void *arg) {
+    (void)version;
+    if (write_p || content_type != 22 || data == nullptr || length == 0 ||
+        static_cast<const uint8_t *>(data)[0] != 1) {
+        return;
+    }
+    auto *capture = static_cast<OuterHelloCapture *>(arg);
+    if (capture->bytes.empty()) {
+        const auto *bytes = static_cast<const uint8_t *>(data);
+        capture->bytes.assign(bytes, bytes + length);
+    }
+}
+
+} // namespace
+
+TEST(TlsClientTest, EchHandshakeCompletesAndHidesInnerServerName) {
+    using boost::asio::ip::tcp;
+    // ECH server keys for public.test; the inner name stays secret.test.
+    bssl::UniquePtr<EVP_HPKE_KEY> hpke_key(EVP_HPKE_KEY_new());
+    ASSERT_TRUE(hpke_key);
+    ASSERT_EQ(EVP_HPKE_KEY_generate(hpke_key.get(), EVP_hpke_x25519_hkdf_sha256()), 1);
+    std::vector<uint8_t> ech_config_list;
+    ASSERT_TRUE(build_ech_config_list(ech_config_list, hpke_key.get(), "public.test"));
+
+    bssl::UniquePtr<SSL_ECH_KEYS> ech_keys(SSL_ECH_KEYS_new());
+    ASSERT_TRUE(ech_keys);
+    // SSL_ECH_KEYS_add takes the single ECHConfig (without list framing).
+    // The server requires a retry config alongside the live one.
+    ASSERT_GT(ech_config_list.size(), 2u);
+    ASSERT_EQ(SSL_ECH_KEYS_add(ech_keys.get(), 0, ech_config_list.data() + 2,
+                               ech_config_list.size() - 2, hpke_key.get()),
+              1);
+    ASSERT_EQ(SSL_ECH_KEYS_add(ech_keys.get(), 1, ech_config_list.data() + 2,
+                               ech_config_list.size() - 2, hpke_key.get()),
+              1);
+
+    boost::asio::io_context context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{
+        context.get_executor()};
+    std::thread runner([&] { context.run(); });
+
+    tcp::acceptor acceptor(context, tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+    tcp::socket server(context);
+    std::promise<void> accepted;
+    auto accepted_future = accepted.get_future();
+    acceptor.async_accept(server, [&](const boost::system::error_code &error) {
+        EXPECT_FALSE(error);
+        accepted.set_value();
+    });
+
+    tcp::socket peer(context);
+    peer.connect(
+        tcp::endpoint(boost::asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()));
+    ASSERT_EQ(accepted_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto stream = std::make_unique<clash_native::net::TcpStream>(std::move(peer));
+
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "secret.test";
+    options.ech_config_list = ech_config_list;
+    options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto sender =
+        clash_native::transport::async_tls_client_handshake(std::move(stream), std::move(options));
+    SuccessReceiver receiver;
+    auto completed = receiver.done.get_future();
+    auto op = stdexec::connect(std::move(sender), std::move(receiver));
+    stdexec::start(op);
+
+    bssl::UniquePtr<SSL_CTX> server_context(SSL_CTX_new(TLS_server_method()));
+    ASSERT_TRUE(server_context);
+    ASSERT_EQ(SSL_CTX_set1_ech_keys(server_context.get(), ech_keys.get()), 1);
+    bssl::UniquePtr<BIO> cert_bio(
+        BIO_new_mem_buf(kCertificate.data(), static_cast<int>(kCertificate.size())));
+    bssl::UniquePtr<X509> certificate(PEM_read_bio_X509(cert_bio.get(), nullptr, nullptr, nullptr));
+    ASSERT_TRUE(certificate);
+    ASSERT_EQ(SSL_CTX_use_certificate(server_context.get(), certificate.get()), 1);
+    bssl::UniquePtr<BIO> key_bio(
+        BIO_new_mem_buf(kPrivateKey.data(), static_cast<int>(kPrivateKey.size())));
+    bssl::UniquePtr<EVP_PKEY> private_key(
+        PEM_read_bio_PrivateKey(key_bio.get(), nullptr, nullptr, nullptr));
+    ASSERT_TRUE(private_key);
+    ASSERT_EQ(SSL_CTX_use_PrivateKey(server_context.get(), private_key.get()), 1);
+    OuterHelloCapture capture;
+    SSL_CTX_set_msg_callback(server_context.get(), ech_outer_hello_callback);
+    SSL_CTX_set_msg_callback_arg(server_context.get(), &capture);
+    bssl::UniquePtr<SSL> server_ssl(SSL_new(server_context.get()));
+    ASSERT_TRUE(server_ssl);
+    BIO *socket_bio = BIO_new_socket(server.native_handle(), BIO_NOCLOSE);
+    ASSERT_NE(socket_bio, nullptr);
+    SSL_set_bio(server_ssl.get(), socket_bio, socket_bio);
+    EXPECT_EQ(SSL_accept(server_ssl.get()), 1);
+    server.close();
+
+    ASSERT_TRUE(completed.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    auto established = completed.get();
+    EXPECT_TRUE(established.has_value());
+
+    // The outer ClientHello must carry the public name; the inner name never
+    // appears on the wire. The capture holds the handshake message, so frame
+    // it as a record for the parser.
+    std::vector<std::uint8_t> outer_record{22, 3, 3, 0, 0};
+    outer_record[3] = static_cast<std::uint8_t>(capture.bytes.size() >> 8);
+    outer_record[4] = static_cast<std::uint8_t>(capture.bytes.size() & 0xff);
+    outer_record.insert(outer_record.end(), capture.bytes.begin(), capture.bytes.end());
+    ClientHello outer;
+    ASSERT_TRUE(parse_client_hello(outer_record, outer));
+    EXPECT_EQ(outer.server_name, "public.test");
 
     context.stop();
     runner.join();

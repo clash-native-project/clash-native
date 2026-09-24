@@ -361,6 +361,41 @@ bool append_section(const ares_dns_record_t *dns_record, ares_dns_section_t sect
                                     ares_dns_rr_get_u16(rr, ARES_RR_SRV_PORT), target};
             break;
         }
+        case static_cast<std::uint16_t>(DnsRecordType::svcb):
+        case static_cast<std::uint16_t>(DnsRecordType::https): {
+            const auto params_key = record.type == static_cast<std::uint16_t>(DnsRecordType::svcb)
+                                        ? ARES_RR_SVCB_PARAMS
+                                        : ARES_RR_HTTPS_PARAMS;
+            const auto target_key = record.type == static_cast<std::uint16_t>(DnsRecordType::svcb)
+                                        ? ARES_RR_SVCB_TARGET
+                                        : ARES_RR_HTTPS_TARGET;
+            const auto priority_key = record.type == static_cast<std::uint16_t>(DnsRecordType::svcb)
+                                          ? ARES_RR_SVCB_PRIORITY
+                                          : ARES_RR_HTTPS_PRIORITY;
+            const auto *target = ares_dns_rr_get_str(rr, target_key);
+            if (target == nullptr) {
+                return false;
+            }
+            DnsSvcbData svcb{ares_dns_rr_get_u16(rr, priority_key), normalize_name(target), {}};
+            const auto param_count = ares_dns_rr_get_opt_cnt(rr, params_key);
+            for (std::size_t param_index = 0; param_index < param_count; ++param_index) {
+                const unsigned char *data = nullptr;
+                std::size_t length = 0;
+                const auto param = ares_dns_rr_get_opt(rr, params_key, param_index, &data, &length);
+                if (param == std::numeric_limits<unsigned short>::max() ||
+                    length > std::numeric_limits<std::uint16_t>::max()) {
+                    return false;
+                }
+                DnsResourceRecordOption option;
+                option.code = param;
+                if (data != nullptr && length != 0) {
+                    option.data.assign(data, data + length);
+                }
+                svcb.params.push_back(std::move(option));
+            }
+            record.svcb = std::move(svcb);
+            break;
+        }
         case static_cast<std::uint16_t>(DnsRecordType::opt): {
             const auto option_count = ares_dns_rr_get_opt_cnt(rr, ARES_RR_OPT_OPTIONS);
             for (std::size_t option_index = 0; option_index < option_count; ++option_index) {

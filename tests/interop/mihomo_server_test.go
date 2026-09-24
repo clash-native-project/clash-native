@@ -732,6 +732,60 @@ listeners:%s
 		}
 	})
 
+	t.Run("Trojan/firefox-fingerprint", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":                    "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":             trojanAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":           mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":        "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":            caPath,
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_FINGERPRINT": "firefox",
+		})
+		defer stopProxy()
+
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-trojan-firefox-", 2048))
+		writeBytes(t, client, payload)
+		if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("half-close C++ to Mihomo Trojan stream: %v", err)
+			}
+		}
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo Trojan returned different bytes")
+		}
+	})
+
+	t.Run("Trojan/safari-fingerprint", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":                    "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":             trojanAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":           mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":        "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":            caPath,
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_FINGERPRINT": "safari",
+		})
+		defer stopProxy()
+
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-trojan-safari-", 2048))
+		writeBytes(t, client, payload)
+		if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("half-close C++ to Mihomo Trojan stream: %v", err)
+			}
+		}
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo Trojan returned different bytes")
+		}
+	})
+
 	t.Run("Trojan/WSS", func(t *testing.T) {
 		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
 			"CLASH_NATIVE_TEST_OUTBOUND":                "trojan",

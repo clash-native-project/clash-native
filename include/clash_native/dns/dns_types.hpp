@@ -80,6 +80,14 @@ struct DnsResourceRecordOption {
     std::vector<std::uint8_t> data;
 };
 
+// SVCB/HTTPS record data (RFC 9460). params carries the SvcParam key/value
+// pairs opaquely (ech is key 5); only the ech value matters to ECH.
+struct DnsSvcbData {
+    std::uint16_t priority = 0;
+    std::string target;
+    std::vector<DnsResourceRecordOption> params;
+};
+
 enum class DnsResourceRecordFieldType : std::uint8_t {
     ipv4_address,
     ipv6_address,
@@ -118,6 +126,8 @@ struct DnsResourceRecord {
     std::optional<DnsMxData> mx;
     std::vector<std::vector<std::uint8_t>> txt_strings;
     std::optional<DnsSrvData> srv;
+    // Set for both svcb (64) and https (65) record types.
+    std::optional<DnsSvcbData> svcb;
     std::vector<DnsResourceRecordField> fields;
 };
 

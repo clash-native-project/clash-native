@@ -59,6 +59,12 @@ struct TrojanOutboundConfig {
     // security_mode. Empty public key disables it.
     std::string reality_public_key;
     std::string reality_short_id;
+    // ECH (Mihomo ech-opts). Disabled unless enabled; a static base64
+    // ECHConfigList or an HTTPS-record lookup (with optional
+    // query-server-name override) supplies the configs.
+    bool ech_enabled = false;
+    std::string ech_config;
+    std::string ech_query_server_name;
     transport::proxy::ShadowTlsClientOptions shadow_tls_options;
     transport::proxy::RestlsClientOptions restls_options;
     transport::proxy::JlsClientOptions jls_options;

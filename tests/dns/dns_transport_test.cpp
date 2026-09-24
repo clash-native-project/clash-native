@@ -4,15 +4,19 @@
 #include <clash_native/dns/dns_policy_router.hpp>
 #include <clash_native/dns/dns_query_service.hpp>
 #include <clash_native/dns/dns_transport.hpp>
+#include <clash_native/dns/ech_resolver.hpp>
 #include <clash_native/dns/resolver_service.hpp>
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
 #include <clash_native/outbound/outbound_registry.hpp>
+#include <clash_native/runtime/asio_runtime.hpp>
 #include <clash_native/transport/http_sessions.hpp>
 
 #include <gtest/gtest.h>
+
+#include <stdexec/execution.hpp>
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/address.hpp>
@@ -2800,6 +2804,144 @@ TEST(ResolverServiceTransportTest, CancellingOneQueryLeavesSiblingFlowing) {
               std::future_status::ready);
     ASSERT_EQ(second_done->get_future().wait_for(std::chrono::seconds(2)),
               std::future_status::ready);
+    resolver.stop();
+    runtime.stop();
+}
+namespace {
+// Drives an ECH query sender into a completion.
+struct FnEchReceiver {
+    using receiver_concept = stdexec::receiver_tag;
+    std::function<void(clash_native::core::Result<std::vector<std::uint8_t>>)> done;
+    void set_value(clash_native::core::Result<std::vector<std::uint8_t>> result) && noexcept {
+        auto terminal = std::move(done);
+        terminal(std::move(result));
+    }
+    void set_error(std::exception_ptr error) && noexcept {
+        auto terminal = std::move(done);
+        try {
+            std::rethrow_exception(std::move(error));
+        } catch (const clash_native::core::Error &failure) {
+            terminal(clash_native::core::fail(failure));
+            return;
+        } catch (...) {
+        }
+        terminal(clash_native::core::fail(clash_native::core::Error{
+            clash_native::core::ErrorCode::transport_io, "test ECH query failed"}));
+    }
+    void set_stopped() && noexcept {
+        auto terminal = std::move(done);
+        terminal(clash_native::core::fail(clash_native::core::Error{
+            clash_native::core::ErrorCode::cancelled, "test ECH query cancelled"}));
+    }
+};
+
+clash_native::dns::DnsPacket make_ech_answer(const clash_native::dns::DnsPacket &query,
+                                             const std::vector<std::uint8_t> &ech_config) {
+    clash_native::dns::DnsPacket answer;
+    answer.id = query.id;
+    answer.wire = query.wire;
+    answer.questions = query.questions;
+    clash_native::dns::DnsResourceRecord record;
+    record.name = query.questions.front().name;
+    record.type = static_cast<std::uint16_t>(clash_native::dns::DnsRecordType::https);
+    record.ttl_seconds = 60;
+    clash_native::dns::DnsSvcbData svcb;
+    svcb.priority = 1;
+    svcb.target = query.questions.front().name;
+    if (!ech_config.empty()) {
+        clash_native::dns::DnsResourceRecordOption ech;
+        ech.code = 5;
+        ech.data = ech_config;
+        svcb.params.push_back(std::move(ech));
+    }
+    record.svcb = std::move(svcb);
+    answer.answers.push_back(std::move(record));
+    return answer;
+}
+
+void run_ech_query(
+    clash_native::dns::ResolverService &resolver, const std::string &name,
+    std::function<void(clash_native::core::Result<std::vector<std::uint8_t>>)> done) {
+    // NOTE: name the sender first; argument order is unspecified.
+    auto sender = clash_native::dns::async_query_ech_config(resolver.query_service(), name);
+    clash_native::async::start_with_receiver(std::move(sender), FnEchReceiver{std::move(done)});
+}
+
+} // namespace
+
+TEST(EchResolverTest, ReturnsFirstEchParamFromHttpsAnswer) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    auto stats = std::make_shared<FakeTransportStats>();
+    const std::vector<std::uint8_t> ech_config{0x00, 0x0a, 0x0d, 0x14};
+    const auto endpoint =
+        boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 5310);
+    clash_native::dns::DnsTransportFactory ech_factory =
+        [endpoint, stats, ech_config](clash_native::runtime::AsioRuntime &runtime,
+                                      clash_native::dns::DnsUpstreamConfig) {
+            return std::make_shared<FakeDnsTransport>(
+                runtime.serialized_executor(), boost::asio::ip::make_address("192.0.2.2"), stats,
+                true, false, 0, false, [ech_config](const clash_native::dns::DnsPacket &query) {
+                    return clash_native::core::Result<clash_native::dns::DnsPacket>{
+                        make_ech_answer(query, ech_config)};
+                });
+        };
+    auto policy = std::make_shared<clash_native::dns::DnsPolicyRouter>("default");
+    clash_native::dns::ResolverService resolver(
+        runtime, clash_native::dns::DnsResolverConfig{{endpoint, std::chrono::milliseconds(500)},
+                                                      {},
+                                                      std::move(policy),
+                                                      std::move(ech_factory)});
+    runtime.start();
+
+    std::promise<clash_native::core::Result<std::vector<std::uint8_t>>> completed;
+    auto future = completed.get_future();
+    boost::asio::post(runtime.serialized_executor(), [&resolver, &completed] {
+        run_ech_query(resolver, "ech.example",
+                      [&completed](auto result) { completed.set_value(std::move(result)); });
+    });
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    const auto result = future.get();
+    ASSERT_TRUE(result) << (result ? "" : result.error().context);
+    EXPECT_EQ(result.value(), ech_config);
+
+    resolver.stop();
+    runtime.stop();
+}
+
+TEST(EchResolverTest, FailsWhenNoEchParamIsPublished) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    auto stats = std::make_shared<FakeTransportStats>();
+    const auto endpoint =
+        boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 5311);
+    clash_native::dns::DnsTransportFactory ech_factory =
+        [endpoint, stats](clash_native::runtime::AsioRuntime &runtime,
+                          clash_native::dns::DnsUpstreamConfig) {
+            return std::make_shared<FakeDnsTransport>(
+                runtime.serialized_executor(), boost::asio::ip::make_address("192.0.2.2"), stats,
+                true, false, 0, false, [](const clash_native::dns::DnsPacket &query) {
+                    return clash_native::core::Result<clash_native::dns::DnsPacket>{
+                        make_ech_answer(query, {})};
+                });
+        };
+    auto policy = std::make_shared<clash_native::dns::DnsPolicyRouter>("default");
+    clash_native::dns::ResolverService resolver(
+        runtime, clash_native::dns::DnsResolverConfig{{endpoint, std::chrono::milliseconds(500)},
+                                                      {},
+                                                      std::move(policy),
+                                                      std::move(ech_factory)});
+    runtime.start();
+
+    std::promise<clash_native::core::Result<std::vector<std::uint8_t>>> completed;
+    auto future = completed.get_future();
+    boost::asio::post(runtime.serialized_executor(), [&resolver, &completed] {
+        run_ech_query(resolver, "plain.example",
+                      [&completed](auto result) { completed.set_value(std::move(result)); });
+    });
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    const auto result = future.get();
+    EXPECT_FALSE(result);
+    EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::resolution);
+
     resolver.stop();
     runtime.stop();
 }

@@ -36,9 +36,15 @@ struct TlsClientOptions {
     std::string client_private_key_pem;
     std::vector<std::string> alpn_protocols;
     // ClientHello camouflage profile (Mihomo fingerprint). Empty means the
-    // default BoringSSL emission; "chrome" selects the Chrome profile.
-    // Required when reality is set, matching Mihomo.
+    // default BoringSSL emission; "chrome", "firefox", and "safari"
+    // select the matching profile. Required when reality is set, matching
+    // Mihomo.
     std::string fingerprint;
+    // ECH ECHConfigList wire bytes (Mihomo ech-opts config). When set, the
+    // handshake offers ECH; the outer ClientHello carries the config's
+    // public name. An ECH rejection fails the handshake (no automatic
+    // retry with backup configs in this version).
+    std::optional<std::vector<std::uint8_t>> ech_config_list;
     std::optional<TlsRealityOptions> reality;
     bool handoff_raw_transport = false;
     std::optional<int> maximum_tls_version;

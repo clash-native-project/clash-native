@@ -272,6 +272,13 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_REALITY_PUBLIC_KEY").value_or("");
         trojan_config.reality_short_id =
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_REALITY_SHORT_ID").value_or("");
+        trojan_config.ech_enabled =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_ECH_ENABLED").value_or("0") != "0";
+        trojan_config.ech_config =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_ECH_CONFIG").value_or("");
+        trojan_config.ech_query_server_name =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_ECH_QUERY_SERVER_NAME")
+                .value_or("");
         trojan_config.websocket_host =
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_HOST").value_or("");
         trojan_config.websocket_path =
