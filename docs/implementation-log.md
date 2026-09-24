@@ -2383,3 +2383,12 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   New `async/held_operation.hpp` holds immovable any-sender ops for
   abort-on-destroy. Resolver top keeps resolve/cancel(RequestId) as
   the management plane. Full suite: 258 passed.
+
+## 2026-09-24
+
+- Phase 3: h2 streaming isolation proven with a real nghttp2
+  loopback server (`http2_streaming_test`: abort one exchange via
+  body cancel observes exactly one RST while the sibling completes;
+  plus a unary probe). ws-mux/smux/QUIC carriers audited
+  review-only (client-only, no loopback peer). Full suite: 260
+  passed.

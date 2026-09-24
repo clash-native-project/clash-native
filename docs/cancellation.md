@@ -12,8 +12,8 @@ cancels exactly that unit; siblings keep flowing.
 | --- | --- | --- |
 | TCP stream (`io::StreamHandle`) | `close()`; relay pumps join per direction | Isolated by construction; covered by relay tests |
 | UDP association (`io::DatagramHandle`) | `close()` aborts parked send/receive | Isolated by construction; Trojan/UoT close paths tested |
-| Streaming exchange (h2/h3) | abandon sender + body cancels | Believed isolated; needs a two-exchange isolation test |
-| Mux logical stream (ws-mux, smux, QUIC, h2 tunnel) | stream close / reset | Needs per-carrier isolation audit |
+| Streaming exchange (h2/h3) | abandon sender + body cancels | Verified: `http2_streaming_test` aborts one exchange (RST) while a sibling completes |
+| Mux logical stream (ws-mux, smux, QUIC, h2 tunnel) | stream close / reset | Audited: per-stream close erases state + signals the peer (ws-mux close frame, smux FIN, ngtcp2 shutdown) without touching the session; no loopback peer exists for these client-only carriers, so coverage stays at review + interop |
 | DNS query | `cancel(RequestId)` today | Redesign to sender-per-query (Phase 2) |
 | Proxy connection | none | Needs `ProxyServer::close_connection(id)` (Phase 1) |
 | Outbound open | bridge abort | Per-operation abort tested (Trojan config tests) |

@@ -350,6 +350,7 @@ if(BUILD_TESTING)
         tests/transport/shadowsocks_transport_test.cpp
         tests/transport/trojan_transport_test.cpp
         tests/transport/gun_transport_test.cpp
+        tests/transport/http2_streaming_test.cpp
         tests/transport/task_coroutine_test.cpp
     )
 
