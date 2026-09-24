@@ -148,7 +148,9 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                                                  : self->config_.server_name;
                 ws_options.tls_verify_peer = self->config_.verify_peer;
                 ws_options.tls_trusted_ca_pem = self->config_.trusted_ca_pem;
-                ws_options.tls_alpn_protocols = {"http/1.1"};
+                ws_options.tls_alpn_protocols = self->config_.alpn_protocols.empty()
+                                                    ? std::vector<std::string>{"http/1.1"}
+                                                    : self->config_.alpn_protocols;
                 ws_options.deadline = self->deadline_;
                 auto plain_stream = std::make_unique<net::TcpStream>(std::move(*self->socket_));
                 self->socket_.reset();
@@ -192,6 +194,9 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                                               : self->config_.server_name;
                 tls_options.verify_peer = self->config_.verify_peer;
                 tls_options.trusted_ca_pem = self->config_.trusted_ca_pem;
+                tls_options.alpn_protocols = self->config_.alpn_protocols.empty()
+                                                 ? std::vector<std::string>{"h2", "http/1.1"}
+                                                 : self->config_.alpn_protocols;
                 tls_options.deadline = self->deadline_;
                 auto plain_stream = std::make_unique<net::TcpStream>(std::move(*self->socket_));
                 self->socket_.reset();

@@ -2285,3 +2285,9 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   (UDP command header, multi-destination semantics). New
   `trojan_transport_test` covers wire bytes, round-trip, chunking,
   and framing errors. Full suite: 240 passed.
+
+## 2026-09-24
+
+- Matched Mihomo Trojan ALPN defaults: empty `alpn_protocols` now
+  offers `{"h2", "http/1.1"}` on TCP and `{"http/1.1"}` on
+  WebSocket; explicit lists override. Full suite: 240 passed.
