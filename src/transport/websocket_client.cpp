@@ -1,5 +1,6 @@
 #include <clash_native/transport/websocket_client.hpp>
 
+#include <clash_native/async/bridge.hpp>
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/transport/tls_client.hpp>
@@ -16,13 +17,18 @@
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
 
+#include <stdexec/execution.hpp>
+
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -327,6 +333,9 @@ std::optional<core::Error> validate_options(const WebSocketClientOptions &option
     }
     if (options.max_message_size == 0 || options.max_message_size > kMaximumMessageSize) {
         return configuration_error("WebSocket message size limit is invalid");
+    }
+    if (options.v2ray_http_upgrade_fast_open && !options.v2ray_http_upgrade) {
+        return configuration_error("WebSocket fast-open requires v2ray-http-upgrade");
     }
     for (const auto &header : options.headers) {
         if (!is_token(header.name) || contains_control(header.value)) {
@@ -676,6 +685,268 @@ class WebSocketStream final : public io::StreamHandle {
     std::shared_ptr<WebSocketStreamState> state_;
 };
 
+// Fast-open HTTP Upgrade tunnel (Mihomo v2ray-http-upgrade-fast-open). Writes
+// flow to the inner stream immediately; the first read drives the 101
+// validation and then serves the stream. A rejected upgrade fails reads
+// (writes fail naturally once closed).
+// Fast-open HTTP Upgrade tunnel (Mihomo v2ray-http-upgrade-fast-open). Writes
+// flow to the inner stream immediately; the first read drives the 101
+// validation and then serves the stream. A rejected upgrade fails reads
+// (writes fail naturally once closed).
+class FastOpenUpgradeStream final : public io::StreamHandle {
+  public:
+    static std::unique_ptr<FastOpenUpgradeStream> create(std::unique_ptr<io::StreamHandle> inner) {
+        return std::unique_ptr<FastOpenUpgradeStream>(new FastOpenUpgradeStream(std::move(inner)));
+    }
+
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        using Signatures =
+            stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                           stdexec::set_error_t(std::exception_ptr),
+                                           stdexec::set_stopped_t()>;
+        std::shared_ptr<State> shared = state_;
+        {
+            std::unique_lock<std::mutex> lock(shared->mutex_);
+            if (shared->failed_) {
+                auto failure = shared->failure_;
+                lock.unlock();
+                return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
+                    [failure](auto terminal) mutable { terminal(core::fail(failure)); },
+                    Translate{})};
+            }
+            if (shared->validated_ && !shared->remainder_.empty()) {
+                const auto count = std::min<std::size_t>(shared->remainder_.size(), buffer.size());
+                std::memcpy(buffer.data(), shared->remainder_.data(), count);
+                shared->remainder_.erase(shared->remainder_.begin(),
+                                         shared->remainder_.begin() +
+                                             static_cast<std::ptrdiff_t>(count));
+                lock.unlock();
+                return io::AnySender<std::optional<std::size_t>>{
+                    stdexec::just(std::optional<std::size_t>{count})};
+            }
+            if (shared->validated_) {
+                lock.unlock();
+                return shared->inner_->async_read_some(buffer);
+            }
+        }
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
+            [shared, buffer](auto terminal) mutable {
+                ValidationLoop::start(std::move(shared), buffer, std::move(terminal));
+            },
+            Translate{})};
+    }
+
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        std::shared_ptr<State> shared = state_;
+        {
+            std::unique_lock<std::mutex> lock(shared->mutex_);
+            if (shared->failed_) {
+                auto failure = shared->failure_;
+                lock.unlock();
+                return io::AnySender<std::size_t>{
+                    stdexec::just_error(std::make_exception_ptr(core::fail(failure)))};
+            }
+        }
+        return shared->inner_->async_write(buffer);
+    }
+
+    boost::asio::any_io_executor executor() noexcept override { return state_->inner_->executor(); }
+
+    boost::asio::ip::tcp::endpoint
+    local_endpoint(boost::system::error_code &error) const noexcept override {
+        return state_->inner_->local_endpoint(error);
+    }
+
+    void shutdown_send(boost::system::error_code &error) noexcept override {
+        state_->inner_->shutdown_send(error);
+    }
+
+    void close() noexcept override {
+        std::unique_lock<std::mutex> lock(state_->mutex_);
+        state_->closed_ = true;
+        state_->inner_->close();
+    }
+
+  private:
+    struct Translate {
+        void operator()(auto receiver, core::Result<std::optional<std::size_t>> result) const {
+            if (!result) {
+                stdexec::set_error(std::move(receiver),
+                                   std::make_exception_ptr(core::fail(result.error())));
+                return;
+            }
+            stdexec::set_value(std::move(receiver), std::move(result.value()));
+        }
+    };
+
+    struct State {
+        std::unique_ptr<io::StreamHandle> inner_;
+        std::mutex mutex_;
+        bool validated_ = false;
+        bool failed_ = false;
+        bool closed_ = false;
+        core::Error failure_ = {core::ErrorCode::cancelled, "fast-open upgrade not validated"};
+        std::vector<std::uint8_t> remainder_;
+    };
+
+    explicit FastOpenUpgradeStream(std::unique_ptr<io::StreamHandle> stream)
+        : state_(std::make_shared<State>()) {
+        state_->inner_ = std::move(stream);
+    }
+
+    // Self-driving 101 validation loop. Calls the terminal exactly once on
+    // every path; a destroyed outer operation drops the late terminal via
+    // the callback sender's settlement flag. The loop is bounded by the
+    // response size guard and by close(), which unblocks the inner read.
+    // NOTE: no shared_from_this anywhere in this loop; ownership flows
+    // explicitly through shared_ptr parameters.
+    struct ValidationLoop : public std::enable_shared_from_this<ValidationLoop> {
+        std::shared_ptr<State> state;
+        boost::asio::mutable_buffer buffer;
+        std::function<void(core::Result<std::optional<std::size_t>>)> terminal;
+        std::string head_;
+        std::array<std::uint8_t, 1024> chunk_{};
+
+        ValidationLoop(std::shared_ptr<State> state, boost::asio::mutable_buffer buffer,
+                       std::function<void(core::Result<std::optional<std::size_t>>)> terminal)
+            : state(std::move(state)), buffer(buffer), terminal(std::move(terminal)) {}
+
+        static void start(std::shared_ptr<State> state, boost::asio::mutable_buffer buffer,
+                          std::function<void(core::Result<std::optional<std::size_t>>)> terminal) {
+            auto loop = std::shared_ptr<ValidationLoop>(
+                new ValidationLoop(std::move(state), std::move(buffer), std::move(terminal)));
+            step(std::move(loop));
+        }
+
+        struct StepReceiver {
+            std::shared_ptr<ValidationLoop> owner;
+            void set_value(std::optional<std::size_t> got) noexcept {
+                ValidationLoop::on_read(std::move(owner), std::move(got));
+            }
+            void set_error(std::exception_ptr error) noexcept {
+                ValidationLoop::on_error(std::move(owner), std::move(error));
+            }
+            void set_stopped() noexcept { ValidationLoop::on_stopped(std::move(owner)); }
+        };
+
+        static void step(std::shared_ptr<ValidationLoop> self) {
+            // NOTE: name the sender first; argument evaluation order is
+            // unspecified and moving self into the receiver first would
+            // null it before the sender is built.
+            auto sender = self->state->inner_->async_read_some(boost::asio::buffer(self->chunk_));
+            async::start_with_receiver(std::move(sender), StepReceiver{std::move(self)});
+        }
+
+        static void on_read(std::shared_ptr<ValidationLoop> self, std::optional<std::size_t> got) {
+            if (!got) {
+                finish(std::move(self), core::fail(handshake_error(boost::asio::error::eof)));
+                return;
+            }
+            self->head_.append(reinterpret_cast<const char *>(self->chunk_.data()), *got);
+            if (self->head_.find("\r\n\r\n") == std::string::npos) {
+                if (self->head_.size() > 64 * 1024) {
+                    finish(std::move(self),
+                           core::fail(handshake_error(boost::asio::error::message_size)));
+                    return;
+                }
+                step(std::move(self));
+                return;
+            }
+            const auto status_line = self->head_.substr(0, self->head_.find("\r\n"));
+            const auto lower_head = lower_copy(self->head_);
+            const bool accepted = status_line.size() >= 12 && status_line.substr(9, 3) == "101" &&
+                                  lower_head.find("\nconnection:") != std::string::npos &&
+                                  lower_head.find("upgrade") != std::string::npos &&
+                                  lower_head.find("\nupgrade:") != std::string::npos &&
+                                  lower_head.find("websocket") != std::string::npos;
+            if (!accepted) {
+                finish(std::move(self), core::fail(handshake_error(boost::asio::error::fault)));
+                return;
+            }
+            const auto body_start = self->head_.find("\r\n\r\n") + 4;
+            std::unique_lock<std::mutex> lock(self->state->mutex_);
+            self->state->remainder_.assign(
+                self->head_.begin() + static_cast<std::ptrdiff_t>(body_start), self->head_.end());
+            self->state->validated_ = true;
+            if (!self->state->remainder_.empty()) {
+                const auto count =
+                    std::min<std::size_t>(self->state->remainder_.size(), self->buffer.size());
+                std::memcpy(self->buffer.data(), self->state->remainder_.data(), count);
+                self->state->remainder_.erase(self->state->remainder_.begin(),
+                                              self->state->remainder_.begin() +
+                                                  static_cast<std::ptrdiff_t>(count));
+                lock.unlock();
+                finish(std::move(self), std::optional<std::size_t>{count});
+                return;
+            }
+            lock.unlock();
+            auto sender = self->state->inner_->async_read_some(self->buffer);
+            async::start_with_receiver(std::move(sender), ServeReceiver{std::move(self)});
+        }
+
+        struct ServeReceiver {
+            std::shared_ptr<ValidationLoop> owner;
+            void set_value(std::optional<std::size_t> got) noexcept {
+                ValidationLoop::finish(std::move(owner), std::move(got));
+            }
+            void set_error(std::exception_ptr error) noexcept {
+                ValidationLoop::finish(std::move(owner),
+                                       core::fail(ServeReceiver::map_error(std::move(error))));
+            }
+            void set_stopped() noexcept {
+                ValidationLoop::finish(std::move(owner),
+                                       core::fail(core::Error{core::ErrorCode::cancelled,
+                                                              "fast-open upgrade read cancelled"}));
+            }
+
+            static core::Error map_error(std::exception_ptr error) {
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    return failure;
+                } catch (...) {
+                }
+                return core::Error{core::ErrorCode::carrier_handshake,
+                                   "fast-open upgrade read failed"};
+            }
+        };
+
+        static void on_error(std::shared_ptr<ValidationLoop> self, std::exception_ptr error) {
+            try {
+                std::rethrow_exception(std::move(error));
+            } catch (const core::Error &failure) {
+                finish(std::move(self), core::fail(failure));
+                return;
+            } catch (...) {
+            }
+            finish(std::move(self), core::fail(core::Error{core::ErrorCode::carrier_handshake,
+                                                           "fast-open upgrade validation read "
+                                                           "failed"}));
+        }
+
+        static void on_stopped(std::shared_ptr<ValidationLoop> self) {
+            finish(std::move(self), core::fail(core::Error{core::ErrorCode::cancelled,
+                                                           "fast-open upgrade validation "
+                                                           "cancelled"}));
+        }
+
+        static void finish(std::shared_ptr<ValidationLoop> self,
+                           core::Result<std::optional<std::size_t>> result) {
+            if (!result) {
+                std::unique_lock<std::mutex> lock(self->state->mutex_);
+                if (!self->state->validated_ && !self->state->failed_) {
+                    self->state->failed_ = true;
+                    self->state->failure_ = result.error();
+                    self->state->inner_->close();
+                }
+            }
+            self->terminal(std::move(result));
+        }
+    };
+
+    std::shared_ptr<State> state_;
+};
 class WebSocketClientHandshakeOperation final
     : public WebSocketClientHandshake,
       public std::enable_shared_from_this<WebSocketClientHandshakeOperation> {
@@ -716,6 +987,24 @@ class WebSocketClientHandshakeOperation final
             co_return;
         }
         if (self->completed_) {
+            co_return;
+        }
+        if (self->options_.v2ray_http_upgrade_fast_open) {
+            if (!early.remainder.empty()) {
+                try {
+                    co_await self->stream_->async_write(boost::asio::buffer(early.remainder));
+                } catch (const core::Error &failure) {
+                    self->finish(core::fail(failure));
+                    co_return;
+                } catch (...) {
+                    self->finish(core::fail(handshake_error(boost::asio::error::fault)));
+                    co_return;
+                }
+                if (self->completed_) {
+                    co_return;
+                }
+            }
+            self->finish(FastOpenUpgradeStream::create(std::move(self->stream_)));
             co_return;
         }
         std::string head;

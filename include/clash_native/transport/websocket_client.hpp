@@ -36,6 +36,10 @@ struct WebSocketClientOptions {
     // v2ray-http-upgrade: plain HTTP Upgrade tunnel without WebSocket
     // framing; initial_payload is written raw after the 101.
     bool v2ray_http_upgrade = false;
+    // v2ray-http-upgrade-fast-open: deliver the tunnel immediately after
+    // sending the Upgrade request (Mihomo fast-open). Writes flow at once;
+    // reads wait for the 101 validation and fail when it is rejected.
+    bool v2ray_http_upgrade_fast_open = false;
     std::size_t max_message_size = 16 * 1024 * 1024;
     // When enabled, perform a TLS handshake before the HTTP/1.1 Upgrade.
     bool tls = false;

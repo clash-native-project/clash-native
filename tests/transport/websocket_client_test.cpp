@@ -377,3 +377,91 @@ TEST(WebSocketClientTest, TunnelsRawBytesWithHttpUpgrade) {
     context.stop();
     worker.join();
 }
+TEST(WebSocketClientTest, FastOpenUpgradeWritesBefore101) {
+    boost::asio::io_context context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{
+        context.get_executor()};
+    std::uint16_t port = 0;
+    RawPeer peer(&port);
+    boost::asio::ip::tcp::socket client(context);
+    client.connect({boost::asio::ip::address_v4::loopback(), port});
+    peer.wait_accept();
+
+    clash_native::transport::WebSocketClientOptions options;
+    options.host = "example.com";
+    options.target = "/up";
+    options.v2ray_http_upgrade = true;
+    options.v2ray_http_upgrade_fast_open = true;
+    options.initial_payload = {'E', 'A', 'R', 'L', 'Y'};
+    auto stream = std::make_unique<clash_native::net::TcpStream>(std::move(client));
+    std::promise<clash_native::core::Result<std::unique_ptr<clash_native::io::StreamHandle>>> done;
+    auto future = done.get_future();
+    const auto handshake = clash_native::transport::async_websocket_client_handshake(
+        std::move(stream), std::move(options),
+        [&done](auto result) { done.set_value(std::move(result)); });
+    std::thread worker([&] { context.run(); });
+
+    const auto request = peer.read_request();
+    EXPECT_NE(request.find("GET /up HTTP/1.1\r\n"), std::string::npos);
+    // Without any 101 sent, the initial payload must already be on the wire:
+    // read it in the background with a deadline.
+    auto early = std::async(std::launch::async, [&peer] { return peer.read_exactly(5); });
+    ASSERT_EQ(early.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_EQ(early.get(), (std::vector<std::uint8_t>{'E', 'A', 'R', 'L', 'Y'}));
+    peer.write_all("HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: "
+                   "websocket\r\n\r\n");
+    auto opened = future.get();
+    ASSERT_TRUE(opened) << (opened ? "" : opened.error().context);
+    // Tunnel works both ways after the 101.
+    auto tunnel = std::move(opened.value());
+    const std::vector<std::uint8_t> ping{'p', 'i', 'n', 'g'};
+    // NOTE: teardown below always stops the context first so a failing
+    // step cannot hang worker.join() behind the live work guard.
+    bool body_ok = false;
+    std::optional<std::size_t> got;
+    std::array<std::uint8_t, 4> pong{};
+    try {
+        EXPECT_EQ(sync_get(tunnel->async_write(boost::asio::buffer(ping))), 4U);
+        if (::testing::Test::HasFailure()) {
+            throw std::runtime_error("ping write mismatch");
+        }
+        EXPECT_EQ(peer.read_exactly(4), ping);
+        if (::testing::Test::HasFailure()) {
+            throw std::runtime_error("ping echo mismatch");
+        }
+        peer.write_all("pong");
+        got = sync_get(tunnel->async_read_some(boost::asio::buffer(pong)));
+        body_ok = true;
+    } catch (const std::exception &failure) {
+    }
+    tunnel->close();
+    context.stop();
+    worker.join();
+    ASSERT_TRUE(body_ok);
+    ASSERT_TRUE(got);
+    EXPECT_EQ(*got, 4U);
+    EXPECT_EQ(std::vector<std::uint8_t>(pong.begin(), pong.end()),
+              (std::vector<std::uint8_t>{'p', 'o', 'n', 'g'}));
+}
+
+TEST(WebSocketClientTest, RejectsFastOpenWithoutUpgrade) {
+    boost::asio::io_context context;
+    auto stream = std::make_unique<TestStream>(context.get_executor());
+    clash_native::transport::WebSocketClientOptions options;
+    options.host = "localhost";
+    options.target = "/up";
+    options.v2ray_http_upgrade_fast_open = true;
+
+    std::promise<clash_native::core::Result<std::unique_ptr<clash_native::io::StreamHandle>>>
+        completion;
+    auto future = completion.get_future();
+    const auto operation = clash_native::transport::async_websocket_client_handshake(
+        std::move(stream), std::move(options),
+        [&completion](auto result) { completion.set_value(std::move(result)); });
+
+    ASSERT_TRUE(operation);
+    context.run();
+    const auto result = future.get();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::configuration);
+}

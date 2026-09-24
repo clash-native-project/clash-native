@@ -39,12 +39,16 @@ struct TrojanOutboundConfig {
     std::size_t websocket_max_early_data = 0;
     std::string websocket_early_data_header;
     bool websocket_v2ray_http_upgrade = false;
+    bool websocket_v2ray_http_upgrade_fast_open = false;
     // Empty means Mihomo defaults: {"h2", "http/1.1"} for TCP,
     // {"http/1.1"} for WebSocket.
     std::vector<std::string> alpn_protocols;
     // ClientHello camouflage profile (Mihomo fingerprint). Empty means the
     // default BoringSSL emission; "chrome" selects the Chrome profile.
     std::string fingerprint;
+    // WS-TLS handshake fingerprint override (Mihomo client-fingerprint).
+    // Empty falls back to fingerprint.
+    std::string client_fingerprint;
     // Trojan-SS (ss-opts): when enabled, the transport stream is wrapped
     // in classic Shadowsocks AEAD framing before the Trojan header is
     // written. Empty method means AES-128-GCM, matching Mihomo.

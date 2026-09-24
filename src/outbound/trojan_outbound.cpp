@@ -471,7 +471,9 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 ws_options.tls_alpn_protocols = self->config_.alpn_protocols.empty()
                                                     ? std::vector<std::string>{"http/1.1"}
                                                     : self->config_.alpn_protocols;
-                ws_options.tls_fingerprint = self->config_.fingerprint;
+                ws_options.tls_fingerprint = self->config_.client_fingerprint.empty()
+                                                 ? self->config_.fingerprint
+                                                 : self->config_.client_fingerprint;
                 if (!self->config_.reality_public_key.empty()) {
                     ws_options.tls_reality = transport::TlsRealityOptions{
                         self->config_.reality_public_key, self->config_.reality_short_id};
@@ -479,6 +481,8 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 ws_options.max_early_data = self->config_.websocket_max_early_data;
                 ws_options.early_data_header_name = self->config_.websocket_early_data_header;
                 ws_options.v2ray_http_upgrade = self->config_.websocket_v2ray_http_upgrade;
+                ws_options.v2ray_http_upgrade_fast_open =
+                    self->config_.websocket_v2ray_http_upgrade_fast_open;
                 ws_options.deadline = self->deadline_;
                 if (!self->config_.ss_enabled) {
                     auto header = build_request_header(self->config_, self->request_.destination,
@@ -836,6 +840,8 @@ TrojanOutbound::open_datagram(core::DatagramRequest request) {
             }
             core::StreamRequest stream_request{*request.initial_destination, std::nullopt,
                                                request.dial_trace};
+            // NOTE: no SS wrap here: the shared connect path already layers
+            // Shadowsocks before the trojan header for every command.
             auto operation = std::make_shared<TrojanConnectOperation>(
                 runtime, std::move(resolver), std::move(config), std::move(stream_request),
                 [handler = std::move(handler)](core::StreamOpenResult result) mutable {

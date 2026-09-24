@@ -2501,3 +2501,15 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   (no backup-config retry in this version); outbound chains stay
   untested live per discipline (no ECH-capable test server exists).
   Full suite: 284 passed.
+
+## 2026-09-24
+
+- Trojan parity sweep: SS already covers UDP through the shared connect
+  path (an extra post-open wrap was added and reverted after proving
+  double encryption); WS client-fingerprint override plumbed;
+  v2ray-http-upgrade fast-open via a validating wrapper stream
+  (immediate writes, reads gated on the 101); trojan UDP and SS-UDP
+  interop cases pass against real Mihomo. Fixed a use-after-move found
+  by cdb (sender and receiver built from one moved object in a single
+  call) and a test-teardown hang masking failures. Full suite:
+  286 passed; Trojan interop group green.

@@ -279,6 +279,11 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
         trojan_config.ech_query_server_name =
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_ECH_QUERY_SERVER_NAME")
                 .value_or("");
+        trojan_config.client_fingerprint =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_CLIENT_FINGERPRINT").value_or("");
+        trojan_config.websocket_v2ray_http_upgrade_fast_open =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_UPGRADE_FAST_OPEN")
+                .value_or("0") != "0";
         trojan_config.websocket_host =
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_HOST").value_or("");
         trojan_config.websocket_path =
