@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-namespace clash_native::transport::shadowsocks {
+namespace clash_native::transport::proxy {
 
 enum class RestlsCommandKind : std::uint8_t {
     noop = 0,
@@ -85,4 +85,4 @@ class RestlsApplicationCodec final {
     std::uint64_t counter_ = 0;
 };
 
-} // namespace clash_native::transport::shadowsocks
+} // namespace clash_native::transport::proxy

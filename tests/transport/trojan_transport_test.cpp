@@ -1,6 +1,9 @@
 #include <clash_native/core/error.hpp>
+#include <clash_native/core/outbound.hpp>
 #include <clash_native/io/datagram_handle.hpp>
 #include <clash_native/net/tcp_stream.hpp>
+#include <clash_native/outbound/trojan_outbound.hpp>
+#include <clash_native/runtime/asio_runtime.hpp>
 #include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/trojan/packet_conn.hpp>
 #include <clash_native/transport/trojan/ss_stream.hpp>
@@ -316,4 +319,48 @@ TEST(TrojanSsStreamTest, RejectsUnsupportedMethodsAndEmptyPassword) {
     EXPECT_FALSE(make_trojan_ss_stream_handle(make_plain(), "AES-128-GCM", ""));
     EXPECT_FALSE(make_trojan_ss_stream_handle(make_plain(), "not-a-method", "password"));
     EXPECT_FALSE(make_trojan_ss_stream_handle(nullptr, "AES-128-GCM", "password"));
+}
+
+TEST(TrojanOutboundConfigTest, RejectsUnknownSecurityMode) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    runtime.start();
+    clash_native::outbound::TrojanOutboundConfig config;
+    config.id = "test-trojan";
+    config.server_host = "127.0.0.1";
+    config.server_port = 1;
+    config.password = "password";
+    config.security_mode = "reality";
+    clash_native::outbound::TrojanOutbound outbound(runtime, config);
+    EXPECT_FALSE(outbound.validate());
+
+    auto wait = stdexec::sync_wait(outbound.connect_stream(
+        {clash_native::core::Destination::domain("example.com", 80), std::nullopt, nullptr}));
+    ASSERT_TRUE(wait.has_value());
+    const auto result = std::move(std::get<0>(*wait));
+    EXPECT_FALSE(result.succeeded());
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::configuration);
+}
+
+TEST(TrojanOutboundConfigTest, OverlayOpenFailurePropagatesWithoutHanging) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    runtime.start();
+    // Closed loopback port: TCP connect refuses before any overlay bytes.
+    clash_native::outbound::TrojanOutboundConfig config;
+    config.id = "test-trojan";
+    config.server_host = "127.0.0.1";
+    config.server_port = 1;
+    config.password = "password";
+    config.security_mode = "shadow-tls";
+    config.shadow_tls_options.password = "overlay-password";
+    clash_native::outbound::TrojanOutbound outbound(runtime, config);
+    EXPECT_TRUE(outbound.validate());
+
+    auto wait = stdexec::sync_wait(outbound.connect_stream(
+        {clash_native::core::Destination::domain("example.com", 80), std::nullopt, nullptr}));
+    ASSERT_TRUE(wait.has_value());
+    const auto result = std::move(std::get<0>(*wait));
+    EXPECT_FALSE(result.succeeded());
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::endpoint_connection);
 }

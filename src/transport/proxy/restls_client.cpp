@@ -1,8 +1,8 @@
-#include <clash_native/transport/shadowsocks/restls_client.hpp>
+#include <clash_native/transport/proxy/restls_client.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
-#include <clash_native/transport/shadowsocks/restls.hpp>
+#include <clash_native/transport/proxy/restls.hpp>
 
 #include <botan/asn1_obj.h>
 #include <botan/auto_rng.h>
@@ -44,7 +44,7 @@
 #include <utility>
 #include <vector>
 
-namespace clash_native::transport::shadowsocks {
+namespace clash_native::transport::proxy {
 
 namespace {
 
@@ -1262,4 +1262,4 @@ void async_open_restls(std::unique_ptr<io::StreamHandle> stream, RestlsClientOpt
         ->start();
 }
 
-} // namespace clash_native::transport::shadowsocks
+} // namespace clash_native::transport::proxy

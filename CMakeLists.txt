@@ -148,12 +148,12 @@ add_library(clash-native-core STATIC
     src/transport/shadowsocks/ss2022_packet.cpp
     src/transport/shadowsocks/ss2022_stream.cpp
     src/transport/shadowsocks/simple_obfs.cpp
-    src/transport/shadowsocks/shadow_tls.cpp
-    src/transport/shadowsocks/shadow_tls_v3.cpp
-    src/transport/shadowsocks/restls.cpp
-    src/transport/shadowsocks/restls_client.cpp
-    src/transport/shadowsocks/jls.cpp
-    src/transport/shadowsocks/jls_client.cpp
+    src/transport/proxy/shadow_tls.cpp
+    src/transport/proxy/shadow_tls_v3.cpp
+    src/transport/proxy/restls.cpp
+    src/transport/proxy/restls_client.cpp
+    src/transport/proxy/jls.cpp
+    src/transport/proxy/jls_client.cpp
     src/transport/shadowsocks/websocket_plugin.cpp
     src/transport/shadowsocks/websocket_mux.cpp
     src/transport/shadowsocks/udp_over_tcp.cpp

@@ -4,6 +4,9 @@
 #include <clash_native/dns/resolver_service.hpp>
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
+#include <clash_native/transport/proxy/jls_client.hpp>
+#include <clash_native/transport/proxy/restls_client.hpp>
+#include <clash_native/transport/proxy/shadow_tls.hpp>
 #include <clash_native/transport/websocket_client.hpp>
 
 #include <cstdint>
@@ -37,6 +40,13 @@ struct TrojanOutboundConfig {
     bool ss_enabled = false;
     std::string ss_method;
     std::string ss_password;
+    // TLS-underlay camouflage for TCP mode, matching Mihomo's mutually
+    // exclusive shadow-tls/restls/jls options. Empty means direct TLS.
+    // (Not applied under WebSocket TLS: the ws client owns its handshake.)
+    std::string security_mode;
+    transport::proxy::ShadowTlsClientOptions shadow_tls_options;
+    transport::proxy::RestlsClientOptions restls_options;
+    transport::proxy::JlsClientOptions jls_options;
 };
 
 class TrojanOutbound final : public core::Outbound {

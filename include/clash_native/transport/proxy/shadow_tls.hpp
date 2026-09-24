@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-namespace clash_native::transport::shadowsocks {
+namespace clash_native::transport::proxy {
 
 struct ShadowTlsClientOptions {
     int version = 2;
@@ -27,4 +27,4 @@ using ShadowTlsOpenHandler = std::function<void(core::Result<std::unique_ptr<io:
 void async_open_shadow_tls(std::unique_ptr<io::StreamHandle> stream, ShadowTlsClientOptions options,
                            ShadowTlsOpenHandler handler);
 
-} // namespace clash_native::transport::shadowsocks
+} // namespace clash_native::transport::proxy

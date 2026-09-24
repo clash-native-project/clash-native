@@ -1,8 +1,8 @@
 #pragma once
 
-#include <clash_native/transport/shadowsocks/shadow_tls.hpp>
+#include <clash_native/transport/proxy/shadow_tls.hpp>
 
-namespace clash_native::transport::shadowsocks {
+namespace clash_native::transport::proxy {
 
 // Opens a Shadow-TLS v3 carrier over an already connected stream. The v3
 // handshake uses a password-authenticated TLS 1.3 ClientHello and preserves
@@ -10,4 +10,4 @@ namespace clash_native::transport::shadowsocks {
 void async_open_shadow_tls_v3(std::unique_ptr<io::StreamHandle> stream,
                               ShadowTlsClientOptions options, ShadowTlsOpenHandler handler);
 
-} // namespace clash_native::transport::shadowsocks
+} // namespace clash_native::transport::proxy

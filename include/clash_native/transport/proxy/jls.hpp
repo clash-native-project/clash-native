@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace clash_native::transport::shadowsocks {
+namespace clash_native::transport::proxy {
 
 struct JlsUser {
     std::string username;
@@ -30,4 +30,4 @@ jls_client_hello_auth_data(std::span<const std::uint8_t> wire_message);
 core::Result<std::vector<std::uint8_t>>
 jls_server_hello_auth_data(std::span<const std::uint8_t> wire_message);
 
-} // namespace clash_native::transport::shadowsocks
+} // namespace clash_native::transport::proxy

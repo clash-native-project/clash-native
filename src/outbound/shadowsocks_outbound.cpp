@@ -7,11 +7,11 @@
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/transport/proxy/crypto.hpp>
+#include <clash_native/transport/proxy/jls_client.hpp>
+#include <clash_native/transport/proxy/restls_client.hpp>
+#include <clash_native/transport/proxy/shadow_tls.hpp>
 #include <clash_native/transport/shadowsocks/aead_packet.hpp>
-#include <clash_native/transport/shadowsocks/jls_client.hpp>
 #include <clash_native/transport/shadowsocks/legacy_stream.hpp>
-#include <clash_native/transport/shadowsocks/restls_client.hpp>
-#include <clash_native/transport/shadowsocks/shadow_tls.hpp>
 #include <clash_native/transport/shadowsocks/simple_obfs.hpp>
 #include <clash_native/transport/shadowsocks/ss2022_packet.hpp>
 #include <clash_native/transport/shadowsocks/ss2022_stream.hpp>
@@ -969,7 +969,7 @@ class ShadowsocksConnectOperation final
     static exec::task<void> open_shadow_tls(std::shared_ptr<ShadowsocksConnectOperation> self) {
         auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
             std::make_unique<net::TcpStream>(std::move(*self->socket_)));
-        ss::ShadowTlsClientOptions options;
+        transport::proxy::ShadowTlsClientOptions options;
         options.version = self->config_.plugin_version;
         options.password = self->config_.plugin_password;
         options.host = self->config_.plugin_host;
@@ -983,7 +983,7 @@ class ShadowsocksConnectOperation final
                 [self, stream = std::move(stream), options = std::move(options)](
                     async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
                         done) mutable {
-                    ss::async_open_shadow_tls(
+                    transport::proxy::async_open_shadow_tls(
                         std::move(*stream), std::move(options),
                         [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
                             done(std::move(opened));
@@ -1009,7 +1009,7 @@ class ShadowsocksConnectOperation final
     static exec::task<void> open_restls(std::shared_ptr<ShadowsocksConnectOperation> self) {
         auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
             std::make_unique<net::TcpStream>(std::move(*self->socket_)));
-        ss::RestlsClientOptions options;
+        transport::proxy::RestlsClientOptions options;
         options.server_name = self->config_.plugin_host;
         options.password = self->config_.plugin_password;
         options.version_hint = self->config_.plugin_version_hint;
@@ -1021,7 +1021,7 @@ class ShadowsocksConnectOperation final
                 [self, stream = std::move(stream), options = std::move(options)](
                     async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
                         done) mutable {
-                    ss::async_open_restls(
+                    transport::proxy::async_open_restls(
                         std::move(*stream), std::move(options),
                         [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
                             done(std::move(opened));
@@ -1047,7 +1047,7 @@ class ShadowsocksConnectOperation final
     static exec::task<void> open_jls(std::shared_ptr<ShadowsocksConnectOperation> self) {
         auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
             std::make_unique<net::TcpStream>(std::move(*self->socket_)));
-        ss::JlsClientOptions options;
+        transport::proxy::JlsClientOptions options;
         options.server_name = self->config_.plugin_host;
         options.username = self->config_.plugin_username;
         options.password = self->config_.plugin_password;
@@ -1059,7 +1059,7 @@ class ShadowsocksConnectOperation final
                 [self, stream = std::move(stream), options = std::move(options)](
                     async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
                         done) mutable {
-                    ss::async_open_jls(
+                    transport::proxy::async_open_jls(
                         std::move(*stream), std::move(options),
                         [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
                             done(std::move(opened));

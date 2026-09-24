@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace clash_native::transport::shadowsocks {
+namespace clash_native::transport::proxy {
 
 struct JlsClientOptions {
     std::string server_name;
@@ -23,4 +23,4 @@ using JlsOpenHandler = std::function<void(core::Result<std::unique_ptr<io::Strea
 void async_open_jls(std::unique_ptr<io::StreamHandle> stream, JlsClientOptions options,
                     JlsOpenHandler handler);
 
-} // namespace clash_native::transport::shadowsocks
+} // namespace clash_native::transport::proxy

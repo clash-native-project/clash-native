@@ -1,8 +1,8 @@
-#include <clash_native/transport/shadowsocks/jls_client.hpp>
+#include <clash_native/transport/proxy/jls_client.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
-#include <clash_native/transport/shadowsocks/jls.hpp>
+#include <clash_native/transport/proxy/jls.hpp>
 
 #include <botan/auto_rng.h>
 #include <botan/credentials_manager.h>
@@ -32,7 +32,7 @@
 #include <utility>
 #include <vector>
 
-namespace clash_native::transport::shadowsocks {
+namespace clash_native::transport::proxy {
 
 namespace {
 
@@ -814,4 +814,4 @@ void async_open_jls(std::unique_ptr<io::StreamHandle> stream, JlsClientOptions o
         ->start();
 }
 
-} // namespace clash_native::transport::shadowsocks
+} // namespace clash_native::transport::proxy

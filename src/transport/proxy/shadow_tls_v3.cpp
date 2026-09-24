@@ -1,4 +1,4 @@
-#include <clash_native/transport/shadowsocks/shadow_tls_v3.hpp>
+#include <clash_native/transport/proxy/shadow_tls_v3.hpp>
 
 #include <clash_native/net/stream_handle_adapter.hpp>
 
@@ -49,7 +49,7 @@
 #include <utility>
 #include <vector>
 
-namespace clash_native::transport::shadowsocks {
+namespace clash_native::transport::proxy {
 
 namespace {
 
@@ -960,4 +960,4 @@ void async_open_shadow_tls_v3(std::unique_ptr<io::StreamHandle> stream,
         ->start();
 }
 
-} // namespace clash_native::transport::shadowsocks
+} // namespace clash_native::transport::proxy

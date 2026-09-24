@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace clash_native::transport::shadowsocks {
+namespace clash_native::transport::proxy {
 
 struct RestlsClientOptions {
     std::string server_name;
@@ -25,4 +25,4 @@ using RestlsOpenHandler = std::function<void(core::Result<std::unique_ptr<io::St
 void async_open_restls(std::unique_ptr<io::StreamHandle> stream, RestlsClientOptions options,
                        RestlsOpenHandler handler);
 
-} // namespace clash_native::transport::shadowsocks
+} // namespace clash_native::transport::proxy

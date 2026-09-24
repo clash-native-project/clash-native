@@ -1,4 +1,4 @@
-#include <clash_native/transport/shadowsocks/restls.hpp>
+#include <clash_native/transport/proxy/restls.hpp>
 
 #include <blake3.h>
 
@@ -12,7 +12,7 @@
 #include <string>
 #include <utility>
 
-namespace clash_native::transport::shadowsocks {
+namespace clash_native::transport::proxy {
 
 namespace {
 
@@ -350,4 +350,4 @@ RestlsApplicationCodec::decode(std::span<const std::uint8_t> record) {
     return result;
 }
 
-} // namespace clash_native::transport::shadowsocks
+} // namespace clash_native::transport::proxy

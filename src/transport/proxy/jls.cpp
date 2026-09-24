@@ -1,4 +1,4 @@
-#include <clash_native/transport/shadowsocks/jls.hpp>
+#include <clash_native/transport/proxy/jls.hpp>
 
 #include <openssl/evp.h>
 
@@ -9,7 +9,7 @@
 #include <string>
 #include <utility>
 
-namespace clash_native::transport::shadowsocks {
+namespace clash_native::transport::proxy {
 
 namespace {
 
@@ -246,4 +246,4 @@ jls_server_hello_auth_data(std::span<const std::uint8_t> wire_message) {
     return result;
 }
 
-} // namespace clash_native::transport::shadowsocks
+} // namespace clash_native::transport::proxy

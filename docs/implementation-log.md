@@ -2303,3 +2303,16 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   stream handle was deliberately not extracted. New SsStream tests
   verify sealing against the shared primitives and bidirectional
   framing. Full suite: 243 passed.
+
+## 2026-09-24
+
+- Moved shadow-tls/restls/JLS clients to shared
+  `transport/proxy/` (namespace `transport::proxy`; SS and test
+  callers re-pointed) and wired them as mutually exclusive
+  TLS-underlay overlays into the Trojan TCP chain
+  (`security_mode` + per-mode options, validated in both
+  `validate()` and open). WebSocket TLS keeps owning its own
+  handshake, so overlays apply to TCP mode only. New outbound
+  config tests cover mode rejection and failure propagation.
+  Mihomo interop for ss-opts/overlays/UDP/gRPC stays batched for
+  after the gRPC carrier. Full suite: 245 passed.

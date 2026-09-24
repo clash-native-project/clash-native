@@ -87,6 +87,13 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                  "Trojan outbound network must be tcp, ws, or wss"}));
             return;
         }
+        if (config_.security_mode != "" && config_.security_mode != "shadow-tls" &&
+            config_.security_mode != "restls" && config_.security_mode != "jls") {
+            finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::configuration,
+                 "Trojan security mode must be shadow-tls, restls, or jls"}));
+            return;
+        }
         deadline_ = std::chrono::steady_clock::now() + kConnectTimeout;
         timer_.expires_at(deadline_);
         timer_.async_wait([self = shared_from_this()](const boost::system::error_code &error) {
@@ -102,6 +109,58 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     }
 
   private:
+    // TLS-underlay camouflage over an established TCP stream. Each
+    // proxy::async_open_* is bridged into the chain task; aborting the
+    // operation cancels the late terminal like the SS plugin opens.
+    static exec::task<core::Result<std::unique_ptr<io::StreamHandle>>>
+    open_security_overlay(std::shared_ptr<TrojanConnectOperation> self,
+                          std::unique_ptr<io::StreamHandle> stream) {
+        const auto &mode = self->config_.security_mode;
+        using Opened = core::Result<std::unique_ptr<io::StreamHandle>>;
+        try {
+            if (mode == "shadow-tls") {
+                auto boxed = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(stream));
+                co_return co_await async::bridge_sender<Opened>(
+                    [self, boxed](async::BridgeSender<Opened>::Handler done) mutable {
+                        transport::proxy::async_open_shadow_tls(
+                            std::move(*boxed), self->config_.shadow_tls_options,
+                            [done](Opened opened) mutable { done(std::move(opened)); });
+                        using AbortFn = async::BridgeSender<Opened>::AbortFn;
+                        return AbortFn{[self] { self->abort(); }};
+                    });
+            }
+            if (mode == "restls") {
+                auto boxed = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(stream));
+                co_return co_await async::bridge_sender<Opened>(
+                    [self, boxed](async::BridgeSender<Opened>::Handler done) mutable {
+                        transport::proxy::async_open_restls(
+                            std::move(*boxed), self->config_.restls_options,
+                            [done](Opened opened) mutable { done(std::move(opened)); });
+                        using AbortFn = async::BridgeSender<Opened>::AbortFn;
+                        return AbortFn{[self] { self->abort(); }};
+                    });
+            }
+            if (mode == "jls") {
+                auto boxed = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(stream));
+                co_return co_await async::bridge_sender<Opened>(
+                    [self, boxed](async::BridgeSender<Opened>::Handler done) mutable {
+                        transport::proxy::async_open_jls(
+                            std::move(*boxed), self->config_.jls_options,
+                            [done](Opened opened) mutable { done(std::move(opened)); });
+                        using AbortFn = async::BridgeSender<Opened>::AbortFn;
+                        return AbortFn{[self] { self->abort(); }};
+                    });
+            }
+            co_return core::fail({core::ErrorCode::configuration,
+                                  "Trojan security mode must be shadow-tls, restls, or jls"});
+        } catch (const core::Error &failure) {
+            co_return core::fail(failure);
+        } catch (...) {
+            co_return core::fail(
+                {core::ErrorCode::transport_io, "Trojan security overlay open failed"});
+        }
+    }
+
     // Straight-line connect chain: TCP connect, TLS or WebSocket transport,
     // Trojan request write. Every terminal funnels through finish(), so the
     // spawned task always ends with a value.
@@ -202,10 +261,23 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 tls_options.deadline = self->deadline_;
                 auto plain_stream = std::make_unique<net::TcpStream>(std::move(*self->socket_));
                 self->socket_.reset();
+                std::unique_ptr<io::StreamHandle> camouflaged = std::move(plain_stream);
+                if (!self->config_.security_mode.empty()) {
+                    auto overlay = co_await open_security_overlay(self, std::move(camouflaged));
+                    if (!overlay) {
+                        self->finish(core::StreamOpenResult::failed(overlay.error()));
+                        co_return;
+                    }
+                    if (self->completed_) {
+                        overlay.value()->close();
+                        co_return;
+                    }
+                    camouflaged = std::move(overlay.value());
+                }
                 transport::TlsClientConnection connection;
                 try {
                     connection = co_await transport::async_tls_client_handshake(
-                        std::move(plain_stream), std::move(tls_options));
+                        std::move(camouflaged), std::move(tls_options));
                 } catch (const core::Error &failure) {
                     self->finish(core::StreamOpenResult::failed(failure));
                     co_return;
@@ -372,6 +444,11 @@ core::Status TrojanOutbound::validate() const {
     if ((config_.network == "ws" || config_.network == "wss") && config_.websocket_path.empty()) {
         return core::fail(
             {core::ErrorCode::configuration, "Trojan WebSocket path must not be empty"});
+    }
+    if (config_.security_mode != "" && config_.security_mode != "shadow-tls" &&
+        config_.security_mode != "restls" && config_.security_mode != "jls") {
+        return core::fail({core::ErrorCode::configuration,
+                           "Trojan security mode must be shadow-tls, restls, or jls"});
     }
     if (config_.ss_enabled) {
         if (config_.ss_password.empty()) {
