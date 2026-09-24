@@ -11,7 +11,11 @@
 #include <boost/asio/ssl/host_name_verification.hpp>
 #include <boost/asio/steady_timer.hpp>
 
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
 
 #include <cstdint>
 #include <memory>
@@ -86,6 +90,50 @@ class TlsClientHandshakeOperationImpl final
                               boost::asio::ssl::context::no_sslv2 |
                               boost::asio::ssl::context::no_sslv3);
 
+        if (!options_.client_certificate_pem.empty() != !options_.client_private_key_pem.empty()) {
+            return core::fail(
+                configuration_error("TLS client certificate and private key must be set together"));
+        }
+        if (!options_.client_certificate_pem.empty()) {
+            auto *native_context = context_->native_handle();
+            using BioPtr = std::unique_ptr<BIO, decltype(&BIO_free)>;
+            BioPtr cert_bio(
+                BIO_new_mem_buf(options_.client_certificate_pem.data(),
+                                static_cast<int>(options_.client_certificate_pem.size())),
+                BIO_free);
+            if (!cert_bio) {
+                return core::fail(configuration_error("TLS client certificate is not valid PEM"));
+            }
+            std::unique_ptr<X509, decltype(&X509_free)> certificate(
+                PEM_read_bio_X509_AUX(cert_bio.get(), nullptr, nullptr, nullptr), X509_free);
+            if (!certificate) {
+                return core::fail(configuration_error("TLS client certificate is not valid PEM"));
+            }
+            if (SSL_CTX_use_certificate(native_context, certificate.get()) != 1) {
+                return core::fail(
+                    configuration_error("failed to configure TLS client certificate"));
+            }
+            BioPtr key_bio(
+                BIO_new_mem_buf(options_.client_private_key_pem.data(),
+                                static_cast<int>(options_.client_private_key_pem.size())),
+                BIO_free);
+            if (!key_bio) {
+                return core::fail(configuration_error("TLS client private key is not valid PEM"));
+            }
+            std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> private_key(
+                PEM_read_bio_PrivateKey(key_bio.get(), nullptr, nullptr, nullptr), EVP_PKEY_free);
+            if (!private_key) {
+                return core::fail(configuration_error("TLS client private key is not valid PEM"));
+            }
+            if (SSL_CTX_use_PrivateKey(native_context, private_key.get()) != 1) {
+                return core::fail(
+                    configuration_error("failed to configure TLS client private key"));
+            }
+            if (SSL_CTX_check_private_key(native_context) != 1) {
+                return core::fail(
+                    configuration_error("TLS client private key does not match the certificate"));
+            }
+        }
         if (options_.verify_peer) {
             if (options_.server_name.empty()) {
                 return core::fail(
@@ -109,9 +157,11 @@ class TlsClientHandshakeOperationImpl final
                         transport_error("failed to load custom TLS trust roots", error));
                 }
             }
+            const auto &verify_name =
+                options_.verify_hostname.empty() ? options_.server_name : options_.verify_hostname;
             stream_->stream_->set_verify_mode(boost::asio::ssl::verify_peer);
             stream_->stream_->set_verify_callback(
-                boost::asio::ssl::host_name_verification(options_.server_name));
+                boost::asio::ssl::host_name_verification(verify_name));
         } else {
             stream_->stream_->set_verify_mode(boost::asio::ssl::verify_none);
         }

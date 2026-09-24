@@ -29,6 +29,9 @@ struct WebSocketClientOptions {
     std::string tls_server_name;
     bool tls_verify_peer = true;
     std::string tls_trusted_ca_pem;
+    std::string tls_verify_hostname;
+    std::string tls_client_certificate_pem;
+    std::string tls_client_private_key_pem;
     std::vector<std::string> tls_alpn_protocols;
     std::optional<std::chrono::steady_clock::time_point> deadline;
 };

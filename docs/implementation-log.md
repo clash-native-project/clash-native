@@ -2402,3 +2402,11 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   overlays replace (not underlay) TLS, and SS read derives from
   the peer salt per direction. Also fixed gun's head/header
   deadlock with eager stream open.
+
+## 2026-09-24
+
+- Trojan option parity batch 1: mutual-TLS client credentials
+  and verify-hostname override in the shared TLS client,
+  plumbed through Trojan TCP/WS/gRPC and the WS client.
+  New `tls_client_test` covers malformed/mismatched credentials.
+  Full suite: 263 passed.

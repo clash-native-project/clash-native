@@ -16,6 +16,13 @@ struct TlsClientOptions {
     std::string server_name;
     bool verify_peer = true;
     std::string trusted_ca_pem;
+    // Overrides the hostname used for certificate verification (Mihomo
+    // name-cert-verify). Empty means server_name.
+    std::string verify_hostname;
+    // Optional mutual-TLS client credentials (Mihomo certificate +
+    // private-key). Both must be set together.
+    std::string client_certificate_pem;
+    std::string client_private_key_pem;
     std::vector<std::string> alpn_protocols;
     bool handoff_raw_transport = false;
     std::optional<int> maximum_tls_version;

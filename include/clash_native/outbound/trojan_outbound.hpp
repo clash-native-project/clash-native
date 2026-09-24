@@ -25,6 +25,9 @@ struct TrojanOutboundConfig {
     std::string server_name;
     std::string trusted_ca_pem;
     bool verify_peer = true;
+    std::string name_cert_verify;
+    std::string certificate;
+    std::string private_key;
     // Supported values are tcp, ws, and wss. The ws mode can be paired with
     // TLS by setting websocket_tls to true; wss always enables TLS.
     std::string network = "tcp";

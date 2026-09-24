@@ -631,6 +631,9 @@ class WebSocketClientHandshakeOperation final
                                           : self->options_.tls_server_name;
             tls_options.verify_peer = self->options_.tls_verify_peer;
             tls_options.trusted_ca_pem = self->options_.tls_trusted_ca_pem;
+            tls_options.verify_hostname = self->options_.tls_verify_hostname;
+            tls_options.client_certificate_pem = self->options_.tls_client_certificate_pem;
+            tls_options.client_private_key_pem = self->options_.tls_client_private_key_pem;
             tls_options.alpn_protocols = self->options_.tls_alpn_protocols;
             if (tls_options.alpn_protocols.empty()) {
                 tls_options.alpn_protocols = {"http/1.1"};

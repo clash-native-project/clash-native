@@ -133,6 +133,9 @@ struct GrpcSessionOpen {
             config.server_name.empty() ? config.server_host : config.server_name;
         tls_options.verify_peer = config.verify_peer;
         tls_options.trusted_ca_pem = config.trusted_ca_pem;
+        tls_options.verify_hostname = config.name_cert_verify;
+        tls_options.client_certificate_pem = config.certificate;
+        tls_options.client_private_key_pem = config.private_key;
         tls_options.alpn_protocols = {"h2"};
         tls_options.deadline = deadline;
         auto plain = std::make_unique<net::TcpStream>(std::move(*socket));
@@ -361,6 +364,9 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                                                  : self->config_.server_name;
                 ws_options.tls_verify_peer = self->config_.verify_peer;
                 ws_options.tls_trusted_ca_pem = self->config_.trusted_ca_pem;
+                ws_options.tls_verify_hostname = self->config_.name_cert_verify;
+                ws_options.tls_client_certificate_pem = self->config_.certificate;
+                ws_options.tls_client_private_key_pem = self->config_.private_key;
                 ws_options.tls_alpn_protocols = self->config_.alpn_protocols.empty()
                                                     ? std::vector<std::string>{"http/1.1"}
                                                     : self->config_.alpn_protocols;
@@ -407,6 +413,9 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                                               : self->config_.server_name;
                 tls_options.verify_peer = self->config_.verify_peer;
                 tls_options.trusted_ca_pem = self->config_.trusted_ca_pem;
+                tls_options.verify_hostname = self->config_.name_cert_verify;
+                tls_options.client_certificate_pem = self->config_.certificate;
+                tls_options.client_private_key_pem = self->config_.private_key;
                 tls_options.alpn_protocols = self->config_.alpn_protocols.empty()
                                                  ? std::vector<std::string>{"h2", "http/1.1"}
                                                  : self->config_.alpn_protocols;

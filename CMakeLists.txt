@@ -348,6 +348,7 @@ if(BUILD_TESTING)
         tests/transport/websocket_client_test.cpp
         tests/transport/udp_stream_test.cpp
         tests/transport/shadowsocks_transport_test.cpp
+        tests/transport/tls_client_test.cpp
         tests/transport/trojan_transport_test.cpp
         tests/transport/gun_transport_test.cpp
         tests/transport/http2_streaming_test.cpp
