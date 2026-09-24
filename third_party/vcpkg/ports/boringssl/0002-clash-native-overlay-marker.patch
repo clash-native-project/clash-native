@@ -1,0 +1,29 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 1111111..2222222 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -5972,7 +5972,12 @@ OPENSSL_EXPORT long SSL_get_default_timeout(const SSL *ssl);
+ // SSL_get_version returns a string describing the TLS version used by `ssl`.
+ // For example, "TLSv1.2" or "DTLSv1".
+ OPENSSL_EXPORT const char *SSL_get_version(const SSL *ssl);
++
++// CLASH_NATIVE_overlay_marker returns a constant identifying the
++// clash-native overlay port build. It exists only to prove the overlay
++// patch pipeline end to end and carries no behavior.
++OPENSSL_EXPORT int CLASH_NATIVE_overlay_marker(void);
+ 
+ // SSL_get_all_version_names outputs a list of possible strings
+ // `SSL_get_version` may return in this version of BoringSSL. It writes at most
+ // `max_out` entries to `out` and returns the total number it would have
+diff --git a/ssl/ssl_versions.cc b/ssl/ssl_versions.cc
+index 3333333..4444444 100644
+--- a/ssl/ssl_versions.cc
++++ b/ssl/ssl_versions.cc
+@@ -433,3 +433,7 @@
+ int SSL_CTX_set_record_protocol_version(SSL_CTX *ctx, int version) {
+   return version == 0;
+ }
++
++int CLASH_NATIVE_overlay_marker(void) {
++  return 1;
++}

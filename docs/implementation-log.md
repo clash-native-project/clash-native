@@ -2425,3 +2425,10 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   failure) plumbed to grpc sessions, and security overlays under
   WS/WSS (camouflage replaces WS TLS, matching Mihomo). New
   WS-shadow-tls interop case passes. Full suite: 266 passed.
+
+## 2026-09-24
+
+- uTLS groundwork R1: project-owned BoringSSL overlay port
+  (`third_party/vcpkg/ports/boringssl`, validated by build.py)
+  with a marker patch proving end-to-end patched builds; marker
+  symbol pinned by a unit test. Full suite: 267 passed.

@@ -8,6 +8,8 @@
 
 #include <gtest/gtest.h>
 
+#include <openssl/ssl.h>
+
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/ip/tcp.hpp>
 
@@ -175,4 +177,10 @@ TEST(TlsClientTest, RejectsMismatchedClientKey) {
     options.client_private_key_pem = std::string(kCertificate);
     const auto failure = handshake_error(std::move(options));
     EXPECT_EQ(failure.code, clash_native::core::ErrorCode::configuration);
+}
+
+TEST(TlsClientTest, OverlayBoringsslMarkerIsPresent) {
+    // Proves the overlay-port patch pipeline end to end: this symbol only
+    // exists in BoringSSL built from third_party/vcpkg/ports/boringssl.
+    EXPECT_EQ(CLASH_NATIVE_overlay_marker(), 1);
 }

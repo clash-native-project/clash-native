@@ -172,6 +172,21 @@ def prepare_vcpkg_ports() -> Path:
         raise RuntimeError(
             "Project Botan overlay is incomplete; missing: " + ", ".join(missing)
         )
+    boringssl_port = PROJECT_ROOT / "third_party" / "vcpkg" / "ports" / "boringssl"
+    required_files = (
+        "portfile.cmake",
+        "vcpkg.json",
+        "install-pc-files.cmake",
+        "openssl.pc.in",
+        "usage",
+        "0001-remove-WX-Werror.patch",
+        "0002-clash-native-overlay-marker.patch",
+    )
+    missing = [name for name in required_files if not (boringssl_port / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            "Project BoringSSL overlay is incomplete; missing: " + ", ".join(missing)
+        )
     return botan_port.parent
 
 
