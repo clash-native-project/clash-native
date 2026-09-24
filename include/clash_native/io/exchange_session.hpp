@@ -59,6 +59,12 @@ struct StreamingExchangeRequest {
     // accepts data; EOF may carry trailer fields through trailers().
     std::shared_ptr<ExchangeBodyStream> body;
     std::optional<std::uint64_t> content_length;
+    // When true, the operation deadline only bounds the response head:
+    // the watchdog is disarmed once response headers arrive and the
+    // bodies then flow without a session-imposed lifetime cap. Long-lived
+    // bidirectional streams (gRPC Tun) opt in; the default keeps the
+    // deadline over the whole exchange.
+    bool head_deadline_only = false;
 };
 
 struct StreamingExchangeResponse {

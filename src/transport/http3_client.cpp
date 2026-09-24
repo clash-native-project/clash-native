@@ -250,6 +250,7 @@ class Http3ClientSession final : public io::ExchangeSession,
         pending->request_content_length = content_length;
         pending->streaming_handler = std::move(channel.sender);
         pending->is_streaming = true;
+        pending->head_deadline_only = request.head_deadline_only;
         pending->timer.expires_at(deadline);
         const auto self = shared_from_this();
         pending->timer.async_wait([self, exchange_id](const boost::system::error_code &error) {
@@ -395,6 +396,7 @@ class Http3ClientSession final : public io::ExchangeSession,
         std::shared_ptr<io::detail::QueuedExchangeBodyStream> streaming_response_body;
         bool is_tunnel = false;
         bool is_streaming = false;
+        bool head_deadline_only = false;
         bool streaming_response_delivered = false;
         bool streaming_response_finished = false;
         bool request_body_read_pending = false;
@@ -971,6 +973,9 @@ class Http3ClientSession final : public io::ExchangeSession,
                     self->complete_streaming_response(exchange_id);
                 }
             });
+        if (pending->head_deadline_only) {
+            (void)pending->timer.cancel();
+        }
         auto handler = std::move(pending->streaming_handler);
         io::StreamingExchangeResponse response{std::move(pending->response),
                                                pending->streaming_response_body};

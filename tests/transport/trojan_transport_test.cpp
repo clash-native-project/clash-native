@@ -364,3 +364,24 @@ TEST(TrojanOutboundConfigTest, OverlayOpenFailurePropagatesWithoutHanging) {
     ASSERT_TRUE(result.error);
     EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::endpoint_connection);
 }
+
+TEST(TrojanOutboundConfigTest, GrpcDialFailurePropagatesWithoutHanging) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    runtime.start();
+    clash_native::outbound::TrojanOutboundConfig config;
+    config.id = "test-trojan";
+    config.server_host = "127.0.0.1";
+    config.server_port = 1;
+    config.password = "password";
+    config.network = "grpc";
+    clash_native::outbound::TrojanOutbound outbound(runtime, config);
+    EXPECT_TRUE(outbound.validate());
+
+    auto wait = stdexec::sync_wait(outbound.connect_stream(
+        {clash_native::core::Destination::domain("example.com", 443), std::nullopt, nullptr}));
+    ASSERT_TRUE(wait.has_value());
+    const auto result = std::move(std::get<0>(*wait));
+    EXPECT_FALSE(result.succeeded());
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::endpoint_connection);
+}

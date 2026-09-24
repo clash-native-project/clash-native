@@ -4,6 +4,7 @@
 #include <clash_native/dns/resolver_service.hpp>
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
+#include <clash_native/transport/proxy/gun_client.hpp>
 #include <clash_native/transport/proxy/jls_client.hpp>
 #include <clash_native/transport/proxy/restls_client.hpp>
 #include <clash_native/transport/proxy/shadow_tls.hpp>
@@ -47,6 +48,13 @@ struct TrojanOutboundConfig {
     transport::proxy::ShadowTlsClientOptions shadow_tls_options;
     transport::proxy::RestlsClientOptions restls_options;
     transport::proxy::JlsClientOptions jls_options;
+    // gRPC (gun) carrier for network "grpc". Empty service name means
+    // "GunService", matching Mihomo.
+    std::string grpc_service_name;
+    std::string grpc_user_agent;
+    int grpc_max_connections = 0;
+    int grpc_min_streams = 0;
+    int grpc_max_streams = 0;
 };
 
 class TrojanOutbound final : public core::Outbound {
@@ -64,6 +72,7 @@ class TrojanOutbound final : public core::Outbound {
     runtime::AsioRuntime &runtime_;
     TrojanOutboundConfig config_;
     std::shared_ptr<dns::ResolverService> resolver_;
+    std::shared_ptr<transport::proxy::gun::GunClient> gun_pool_;
     core::OutboundDescriptor descriptor_;
     core::OutboundCapabilities capabilities_{true, core::DatagramSemantics::multi_destination,
                                              core::TargetRequirement::domain_or_ip,

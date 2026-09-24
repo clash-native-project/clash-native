@@ -148,6 +148,8 @@ add_library(clash-native-core STATIC
     src/transport/shadowsocks/ss2022_packet.cpp
     src/transport/shadowsocks/ss2022_stream.cpp
     src/transport/shadowsocks/simple_obfs.cpp
+    src/transport/proxy/gun_client.cpp
+    src/transport/proxy/gun_stream.cpp
     src/transport/proxy/shadow_tls.cpp
     src/transport/proxy/shadow_tls_v3.cpp
     src/transport/proxy/restls.cpp
@@ -347,6 +349,7 @@ if(BUILD_TESTING)
         tests/transport/udp_stream_test.cpp
         tests/transport/shadowsocks_transport_test.cpp
         tests/transport/trojan_transport_test.cpp
+        tests/transport/gun_transport_test.cpp
     )
 
     target_include_directories(clash-native-tests

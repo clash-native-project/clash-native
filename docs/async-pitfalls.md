@@ -95,3 +95,25 @@ tasks; the following keep their shape deliberately:
   stay on `callback_sender`.
 - Test-only APIs (e.g. the gRPC client): convert if and when a
   production caller appears.
+
+## Fresh tasks must not cross a scope-spawn boundary
+
+A newly created `exec::task` carries its captures in the coroutine frame.
+Moving that task through intermediaries (`std::optional` boxes,
+`stdexec::then` pipes) into `async_scope::spawn` corrupted the frame on
+Windows clang-cl (observed: captures read back null, then AV/hang). The
+established `run()` shape works because the task is spawned directly.
+Rules:
+
+- Spawn a task directly: `scope.spawn(run(...))` with captures bound at
+  creation. Do not ferry a task object through optionals or adaptors
+  first.
+- Drive a value-only chain to a callback with a plain shared state
+  machine (`start_with_receiver` + small receivers), not by adapting a
+  task into a bridge.
+- `exec::task` cannot be type-erased into `AnySender` either (sticky
+  scheduler affinity fails `sender_to<any_receiver>`); expose chains as
+  `bridge_sender` + `then`, like `async_tls_client_handshake`.
+- A `Guard`-style RAII reservation must be filled in place
+  (`make_shared<Guard>()` + assign); a `Guard{...}` temporary runs its
+  armed destructor and releases early.

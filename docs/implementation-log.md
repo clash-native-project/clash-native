@@ -2316,3 +2316,19 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   config tests cover mode rejection and failure propagation.
   Mihomo interop for ss-opts/overlays/UDP/gRPC stays batched for
   after the gRPC carrier. Full suite: 245 passed.
+
+## 2026-09-24
+
+- Added the gRPC (gun) carrier: `transport/proxy/gun_stream`
+  (Tun framing, producer request body with backpressure, remain-style
+  response parsing over `exchange_streaming`) plus `transport/proxy`
+  `gun_client` pool (least-count transport selection with Mihomo's
+  max-connections/min-streams/max-streams rule). Wired
+  `network: grpc` into the Trojan chain (pooled h2-ALPN sessions,
+  enforced h2 negotiation, ss-opts/header reuse, UDP via packet
+  conn). Added `head_deadline_only` to streaming exchanges (h2+h3)
+  so long-lived Tun streams are not cut by the handshake watchdog.
+  New gun tests cover framing vectors, head/writes, remain reads,
+  and pool growth. Full suite: 251 passed.
+- Recorded the fresh-task scope-spawn corruption and the Guard
+  temporary pitfalls in `docs/async-pitfalls.md`.

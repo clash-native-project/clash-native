@@ -228,6 +228,7 @@ class Http2ClientSession final : public io::ExchangeSession,
         auto pending = std::make_shared<Pending>(executor_);
         pending->request = std::move(request.request);
         pending->request_body = std::move(request.body);
+        pending->head_deadline_only = request.head_deadline_only;
         pending->request_content_length = content_length;
         pending->streaming_request = true;
         pending->streaming_handler = std::move(channel.sender);
@@ -382,6 +383,7 @@ class Http2ClientSession final : public io::ExchangeSession,
         bool completed = false;
         bool response_too_large = false;
         bool streaming_request = false;
+        bool head_deadline_only = false;
         bool streaming_response_delivered = false;
         bool streaming_response_complete = false;
         bool streaming_body_overflow = false;
@@ -1208,6 +1210,9 @@ class Http2ClientSession final : public io::ExchangeSession,
                 }
             },
             [] {});
+        if (pending->head_deadline_only) {
+            (void)pending->timer.cancel();
+        }
         auto handler = std::move(pending->streaming_handler);
         auto response = std::move(pending->response);
         post_streaming_result(std::move(handler), io::StreamingExchangeResponse{
