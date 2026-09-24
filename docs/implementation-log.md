@@ -2392,3 +2392,13 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   plus a unary probe). ws-mux/smux/QUIC carriers audited
   review-only (client-only, no loopback peer). Full suite: 260
   passed.
+
+## 2026-09-24
+
+- Trojan interop batch: test_host env plumbing (ss-opts,
+  security overlays, gRPC) plus five new Mihomo listeners and
+  cases (SS, grpc, shadow-tls, restls, JLS). All ten Trojan
+  interop cases pass. Fixed two real bugs found by interop:
+  overlays replace (not underlay) TLS, and SS read derives from
+  the peer salt per direction. Also fixed gun's head/header
+  deadlock with eager stream open.

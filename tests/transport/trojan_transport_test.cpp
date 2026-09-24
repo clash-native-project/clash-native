@@ -270,18 +270,19 @@ TEST(TrojanSsStreamTest, SealsSaltAndChunksVerifiableWithSharedPrimitives) {
     EXPECT_EQ(std::string(plaintext.value().begin(), plaintext.value().end()), payload);
 }
 
-TEST(TrojanSsStreamTest, DecryptsPeerChunksSealedWithSessionKey) {
+TEST(TrojanSsStreamTest, DecryptsPeerChunksSealedWithPeerSalt) {
     SsLoopback loop;
-    // A first client write seeds the salt; drain salt + chunk to derive
-    // the shared session key.
+    // Drain the client salt + chunk; the reply direction uses the
+    // peer's own salt, like a real server.
     const std::string ping = "ping";
     EXPECT_EQ(sync_get(loop.stream->async_write(boost::asio::buffer(ping))), ping.size());
-    auto salt = read_exactly(loop.peer, 16);
-    auto key = derive_aead_subkey("AES-128-GCM", "ss-password", salt);
-    ASSERT_TRUE(key);
+    read_exactly(loop.peer, 16);
     read_exactly(loop.peer, 2 + 16 + ping.size() + 16);
 
-    // Peer seals a reply chunk with the session key at nonce zero.
+    const std::vector<std::uint8_t> server_salt{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                                                0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f};
+    auto key = derive_aead_subkey("AES-128-GCM", "ss-password", server_salt);
+    ASSERT_TRUE(key);
     const std::string reply = "server reply";
     std::vector<std::uint8_t> nonce(12, 0);
     const std::array<std::uint8_t, 2> length{0x00, static_cast<std::uint8_t>(reply.size())};
@@ -295,7 +296,7 @@ TEST(TrojanSsStreamTest, DecryptsPeerChunksSealedWithSessionKey) {
                      std::span<const std::uint8_t>(
                          reinterpret_cast<const std::uint8_t *>(reply.data()), reply.size()));
     ASSERT_TRUE(encrypted_payload);
-    std::vector<std::uint8_t> wire;
+    std::vector<std::uint8_t> wire(server_salt.begin(), server_salt.end());
     wire.insert(wire.end(), encrypted_length.value().begin(), encrypted_length.value().end());
     wire.insert(wire.end(), encrypted_payload.value().begin(), encrypted_payload.value().end());
     EXPECT_EQ(loop.peer.send(boost::asio::buffer(wire)), wire.size());

@@ -414,6 +414,10 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 auto plain_stream = std::make_unique<net::TcpStream>(std::move(*self->socket_));
                 self->socket_.reset();
                 std::unique_ptr<io::StreamHandle> camouflaged = std::move(plain_stream);
+                // The camouflage layers carry their own TLS handshake and
+                // replace the Trojan TLS step (matching Mihomo's
+                // StreamTLSConn); without them the plain stream goes
+                // through the shared TLS client below.
                 if (!self->config_.security_mode.empty()) {
                     auto overlay = co_await open_security_overlay(self, std::move(camouflaged));
                     if (!overlay) {
@@ -424,27 +428,28 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                         overlay.value()->close();
                         co_return;
                     }
-                    camouflaged = std::move(overlay.value());
-                }
-                transport::TlsClientConnection connection;
-                try {
-                    connection = co_await transport::async_tls_client_handshake(
-                        std::move(camouflaged), std::move(tls_options));
-                } catch (const core::Error &failure) {
-                    self->finish(core::StreamOpenResult::failed(failure));
-                    co_return;
-                } catch (...) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::endpoint_connection, "Trojan TLS failed"}));
-                    co_return;
-                }
-                if (self->completed_) {
-                    if (connection.stream) {
-                        connection.stream->close();
+                    self->transport_stream_ = std::move(overlay.value());
+                } else {
+                    transport::TlsClientConnection connection;
+                    try {
+                        connection = co_await transport::async_tls_client_handshake(
+                            std::move(camouflaged), std::move(tls_options));
+                    } catch (const core::Error &failure) {
+                        self->finish(core::StreamOpenResult::failed(failure));
+                        co_return;
+                    } catch (...) {
+                        self->finish(core::StreamOpenResult::failed(
+                            {core::ErrorCode::endpoint_connection, "Trojan TLS failed"}));
+                        co_return;
                     }
-                    co_return;
+                    if (self->completed_) {
+                        if (connection.stream) {
+                            connection.stream->close();
+                        }
+                        co_return;
+                    }
+                    self->transport_stream_ = std::move(connection.stream);
                 }
-                self->transport_stream_ = std::move(connection.stream);
             }
             if (self->config_.ss_enabled) {
                 const auto method =

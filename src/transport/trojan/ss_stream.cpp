@@ -82,9 +82,10 @@ class TrojanSsStreamState final : public std::enable_shared_from_this<TrojanSsSt
     using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
 
     TrojanSsStreamState(std::unique_ptr<io::StreamHandle> stream, proxy::CipherMethod method,
-                        std::vector<std::uint8_t> key, std::vector<std::uint8_t> salt)
+                        std::vector<std::uint8_t> key, std::vector<std::uint8_t> salt,
+                        std::string password)
         : stream_(std::move(stream)), method_(std::move(method)), key_(std::move(key)),
-          salt_(std::move(salt)) {
+          salt_(std::move(salt)), password_(std::move(password)) {
         read_nonce_.assign(method_.nonce_size, 0);
         write_nonce_.assign(method_.nonce_size, 0);
     }
@@ -102,7 +103,9 @@ class TrojanSsStreamState final : public std::enable_shared_from_this<TrojanSsSt
             post_write_result(std::move(handler), boost::asio::error::operation_aborted, 0);
             return;
         }
-        // Seal synchronously so nonce order follows call order.
+        // Seal synchronously so nonce order follows call order. Peers
+        // reject zero-length chunks, so an empty payload only carries the
+        // not-yet-written salt; otherwise it completes without a write.
         auto wire = std::make_shared<std::vector<std::uint8_t>>();
         try {
             if (!salt_written_) {
@@ -111,11 +114,15 @@ class TrojanSsStreamState final : public std::enable_shared_from_this<TrojanSsSt
             }
             const auto *data = static_cast<const std::uint8_t *>(buffer.data());
             std::size_t offset = 0;
-            do {
+            while (offset < buffer.size()) {
                 const auto chunk_size = std::min(kMaxChunkPayload, buffer.size() - offset);
                 append_record(std::span<const std::uint8_t>(data + offset, chunk_size), *wire);
                 offset += chunk_size;
-            } while (offset < buffer.size());
+            }
+            if (wire->empty()) {
+                post_write_result(std::move(handler), {}, 0);
+                return;
+            }
         } catch (...) {
             post_write_result(std::move(handler), protocol_error(), 0);
             return;
@@ -163,6 +170,12 @@ class TrojanSsStreamState final : public std::enable_shared_from_this<TrojanSsSt
         receive_handler_ = std::move(handler);
         if (buffer.size() == 0) {
             finish_receive({}, 0);
+            return;
+        }
+        // Each direction carries its own salt: derive the read key from
+        // the peer's salt before the first chunk.
+        if (!read_key_ready_) {
+            read_peer_salt();
             return;
         }
         read_chunk_length();
@@ -217,6 +230,25 @@ class TrojanSsStreamState final : public std::enable_shared_from_this<TrojanSsSt
         async::start_with_receiver(std::move(sender), StreamReadBridge{std::move(pull)});
     }
 
+    void read_peer_salt() {
+        auto salt = std::make_shared<std::vector<std::uint8_t>>(method_.key_size);
+        auto self = shared_from_this();
+        read_exact(salt, 0, [self, salt](const boost::system::error_code &error) {
+            if (error) {
+                self->finish_receive(error, 0);
+                return;
+            }
+            auto key = proxy::derive_aead_subkey(self->method_.name, self->password_, *salt);
+            if (!key) {
+                self->finish_receive(protocol_error(), 0);
+                return;
+            }
+            self->read_key_ = std::move(key.value());
+            self->read_key_ready_ = true;
+            self->read_chunk_length();
+        });
+    }
+
     void read_chunk_length() {
         auto encrypted = std::make_shared<std::vector<std::uint8_t>>(2 + method_.overhead);
         auto self = shared_from_this();
@@ -230,8 +262,8 @@ class TrojanSsStreamState final : public std::enable_shared_from_this<TrojanSsSt
                 self->finish_receive(error, 0);
                 return;
             }
-            auto length =
-                proxy::aead_decrypt(self->method_.name, self->key_, self->read_nonce_, *encrypted);
+            auto length = proxy::aead_decrypt(self->method_.name, self->read_key_,
+                                              self->read_nonce_, *encrypted);
             if (!length || length.value().size() != 2) {
                 self->finish_receive(protocol_error(), 0);
                 return;
@@ -256,8 +288,8 @@ class TrojanSsStreamState final : public std::enable_shared_from_this<TrojanSsSt
                 self->finish_receive(protocol_error(), 0);
                 return;
             }
-            auto plaintext =
-                proxy::aead_decrypt(self->method_.name, self->key_, self->read_nonce_, *encrypted);
+            auto plaintext = proxy::aead_decrypt(self->method_.name, self->read_key_,
+                                                 self->read_nonce_, *encrypted);
             if (!plaintext || plaintext.value().empty()) {
                 self->finish_receive(protocol_error(), 0);
                 return;
@@ -318,6 +350,9 @@ class TrojanSsStreamState final : public std::enable_shared_from_this<TrojanSsSt
     proxy::CipherMethod method_;
     std::vector<std::uint8_t> key_;
     std::vector<std::uint8_t> salt_;
+    std::string password_;
+    std::vector<std::uint8_t> read_key_;
+    bool read_key_ready_ = false;
     std::vector<std::uint8_t> read_nonce_;
     std::vector<std::uint8_t> write_nonce_;
     std::vector<std::uint8_t> pending_plaintext_;
@@ -437,7 +472,8 @@ make_trojan_ss_stream_handle(std::unique_ptr<io::StreamHandle> stream, std::stri
         return core::fail(key.error());
     }
     auto state = std::make_shared<TrojanSsStreamState>(std::move(stream), std::move(spec.value()),
-                                                       std::move(key.value()), std::move(salt));
+                                                       std::move(key.value()), std::move(salt),
+                                                       std::string(password));
     return std::unique_ptr<io::StreamHandle>(
         std::make_unique<TrojanSsStreamHandle>(std::move(state)));
 }

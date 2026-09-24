@@ -45,9 +45,13 @@ struct GunStreamOptions {
 using GunStreamHandler = std::function<void(core::Result<std::unique_ptr<io::StreamHandle>>)>;
 
 // Opens a bidirectional Tun stream over an HTTP/2 exchange session:
-// POST https://host/<service>/Tun with a streaming request body. The
-// response head must arrive with status 200; request and response bodies
-// then flow concurrently until either side closes.
+// POST https://host/<service>/Tun with a streaming request body. Like
+// Mihomo's gun Dial, the handle is delivered as soon as the request is
+// submitted, WITHOUT waiting for the response head: the peer reads our
+// first message before answering, so waiting would deadlock. Reads park
+// until the head arrives; a head failure poisons later reads and writes.
+// Request and response bodies then flow concurrently until either side
+// closes.
 void async_open_gun_stream(std::shared_ptr<io::ExchangeSession> session, GunStreamOptions options,
                            GunStreamHandler handler);
 

@@ -266,17 +266,45 @@ class GunStreamState final : public std::enable_shared_from_this<GunStreamState>
     using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
     using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
 
-    GunStreamState(std::shared_ptr<io::ExchangeBodyStream> response_body,
-                   std::shared_ptr<GunRequestBody> request_body,
+    GunStreamState(std::shared_ptr<GunRequestBody> request_body,
                    boost::asio::any_io_executor executor)
-        : response_body_(std::move(response_body)), request_body_(std::move(request_body)),
-          executor_(std::move(executor)) {}
+        : request_body_(std::move(request_body)), executor_(std::move(executor)) {}
+
+    // Attaches the response body once the head arrives; resumes a
+    // parked read if any.
+    void attach_response_body(std::shared_ptr<io::ExchangeBodyStream> body) {
+        response_body_ = std::move(body);
+        if (read_in_progress_ && receive_handler_) {
+            read_frame_prefix();
+        }
+    }
+
+    // Poisons the stream: pending and future reads/writes fail.
+    void poison(core::Error error) {
+        (void)error;
+        poisoned_ = true;
+        request_body_->close();
+        if (response_body_) {
+            response_body_->cancel();
+        }
+        if (read_in_progress_) {
+            read_in_progress_ = false;
+            auto handler = std::move(receive_handler_);
+            if (handler) {
+                post_read_result(std::move(handler), protocol_error(), 0);
+            }
+        }
+    }
 
     boost::asio::any_io_executor executor() noexcept { return executor_; }
 
     void send(boost::asio::const_buffer buffer, WriteHandler handler) {
         if (closed_) {
             post_write_result(std::move(handler), boost::asio::error::operation_aborted, 0);
+            return;
+        }
+        if (poisoned_) {
+            post_write_result(std::move(handler), protocol_error(), 0);
             return;
         }
         if (buffer.size() > kMaxFramePayload) {
@@ -303,6 +331,10 @@ class GunStreamState final : public std::enable_shared_from_this<GunStreamState>
             post_read_result(std::move(handler), boost::asio::error::operation_aborted, 0);
             return;
         }
+        if (poisoned_) {
+            post_read_result(std::move(handler), protocol_error(), 0);
+            return;
+        }
         if (read_in_progress_) {
             post_read_result(std::move(handler), boost::asio::error::already_started, 0);
             return;
@@ -314,6 +346,11 @@ class GunStreamState final : public std::enable_shared_from_this<GunStreamState>
         read_in_progress_ = true;
         output_buffer_ = buffer;
         receive_handler_ = std::move(handler);
+        // The response body arrives with the head, after our first
+        // writes; park until attach_response_body resumes us.
+        if (!response_body_) {
+            return;
+        }
         if (remain_ > 0) {
             read_remainder();
             return;
@@ -336,7 +373,9 @@ class GunStreamState final : public std::enable_shared_from_this<GunStreamState>
         // Body cancels wind the exchange down; no per-exchange cancel exists
         // in the io:: vocabulary (late terminals drop at the shells).
         request_body_->close();
-        response_body_->cancel();
+        if (response_body_) {
+            response_body_->cancel();
+        }
         if (read_in_progress_) {
             read_in_progress_ = false;
             auto handler = std::move(receive_handler_);
@@ -475,6 +514,7 @@ class GunStreamState final : public std::enable_shared_from_this<GunStreamState>
     std::size_t remain_ = 0;
     bool read_in_progress_ = false;
     bool closed_ = false;
+    bool poisoned_ = false;
 };
 
 class GunStreamHandle final : public io::StreamHandle {
@@ -602,47 +642,50 @@ void async_open_gun_stream(std::shared_ptr<io::ExchangeSession> session, GunStre
     }
     const auto service = options.service_name.empty() ? "GunService" : options.service_name;
     const auto target = service.front() == '/' ? service : "/" + service + "/Tun";
+    // Eager open: the handle is delivered before start() returns so the
+    // caller can write immediately; the head resolves in the background
+    // and attaches (or poisons) the shared state. The handler fires
+    // exactly once, with the eager handle.
     struct Opener : public std::enable_shared_from_this<Opener> {
         std::shared_ptr<io::ExchangeSession> session;
         GunStreamOptions options;
         GunStreamHandler handler;
         io::ExchangeRequest head;
         std::shared_ptr<GunRequestBody> request_body;
+        std::shared_ptr<GunStreamState> state;
         struct OpenBridge {
             using receiver_concept = stdexec::receiver_tag;
             std::shared_ptr<Opener> opener;
             void set_value(io::StreamingExchangeResponse response) && noexcept {
                 auto self = std::move(opener);
                 if (response.response.status != 200) {
-                    self->handler(core::fail({core::ErrorCode::protocol_framing,
-                                              "gun handshake saw unexpected HTTP status"}));
+                    self->state->poison({core::ErrorCode::protocol_framing,
+                                         "gun handshake saw unexpected HTTP status"});
                     return;
                 }
-                auto state = std::make_shared<GunStreamState>(std::move(response.body),
-                                                              std::move(self->request_body),
-                                                              self->options.executor);
-                self->handler(std::unique_ptr<io::StreamHandle>(
-                    std::make_unique<GunStreamHandle>(std::move(state))));
+                self->state->attach_response_body(std::move(response.body));
             }
             void set_error(std::exception_ptr error) && noexcept {
                 auto self = std::move(opener);
+                core::Error failure{core::ErrorCode::transport_io, "gun handshake failed"};
                 try {
                     std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->handler(core::fail(failure));
-                    return;
+                } catch (const core::Error &open_failure) {
+                    failure = open_failure;
                 } catch (...) {
                 }
-                self->handler(core::fail({core::ErrorCode::transport_io, "gun handshake failed"}));
+                self->state->poison(failure);
             }
             void set_stopped() && noexcept {
                 auto self = std::move(opener);
-                self->handler(core::fail({core::ErrorCode::cancelled, "gun handshake cancelled"}));
+                self->state->poison({core::ErrorCode::cancelled, "gun handshake cancelled"});
             }
         };
         void start() {
             auto self = shared_from_this();
             request_body = std::make_shared<GunRequestBody>(options.executor);
+            state = std::make_shared<GunStreamState>(request_body, options.executor);
+            handler(std::unique_ptr<io::StreamHandle>(std::make_unique<GunStreamHandle>(state)));
             io::StreamingExchangeRequest streaming;
             streaming.request = std::move(head);
             streaming.body = request_body;

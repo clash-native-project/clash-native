@@ -271,6 +271,49 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_PATH").value_or("/");
         trojan_config.websocket_tls =
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_TLS").value_or("0") != "0";
+        trojan_config.ss_enabled =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SS_ENABLED").value_or("0") != "0";
+        trojan_config.ss_method = environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SS_METHOD")
+                                      .value_or("AES-128-GCM");
+        trojan_config.ss_password =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SS_PASSWORD").value_or("");
+        trojan_config.security_mode =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SECURITY_MODE").value_or("");
+        trojan_config.shadow_tls_options.password =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SHADOWTLS_PASSWORD").value_or("");
+        trojan_config.shadow_tls_options.host =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SHADOWTLS_HOST").value_or("");
+        trojan_config.shadow_tls_options.skip_cert_verify =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SHADOWTLS_SKIP_VERIFY")
+                .value_or("0") != "0";
+        if (const auto version =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SHADOWTLS_VERSION")) {
+            trojan_config.shadow_tls_options.version = std::stoi(*version);
+        }
+        trojan_config.restls_options.server_name =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_RESTLS_SERVER_NAME").value_or("");
+        trojan_config.restls_options.password =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_RESTLS_PASSWORD").value_or("");
+        trojan_config.restls_options.restls_script =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_RESTLS_SCRIPT").value_or("");
+        trojan_config.restls_options.version_hint =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_RESTLS_VERSION").value_or("tls12");
+        trojan_config.restls_options.skip_cert_verify =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_RESTLS_SKIP_VERIFY")
+                .value_or("0") != "0";
+        trojan_config.jls_options.server_name =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_JLS_SERVER_NAME").value_or("");
+        trojan_config.jls_options.username =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_JLS_USERNAME").value_or("");
+        trojan_config.jls_options.password =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_JLS_PASSWORD").value_or("");
+        trojan_config.jls_options.skip_cert_verify =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_JLS_SKIP_VERIFY").value_or("0") !=
+            "0";
+        trojan_config.grpc_service_name =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_GRPC_SERVICE").value_or("");
+        trojan_config.grpc_user_agent =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_GRPC_USER_AGENT").value_or("");
         auto outbound = std::make_shared<clash_native::outbound::TrojanOutbound>(
             runtime, std::move(trojan_config), std::move(resolver));
         if (const auto result = outbound->validate(); !result) {

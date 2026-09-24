@@ -238,7 +238,7 @@ $env:CLASH_NATIVE_TEST_HOST = 'D:\Project\cpp\clash-native\build\windows-clang-c
 # Run the Shadowsocks ResTLS TLS 1.2 and TLS 1.3 cases.
 & $interop '-test.count=1' '-test.run=^TestMihomoActualServerInteroperability$/Shadowsocks/restls-tls(12|13)$' '-test.v=true'
 
-# Run Trojan TCP/TLS, WSS, and plain WS carrier cases.
+# Run all Trojan cases: TCP/TLS, WSS, plain WS, SS, gRPC, shadow-tls, restls, JLS.
 $env:CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE = '1'
 & $interop '-test.count=1' '-test.run=^TestMihomoActualServerInteroperability$/Trojan/' '-test.v=true'
 
