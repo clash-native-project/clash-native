@@ -5,6 +5,11 @@
 #include <clash_native/io/stream_handle.hpp>
 #include <clash_native/transport/proxy/gun_stream.hpp>
 
+#include <clash_native/async/bridge.hpp>
+
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
+
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -80,6 +85,24 @@ class GunClient final : public std::enable_shared_from_this<GunClient> {
     };
 
     std::shared_ptr<TransportEntry> pick_transport();
+
+    struct DialGuard {
+        std::shared_ptr<TransportEntry> entry;
+        bool armed = true;
+        ~DialGuard() {
+            if (armed) {
+                entry->streams.fetch_sub(1, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    using OpenResult = core::Result<std::unique_ptr<io::StreamHandle>>;
+    using OpenHandler = async::BridgeSender<OpenResult>::Handler;
+
+    static exec::task<void> run_open(std::shared_ptr<GunClient> client,
+                                     std::shared_ptr<TransportEntry> entry, SessionMaker maker,
+                                     gun::GunStreamOptions options,
+                                     std::shared_ptr<DialGuard> guard, OpenHandler done);
 
     GunClientOptions options_;
     SessionMaker maker_;

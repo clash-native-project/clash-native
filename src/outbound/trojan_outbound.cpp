@@ -64,163 +64,116 @@ std::error_code to_std_error(const boost::system::error_code &error) {
 }
 
 // gRPC Transport session: resolve, TCP connect, TLS with enforced h2 ALPN,
-// then an HTTP/2 exchange session. Callback chain on shared state (a task
-// here would need an immediately-invoked capturing lambda, which is banned
-// by docs/async-pitfalls.md).
+// then an HTTP/2 exchange session. Named-function task spawned directly
+// into a scope (the run() shape); every terminal funnels through done.
+struct GrpcSessionOpen {
+    using SessionResult = core::Result<std::shared_ptr<io::ExchangeSession>>;
+    using SessionHandler = async::BridgeSender<SessionResult>::Handler;
+    static exec::task<void> run(runtime::AsioRuntime *runtime,
+                                std::shared_ptr<dns::ResolverService> resolver,
+                                TrojanOutboundConfig config, SessionHandler done) {
+        const auto deadline = std::chrono::steady_clock::now() + kConnectTimeout;
+        auto socket =
+            std::make_shared<boost::asio::ip::tcp::socket>(runtime->serialized_executor());
+        auto finish = [done = std::move(done), socket](SessionResult result) mutable {
+            if (!result && socket) {
+                boost::system::error_code ignored;
+                socket->cancel(ignored);
+                socket->close(ignored);
+            }
+            done(std::move(result));
+        };
+        auto addresses = co_await async::bridge_sender<core::Result<detail::AddressList>>(
+            [runtime, resolver = std::move(resolver), host = config.server_host](
+                async::BridgeSender<core::Result<detail::AddressList>>::Handler open) mutable {
+                // The bridge starter must be copyable: resolve_host takes
+                // its handler by value, so the lambda already copies.
+                detail::resolve_host(*runtime, std::move(resolver), std::move(host),
+                                     [open](core::Result<detail::AddressList> result) mutable {
+                                         open(std::move(result));
+                                     });
+                using AbortFn = async::BridgeSender<core::Result<detail::AddressList>>::AbortFn;
+                return AbortFn{[] {}};
+            });
+        if (!addresses || addresses.value().empty()) {
+            finish(!addresses ? core::fail(addresses.error())
+                              : core::fail(core::Error{core::ErrorCode::resolution,
+                                                       "Trojan gRPC server hostname resolved to "
+                                                       "no addresses"}));
+            co_return;
+        }
+        auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
+        for (const auto &address : addresses.value()) {
+            endpoints->emplace_back(address, config.server_port);
+        }
+        try {
+            co_await (boost::asio::async_connect(*socket, *endpoints, exec::asio::use_sender) |
+                      stdexec::then([](const boost::asio::ip::tcp::endpoint &) {}) |
+                      stdexec::let_error([](std::exception_ptr error) {
+                          try {
+                              std::rethrow_exception(std::move(error));
+                          } catch (const boost::system::system_error &failure) {
+                              return stdexec::just_error(std::make_exception_ptr(
+                                  core::Error{core::ErrorCode::endpoint_connection,
+                                              "failed to connect to Trojan gRPC server",
+                                              to_std_error(failure.code())}));
+                          }
+                          std::rethrow_exception(std::current_exception());
+                      }));
+        } catch (const core::Error &failure) {
+            finish(core::fail(failure));
+            co_return;
+        } catch (...) {
+            finish(core::fail(
+                {core::ErrorCode::endpoint_connection, "failed to connect to Trojan gRPC server"}));
+            co_return;
+        }
+        transport::TlsClientOptions tls_options;
+        tls_options.server_name =
+            config.server_name.empty() ? config.server_host : config.server_name;
+        tls_options.verify_peer = config.verify_peer;
+        tls_options.trusted_ca_pem = config.trusted_ca_pem;
+        tls_options.alpn_protocols = {"h2"};
+        tls_options.deadline = deadline;
+        auto plain = std::make_unique<net::TcpStream>(std::move(*socket));
+        transport::TlsClientConnection tls;
+        try {
+            tls = co_await transport::async_tls_client_handshake(std::move(plain),
+                                                                 std::move(tls_options));
+        } catch (const core::Error &failure) {
+            finish(core::fail(failure));
+            co_return;
+        } catch (...) {
+            finish(core::fail({core::ErrorCode::endpoint_connection, "Trojan gRPC TLS failed"}));
+            co_return;
+        }
+        if (tls.negotiated_alpn != "h2") {
+            tls.stream->close();
+            finish(core::fail(
+                {core::ErrorCode::carrier_handshake, "Trojan gRPC server did not negotiate h2"}));
+            co_return;
+        }
+        finish(SessionResult{transport::make_http2_exchange_session(std::move(tls.stream))});
+    }
+};
+
 io::AnySender<std::shared_ptr<io::ExchangeSession>>
 open_grpc_session(runtime::AsioRuntime &runtime, std::shared_ptr<dns::ResolverService> resolver,
                   TrojanOutboundConfig config) {
-    using SessionResult = core::Result<std::shared_ptr<io::ExchangeSession>>;
-    using SessionHandler = async::BridgeSender<SessionResult>::Handler;
-    struct SessionOpen : public std::enable_shared_from_this<SessionOpen> {
-        runtime::AsioRuntime *runtime = nullptr;
-        std::shared_ptr<dns::ResolverService> resolver;
-        TrojanOutboundConfig config;
-        std::chrono::steady_clock::time_point deadline{};
-        std::shared_ptr<boost::asio::ip::tcp::socket> socket;
-        SessionHandler done;
-        bool delivered = false;
-        void start() {
-            auto self = shared_from_this();
-            detail::resolve_host(*runtime, std::move(resolver), config.server_host,
-                                 [self](core::Result<detail::AddressList> result) mutable {
-                                     self->resolved(std::move(result));
-                                 });
-        }
-        void resolved(core::Result<detail::AddressList> result) {
-            if (!result || result.value().empty()) {
-                finish(!result ? core::fail(result.error())
-                               : core::fail(core::Error{core::ErrorCode::resolution,
-                                                        "Trojan gRPC server hostname resolved to "
-                                                        "no addresses"}));
-                return;
-            }
-            auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
-            for (const auto &address : result.value()) {
-                endpoints->emplace_back(address, config.server_port);
-            }
-            socket = std::make_shared<boost::asio::ip::tcp::socket>(runtime->serialized_executor());
-            auto self = shared_from_this();
-            // NOTE: name the sender first; argument order is unspecified.
-            auto sender = boost::asio::async_connect(*socket, *endpoints, exec::asio::use_sender) |
-                          stdexec::then([](const boost::asio::ip::tcp::endpoint &) {}) |
-                          stdexec::let_error([](std::exception_ptr error) {
-                              try {
-                                  std::rethrow_exception(std::move(error));
-                              } catch (const boost::system::system_error &failure) {
-                                  return stdexec::just_error(std::make_exception_ptr(
-                                      core::Error{core::ErrorCode::endpoint_connection,
-                                                  "failed to connect to Trojan gRPC server",
-                                                  to_std_error(failure.code())}));
-                              }
-                              std::rethrow_exception(std::current_exception());
-                          });
-            async::start_with_receiver(std::move(sender), ConnectReceiver{self});
-        }
-        struct ConnectReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<SessionOpen> open;
-            void set_value() && noexcept {
-                auto self = std::move(open);
-                self->handshake();
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                auto self = std::move(open);
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->finish(core::fail(failure));
-                    return;
-                } catch (...) {
-                }
-                self->finish(core::fail({core::ErrorCode::endpoint_connection,
-                                         "failed to connect to Trojan gRPC server"}));
-            }
-            void set_stopped() && noexcept {
-                auto self = std::move(open);
-                self->finish(
-                    core::fail({core::ErrorCode::cancelled, "Trojan gRPC connect cancelled"}));
-            }
-        };
-        void handshake() {
-            transport::TlsClientOptions tls_options;
-            tls_options.server_name =
-                config.server_name.empty() ? config.server_host : config.server_name;
-            tls_options.verify_peer = config.verify_peer;
-            tls_options.trusted_ca_pem = config.trusted_ca_pem;
-            tls_options.alpn_protocols = {"h2"};
-            tls_options.deadline = deadline;
-            auto plain = std::make_unique<net::TcpStream>(std::move(*socket));
-            auto self = shared_from_this();
-            // NOTE: name the sender first; argument order is unspecified.
-            auto sender =
-                transport::async_tls_client_handshake(std::move(plain), std::move(tls_options));
-            async::start_with_receiver(std::move(sender), HandshakeReceiver{self});
-        }
-        struct HandshakeReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<SessionOpen> open;
-            void set_value(transport::TlsClientConnection tls) && noexcept {
-                auto self = std::move(open);
-                if (tls.negotiated_alpn != "h2") {
-                    tls.stream->close();
-                    self->finish(core::fail({core::ErrorCode::carrier_handshake,
-                                             "Trojan gRPC server did not negotiate h2"}));
-                    return;
-                }
-                self->finish(
-                    SessionResult{transport::make_http2_exchange_session(std::move(tls.stream))});
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                auto self = std::move(open);
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->finish(core::fail(failure));
-                    return;
-                } catch (...) {
-                }
-                self->finish(
-                    core::fail({core::ErrorCode::endpoint_connection, "Trojan gRPC TLS failed"}));
-            }
-            void set_stopped() && noexcept {
-                auto self = std::move(open);
-                self->finish(
-                    core::fail({core::ErrorCode::cancelled, "Trojan gRPC handshake cancelled"}));
-            }
-        };
-        void finish(SessionResult result) {
-            if (delivered) {
-                return;
-            }
-            delivered = true;
-            if (!result) {
-                boost::system::error_code ignored;
-                if (socket) {
-                    socket->cancel(ignored);
-                    socket->close(ignored);
-                }
-            }
-            done(std::move(result));
-        }
+    using SessionResult = GrpcSessionOpen::SessionResult;
+    using SessionHandler = GrpcSessionOpen::SessionHandler;
+    struct Shared {
+        exec::async_scope scope;
     };
-    auto open = std::make_shared<SessionOpen>();
-    open->runtime = &runtime;
-    open->resolver = std::move(resolver);
-    open->config = std::move(config);
-    open->deadline = std::chrono::steady_clock::now() + kConnectTimeout;
-    auto bridged = async::bridge_sender<SessionResult>([open](SessionHandler done) mutable {
-        if (open->done) {
-            auto late = std::move(done);
-            late(core::fail({core::ErrorCode::cancelled, "Trojan gRPC session restarted"}));
+    auto shared = std::make_shared<Shared>();
+    auto bridged = async::bridge_sender<SessionResult>(
+        [shared, &runtime, resolver = std::move(resolver),
+         config = std::move(config)](SessionHandler done) mutable {
+            shared->scope.spawn(GrpcSessionOpen::run(&runtime, std::move(resolver),
+                                                     std::move(config), std::move(done)));
             using AbortFn = async::BridgeSender<SessionResult>::AbortFn;
             return AbortFn{[] {}};
-        }
-        open->done = std::move(done);
-        open->start();
-        using AbortFn = async::BridgeSender<SessionResult>::AbortFn;
-        return AbortFn{[] {}};
-    });
+        });
     auto sender = std::move(bridged) | stdexec::then([](SessionResult result) {
                       if (!result) {
                           throw result.error();

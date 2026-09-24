@@ -2342,3 +2342,11 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   `tests/transport/task_coroutine_test.cpp` pins the allowed shapes;
   `docs/async-pitfalls.md` states the exact rule. Full suite: 255
   passed.
+
+## 2026-09-24
+
+- Taskified the gun dial and Trojan gRPC session chains as named
+  static functions (`GunClient::run_open`, `GrpcSessionOpen::run`)
+  spawned directly into their scopes, now that the
+  immediately-invoked-lambda rule is precise. The interim callback
+  versions are gone. Full suite: 255 passed.

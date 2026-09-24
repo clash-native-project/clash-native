@@ -56,6 +56,84 @@ std::shared_ptr<GunClient::TransportEntry> GunClient::pick_transport() {
     return lightest;
 }
 
+exec::task<void> GunClient::run_open(std::shared_ptr<GunClient> client,
+                                     std::shared_ptr<TransportEntry> entry, SessionMaker maker,
+                                     gun::GunStreamOptions options,
+                                     std::shared_ptr<DialGuard> guard, OpenHandler done) {
+    OpenResult result = core::fail({core::ErrorCode::transport_io, "gun dial failed"});
+    try {
+        if (!entry->session) {
+            auto session = co_await async::bridge_sender<
+                core::Result<std::shared_ptr<io::ExchangeSession>>>(
+                [maker](
+                    async::BridgeSender<core::Result<std::shared_ptr<io::ExchangeSession>>>::Handler
+                        open) mutable {
+                    // The bridge starter must be copyable: drive the
+                    // maker sender straight into the terminal.
+                    struct MakerReceiver {
+                        using receiver_concept = stdexec::receiver_tag;
+                        async::BridgeSender<
+                            core::Result<std::shared_ptr<io::ExchangeSession>>>::Handler open;
+                        void set_value(std::shared_ptr<io::ExchangeSession> session) && noexcept {
+                            auto terminal = std::move(open);
+                            terminal(core::Result<std::shared_ptr<io::ExchangeSession>>{
+                                std::move(session)});
+                        }
+                        void set_error(std::exception_ptr error) && noexcept {
+                            auto terminal = std::move(open);
+                            try {
+                                std::rethrow_exception(std::move(error));
+                            } catch (const core::Error &failure) {
+                                terminal(core::fail(failure));
+                                return;
+                            } catch (...) {
+                            }
+                            terminal(core::fail(
+                                {core::ErrorCode::transport_io, "gun session open failed"}));
+                        }
+                        void set_stopped() && noexcept {
+                            auto terminal = std::move(open);
+                            terminal(core::fail(
+                                {core::ErrorCode::cancelled, "gun session open cancelled"}));
+                        }
+                    };
+                    // NOTE: name the sender first; argument order is unspecified.
+                    auto sender = maker();
+                    async::start_with_receiver(std::move(sender), MakerReceiver{std::move(open)});
+                    using AbortFn = async::BridgeSender<
+                        core::Result<std::shared_ptr<io::ExchangeSession>>>::AbortFn;
+                    return AbortFn{[] {}};
+                });
+            if (!session) {
+                result = core::fail(session.error());
+                done(std::move(result));
+                co_return;
+            }
+            entry->session = std::move(session.value());
+        }
+        auto stream =
+            co_await async::bridge_sender<OpenResult>([entry, options](OpenHandler open) mutable {
+                gun::async_open_gun_stream(
+                    entry->session, options,
+                    [open](OpenResult opened) mutable { open(std::move(opened)); });
+                using AbortFn = async::BridgeSender<OpenResult>::AbortFn;
+                return AbortFn{[] {}};
+            });
+        if (stream) {
+            guard->armed = false;
+            result = OpenResult{std::unique_ptr<io::StreamHandle>(
+                std::make_unique<CountedStreamHandle>(std::move(stream.value()), entry))};
+        } else {
+            result = core::fail(stream.error());
+        }
+    } catch (const core::Error &failure) {
+        result = core::fail(failure);
+    } catch (...) {
+    }
+    done(std::move(result));
+    (void)client;
+}
+
 io::AnySender<std::unique_ptr<io::StreamHandle>> GunClient::dial() {
     auto self = shared_from_this();
     auto entry = pick_transport();
@@ -65,112 +143,28 @@ io::AnySender<std::unique_ptr<io::StreamHandle>> GunClient::dial() {
                 core::Error{core::ErrorCode::cancelled, "gun client is closed"}))};
     }
     entry->streams.fetch_add(1, std::memory_order_relaxed);
-    // Release the reservation if the open below never delivers a stream.
-    struct Guard {
-        std::shared_ptr<TransportEntry> entry;
-        bool armed = true;
-        ~Guard() {
-            if (armed) {
-                entry->streams.fetch_sub(1, std::memory_order_relaxed);
-            }
-        }
-    };
-    // NOTE: fill the shared guard in place; a Guard{entry} temporary
+    // NOTE: fill the shared guard in place; a DialGuard{entry} temporary
     // would run its armed destructor and release the reservation early.
-    auto guard = std::make_shared<Guard>();
+    auto guard = std::make_shared<DialGuard>();
     guard->entry = entry;
     auto maker = maker_;
     auto options = options_.stream;
     options.deadline = std::chrono::steady_clock::now() + options_.open_timeout;
-    // Callback open chain (no task: the dial path stays on plain shared
-    // state): ensure the Transport session, then the Tun stream, and
-    // deliver the in-band result through done exactly once.
-    struct Open : public std::enable_shared_from_this<Open> {
-        std::shared_ptr<TransportEntry> entry;
-        GunClient::SessionMaker maker;
-        gun::GunStreamOptions options;
-        std::shared_ptr<Guard> guard;
-        async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler done;
-        bool delivered = false;
-        void start() {
-            if (entry->session) {
-                open_stream();
-                return;
-            }
-            auto self = shared_from_this();
-            // NOTE: name the sender first; argument order is unspecified.
-            auto sender = maker();
-            async::start_with_receiver(std::move(sender), MakerReceiver{self});
-        }
-        struct MakerReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<Open> open;
-            void set_value(std::shared_ptr<io::ExchangeSession> session) && noexcept {
-                auto self = std::move(open);
-                self->entry->session = std::move(session);
-                self->open_stream();
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                auto self = std::move(open);
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->finish(core::fail(failure));
-                    return;
-                } catch (...) {
-                }
-                self->finish(
-                    core::fail({core::ErrorCode::transport_io, "gun session open failed"}));
-            }
-            void set_stopped() && noexcept {
-                auto self = std::move(open);
-                self->finish(
-                    core::fail({core::ErrorCode::cancelled, "gun session open cancelled"}));
-            }
-        };
-        void open_stream() {
-            auto self = shared_from_this();
-            gun::async_open_gun_stream(
-                entry->session, options,
-                [self](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
-                    if (!opened) {
-                        self->finish(core::fail(opened.error()));
-                        return;
-                    }
-                    self->guard->armed = false;
-                    self->finish(core::Result<std::unique_ptr<io::StreamHandle>>{
-                        std::unique_ptr<io::StreamHandle>(std::make_unique<CountedStreamHandle>(
-                            std::move(opened.value()), self->entry))});
-                });
-        }
-        void finish(core::Result<std::unique_ptr<io::StreamHandle>> result) {
-            if (delivered) {
-                return;
-            }
-            delivered = true;
-            done(std::move(result));
-        }
+    struct Shared {
+        exec::async_scope scope;
     };
-    auto open = std::make_shared<Open>();
-    open->entry = entry;
-    open->maker = std::move(maker);
-    open->options = std::move(options);
-    open->guard = std::move(guard);
+    auto shared = std::make_shared<Shared>();
+    // Linear open chain as a named-function task spawned directly into
+    // the shared scope (the run() shape): ensure the Transport session,
+    // then the Tun stream, and deliver the in-band result through done
+    // exactly once. Failures stay values; stop can only come from a
+    // scope stop, which this client never requests.
     auto bridged = async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
-        [open](async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
-                   done) mutable {
-            // The bridge starter must be copyable: all state rides in
-            // the shared open box; a second start after the move fails
-            // fast instead of hanging.
-            if (open->done) {
-                auto late = std::move(done);
-                late(core::fail({core::ErrorCode::cancelled, "gun dial restarted"}));
-                using AbortFn =
-                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::AbortFn;
-                return AbortFn{[] {}};
-            }
-            open->done = std::move(done);
-            open->start();
+        [shared, self, entry, maker = std::move(maker), options = std::move(options),
+         guard](async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                    done) mutable {
+            shared->scope.spawn(run_open(self, entry, std::move(maker), std::move(options),
+                                         std::move(guard), std::move(done)));
             using AbortFn =
                 async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::AbortFn;
             return AbortFn{[] {}};
