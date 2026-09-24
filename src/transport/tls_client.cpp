@@ -20,12 +20,15 @@
 #include <openssl/hmac.h>
 #include <openssl/mem.h>
 #include <openssl/pem.h>
+#include <openssl/sha.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <zlib.h>
 
 #include <brotli/decode.h>
 
+#include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -335,6 +338,50 @@ bool hex_decode(std::string_view input, std::string &out) {
     return true;
 }
 
+// Parses a server certificate SHA-256 pin (Mihomo fingerprint = SSL
+// pinning). Browser profile names are rejected with a pointer to
+// client-fingerprint, mirroring Mihomo. Colons and whitespace are ignored.
+core::Result<std::array<std::uint8_t, 32>> parse_certificate_pin(const std::string &input) {
+    static constexpr const char *kBrowserNames[] = {
+        "chrome", "firefox", "safari", "ios",    "android",
+        "edge",   "360",     "qq",     "random", "randomized",
+    };
+    for (const char *name : kBrowserNames) {
+        if (input == name) {
+            return core::fail(configuration_error(
+                "`fingerprint` is used for TLS certificate pinning. If you need to specify "
+                "the browser fingerprint, use `client-fingerprint`"));
+        }
+    }
+    std::string cleaned;
+    cleaned.reserve(input.size());
+    for (const char c : input) {
+        if (c == ':' || std::isspace(static_cast<unsigned char>(c)) != 0) {
+            continue;
+        }
+        cleaned.push_back(c);
+    }
+    std::string raw;
+    if (!hex_decode(cleaned, raw) || raw.size() != 32) {
+        return core::fail(
+            configuration_error("TLS certificate pin is not a valid SHA-256 hex fingerprint"));
+    }
+    std::array<std::uint8_t, 32> pin{};
+    std::memcpy(pin.data(), raw.data(), pin.size());
+    return pin;
+}
+
+bool certificate_sha256(const X509 *certificate, std::uint8_t out[32]) {
+    uint8_t *der = nullptr;
+    const int length = i2d_X509(certificate, &der);
+    if (length <= 0 || der == nullptr) {
+        return false;
+    }
+    SHA256(der, static_cast<std::size_t>(length), out);
+    OPENSSL_free(der);
+    return true;
+}
+
 // REALITY client state shared between the ClientHello mutator (ticket
 // construction) and the verify callback (identity check). Owned by the
 // handshake operation; the mutator runs synchronously inside the handshake.
@@ -586,6 +633,16 @@ class TlsClientHandshakeOperationImpl final
                 return profile;
             }
         }
+        if (!options_.certificate_pin.empty()) {
+            auto pin = parse_certificate_pin(options_.certificate_pin);
+            if (!pin) {
+                return core::fail(pin.error());
+            }
+            cert_pin_ = pin.value();
+            has_cert_pin_ = true;
+            pin_verify_name_ =
+                options_.verify_hostname.empty() ? options_.server_name : options_.verify_hostname;
+        }
         if (options_.reality) {
             // Mihomo requires a fingerprint for REALITY camouflage.
             if (options_.fingerprint.empty()) {
@@ -621,6 +678,14 @@ class TlsClientHandshakeOperationImpl final
                 [self](bool preverified, boost::asio::ssl::verify_context &context) {
                     boost::asio::ssl::host_name_verification fallback(self->reality_verify_name_);
                     return self->verify_reality_peer(preverified, context, fallback);
+                });
+        } else if (has_cert_pin_) {
+            stream_->stream_->set_verify_mode(options_.verify_peer ? boost::asio::ssl::verify_peer
+                                                                   : boost::asio::ssl::verify_none);
+            const auto self = shared_from_this();
+            stream_->stream_->set_verify_callback(
+                [self](bool, boost::asio::ssl::verify_context &context) {
+                    return self->verify_pinned_peer(context);
                 });
         }
 
@@ -787,6 +852,72 @@ class TlsClientHandshakeOperationImpl final
     bool completed_ = false;
     RealityState reality_state_{};
     std::string reality_verify_name_;
+    std::array<std::uint8_t, 32> cert_pin_{};
+    bool has_cert_pin_ = false;
+    std::string pin_verify_name_;
+
+    // Pinned-chain verification for a non-leaf match: trust the matched
+    // certificate as the root and verify the leaf plus hostname, mirroring
+    // Mihomo's fingerprint verifier.
+    bool verify_pinned_chain(STACK_OF(X509) * chain, int matched) const {
+        X509 *leaf = sk_X509_value(chain, 0);
+        X509 *trusted = sk_X509_value(chain, matched);
+        if (leaf == nullptr || trusted == nullptr) {
+            return false;
+        }
+        bssl::UniquePtr<X509_STORE> store(X509_STORE_new());
+        bssl::UniquePtr<STACK_OF(X509)> intermediates(sk_X509_new_null());
+        bssl::UniquePtr<X509_STORE_CTX> verify(X509_STORE_CTX_new());
+        if (!store || !intermediates || !verify) {
+            return false;
+        }
+        if (X509_STORE_add_cert(store.get(), trusted) != 1) {
+            return false;
+        }
+        for (int index = 1; index <= matched; ++index) {
+            X509 *intermediate = sk_X509_value(chain, index);
+            if (intermediate == nullptr || sk_X509_push(intermediates.get(), intermediate) == 0) {
+                return false;
+            }
+        }
+        if (X509_STORE_CTX_init(verify.get(), store.get(), leaf, intermediates.get()) != 1 ||
+            X509_verify_cert(verify.get()) != 1) {
+            return false;
+        }
+        return X509_check_host(leaf, pin_verify_name_.data(), pin_verify_name_.size(), 0,
+                               nullptr) == 1;
+    }
+
+    bool verify_pinned_peer(boost::asio::ssl::verify_context &context) const {
+        X509_STORE_CTX *store = context.native_handle();
+        // Collect the whole chain; the pin decides at the leaf.
+        if (X509_STORE_CTX_get_error_depth(store) != 0) {
+            return true;
+        }
+        STACK_OF(X509) *chain = X509_STORE_CTX_get0_chain(store);
+        if (chain == nullptr) {
+            return false;
+        }
+        const auto count = static_cast<int>(sk_X509_num(chain));
+        for (int index = 0; index < count; ++index) {
+            const X509 *certificate = sk_X509_value(chain, index);
+            if (certificate == nullptr) {
+                return false;
+            }
+            uint8_t digest[32] = {0};
+            if (!certificate_sha256(certificate, digest)) {
+                return false;
+            }
+            if (CRYPTO_memcmp(digest, cert_pin_.data(), cert_pin_.size()) != 0) {
+                continue;
+            }
+            if (index == 0) {
+                return true;
+            }
+            return verify_pinned_chain(chain, index);
+        }
+        return false;
+    }
 };
 
 } // namespace detail

@@ -2,6 +2,10 @@ package interop
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -46,6 +50,18 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	trojanCertPin := func() string {
+		block, _ := pem.Decode(tlsMaterial.CertificatePEM)
+		if block == nil {
+			t.Fatal("decode trojan test certificate")
+		}
+		leaf, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(leaf.Raw)
+		return hex.EncodeToString(sum[:])
+	}()
 
 	methods := []string{
 		"aes-128-gcm", "aes-192-gcm", "aes-256-gcm", "chacha20-ietf-poly1305",
@@ -681,12 +697,12 @@ listeners:%s
 
 	t.Run("Trojan/chrome-fingerprint", func(t *testing.T) {
 		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
-			"CLASH_NATIVE_TEST_OUTBOUND":                    "trojan",
-			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":             trojanAddress,
-			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":           mihomoTestPassword,
-			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":        "localhost",
-			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":            caPath,
-			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_FINGERPRINT": "chrome",
+			"CLASH_NATIVE_TEST_OUTBOUND":                           "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":                    trojanAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":                  mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":               "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":                   caPath,
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_CLIENT_FINGERPRINT": "chrome",
 		})
 		defer stopProxy()
 
@@ -712,7 +728,7 @@ listeners:%s
 			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":                    trojanRealityAddress,
 			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":                  mihomoTestPassword,
 			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":               "localhost",
-			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_FINGERPRINT":        "chrome",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_CLIENT_FINGERPRINT": "chrome",
 			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_REALITY_PUBLIC_KEY": "Xj9HL2uOWizinSrzA5lePf8eUH9wQOeu6gG1QQrWIzc",
 			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_REALITY_SHORT_ID":   "deadbeef",
 		})
@@ -736,12 +752,12 @@ listeners:%s
 
 	t.Run("Trojan/firefox-fingerprint", func(t *testing.T) {
 		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
-			"CLASH_NATIVE_TEST_OUTBOUND":                    "trojan",
-			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":             trojanAddress,
-			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":           mihomoTestPassword,
-			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":        "localhost",
-			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":            caPath,
-			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_FINGERPRINT": "firefox",
+			"CLASH_NATIVE_TEST_OUTBOUND":                           "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":                    trojanAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":                  mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":               "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":                   caPath,
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_CLIENT_FINGERPRINT": "firefox",
 		})
 		defer stopProxy()
 
@@ -763,12 +779,12 @@ listeners:%s
 
 	t.Run("Trojan/safari-fingerprint", func(t *testing.T) {
 		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
-			"CLASH_NATIVE_TEST_OUTBOUND":                    "trojan",
-			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":             trojanAddress,
-			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":           mihomoTestPassword,
-			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":        "localhost",
-			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":            caPath,
-			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_FINGERPRINT": "safari",
+			"CLASH_NATIVE_TEST_OUTBOUND":                           "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":                    trojanAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":                  mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":               "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":                   caPath,
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_CLIENT_FINGERPRINT": "safari",
 		})
 		defer stopProxy()
 
@@ -796,9 +812,8 @@ listeners:%s
 			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":               "localhost",
 			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":                   caPath,
 			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_NETWORK":            "wss",
-			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_HOST":            "localhost",
 			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_PATH":            "/ws",
-			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_FINGERPRINT":        "chrome",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_TLS":             "1",
 			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_CLIENT_FINGERPRINT": "firefox",
 		})
 		defer stopProxy()
@@ -819,37 +834,58 @@ listeners:%s
 		}
 	})
 
-	t.Run("Trojan/UDP", func(t *testing.T) {
-		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
-			"CLASH_NATIVE_TEST_OUTBOUND":             "trojan",
-			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":      trojanAddress,
-			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":    mihomoTestPassword,
-			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME": "localhost",
-			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":     caPath,
-			"CLASH_NATIVE_TEST_PROXY_HOST":           udpHost,
-		})
-		defer stopProxy()
-		payload := []byte(strings.Repeat("cpp-to-mihomo-trojan-udp-", 64))
-		testShadowsocksUDPAssociateWithPayload(t, proxyAddress, udpEcho.Addr().String(),
-			udpEcho.Addr().IP, payload)
-	})
-
-	t.Run("Trojan/SS-UDP", func(t *testing.T) {
+	t.Run("Trojan/cert-pin", func(t *testing.T) {
 		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
 			"CLASH_NATIVE_TEST_OUTBOUND":                    "trojan",
-			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":             trojanSSAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":             trojanAddress,
 			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":           mihomoTestPassword,
 			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":        "localhost",
-			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":            caPath,
-			"CLASH_NATIVE_TEST_PROXY_HOST":                  udpHost,
-			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SS_ENABLED":  "1",
-			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SS_METHOD":   "AES-128-GCM",
-			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SS_PASSWORD": trojanSSPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_FINGERPRINT": trojanCertPin,
 		})
 		defer stopProxy()
-		payload := []byte(strings.Repeat("cpp-to-mihomo-trojan-ss-udp-", 64))
-		testShadowsocksUDPAssociateWithPayload(t, proxyAddress, udpEcho.Addr().String(),
-			udpEcho.Addr().IP, payload)
+
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-trojan-cert-pin-", 2048))
+		writeBytes(t, client, payload)
+		if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("half-close C++ to Mihomo Trojan stream: %v", err)
+			}
+		}
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo Trojan returned different bytes")
+		}
+	})
+
+	t.Run("Trojan/wrong-cert-pin", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":                    "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":             trojanAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":           mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":        "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_FINGERPRINT": strings.Repeat("0", 64),
+		})
+		defer stopProxy()
+
+		control, err := net.DialTimeout("tcp", proxyAddress, 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer control.Close()
+		_ = control.SetDeadline(time.Now().Add(5 * time.Second))
+		writeBytes(t, control, []byte{5, 1, 0})
+		method := make([]byte, 2)
+		readBytes(t, control, method)
+		if string(method) != string([]byte{5, 0}) {
+			t.Fatalf("unexpected SOCKS5 method response: %v", method)
+		}
+		writeSocksConnectRequest(t, control, tcpEcho.Addr())
+		if code := readSocks5ReplyCode(t, control); code == 0 {
+			t.Fatal("C++ Trojan outbound accepted a wrong certificate pin")
+		}
 	})
 
 	t.Run("Trojan/WSS", func(t *testing.T) {

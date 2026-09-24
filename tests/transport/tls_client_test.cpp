@@ -16,6 +16,7 @@
 #include <openssl/hkdf.h>
 #include <openssl/hmac.h>
 #include <openssl/hpke.h>
+#include <openssl/sha.h>
 #include <openssl/ssl.h>
 
 #include <boost/asio/buffer.hpp>
@@ -1594,4 +1595,143 @@ TEST(TlsClientTest, EchHandshakeCompletesAndHidesInnerServerName) {
 
     context.stop();
     runner.join();
+}
+namespace {
+
+std::string test_certificate_sha256_hex() {
+    bssl::UniquePtr<BIO> cert_bio(
+        BIO_new_mem_buf(kCertificate.data(), static_cast<int>(kCertificate.size())));
+    bssl::UniquePtr<X509> certificate(PEM_read_bio_X509(cert_bio.get(), nullptr, nullptr, nullptr));
+    if (!certificate) {
+        return "";
+    }
+    uint8_t *der = nullptr;
+    const int length = i2d_X509(certificate.get(), &der);
+    if (length <= 0 || der == nullptr) {
+        return "";
+    }
+    uint8_t digest[SHA256_DIGEST_LENGTH] = {0};
+    SHA256(der, static_cast<size_t>(length), digest);
+    OPENSSL_free(der);
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string hex;
+    for (const auto byte : digest) {
+        hex.push_back(kHex[byte >> 4]);
+        hex.push_back(kHex[byte & 0x0f]);
+    }
+    return hex;
+}
+
+bool run_pin_handshake(const std::string &pin, bool verify_peer) {
+    using boost::asio::ip::tcp;
+    boost::asio::io_context context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{
+        context.get_executor()};
+    std::thread runner([&] { context.run(); });
+
+    tcp::acceptor acceptor(context, tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+    tcp::socket server(context);
+    std::promise<void> accepted;
+    auto accepted_future = accepted.get_future();
+    acceptor.async_accept(server, [&](const boost::system::error_code &error) {
+        EXPECT_FALSE(error);
+        accepted.set_value();
+    });
+
+    tcp::socket peer(context);
+    peer.connect(
+        tcp::endpoint(boost::asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()));
+    if (accepted_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        context.stop();
+        runner.join();
+        return false;
+    }
+    auto stream = std::make_unique<clash_native::net::TcpStream>(std::move(peer));
+
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = verify_peer;
+    options.server_name = "localhost";
+    options.certificate_pin = pin;
+    options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto sender =
+        clash_native::transport::async_tls_client_handshake(std::move(stream), std::move(options));
+    SuccessReceiver receiver;
+    auto completed = receiver.done.get_future();
+    auto op = stdexec::connect(std::move(sender), std::move(receiver));
+    stdexec::start(op);
+
+    bssl::UniquePtr<SSL_CTX> server_context(SSL_CTX_new(TLS_server_method()));
+    if (!server_context) {
+        context.stop();
+        runner.join();
+        return false;
+    }
+    bssl::UniquePtr<BIO> cert_bio(
+        BIO_new_mem_buf(kCertificate.data(), static_cast<int>(kCertificate.size())));
+    bssl::UniquePtr<X509> certificate(PEM_read_bio_X509(cert_bio.get(), nullptr, nullptr, nullptr));
+    bssl::UniquePtr<BIO> key_bio(
+        BIO_new_mem_buf(kPrivateKey.data(), static_cast<int>(kPrivateKey.size())));
+    bssl::UniquePtr<EVP_PKEY> private_key(
+        PEM_read_bio_PrivateKey(key_bio.get(), nullptr, nullptr, nullptr));
+    if (!certificate || !private_key ||
+        SSL_CTX_use_certificate(server_context.get(), certificate.get()) != 1 ||
+        SSL_CTX_use_PrivateKey(server_context.get(), private_key.get()) != 1) {
+        context.stop();
+        runner.join();
+        return false;
+    }
+    bssl::UniquePtr<SSL> server_ssl(SSL_new(server_context.get()));
+    BIO *socket_bio = BIO_new_socket(server.native_handle(), BIO_NOCLOSE);
+    SSL_set_bio(server_ssl.get(), socket_bio, socket_bio);
+    const bool server_ok = SSL_accept(server_ssl.get()) == 1;
+    server.close();
+
+    bool client_ok = false;
+    if (completed.wait_for(std::chrono::seconds(5)) == std::future_status::ready) {
+        auto established = completed.get();
+        client_ok = established.has_value();
+    }
+    context.stop();
+    runner.join();
+    return server_ok && client_ok;
+}
+
+} // namespace
+
+TEST(TlsClientTest, RejectsBrowserNameAsCertificatePin) {
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "example.com";
+    options.certificate_pin = "chrome";
+    const auto failure = handshake_error(std::move(options));
+    EXPECT_EQ(failure.code, clash_native::core::ErrorCode::configuration);
+}
+
+TEST(TlsClientTest, RejectsMalformedCertificatePin) {
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "example.com";
+    options.certificate_pin = "zz-top";
+    EXPECT_EQ(handshake_error(options).code, clash_native::core::ErrorCode::configuration);
+    options.certificate_pin = "abcd";
+    EXPECT_EQ(handshake_error(options).code, clash_native::core::ErrorCode::configuration);
+}
+
+TEST(TlsClientTest, CertificatePinAcceptsMatchingServer) {
+    const auto pin = test_certificate_sha256_hex();
+    ASSERT_EQ(pin.size(), 64u);
+    EXPECT_TRUE(run_pin_handshake(pin, true));
+    // Colons are ignored, like openssl -fingerprint output.
+    std::string colon_pin;
+    for (std::size_t i = 0; i < pin.size(); ++i) {
+        if (i > 0 && i % 2 == 0) {
+            colon_pin.push_back(':');
+        }
+        colon_pin.push_back(pin[i]);
+    }
+    EXPECT_TRUE(run_pin_handshake(colon_pin, true));
+}
+
+TEST(TlsClientTest, CertificatePinRejectsMismatch) {
+    EXPECT_FALSE(run_pin_handshake(std::string(64, '0'), true));
 }

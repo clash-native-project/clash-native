@@ -45,6 +45,12 @@ struct TlsClientOptions {
     // public name. An ECH rejection fails the handshake (no automatic
     // retry with backup configs in this version).
     std::optional<std::vector<std::uint8_t>> ech_config_list;
+    // Server certificate SHA-256 pin, hex with optional colons (Mihomo
+    // fingerprint = SSL pinning). When set, a chain containing the pinned
+    // certificate is accepted (leaf outright, non-leaf via re-rooted chain
+    // verification); anything else is rejected. Takes precedence over
+    // normal chain verification but not over REALITY.
+    std::string certificate_pin;
     std::optional<TlsRealityOptions> reality;
     bool handoff_raw_transport = false;
     std::optional<int> maximum_tls_version;

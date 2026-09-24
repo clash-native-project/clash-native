@@ -2513,3 +2513,15 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   by cdb (sender and receiver built from one moved object in a single
   call) and a test-teardown hang masking failures. Full suite:
   286 passed; Trojan interop group green.
+
+## 2026-09-24
+
+- Trojan fingerprint semantics correction: Mihomo `fingerprint` is server
+  certificate SHA-256 pinning, `client-fingerprint` is the ClientHello
+  profile (verified against Mihomo docs and tls.go). Implemented pin
+  verification in tls_client (browser names rejected with a pointer to
+  client-fingerprint, leaf match accepted outright, non-leaf re-rooted
+  with hostname check) and remapped trojan TCP/gRPC/WS to use
+  client-fingerprint for the hello. Interop updated plus cert-pin
+  accept/reject cases against real Mihomo. Full suite: 290 passed;
+  Trojan interop group green.

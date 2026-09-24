@@ -197,7 +197,8 @@ struct GrpcSessionOpen {
         tls_options.client_certificate_pem = config.certificate;
         tls_options.client_private_key_pem = config.private_key;
         tls_options.alpn_protocols = {"h2"};
-        tls_options.fingerprint = config.fingerprint;
+        tls_options.certificate_pin = config.fingerprint;
+        tls_options.fingerprint = config.client_fingerprint;
         if (!config.reality_public_key.empty()) {
             tls_options.reality =
                 transport::TlsRealityOptions{config.reality_public_key, config.reality_short_id};
@@ -471,9 +472,8 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 ws_options.tls_alpn_protocols = self->config_.alpn_protocols.empty()
                                                     ? std::vector<std::string>{"http/1.1"}
                                                     : self->config_.alpn_protocols;
-                ws_options.tls_fingerprint = self->config_.client_fingerprint.empty()
-                                                 ? self->config_.fingerprint
-                                                 : self->config_.client_fingerprint;
+                ws_options.tls_fingerprint = self->config_.client_fingerprint;
+                ws_options.tls_certificate_pin = self->config_.fingerprint;
                 if (!self->config_.reality_public_key.empty()) {
                     ws_options.tls_reality = transport::TlsRealityOptions{
                         self->config_.reality_public_key, self->config_.reality_short_id};
@@ -556,7 +556,8 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 tls_options.alpn_protocols = self->config_.alpn_protocols.empty()
                                                  ? std::vector<std::string>{"h2", "http/1.1"}
                                                  : self->config_.alpn_protocols;
-                tls_options.fingerprint = self->config_.fingerprint;
+                tls_options.certificate_pin = self->config_.fingerprint;
+                tls_options.fingerprint = self->config_.client_fingerprint;
                 if (!self->config_.reality_public_key.empty()) {
                     tls_options.reality = transport::TlsRealityOptions{
                         self->config_.reality_public_key, self->config_.reality_short_id};

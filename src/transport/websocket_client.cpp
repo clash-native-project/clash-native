@@ -1096,6 +1096,7 @@ class WebSocketClientHandshakeOperation final
                 tls_options.alpn_protocols = {"http/1.1"};
             }
             tls_options.fingerprint = self->options_.tls_fingerprint;
+            tls_options.certificate_pin = self->options_.tls_certificate_pin;
             tls_options.reality = self->options_.tls_reality;
             tls_options.ech_config_list = self->options_.tls_ech_config_list;
             tls_options.deadline = self->options_.deadline;
