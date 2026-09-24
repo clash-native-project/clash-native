@@ -79,6 +79,9 @@ class ProxyServer {
     std::shared_ptr<runtime::RuntimeSnapshotStore> runtime_snapshot_store() const noexcept;
     core::Status start();
     void stop() noexcept;
+    // Aborts exactly one connection by registry id, leaving siblings
+    // untouched. Returns false when no live session holds the id.
+    bool close_connection(observability::ConnectionRegistry::ConnectionId id) noexcept;
     bool running() const noexcept;
     boost::asio::ip::tcp::endpoint endpoint() const noexcept;
     std::optional<boost::asio::ip::udp::endpoint> socks5_udp_endpoint() const noexcept;

@@ -157,6 +157,7 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
                  CloseHandler close_handler);
     void start();
     void stop() noexcept;
+    std::optional<observability::ConnectionRegistry::ConnectionId> connection_id() const noexcept;
 
   private:
     struct UdpPath {
@@ -248,7 +249,9 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     std::unique_ptr<io::StreamHandle> remote_;
     std::shared_ptr<TcpRelay> relay_;
     CloseHandler close_handler_;
-    std::optional<observability::ConnectionRegistry::ConnectionId> connection_id_;
+    // Atomic: the management plane (close_connection) reads this from any
+    // thread while the session runs on the executor. Zero means none.
+    std::atomic<observability::ConnectionRegistry::ConnectionId> connection_id_{0};
     std::atomic_bool closed_{false};
     Protocol protocol_ = Protocol::socks5;
     bool http_forward_ = false;

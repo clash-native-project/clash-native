@@ -658,9 +658,9 @@ void ProxySession::reset_http_forward_exchange() {
         remote_->close();
         remote_.reset();
     }
-    if (connection_id_ && owner_.connection_registry_) {
-        owner_.connection_registry_->remove(*connection_id_);
-        connection_id_.reset();
+    const auto forward_id = connection_id_.exchange(0, std::memory_order_acq_rel);
+    if (forward_id != 0 && owner_.connection_registry_) {
+        owner_.connection_registry_->remove(forward_id);
     }
 
     http_forward_ = false;
@@ -679,8 +679,9 @@ void ProxySession::reset_http_forward_exchange() {
 }
 
 void ProxySession::finish_http_forward() {
-    if (connection_id_ && owner_.connection_registry_) {
-        owner_.connection_registry_->update_stats(*connection_id_, http_forward_request_bytes_,
+    const auto finished_id = connection_id_.load(std::memory_order_acquire);
+    if (finished_id != 0 && owner_.connection_registry_) {
+        owner_.connection_registry_->update_stats(finished_id, http_forward_request_bytes_,
                                                   http_forward_response_bytes_);
     }
     const bool keep_alive = http_client_keep_alive_ && http_exchange_keep_alive_;

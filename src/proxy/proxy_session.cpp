@@ -38,6 +38,15 @@ void ProxySession::start() {
 
 void ProxySession::stop() noexcept { close(); }
 
+std::optional<observability::ConnectionRegistry::ConnectionId>
+ProxySession::connection_id() const noexcept {
+    const auto id = connection_id_.load(std::memory_order_acquire);
+    if (id == 0) {
+        return std::nullopt;
+    }
+    return id;
+}
+
 void ProxySession::reset_handshake_timer() {
     handshake_timer_.expires_after(kHandshakeTimeout);
     auto self = shared_from_this();
@@ -117,11 +126,13 @@ void ProxySession::open_target(core::Destination destination) {
                                                                       : "http",
                                       authenticated_user_,
                                       {}};
+    std::optional<observability::ConnectionRegistry::ConnectionId> connection_id;
     if (owner_.connection_registry_) {
-        connection_id_ = owner_.connection_registry_->add(metadata, {});
+        connection_id = owner_.connection_registry_->add(metadata, {});
+        connection_id_.store(*connection_id, std::memory_order_release);
     }
     auto self = shared_from_this();
-    self->scope_.spawn(run_open_target(self, std::move(metadata), connection_id_));
+    self->scope_.spawn(run_open_target(self, std::move(metadata), std::move(connection_id)));
 }
 
 exec::task<void> ProxySession::run_open_target(
@@ -197,9 +208,10 @@ void ProxySession::start_relay() {
     relay_ = TcpRelay::start(
         client_.detach(), std::move(remote_),
         [self](RelayStats stats) {
-            if (self->connection_id_ && self->owner_.connection_registry_) {
+            const auto connection_id = self->connection_id_.load(std::memory_order_acquire);
+            if (connection_id != 0 && self->owner_.connection_registry_) {
                 self->owner_.connection_registry_->update_stats(
-                    *self->connection_id_, stats.left_to_right_bytes, stats.right_to_left_bytes);
+                    connection_id, stats.left_to_right_bytes, stats.right_to_left_bytes);
             }
             self->close();
         },
@@ -252,9 +264,9 @@ void ProxySession::close() noexcept {
     }
     udp_snapshot_.reset();
 
-    if (connection_id_ && owner_.connection_registry_) {
-        owner_.connection_registry_->remove(*connection_id_);
-        connection_id_.reset();
+    const auto connection_id = connection_id_.exchange(0, std::memory_order_acq_rel);
+    if (connection_id != 0 && owner_.connection_registry_) {
+        owner_.connection_registry_->remove(connection_id);
     }
 
     boost::system::error_code ignored;

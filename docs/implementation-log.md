@@ -2357,3 +2357,11 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   Phase 0 pins baselines with two isolation tests (DNS
   cancel-one-of-two at the resolver, gun sibling-stream survival).
   Full suite: 257 passed.
+
+## 2026-09-24
+
+- Phase 1: `ProxyServer::close_connection(id)` aborts exactly one
+  session (relay/remote/bodies/UDP paths closed, registry record
+  removed) while siblings keep relaying. Session connection ids are
+  now atomic for management-plane reads. New stage1 test proves
+  one-session EOF plus sibling survival. Full suite: 258 passed.

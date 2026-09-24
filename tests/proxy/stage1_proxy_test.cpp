@@ -778,3 +778,121 @@ TEST(HttpProxyTest, ForwardsHttp11UpgradeAndRelaysTheUpgradedStream) {
     target.stop();
     runtime.stop();
 }
+
+namespace {
+
+void socks5_connect(boost::asio::ip::tcp::socket &client,
+                    const boost::asio::ip::tcp::endpoint &target) {
+    const std::array<std::uint8_t, 3> method_request{5, 1, 0};
+    boost::asio::write(client, boost::asio::buffer(method_request));
+    std::array<std::uint8_t, 2> method_response{};
+    boost::asio::read(client, boost::asio::buffer(method_response));
+    if (method_response != (std::array<std::uint8_t, 2>{5, 0})) {
+        throw std::runtime_error("socks5 method handshake failed");
+    }
+    const auto port = target.port();
+    const auto address = target.address().to_v4().to_bytes();
+    std::vector<std::uint8_t> request{5,
+                                      1,
+                                      0,
+                                      1,
+                                      address[0],
+                                      address[1],
+                                      address[2],
+                                      address[3],
+                                      static_cast<std::uint8_t>(port >> 8),
+                                      static_cast<std::uint8_t>(port & 0xff)};
+    boost::asio::write(client, boost::asio::buffer(request));
+    std::array<std::uint8_t, 10> response{};
+    boost::asio::read(client, boost::asio::buffer(response));
+    if (response[0] != 5 || response[1] != 0) {
+        throw std::runtime_error("socks5 connect failed");
+    }
+}
+
+std::string echo_round_trip(boost::asio::ip::tcp::socket &client, const std::string &payload) {
+    boost::asio::write(client, boost::asio::buffer(payload));
+    std::string echoed(payload.size(), '\0');
+    boost::asio::read(client, boost::asio::buffer(echoed));
+    return echoed;
+}
+
+} // namespace
+
+// Phase 1 cancellation: closing one connection by id tears down exactly
+// that session; the sibling keeps relaying.
+TEST(Stage1ProxyTest, CloseConnectionAbortsOneSessionOnly) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    // Two-shot echo target: one accept per proxied connection.
+    boost::asio::ip::tcp::acceptor target(runtime.context(),
+                                          {boost::asio::ip::address_v4::loopback(), 0});
+    const auto target_endpoint = target.local_endpoint();
+    for (int index = 0; index < 2; ++index) {
+        auto target_socket = std::make_shared<boost::asio::ip::tcp::socket>(runtime.context());
+        target.async_accept(
+            *target_socket, [target_socket](const boost::system::error_code &error) {
+                if (!error) {
+                    std::make_shared<EchoSession>(std::move(*target_socket))->start();
+                }
+            });
+    }
+
+    auto registry = std::make_shared<clash_native::observability::ConnectionRegistry>();
+    clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
+    proxy.set_connection_registry(registry);
+    ASSERT_TRUE(proxy.start());
+    runtime.start();
+
+    boost::asio::ip::tcp::socket first(runtime.context());
+    first.connect(proxy.endpoint());
+    ASSERT_NO_THROW(socks5_connect(first, target_endpoint));
+    EXPECT_EQ(echo_round_trip(first, "first"), "first");
+
+    boost::asio::ip::tcp::socket second(runtime.context());
+    second.connect(proxy.endpoint());
+    ASSERT_NO_THROW(socks5_connect(second, target_endpoint));
+    EXPECT_EQ(echo_round_trip(second, "second"), "second");
+
+    std::vector<clash_native::observability::ConnectionRegistry::ConnectionId> ids;
+    for (int attempt = 0; attempt < 200 && ids.size() != 2; ++attempt) {
+        ids.clear();
+        for (const auto &record : registry->snapshot()) {
+            ids.push_back(record.id);
+        }
+        if (ids.size() != 2) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    ASSERT_EQ(ids.size(), 2U);
+
+    EXPECT_TRUE(proxy.close_connection(ids[0]));
+    EXPECT_FALSE(proxy.close_connection(0xFFFFFFFFFFFFFFFFULL));
+
+    // The aborted side observes EOF…
+    std::array<std::uint8_t, 8> eof_probe{};
+    boost::system::error_code eof_error;
+    boost::asio::read(first, boost::asio::buffer(eof_probe), eof_error);
+    EXPECT_EQ(eof_error, boost::asio::error::eof);
+    for (int attempt = 0; attempt < 200 && !registry->snapshot().empty(); ++attempt) {
+        bool gone = true;
+        for (const auto &record : registry->snapshot()) {
+            if (record.id == ids[0]) {
+                gone = false;
+            }
+        }
+        if (gone) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // …while the sibling keeps relaying.
+    EXPECT_EQ(echo_round_trip(second, "still-here"), "still-here");
+
+    boost::system::error_code ignored;
+    first.close(ignored);
+    second.close(ignored);
+    proxy.stop();
+    target.close(ignored);
+    runtime.stop();
+}

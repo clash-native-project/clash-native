@@ -773,4 +773,24 @@ void ProxyServer::remove_session(const SessionPtr &session) noexcept {
     sessions_.erase(session);
 }
 
+bool ProxyServer::close_connection(observability::ConnectionRegistry::ConnectionId id) noexcept {
+    SessionPtr target;
+    {
+        std::lock_guard lock(sessions_mutex_);
+        for (const auto &session : sessions_) {
+            if (session->connection_id() == id) {
+                target = session;
+                break;
+            }
+        }
+    }
+    // Outside the lock: stop() closes the session, which removes itself
+    // from the set through the close handler.
+    if (!target) {
+        return false;
+    }
+    target->stop();
+    return true;
+}
+
 } // namespace clash_native::proxy
