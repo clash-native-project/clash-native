@@ -4,7 +4,7 @@
 #include <clash_native/async/callback_sender.hpp>
 
 #include <clash_native/net/stream_handle_adapter.hpp>
-#include <clash_native/transport/shadowsocks/crypto.hpp>
+#include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/tls_client.hpp>
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>

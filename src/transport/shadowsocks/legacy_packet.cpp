@@ -1,6 +1,6 @@
 #include <clash_native/transport/shadowsocks/legacy_packet.hpp>
 
-#include <clash_native/transport/shadowsocks/crypto.hpp>
+#include <clash_native/transport/proxy/crypto.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -20,24 +20,24 @@ core::Error packet_error(std::string context) {
 core::Result<std::vector<std::uint8_t>>
 encrypt_legacy_datagram(std::string_view method, std::string_view password,
                         std::span<const std::uint8_t> plaintext) {
-    const auto spec = cipher_method(method);
+    const auto spec = transport::proxy::cipher_method(method);
     if (!spec) {
         return core::fail(spec.error());
     }
-    if (spec.value().kind != CipherKind::stream) {
+    if (spec.value().kind != transport::proxy::CipherKind::stream) {
         return core::fail({core::ErrorCode::configuration,
                            "legacy datagram encryption requires a stream cipher"});
     }
     std::vector<std::uint8_t> iv(spec.value().iv_size);
-    if (!random_bytes(iv)) {
+    if (!transport::proxy::random_bytes(iv)) {
         return core::fail(
             {core::ErrorCode::authentication, "failed to generate Shadowsocks datagram IV"});
     }
-    auto key = derive_legacy_key(method, password, iv);
+    auto key = transport::proxy::derive_legacy_key(method, password, iv);
     if (!key) {
         return core::fail(key.error());
     }
-    auto cipher = LegacyStreamCipher::create(method, key.value(), iv, true);
+    auto cipher = transport::proxy::LegacyStreamCipher::create(method, key.value(), iv, true);
     if (!cipher) {
         return core::fail(cipher.error());
     }
@@ -52,11 +52,11 @@ encrypt_legacy_datagram(std::string_view method, std::string_view password,
 core::Result<std::vector<std::uint8_t>>
 decrypt_legacy_datagram(std::string_view method, std::string_view password,
                         std::span<const std::uint8_t> wire) {
-    const auto spec = cipher_method(method);
+    const auto spec = transport::proxy::cipher_method(method);
     if (!spec) {
         return core::fail(spec.error());
     }
-    if (spec.value().kind != CipherKind::stream) {
+    if (spec.value().kind != transport::proxy::CipherKind::stream) {
         return core::fail({core::ErrorCode::configuration,
                            "legacy datagram decryption requires a stream cipher"});
     }
@@ -64,11 +64,11 @@ decrypt_legacy_datagram(std::string_view method, std::string_view password,
         return core::fail(packet_error("Shadowsocks legacy datagram is shorter than its IV"));
     }
     const auto iv = wire.first(spec.value().iv_size);
-    auto key = derive_legacy_key(method, password, iv);
+    auto key = transport::proxy::derive_legacy_key(method, password, iv);
     if (!key) {
         return core::fail(key.error());
     }
-    auto cipher = LegacyStreamCipher::create(method, key.value(), iv, false);
+    auto cipher = transport::proxy::LegacyStreamCipher::create(method, key.value(), iv, false);
     if (!cipher) {
         return core::fail(cipher.error());
     }
@@ -82,8 +82,9 @@ decrypt_legacy_datagram(std::string_view method, std::string_view password,
 
 std::size_t legacy_datagram_payload_limit(std::string_view method, std::size_t wire_limit,
                                           std::size_t address_limit) noexcept {
-    const auto spec = cipher_method(method);
-    if (!spec || spec.value().kind != CipherKind::stream || wire_limit < spec.value().iv_size) {
+    const auto spec = transport::proxy::cipher_method(method);
+    if (!spec || spec.value().kind != transport::proxy::CipherKind::stream ||
+        wire_limit < spec.value().iv_size) {
         return 0;
     }
     const auto encrypted_limit = wire_limit - spec.value().iv_size;

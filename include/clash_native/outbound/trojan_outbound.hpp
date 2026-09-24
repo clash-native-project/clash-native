@@ -31,6 +31,12 @@ struct TrojanOutboundConfig {
     // Empty means Mihomo defaults: {"h2", "http/1.1"} for TCP,
     // {"http/1.1"} for WebSocket.
     std::vector<std::string> alpn_protocols;
+    // Trojan-SS (ss-opts): when enabled, the transport stream is wrapped
+    // in classic Shadowsocks AEAD framing before the Trojan header is
+    // written. Empty method means AES-128-GCM, matching Mihomo.
+    bool ss_enabled = false;
+    std::string ss_method;
+    std::string ss_password;
 };
 
 class TrojanOutbound final : public core::Outbound {

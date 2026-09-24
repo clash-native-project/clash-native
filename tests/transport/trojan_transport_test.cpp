@@ -1,7 +1,9 @@
 #include <clash_native/core/error.hpp>
 #include <clash_native/io/datagram_handle.hpp>
 #include <clash_native/net/tcp_stream.hpp>
+#include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/trojan/packet_conn.hpp>
+#include <clash_native/transport/trojan/ss_stream.hpp>
 
 #include <gtest/gtest.h>
 
@@ -185,4 +187,133 @@ TEST(TrojanPacketConnTest, ReportsTruncationAsMessageSize) {
     } catch (const clash_native::core::Error &failure) {
         EXPECT_EQ(failure.code, clash_native::core::ErrorCode::transport_io);
     }
+}
+
+namespace {
+
+using clash_native::transport::proxy::aead_decrypt;
+using clash_native::transport::proxy::aead_encrypt;
+using clash_native::transport::proxy::derive_aead_subkey;
+
+// Loopback TCP pair where the client end is wrapped in the Trojan ss
+// stream under test; the peer side speaks raw Shadowsocks AEAD framing.
+struct SsLoopback {
+    boost::asio::io_context context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{
+        context.get_executor()};
+    boost::asio::ip::tcp::socket peer{context};
+    std::unique_ptr<clash_native::io::StreamHandle> stream;
+
+    SsLoopback() {
+        using boost::asio::ip::tcp;
+        tcp::acceptor acceptor(context, tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+        tcp::socket server(context);
+        std::promise<void> accepted;
+        auto accepted_future = accepted.get_future();
+        acceptor.async_accept(server, [&](const boost::system::error_code &error) {
+            EXPECT_FALSE(error);
+            accepted.set_value();
+        });
+        worker_ = std::thread([this] { context.run(); });
+        peer.connect(tcp::endpoint(boost::asio::ip::address_v4::loopback(),
+                                   acceptor.local_endpoint().port()));
+        if (accepted_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+            throw std::runtime_error("loopback accept timed out");
+        }
+        auto plain = std::make_unique<clash_native::net::TcpStream>(std::move(server));
+        auto handle = clash_native::transport::trojan::make_trojan_ss_stream_handle(
+            std::move(plain), "AES-128-GCM", "ss-password");
+        if (!handle) {
+            throw std::runtime_error("make_trojan_ss_stream_handle failed");
+        }
+        stream = std::move(handle.value());
+    }
+
+    ~SsLoopback() {
+        stream.reset();
+        context.stop();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+  private:
+    std::thread worker_;
+};
+
+} // namespace
+
+TEST(TrojanSsStreamTest, SealsSaltAndChunksVerifiableWithSharedPrimitives) {
+    SsLoopback loop;
+    const std::string payload = "trojan-ss hello";
+    EXPECT_EQ(sync_get(loop.stream->async_write(boost::asio::buffer(payload))), payload.size());
+
+    // Salt first, then one sealed length + sealed payload chunk.
+    auto salt = read_exactly(loop.peer, 16);
+    auto key = derive_aead_subkey("AES-128-GCM", "ss-password", salt);
+    ASSERT_TRUE(key);
+    std::vector<std::uint8_t> nonce(12, 0);
+    auto encrypted_length = read_exactly(loop.peer, 2 + 16);
+    auto length = aead_decrypt("AES-128-GCM", key.value(), nonce, encrypted_length);
+    ASSERT_TRUE(length);
+    ASSERT_EQ(length.value().size(), 2U);
+    const std::size_t payload_size =
+        (static_cast<std::size_t>(length.value()[0]) << 8) | length.value()[1];
+    EXPECT_EQ(payload_size, payload.size());
+    nonce[0] = 1;
+    auto encrypted_payload = read_exactly(loop.peer, payload_size + 16);
+    auto plaintext = aead_decrypt("AES-128-GCM", key.value(), nonce, encrypted_payload);
+    ASSERT_TRUE(plaintext);
+    EXPECT_EQ(std::string(plaintext.value().begin(), plaintext.value().end()), payload);
+}
+
+TEST(TrojanSsStreamTest, DecryptsPeerChunksSealedWithSessionKey) {
+    SsLoopback loop;
+    // A first client write seeds the salt; drain salt + chunk to derive
+    // the shared session key.
+    const std::string ping = "ping";
+    EXPECT_EQ(sync_get(loop.stream->async_write(boost::asio::buffer(ping))), ping.size());
+    auto salt = read_exactly(loop.peer, 16);
+    auto key = derive_aead_subkey("AES-128-GCM", "ss-password", salt);
+    ASSERT_TRUE(key);
+    read_exactly(loop.peer, 2 + 16 + ping.size() + 16);
+
+    // Peer seals a reply chunk with the session key at nonce zero.
+    const std::string reply = "server reply";
+    std::vector<std::uint8_t> nonce(12, 0);
+    const std::array<std::uint8_t, 2> length{0x00, static_cast<std::uint8_t>(reply.size())};
+    auto encrypted_length =
+        aead_encrypt("AES-128-GCM", key.value(), nonce,
+                     std::span<const std::uint8_t>(length.data(), length.size()));
+    ASSERT_TRUE(encrypted_length);
+    nonce[0] = 1;
+    auto encrypted_payload =
+        aead_encrypt("AES-128-GCM", key.value(), nonce,
+                     std::span<const std::uint8_t>(
+                         reinterpret_cast<const std::uint8_t *>(reply.data()), reply.size()));
+    ASSERT_TRUE(encrypted_payload);
+    std::vector<std::uint8_t> wire;
+    wire.insert(wire.end(), encrypted_length.value().begin(), encrypted_length.value().end());
+    wire.insert(wire.end(), encrypted_payload.value().begin(), encrypted_payload.value().end());
+    EXPECT_EQ(loop.peer.send(boost::asio::buffer(wire)), wire.size());
+
+    std::array<std::uint8_t, 64> receive{};
+    const auto got = sync_get(loop.stream->async_read_some(boost::asio::buffer(receive)));
+    ASSERT_TRUE(got);
+    EXPECT_EQ(*got, reply.size());
+    EXPECT_EQ(std::string(reinterpret_cast<const char *>(receive.data()), *got), reply);
+}
+
+TEST(TrojanSsStreamTest, RejectsUnsupportedMethodsAndEmptyPassword) {
+    using clash_native::transport::trojan::make_trojan_ss_stream_handle;
+    boost::asio::io_context context;
+    auto make_plain = [&] {
+        return std::make_unique<clash_native::net::TcpStream>(
+            boost::asio::ip::tcp::socket(context));
+    };
+    EXPECT_FALSE(make_trojan_ss_stream_handle(make_plain(), "2022-BLAKE3-AES-128-GCM", "password"));
+    EXPECT_FALSE(make_trojan_ss_stream_handle(make_plain(), "rc4-md5", "password"));
+    EXPECT_FALSE(make_trojan_ss_stream_handle(make_plain(), "AES-128-GCM", ""));
+    EXPECT_FALSE(make_trojan_ss_stream_handle(make_plain(), "not-a-method", "password"));
+    EXPECT_FALSE(make_trojan_ss_stream_handle(nullptr, "AES-128-GCM", "password"));
 }

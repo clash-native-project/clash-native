@@ -141,7 +141,7 @@ add_library(clash-native-core STATIC
     src/transport/grpc_client.cpp
     src/transport/kcp_client.cpp
     src/transport/websocket_client.cpp
-    src/transport/shadowsocks/crypto.cpp
+    src/transport/proxy/crypto.cpp
     src/transport/shadowsocks/aead_packet.cpp
     src/transport/shadowsocks/legacy_packet.cpp
     src/transport/shadowsocks/legacy_stream.cpp
@@ -166,6 +166,7 @@ add_library(clash-native-core STATIC
     src/transport/quic_client.cpp
     src/transport/tls_client.cpp
     src/transport/trojan/packet_conn.cpp
+    src/transport/trojan/ss_stream.cpp
     src/outbound/shadowsocks_outbound.cpp
     src/outbound/trojan_outbound.cpp
     src/outbound/http_proxy_outbound.cpp

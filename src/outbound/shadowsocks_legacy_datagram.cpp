@@ -7,7 +7,7 @@
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
-#include <clash_native/transport/shadowsocks/crypto.hpp>
+#include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/shadowsocks/legacy_packet.hpp>
 
 #include <stdexec/execution.hpp>
@@ -301,11 +301,11 @@ core::Result<std::unique_ptr<io::DatagramHandle>>
 make_legacy_shadowsocks_datagram_handle(std::shared_ptr<net::UdpStream> socket,
                                         boost::asio::ip::udp::endpoint server, std::string method,
                                         std::string password) {
-    const auto spec = transport::shadowsocks::cipher_method(method);
+    const auto spec = transport::proxy::cipher_method(method);
     if (!spec) {
         return core::fail(spec.error());
     }
-    if (spec.value().kind != transport::shadowsocks::CipherKind::stream) {
+    if (spec.value().kind != transport::proxy::CipherKind::stream) {
         return core::fail({core::ErrorCode::configuration,
                            "legacy Shadowsocks datagram handle requires a stream cipher"});
     }

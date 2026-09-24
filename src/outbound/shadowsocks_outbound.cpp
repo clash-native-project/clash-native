@@ -6,8 +6,8 @@
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
+#include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/shadowsocks/aead_packet.hpp>
-#include <clash_native/transport/shadowsocks/crypto.hpp>
 #include <clash_native/transport/shadowsocks/jls_client.hpp>
 #include <clash_native/transport/shadowsocks/legacy_stream.hpp>
 #include <clash_native/transport/shadowsocks/restls_client.hpp>
@@ -83,10 +83,10 @@ std::vector<std::uint8_t> append_tcp_record(std::string_view method,
     const auto payload_size = static_cast<std::uint16_t>(payload.size());
     const std::array<std::uint8_t, 2> length{static_cast<std::uint8_t>(payload_size >> 8),
                                              static_cast<std::uint8_t>(payload_size & 0xff)};
-    auto encrypted_length = ss::aead_encrypt(method, key, nonce, length);
-    ss::increment_nonce(nonce);
-    auto encrypted_payload = ss::aead_encrypt(method, key, nonce, payload);
-    ss::increment_nonce(nonce);
+    auto encrypted_length = transport::proxy::aead_encrypt(method, key, nonce, length);
+    transport::proxy::increment_nonce(nonce);
+    auto encrypted_payload = transport::proxy::aead_encrypt(method, key, nonce, payload);
+    transport::proxy::increment_nonce(nonce);
     if (!encrypted_length || !encrypted_payload) {
         return {};
     }
@@ -173,7 +173,7 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
               method(std::move(method)), password(std::move(password)), key(std::move(key)),
               write_nonce(std::move(write_nonce)), initial_wire(std::move(initial_wire)),
               obfs_mode(obfs_mode), obfs_response_ready(obfs_mode == ss::ObfsMode::none) {
-            if (const auto spec = ss::cipher_method(this->method)) {
+            if (const auto spec = transport::proxy::cipher_method(this->method)) {
                 read_nonce.assign(spec.value().nonce_size, 0);
                 encrypted_length.resize(2 + spec.value().overhead);
             }
@@ -185,7 +185,7 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
             : socket(carrier ? carrier->socket() : nullptr), carrier(std::move(carrier)),
               method(std::move(method)), password(std::move(password)), key(std::move(key)),
               write_nonce(std::move(write_nonce)), initial_wire(std::move(initial_wire)) {
-            if (const auto spec = ss::cipher_method(this->method)) {
+            if (const auto spec = transport::proxy::cipher_method(this->method)) {
                 read_nonce.assign(spec.value().nonce_size, 0);
                 encrypted_length.resize(2 + spec.value().overhead);
             }
@@ -279,7 +279,7 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
         void close() noexcept { carrier->close(); }
 
         void receive_salt() {
-            const auto method_info = ss::cipher_method(method);
+            const auto method_info = transport::proxy::cipher_method(method);
             if (!method_info) {
                 finish_read(protocol_error(), 0);
                 return;
@@ -292,8 +292,8 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
                                self->finish_read(error, 0);
                                return;
                            }
-                           auto key_result = ss::derive_aead_subkey(self->method, self->password,
-                                                                    self->receive_salt_buffer);
+                           auto key_result = transport::proxy::derive_aead_subkey(
+                               self->method, self->password, self->receive_salt_buffer);
                            if (!key_result) {
                                self->finish_read(authentication_error(), 0);
                                return;
@@ -332,13 +332,13 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
                         self->finish_read(error, 0);
                         return;
                     }
-                    const auto length = ss::aead_decrypt(self->method, self->read_key,
-                                                         self->read_nonce, self->encrypted_length);
+                    const auto length = transport::proxy::aead_decrypt(
+                        self->method, self->read_key, self->read_nonce, self->encrypted_length);
                     if (!length || length.value().size() != 2) {
                         self->finish_read(authentication_error(), 0);
                         return;
                     }
-                    ss::increment_nonce(self->read_nonce);
+                    transport::proxy::increment_nonce(self->read_nonce);
                     const auto payload_size =
                         (static_cast<std::size_t>(length.value()[0]) << 8) | length.value()[1];
                     if (payload_size == 0 || payload_size > kMaxChunkPayload) {
@@ -351,7 +351,7 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
 
         void receive_payload(std::size_t payload_size) {
             auto self = shared_from_this();
-            const auto method_info = ss::cipher_method(method);
+            const auto method_info = transport::proxy::cipher_method(method);
             if (!method_info) {
                 finish_read(protocol_error(), 0);
                 return;
@@ -363,14 +363,14 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
                                self->finish_read(error, 0);
                                return;
                            }
-                           auto plaintext =
-                               ss::aead_decrypt(self->method, self->read_key, self->read_nonce,
-                                                self->encrypted_payload);
+                           auto plaintext = transport::proxy::aead_decrypt(
+                               self->method, self->read_key, self->read_nonce,
+                               self->encrypted_payload);
                            if (!plaintext || plaintext.value().empty()) {
                                self->finish_read(authentication_error(), 0);
                                return;
                            }
-                           ss::increment_nonce(self->read_nonce);
+                           transport::proxy::increment_nonce(self->read_nonce);
                            self->pending_plaintext = std::move(plaintext.value());
                            self->pending_offset = 0;
                            self->copy_pending(self->read_buffer, std::move(self->read_handler));
@@ -813,7 +813,7 @@ class ShadowsocksConnectOperation final
             return core::fail({core::ErrorCode::configuration,
                                "Shadowsocks outbound ID, server, port, and password are required"});
         }
-        const auto method = ss::cipher_method(config_.method);
+        const auto method = transport::proxy::cipher_method(config_.method);
         if (!method) {
             return core::fail(method.error());
         }
@@ -1084,7 +1084,7 @@ class ShadowsocksConnectOperation final
 
     static exec::task<void>
     send_initial_request(std::shared_ptr<ShadowsocksConnectOperation> self) {
-        const auto method = ss::cipher_method(self->config_.method);
+        const auto method = transport::proxy::cipher_method(self->config_.method);
         if (method.value().shadowsocks_2022) {
             auto address = detail::encode_proxy_address(self->request_.destination);
             if (!address) {
@@ -1131,17 +1131,18 @@ class ShadowsocksConnectOperation final
             self->finish(std::move(*opened));
             co_return;
         }
-        if (method.value().kind == ss::CipherKind::stream) {
+        if (method.value().kind == transport::proxy::CipherKind::stream) {
             co_await send_legacy_initial_request(self, method.value());
             co_return;
         }
         std::vector<std::uint8_t> salt(method.value().key_size);
-        if (!ss::random_bytes(salt)) {
+        if (!transport::proxy::random_bytes(salt)) {
             self->finish(core::StreamOpenResult::failed(
                 {core::ErrorCode::authentication, "failed to generate Shadowsocks salt"}));
             co_return;
         }
-        auto key = ss::derive_aead_subkey(self->config_.method, self->config_.password, salt);
+        auto key = transport::proxy::derive_aead_subkey(self->config_.method,
+                                                        self->config_.password, salt);
         auto address = detail::encode_proxy_address(self->request_.destination);
         if (!key || !address) {
             self->finish(core::StreamOpenResult::failed(!key ? key.error() : address.error()));
@@ -1346,20 +1347,22 @@ class ShadowsocksConnectOperation final
 
     static exec::task<void>
     send_legacy_initial_request(std::shared_ptr<ShadowsocksConnectOperation> self,
-                                const ss::CipherMethod &method) {
+                                const transport::proxy::CipherMethod &method) {
         std::vector<std::uint8_t> iv(method.iv_size);
-        if (!ss::random_bytes(iv)) {
+        if (!transport::proxy::random_bytes(iv)) {
             self->finish(core::StreamOpenResult::failed(
                 {core::ErrorCode::authentication, "failed to generate Shadowsocks legacy IV"}));
             co_return;
         }
-        auto key = ss::derive_legacy_key(self->config_.method, self->config_.password, iv);
+        auto key =
+            transport::proxy::derive_legacy_key(self->config_.method, self->config_.password, iv);
         auto address = detail::encode_proxy_address(self->request_.destination);
         if (!key || !address) {
             self->finish(core::StreamOpenResult::failed(!key ? key.error() : address.error()));
             co_return;
         }
-        auto cipher = ss::LegacyStreamCipher::create(self->config_.method, key.value(), iv, true);
+        auto cipher = transport::proxy::LegacyStreamCipher::create(self->config_.method,
+                                                                   key.value(), iv, true);
         if (!cipher) {
             self->finish(core::StreamOpenResult::failed(cipher.error()));
             co_return;
@@ -1376,7 +1379,8 @@ class ShadowsocksConnectOperation final
             co_return;
         }
         if (const auto obfs = self->obfs_options(); obfs) {
-            auto write_cipher = std::make_shared<ss::LegacyStreamCipher>(std::move(cipher.value()));
+            auto write_cipher =
+                std::make_shared<transport::proxy::LegacyStreamCipher>(std::move(cipher.value()));
             core::Status obfs_result;
             try {
                 if (obfs->mode == ss::ObfsMode::http) {
@@ -1422,7 +1426,8 @@ class ShadowsocksConnectOperation final
             self->finish(core::StreamOpenResult::opened(std::move(stream.value())));
             co_return;
         }
-        auto write_cipher = std::make_shared<ss::LegacyStreamCipher>(std::move(cipher.value()));
+        auto write_cipher =
+            std::make_shared<transport::proxy::LegacyStreamCipher>(std::move(cipher.value()));
         try {
             if (self->carrier_) {
                 co_await self->carrier_->async_write(boost::asio::buffer(*wire));
@@ -1467,10 +1472,12 @@ class ShadowsocksConnectOperation final
         self->finish(core::StreamOpenResult::opened(std::move(stream.value())));
     }
 
-    static exec::task<void> open_websocket_legacy(std::shared_ptr<ShadowsocksConnectOperation> self,
-                                                  std::vector<std::uint8_t> wire,
-                                                  ss::LegacyStreamCipher write_cipher) {
-        auto cipher = std::make_shared<ss::LegacyStreamCipher>(std::move(write_cipher));
+    static exec::task<void>
+    open_websocket_legacy(std::shared_ptr<ShadowsocksConnectOperation> self,
+                          std::vector<std::uint8_t> wire,
+                          transport::proxy::LegacyStreamCipher write_cipher) {
+        auto cipher =
+            std::make_shared<transport::proxy::LegacyStreamCipher>(std::move(write_cipher));
         auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
             std::make_unique<net::TcpStream>(std::move(*self->socket_)));
         core::Result<std::unique_ptr<io::StreamHandle>> plugin;
@@ -1601,7 +1608,7 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
               std::string method, std::string password)
             : socket(std::move(socket)), server(std::move(server)), method(std::move(method)),
               password(std::move(password)) {
-            const auto method_info = ss::cipher_method(this->method);
+            const auto method_info = transport::proxy::cipher_method(this->method);
             if (method_info && method_info.value().shadowsocks_2022) {
                 ss2022_codec = std::make_unique<ss::Shadowsocks2022DatagramCodec>(this->method,
                                                                                   this->password);
@@ -1612,7 +1619,7 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
                   WriteHandler handler) {
             const auto target = destination.to_destination();
             auto address = detail::encode_proxy_address(detail::to_core_destination(target));
-            const auto method_info = ss::cipher_method(method);
+            const auto method_info = transport::proxy::cipher_method(method);
             if (!address || !method_info) {
                 boost::asio::post(socket->executor(), [handler = std::move(handler)]() mutable {
                     handler(protocol_error(), 0);
@@ -1770,7 +1777,7 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
                                                     kMaxProxyAddressSize),
                     kMaxUdpWireSize);
             }
-            const auto spec = ss::cipher_method(method);
+            const auto spec = transport::proxy::cipher_method(method);
             if (!spec) {
                 return 0;
             }
@@ -1886,7 +1893,7 @@ core::Status ShadowsocksOutbound::validate() const {
         return core::fail({core::ErrorCode::configuration,
                            "Shadowsocks outbound ID, server, port, and password are required"});
     }
-    const auto method = ss::cipher_method(config_.method);
+    const auto method = transport::proxy::cipher_method(config_.method);
     if (!method) {
         return core::Status(core::fail(method.error()));
     }
@@ -2122,12 +2129,12 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
                          detail::to_std_error(error)}));
                     return;
                 }
-                const auto method = ss::cipher_method(config.method);
+                const auto method = transport::proxy::cipher_method(config.method);
                 if (!method) {
                     handler(core::DatagramOpenResult::failed(method.error()));
                     return;
                 }
-                if (method.value().kind == ss::CipherKind::stream) {
+                if (method.value().kind == transport::proxy::CipherKind::stream) {
                     auto handle = detail::make_legacy_shadowsocks_datagram_handle(
                         std::move(socket), server, config.method, config.password);
                     if (!handle) {

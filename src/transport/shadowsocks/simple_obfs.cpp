@@ -1,7 +1,7 @@
 #include <clash_native/transport/shadowsocks/simple_obfs.hpp>
 
 #include <clash_native/core/base64.hpp>
-#include <clash_native/transport/shadowsocks/crypto.hpp>
+#include <clash_native/transport/proxy/crypto.hpp>
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/read.hpp>
@@ -71,8 +71,8 @@ make_tls_client_hello_impl(std::span<const std::uint8_t> payload, std::string_vi
     }
     std::array<std::uint8_t, 28> random_bytes_buffer{};
     std::array<std::uint8_t, 32> session_id{};
-    if (!random_bytes(random_bytes_buffer) ||
-        (requested_session_id.empty() ? !random_bytes(session_id)
+    if (!transport::proxy::random_bytes(random_bytes_buffer) ||
+        (requested_session_id.empty() ? !transport::proxy::random_bytes(session_id)
                                       : requested_session_id.size() != session_id.size())) {
         return {};
     }
@@ -290,7 +290,7 @@ class HttpObfsRequest final : public std::enable_shared_from_this<HttpObfsReques
         }
 
         std::array<std::uint8_t, 16> key_bytes{};
-        if (!random_bytes(key_bytes)) {
+        if (!transport::proxy::random_bytes(key_bytes)) {
             finish(core::fail({core::ErrorCode::authentication,
                                "failed to generate HTTP obfs handshake key",
                                {}}));

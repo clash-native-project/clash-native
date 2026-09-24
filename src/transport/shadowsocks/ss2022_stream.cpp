@@ -4,7 +4,7 @@
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
-#include <clash_native/transport/shadowsocks/crypto.hpp>
+#include <clash_native/transport/proxy/crypto.hpp>
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/post.hpp>
@@ -120,10 +120,10 @@ core::Result<std::vector<std::uint8_t>> encrypt_record(std::string_view method,
     }
     std::array<std::uint8_t, 2> length{static_cast<std::uint8_t>(payload.size() >> 8),
                                        static_cast<std::uint8_t>(payload.size())};
-    auto encrypted_length = aead_encrypt(method, key, nonce, length);
-    increment_nonce(nonce);
-    auto encrypted_payload = aead_encrypt(method, key, nonce, payload);
-    increment_nonce(nonce);
+    auto encrypted_length = transport::proxy::aead_encrypt(method, key, nonce, length);
+    transport::proxy::increment_nonce(nonce);
+    auto encrypted_payload = transport::proxy::aead_encrypt(method, key, nonce, payload);
+    transport::proxy::increment_nonce(nonce);
     if (!encrypted_length || !encrypted_payload) {
         return core::fail(
             {core::ErrorCode::authentication, "failed to encrypt Shadowsocks 2022 record"});
@@ -139,8 +139,8 @@ core::Result<std::vector<std::uint8_t>> encrypt_chunk(std::string_view method,
                                                       std::span<const std::uint8_t> key,
                                                       std::vector<std::uint8_t> &nonce,
                                                       std::span<const std::uint8_t> payload) {
-    auto result = aead_encrypt(method, key, nonce, payload);
-    increment_nonce(nonce);
+    auto result = transport::proxy::aead_encrypt(method, key, nonce, payload);
+    transport::proxy::increment_nonce(nonce);
     return result;
 }
 
@@ -308,7 +308,7 @@ class Shadowsocks2022StreamState final
     }
 
     void receive_salt() {
-        const auto method = cipher_method(method_);
+        const auto method = transport::proxy::cipher_method(method_);
         if (!method) {
             finish_read(protocol_error(), 0);
             return;
@@ -320,8 +320,8 @@ class Shadowsocks2022StreamState final
                 self->finish_read(error, 0);
                 return;
             }
-            auto key = derive_shadowsocks_2022_session_key(self->method_, self->password_,
-                                                           self->read_salt_);
+            auto key = transport::proxy::derive_shadowsocks_2022_session_key(
+                self->method_, self->password_, self->read_salt_);
             if (!key) {
                 self->finish_read(authentication_error(), 0);
                 return;
@@ -332,7 +332,7 @@ class Shadowsocks2022StreamState final
     }
 
     void receive_response_fixed() {
-        const auto method = cipher_method(method_);
+        const auto method = transport::proxy::cipher_method(method_);
         if (!method || !read_key_) {
             finish_read(protocol_error(), 0);
             return;
@@ -347,8 +347,8 @@ class Shadowsocks2022StreamState final
                 self->finish_read(error, 0);
                 return;
             }
-            auto fixed =
-                aead_decrypt(self->method_, *self->read_key_, self->read_nonce_, *encrypted);
+            auto fixed = transport::proxy::aead_decrypt(self->method_, *self->read_key_,
+                                                        self->read_nonce_, *encrypted);
             self->increment_read_nonce();
             if (!fixed || fixed.value().size() != fixed_size || fixed.value()[0] != kServerHeader ||
                 !std::equal(self->request_salt_.begin(), self->request_salt_.end(),
@@ -372,7 +372,7 @@ class Shadowsocks2022StreamState final
     }
 
     void receive_response_variable(std::size_t variable_size) {
-        const auto method = cipher_method(method_);
+        const auto method = transport::proxy::cipher_method(method_);
         auto encrypted =
             std::make_shared<std::vector<std::uint8_t>>(variable_size + method.value().overhead);
         auto self = shared_from_this();
@@ -382,8 +382,8 @@ class Shadowsocks2022StreamState final
                            self->finish_read(error, 0);
                            return;
                        }
-                       auto variable = aead_decrypt(self->method_, *self->read_key_,
-                                                    self->read_nonce_, *encrypted);
+                       auto variable = transport::proxy::aead_decrypt(
+                           self->method_, *self->read_key_, self->read_nonce_, *encrypted);
                        self->increment_read_nonce();
                        if (!variable || variable.value().size() != variable_size) {
                            self->finish_read(authentication_error(), 0);
@@ -413,7 +413,7 @@ class Shadowsocks2022StreamState final
     }
 
     template <typename Handler> void read_record(Handler handler) {
-        const auto method = cipher_method(method_);
+        const auto method = transport::proxy::cipher_method(method_);
         if (!method || !read_key_) {
             finish_read(protocol_error(), 0);
             return;
@@ -421,46 +421,47 @@ class Shadowsocks2022StreamState final
         auto encrypted_length =
             std::make_shared<std::vector<std::uint8_t>>(2 + method.value().overhead);
         auto self = shared_from_this();
-        read_exact(boost::asio::buffer(*encrypted_length),
-                   [self, encrypted_length,
-                    handler = std::move(handler)](const boost::system::error_code &error) mutable {
-                       if (error) {
-                           self->finish_read(error, 0);
-                           return;
-                       }
-                       auto length = aead_decrypt(self->method_, *self->read_key_,
-                                                  self->read_nonce_, *encrypted_length);
-                       self->increment_read_nonce();
-                       if (!length || length.value().size() != 2) {
-                           self->finish_read(authentication_error(), 0);
-                           return;
-                       }
-                       const auto size = read_u16(length.value());
-                       if (size == 0 || size > kMaxChunkPayload) {
-                           self->finish_read(protocol_error(), 0);
-                           return;
-                       }
-                       const auto method = cipher_method(self->method_);
-                       auto encrypted_payload = std::make_shared<std::vector<std::uint8_t>>(
-                           size + method.value().overhead);
-                       self->read_exact(
-                           boost::asio::buffer(*encrypted_payload),
-                           [self, encrypted_payload, handler = std::move(handler)](
-                               const boost::system::error_code &payload_error) mutable {
-                               if (payload_error) {
-                                   self->finish_read(payload_error, 0);
-                                   return;
-                               }
-                               auto payload = aead_decrypt(self->method_, *self->read_key_,
-                                                           self->read_nonce_, *encrypted_payload);
-                               self->increment_read_nonce();
-                               if (!payload) {
-                                   self->finish_read(authentication_error(), 0);
-                                   return;
-                               }
-                               handler(std::move(payload.value()));
-                           });
-                   });
+        read_exact(
+            boost::asio::buffer(*encrypted_length),
+            [self, encrypted_length,
+             handler = std::move(handler)](const boost::system::error_code &error) mutable {
+                if (error) {
+                    self->finish_read(error, 0);
+                    return;
+                }
+                auto length = transport::proxy::aead_decrypt(self->method_, *self->read_key_,
+                                                             self->read_nonce_, *encrypted_length);
+                self->increment_read_nonce();
+                if (!length || length.value().size() != 2) {
+                    self->finish_read(authentication_error(), 0);
+                    return;
+                }
+                const auto size = read_u16(length.value());
+                if (size == 0 || size > kMaxChunkPayload) {
+                    self->finish_read(protocol_error(), 0);
+                    return;
+                }
+                const auto method = transport::proxy::cipher_method(self->method_);
+                auto encrypted_payload =
+                    std::make_shared<std::vector<std::uint8_t>>(size + method.value().overhead);
+                self->read_exact(boost::asio::buffer(*encrypted_payload),
+                                 [self, encrypted_payload, handler = std::move(handler)](
+                                     const boost::system::error_code &payload_error) mutable {
+                                     if (payload_error) {
+                                         self->finish_read(payload_error, 0);
+                                         return;
+                                     }
+                                     auto payload = transport::proxy::aead_decrypt(
+                                         self->method_, *self->read_key_, self->read_nonce_,
+                                         *encrypted_payload);
+                                     self->increment_read_nonce();
+                                     if (!payload) {
+                                         self->finish_read(authentication_error(), 0);
+                                         return;
+                                     }
+                                     handler(std::move(payload.value()));
+                                 });
+            });
     }
 
     using ExactReadHandler = std::function<void(const boost::system::error_code &)>;
@@ -524,7 +525,7 @@ class Shadowsocks2022StreamState final
                                    });
     }
 
-    void increment_read_nonce() { increment_nonce(read_nonce_); }
+    void increment_read_nonce() { transport::proxy::increment_nonce(read_nonce_); }
 
     void copy_pending(boost::asio::mutable_buffer buffer, StreamReadHandler handler) {
         const auto count = std::min(buffer.size(), pending_plaintext_.size() - pending_offset_);
@@ -672,20 +673,20 @@ class Shadowsocks2022OpenOperation final
     void start() { scope_.spawn(run_open(shared_from_this())); }
 
     static exec::task<void> run_open(std::shared_ptr<Shadowsocks2022OpenOperation> self) {
-        const auto method = cipher_method(self->method_);
+        const auto method = transport::proxy::cipher_method(self->method_);
         if (!method || !method.value().shadowsocks_2022) {
             self->complete(core::StreamOpenResult::failed(
                 {core::ErrorCode::configuration, "unsupported Shadowsocks 2022 method"}));
             co_return;
         }
         self->request_salt_.resize(method.value().key_size);
-        if (!random_bytes(self->request_salt_)) {
+        if (!transport::proxy::random_bytes(self->request_salt_)) {
             self->complete(core::StreamOpenResult::failed(
                 {core::ErrorCode::authentication, "failed to generate Shadowsocks 2022 salt"}));
             co_return;
         }
-        auto key = derive_shadowsocks_2022_session_key(self->method_, self->password_,
-                                                       self->request_salt_);
+        auto key = transport::proxy::derive_shadowsocks_2022_session_key(
+            self->method_, self->password_, self->request_salt_);
         if (!key || self->destination_.empty() ||
             self->destination_.size() + 2 > kMaxChunkPayload) {
             self->complete(core::StreamOpenResult::failed(

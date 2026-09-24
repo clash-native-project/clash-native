@@ -6,7 +6,7 @@
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/transport/kcp_client.hpp>
-#include <clash_native/transport/shadowsocks/crypto.hpp>
+#include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/shadowsocks/kcptun_packet_codec.hpp>
 #include <clash_native/transport/shadowsocks/kcptun_snappy.hpp>
 
@@ -685,7 +685,7 @@ make_kcptun_carrier(runtime::AsioRuntime &runtime, boost::asio::ip::udp::endpoin
     }
 
     std::array<std::uint8_t, sizeof(std::uint32_t)> conversation_bytes{};
-    if (!random_bytes(conversation_bytes)) {
+    if (!transport::proxy::random_bytes(conversation_bytes)) {
         return core::fail({core::ErrorCode::authentication,
                            "failed to generate Shadowsocks kcptun conversation ID",
                            {}});

@@ -3,8 +3,10 @@
 
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/trojan_outbound.hpp>
+#include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/tls_client.hpp>
 #include <clash_native/transport/trojan/packet_conn.hpp>
+#include <clash_native/transport/trojan/ss_stream.hpp>
 #include <exec/asio/use_sender.hpp>
 
 #include "outbound_utils.hpp"
@@ -220,6 +222,17 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 }
                 self->transport_stream_ = std::move(connection.stream);
             }
+            if (self->config_.ss_enabled) {
+                const auto method =
+                    self->config_.ss_method.empty() ? "AES-128-GCM" : self->config_.ss_method;
+                auto ss_stream = transport::trojan::make_trojan_ss_stream_handle(
+                    std::move(self->transport_stream_), method, self->config_.ss_password);
+                if (!ss_stream) {
+                    self->finish(core::StreamOpenResult::failed(ss_stream.error()));
+                    co_return;
+                }
+                self->transport_stream_ = std::move(ss_stream.value());
+            }
             const auto password_key = trojan_password_key(self->config_.password);
             const auto address = detail::encode_proxy_address(self->request_.destination);
             if (!password_key || !address) {
@@ -359,6 +372,22 @@ core::Status TrojanOutbound::validate() const {
     if ((config_.network == "ws" || config_.network == "wss") && config_.websocket_path.empty()) {
         return core::fail(
             {core::ErrorCode::configuration, "Trojan WebSocket path must not be empty"});
+    }
+    if (config_.ss_enabled) {
+        if (config_.ss_password.empty()) {
+            return core::fail(
+                {core::ErrorCode::configuration, "Trojan ss-opts password must not be empty"});
+        }
+        const auto method = config_.ss_method.empty() ? "AES-128-GCM" : config_.ss_method;
+        auto spec = transport::proxy::cipher_method(method);
+        if (!spec) {
+            return core::fail(spec.error());
+        }
+        if (spec.value().kind != transport::proxy::CipherKind::aead ||
+            spec.value().shadowsocks_2022) {
+            return core::fail({core::ErrorCode::configuration,
+                               "Trojan ss-opts supports classic AEAD methods only"});
+        }
     }
     return {};
 }

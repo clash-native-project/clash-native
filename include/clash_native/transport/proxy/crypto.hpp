@@ -13,7 +13,7 @@
 #include <string_view>
 #include <vector>
 
-namespace clash_native::transport::shadowsocks {
+namespace clash_native::transport::proxy {
 
 enum class CipherKind {
     aead,
@@ -101,4 +101,4 @@ class LegacyStreamCipher final {
 bool random_bytes(std::span<std::uint8_t> bytes) noexcept;
 void increment_nonce(std::span<std::uint8_t> nonce) noexcept;
 
-} // namespace clash_native::transport::shadowsocks
+} // namespace clash_native::transport::proxy

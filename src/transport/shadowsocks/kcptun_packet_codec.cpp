@@ -1,6 +1,6 @@
 #include <clash_native/transport/shadowsocks/kcptun_packet_codec.hpp>
 
-#include <clash_native/transport/shadowsocks/crypto.hpp>
+#include <clash_native/transport/proxy/crypto.hpp>
 
 #include <botan/aead.h>
 #include <botan/block_cipher.h>
@@ -411,7 +411,7 @@ std::vector<std::uint8_t> crypt_packet(const KcptunPacketCodec::Impl &impl,
     }
     if (impl.cipher_kind == KcptunPacketCodec::Impl::CipherKind::aes_gcm) {
         std::vector<std::uint8_t> nonce(kAeadNonceSize);
-        if (!random_bytes(nonce)) {
+        if (!transport::proxy::random_bytes(nonce)) {
             return {};
         }
         try {
@@ -432,7 +432,7 @@ std::vector<std::uint8_t> crypt_packet(const KcptunPacketCodec::Impl &impl,
         }
     }
     std::vector<std::uint8_t> output(kCryptHeaderSize + plaintext.size());
-    if (!random_bytes(std::span<std::uint8_t>(output).first(kCryptNonceSize))) {
+    if (!transport::proxy::random_bytes(std::span<std::uint8_t>(output).first(kCryptNonceSize))) {
         return {};
     }
     put_u32(output.data() + kCryptNonceSize, crc32_ieee(plaintext));

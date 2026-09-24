@@ -1,5 +1,5 @@
 #include <clash_native/core/base64.hpp>
-#include <clash_native/transport/shadowsocks/crypto.hpp>
+#include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/shadowsocks/jls.hpp>
 #include <clash_native/transport/shadowsocks/legacy_packet.hpp>
 #include <clash_native/transport/shadowsocks/restls.hpp>
@@ -30,7 +30,7 @@
 
 namespace {
 
-using clash_native::transport::shadowsocks::LegacyStreamCipher;
+using clash_native::transport::proxy::LegacyStreamCipher;
 
 class BufferedStream final : public clash_native::io::StreamHandle {
   public:
@@ -97,7 +97,7 @@ TEST(ShadowsocksTransportTest, RecognizesClassicCipherFamilies) {
                                  "aes-192-ccm",
                                  "aes-256-ccm"};
     for (const auto method : methods) {
-        EXPECT_TRUE(clash_native::transport::shadowsocks::cipher_method(method)) << method;
+        EXPECT_TRUE(clash_native::transport::proxy::cipher_method(method)) << method;
     }
 }
 
@@ -106,20 +106,20 @@ TEST(ShadowsocksTransportTest, RecognizesAndRoundTripsShadowsocks2022) {
                                  "2022-blake3-chacha20-poly1305"};
     const std::vector<std::uint8_t> plaintext{'s', 's', '2', '0', '2', '2'};
     for (const auto method : methods) {
-        const auto spec = clash_native::transport::shadowsocks::cipher_method(method);
+        const auto spec = clash_native::transport::proxy::cipher_method(method);
         ASSERT_TRUE(spec) << method;
         std::vector<std::uint8_t> psk(spec.value().key_size, 0x31);
         const auto password = clash_native::core::base64_encode(
             std::string(reinterpret_cast<const char *>(psk.data()), psk.size()));
         std::vector<std::uint8_t> salt(spec.value().salt_size, 0x52);
-        const auto key = clash_native::transport::shadowsocks::derive_shadowsocks_2022_session_key(
+        const auto key = clash_native::transport::proxy::derive_shadowsocks_2022_session_key(
             method, password, salt);
         ASSERT_TRUE(key) << method;
         std::vector<std::uint8_t> nonce(spec.value().nonce_size, 0x17);
-        const auto ciphertext = clash_native::transport::shadowsocks::aead_encrypt(
-            method, key.value(), nonce, plaintext);
+        const auto ciphertext =
+            clash_native::transport::proxy::aead_encrypt(method, key.value(), nonce, plaintext);
         ASSERT_TRUE(ciphertext) << method;
-        const auto recovered = clash_native::transport::shadowsocks::aead_decrypt(
+        const auto recovered = clash_native::transport::proxy::aead_decrypt(
             method, key.value(), nonce, ciphertext.value());
         ASSERT_TRUE(recovered) << method;
         EXPECT_EQ(recovered.value(), plaintext) << method;
@@ -140,17 +140,17 @@ TEST(ShadowsocksTransportTest, EncryptsAndDecryptsAeadPayloads) {
     const std::vector<std::uint8_t> plaintext{'s', 'h', 'a', 'd', 'o', 'w',
                                               's', 'o', 'c', 'k', 's'};
     for (const auto method : methods) {
-        const auto spec = clash_native::transport::shadowsocks::cipher_method(method);
+        const auto spec = clash_native::transport::proxy::cipher_method(method);
         ASSERT_TRUE(spec) << method;
         std::vector<std::uint8_t> salt(spec.value().salt_size, 0x23);
         std::vector<std::uint8_t> nonce(spec.value().nonce_size, 0x42);
         const auto key =
-            clash_native::transport::shadowsocks::derive_aead_subkey(method, "test-password", salt);
+            clash_native::transport::proxy::derive_aead_subkey(method, "test-password", salt);
         ASSERT_TRUE(key) << method;
-        const auto ciphertext = clash_native::transport::shadowsocks::aead_encrypt(
-            method, key.value(), nonce, plaintext);
+        const auto ciphertext =
+            clash_native::transport::proxy::aead_encrypt(method, key.value(), nonce, plaintext);
         ASSERT_TRUE(ciphertext) << method;
-        const auto recovered = clash_native::transport::shadowsocks::aead_decrypt(
+        const auto recovered = clash_native::transport::proxy::aead_decrypt(
             method, key.value(), nonce, ciphertext.value());
         ASSERT_TRUE(recovered) << method;
         EXPECT_EQ(recovered.value(), plaintext) << method;
@@ -163,7 +163,7 @@ TEST(ShadowsocksTransportTest, EncryptsShadowsocks2022DatagramRequests) {
     constexpr std::array methods{"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
                                  "2022-blake3-chacha20-poly1305"};
     for (const auto method : methods) {
-        const auto spec = clash_native::transport::shadowsocks::cipher_method(method);
+        const auto spec = clash_native::transport::proxy::cipher_method(method);
         ASSERT_TRUE(spec) << method;
         std::vector<std::uint8_t> psk(spec.value().key_size, 0x41);
         const auto password = clash_native::core::base64_encode(
@@ -200,10 +200,10 @@ TEST(ShadowsocksTransportTest, RoundTripsXchacha20Poly1305PacketPrimitive) {
     }
     const std::vector<std::uint8_t> plaintext{'x', 'c', 'h', 'a', 'c', 'h', 'a'};
     const auto ciphertext =
-        clash_native::transport::shadowsocks::xchacha20_poly1305_encrypt(key, nonce, plaintext);
+        clash_native::transport::proxy::xchacha20_poly1305_encrypt(key, nonce, plaintext);
     ASSERT_TRUE(ciphertext);
-    const auto recovered = clash_native::transport::shadowsocks::xchacha20_poly1305_decrypt(
-        key, nonce, ciphertext.value());
+    const auto recovered =
+        clash_native::transport::proxy::xchacha20_poly1305_decrypt(key, nonce, ciphertext.value());
     ASSERT_TRUE(recovered);
     EXPECT_EQ(recovered.value(), plaintext);
 }
@@ -219,18 +219,18 @@ TEST(ShadowsocksTransportTest, MatchesMihomoXchacha8Construction) {
         for (std::size_t index = 0; index < plaintext.size(); ++index) {
             plaintext[index] = static_cast<std::uint8_t>(index * 17U + 3U);
         }
-        const auto xchacha8 = clash_native::transport::shadowsocks::aead_encrypt(
-            "xchacha8-ietf-poly1305", key, nonce, plaintext);
+        const auto xchacha8 = clash_native::transport::proxy::aead_encrypt("xchacha8-ietf-poly1305",
+                                                                           key, nonce, plaintext);
         ASSERT_TRUE(xchacha8) << "size=" << size;
         const auto xchacha20 =
-            clash_native::transport::shadowsocks::xchacha20_poly1305_encrypt(key, nonce, plaintext);
+            clash_native::transport::proxy::xchacha20_poly1305_encrypt(key, nonce, plaintext);
         ASSERT_TRUE(xchacha20) << "size=" << size;
         EXPECT_NE(xchacha8.value(), xchacha20.value()) << "size=" << size;
-        const auto recovered = clash_native::transport::shadowsocks::aead_decrypt(
+        const auto recovered = clash_native::transport::proxy::aead_decrypt(
             "xchacha8-ietf-poly1305", key, nonce, xchacha8.value());
         ASSERT_TRUE(recovered) << "size=" << size;
         EXPECT_EQ(recovered.value(), plaintext) << "size=" << size;
-        clash_native::transport::shadowsocks::increment_nonce(nonce);
+        clash_native::transport::proxy::increment_nonce(nonce);
     }
 
     const std::vector<std::uint8_t> vector_plaintext = [] {
@@ -240,7 +240,7 @@ TEST(ShadowsocksTransportTest, MatchesMihomoXchacha8Construction) {
         }
         return result;
     }();
-    const auto vector_ciphertext = clash_native::transport::shadowsocks::aead_encrypt(
+    const auto vector_ciphertext = clash_native::transport::proxy::aead_encrypt(
         "xchacha8-ietf-poly1305", key,
         std::vector<std::uint8_t>{5,   18,  31,  44,  57,  70,  83,  96,  109, 122, 135, 148,
                                   161, 174, 187, 200, 213, 226, 239, 252, 9,   22,  35,  48},
@@ -260,11 +260,11 @@ TEST(ShadowsocksTransportTest, EncryptsAndDecryptsLegacyStreams) {
                                  "chacha20-ietf", "xchacha20"};
     const std::vector<std::uint8_t> source(257, 0x7a);
     for (const auto method : methods) {
-        const auto spec = clash_native::transport::shadowsocks::cipher_method(method);
+        const auto spec = clash_native::transport::proxy::cipher_method(method);
         ASSERT_TRUE(spec) << method;
         std::vector<std::uint8_t> iv(spec.value().iv_size, 0x19);
         const auto key =
-            clash_native::transport::shadowsocks::derive_legacy_key(method, "test-password", iv);
+            clash_native::transport::proxy::derive_legacy_key(method, "test-password", iv);
         ASSERT_TRUE(key) << method;
         auto encrypted = source;
         auto encryptor = LegacyStreamCipher::create(method, key.value(), iv, true);

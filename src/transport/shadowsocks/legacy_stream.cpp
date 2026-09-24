@@ -3,7 +3,7 @@
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
-#include <clash_native/transport/shadowsocks/crypto.hpp>
+#include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/shadowsocks/simple_obfs.hpp>
 
 #include <boost/asio/buffer.hpp>
@@ -71,7 +71,7 @@ struct CarrierWriteBridge {
 class LegacyStreamState final : public std::enable_shared_from_this<LegacyStreamState> {
   public:
     LegacyStreamState(std::shared_ptr<boost::asio::ip::tcp::socket> socket, std::string method,
-                      std::string password, LegacyStreamCipher write_cipher,
+                      std::string password, transport::proxy::LegacyStreamCipher write_cipher,
                       std::vector<std::uint8_t> initial_wire, ObfsMode obfs_mode)
         : socket_(std::move(socket)), carrier_(std::make_shared<StreamCarrier>(socket_)),
           method_(std::move(method)), password_(std::move(password)),
@@ -79,7 +79,7 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
           obfs_mode_(obfs_mode), obfs_response_ready_(obfs_mode == ObfsMode::none) {}
 
     LegacyStreamState(std::shared_ptr<StreamCarrier> carrier, std::string method,
-                      std::string password, LegacyStreamCipher write_cipher,
+                      std::string password, transport::proxy::LegacyStreamCipher write_cipher,
                       std::vector<std::uint8_t> initial_wire)
         : socket_(carrier ? carrier->socket() : nullptr), carrier_(std::move(carrier)),
           method_(std::move(method)), password_(std::move(password)),
@@ -185,7 +185,7 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
     }
 
     void receive_iv() {
-        const auto spec = cipher_method(method_);
+        const auto spec = transport::proxy::cipher_method(method_);
         if (!spec) {
             finish_read(boost::asio::error::operation_not_supported, 0);
             return;
@@ -198,14 +198,14 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
                            self->finish_read(error, 0);
                            return;
                        }
-                       auto key = derive_legacy_key(self->method_, self->password_,
-                                                    self->receive_iv_buffer_);
+                       auto key = transport::proxy::derive_legacy_key(
+                           self->method_, self->password_, self->receive_iv_buffer_);
                        if (!key) {
                            self->finish_read(boost::asio::error::operation_not_supported, 0);
                            return;
                        }
-                       auto cipher = LegacyStreamCipher::create(self->method_, key.value(),
-                                                                self->receive_iv_buffer_, false);
+                       auto cipher = transport::proxy::LegacyStreamCipher::create(
+                           self->method_, key.value(), self->receive_iv_buffer_, false);
                        if (!cipher) {
                            self->finish_read(boost::asio::error::operation_not_supported, 0);
                            return;
@@ -374,8 +374,8 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
     std::shared_ptr<StreamCarrier> carrier_;
     std::string method_;
     std::string password_;
-    LegacyStreamCipher write_cipher_;
-    std::optional<LegacyStreamCipher> read_cipher_;
+    transport::proxy::LegacyStreamCipher write_cipher_;
+    std::optional<transport::proxy::LegacyStreamCipher> read_cipher_;
     std::vector<std::uint8_t> receive_iv_buffer_;
     std::vector<std::uint8_t> initial_wire_;
     std::size_t initial_wire_offset_ = 0;
@@ -443,7 +443,7 @@ class LegacyStreamHandle final : public io::StreamHandle {
 
 core::Result<std::unique_ptr<io::StreamHandle>>
 make_legacy_stream_handle(std::shared_ptr<boost::asio::ip::tcp::socket> socket, std::string method,
-                          std::string password, LegacyStreamCipher write_cipher,
+                          std::string password, transport::proxy::LegacyStreamCipher write_cipher,
                           std::vector<std::uint8_t> initial_wire, ObfsMode obfs_mode) {
     auto state = std::make_shared<LegacyStreamState>(std::move(socket), std::move(method),
                                                      std::move(password), std::move(write_cipher),
@@ -454,7 +454,7 @@ make_legacy_stream_handle(std::shared_ptr<boost::asio::ip::tcp::socket> socket, 
 
 core::Result<std::unique_ptr<io::StreamHandle>>
 make_legacy_stream_handle(std::shared_ptr<StreamCarrier> carrier, std::string method,
-                          std::string password, LegacyStreamCipher write_cipher,
+                          std::string password, transport::proxy::LegacyStreamCipher write_cipher,
                           std::vector<std::uint8_t> initial_wire) {
     if (!carrier) {
         return core::fail(

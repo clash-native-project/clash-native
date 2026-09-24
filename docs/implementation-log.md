@@ -2291,3 +2291,15 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Matched Mihomo Trojan ALPN defaults: empty `alpn_protocols` now
   offers `{"h2", "http/1.1"}` on TCP and `{"http/1.1"}` on
   WebSocket; explicit lists override. Full suite: 240 passed.
+
+## 2026-09-24
+
+- Added Trojan-SS (ss-opts): extracted the stateless AEAD crypto
+  primitives from `transport/shadowsocks/crypto` to shared
+  `transport/proxy/crypto` (namespace `transport::proxy`; SS callers
+  re-pointed, behavior unchanged), and added a Trojan-side AEAD
+  stream wrapper in `transport/trojan/ss_stream` (salt + sealed
+  0x3FFF chunks, classic AEAD only). The SS outbound's stateful
+  stream handle was deliberately not extracted. New SsStream tests
+  verify sealing against the shared primitives and bidirectional
+  framing. Full suite: 243 passed.

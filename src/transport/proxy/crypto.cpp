@@ -1,4 +1,4 @@
-#include <clash_native/transport/shadowsocks/crypto.hpp>
+#include <clash_native/transport/proxy/crypto.hpp>
 
 #include <clash_native/core/base64.hpp>
 
@@ -25,7 +25,7 @@
 #include <string>
 #include <utility>
 
-namespace clash_native::transport::shadowsocks {
+namespace clash_native::transport::proxy {
 
 namespace {
 
@@ -878,4 +878,4 @@ void increment_nonce(std::span<std::uint8_t> nonce) noexcept {
     }
 }
 
-} // namespace clash_native::transport::shadowsocks
+} // namespace clash_native::transport::proxy

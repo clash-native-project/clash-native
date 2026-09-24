@@ -1,6 +1,6 @@
 #include <clash_native/transport/shadowsocks/ss2022_packet.hpp>
 
-#include <clash_native/transport/shadowsocks/crypto.hpp>
+#include <clash_native/transport/proxy/crypto.hpp>
 
 #include <openssl/evp.h>
 
@@ -59,7 +59,7 @@ std::uint64_t unix_seconds() {
                                           .count());
 }
 
-bool is_aes_method(const CipherMethod &method) {
+bool is_aes_method(const transport::proxy::CipherMethod &method) {
     return method.name == "2022-blake3-aes-128-gcm" || method.name == "2022-blake3-aes-256-gcm";
 }
 
@@ -132,13 +132,13 @@ strip_response_header(std::span<const std::uint8_t> plaintext, std::uint64_t exp
 
 Shadowsocks2022DatagramCodec::Shadowsocks2022DatagramCodec(std::string method, std::string password)
     : method_(std::move(method)), password_(std::move(password)) {
-    const auto method_info = cipher_method(method_);
+    const auto method_info = transport::proxy::cipher_method(method_);
     if (method_info && method_info.value().shadowsocks_2022) {
-        auto psk = decode_shadowsocks_2022_psk(method_, password_);
+        auto psk = transport::proxy::decode_shadowsocks_2022_psk(method_, password_);
         if (psk) {
             psk_ = std::move(psk.value());
             std::array<std::uint8_t, sizeof(session_id_)> bytes{};
-            if (random_bytes(bytes)) {
+            if (transport::proxy::random_bytes(bytes)) {
                 session_id_ = read_u64(bytes, 0);
             }
         }
@@ -148,7 +148,7 @@ Shadowsocks2022DatagramCodec::Shadowsocks2022DatagramCodec(std::string method, s
 core::Result<std::vector<std::uint8_t>>
 Shadowsocks2022DatagramCodec::encrypt(std::span<const std::uint8_t> destination,
                                       std::span<const std::uint8_t> payload) {
-    const auto method_info = cipher_method(method_);
+    const auto method_info = transport::proxy::cipher_method(method_);
     if (!method_info || !method_info.value().shadowsocks_2022 || psk_.empty() ||
         destination.empty()) {
         return core::fail(packet_error("invalid Shadowsocks 2022 UDP configuration"));
@@ -176,12 +176,13 @@ Shadowsocks2022DatagramCodec::encrypt(std::span<const std::uint8_t> destination,
         std::array<std::uint8_t, sizeof(session_id_)> session_salt{};
         std::copy(packet_header.begin(), packet_header.begin() + session_salt.size(),
                   session_salt.begin());
-        auto session_key = derive_shadowsocks_2022_subkey(method_, password_, session_salt);
+        auto session_key =
+            transport::proxy::derive_shadowsocks_2022_subkey(method_, password_, session_salt);
         if (!session_key) {
             return core::fail(session_key.error());
         }
         const auto nonce = std::span<const std::uint8_t>(packet_header).subspan(4, 12);
-        auto ciphertext = aead_encrypt(method_, session_key.value(), nonce, body);
+        auto ciphertext = transport::proxy::aead_encrypt(method_, session_key.value(), nonce, body);
         if (!ciphertext) {
             return core::fail(ciphertext.error());
         }
@@ -195,7 +196,7 @@ Shadowsocks2022DatagramCodec::encrypt(std::span<const std::uint8_t> destination,
     }
 
     std::array<std::uint8_t, kPacketNonceSize> nonce{};
-    if (!random_bytes(nonce)) {
+    if (!transport::proxy::random_bytes(nonce)) {
         return core::fail(
             {core::ErrorCode::authentication, "failed to generate Shadowsocks 2022 UDP nonce"});
     }
@@ -204,7 +205,7 @@ Shadowsocks2022DatagramCodec::encrypt(std::span<const std::uint8_t> destination,
     append_u64(encrypted_body, session_id_);
     append_u64(encrypted_body, packet_id);
     encrypted_body.insert(encrypted_body.end(), body.begin(), body.end());
-    auto ciphertext = xchacha20_poly1305_encrypt(psk_, nonce, encrypted_body);
+    auto ciphertext = transport::proxy::xchacha20_poly1305_encrypt(psk_, nonce, encrypted_body);
     if (!ciphertext) {
         return core::fail(ciphertext.error());
     }
@@ -215,7 +216,7 @@ Shadowsocks2022DatagramCodec::encrypt(std::span<const std::uint8_t> destination,
 
 core::Result<std::vector<std::uint8_t>>
 Shadowsocks2022DatagramCodec::decrypt(std::span<const std::uint8_t> wire) {
-    const auto method_info = cipher_method(method_);
+    const auto method_info = transport::proxy::cipher_method(method_);
     if (!method_info || !method_info.value().shadowsocks_2022 || psk_.empty()) {
         return core::fail(packet_error("invalid Shadowsocks 2022 UDP configuration"));
     }
@@ -228,13 +229,14 @@ Shadowsocks2022DatagramCodec::decrypt(std::span<const std::uint8_t> wire) {
             return core::fail(packet_header.error());
         }
         const auto session_salt = std::span<const std::uint8_t>(*packet_header).first(8);
-        auto session_key = derive_shadowsocks_2022_subkey(method_, password_, session_salt);
+        auto session_key =
+            transport::proxy::derive_shadowsocks_2022_subkey(method_, password_, session_salt);
         if (!session_key) {
             return core::fail(session_key.error());
         }
         const auto nonce = std::span<const std::uint8_t>(*packet_header).subspan(4, 12);
-        auto plaintext =
-            aead_decrypt(method_, session_key.value(), nonce, wire.subspan(kPacketHeaderSize));
+        auto plaintext = transport::proxy::aead_decrypt(method_, session_key.value(), nonce,
+                                                        wire.subspan(kPacketHeaderSize));
         if (!plaintext) {
             return core::fail(plaintext.error());
         }
@@ -243,8 +245,8 @@ Shadowsocks2022DatagramCodec::decrypt(std::span<const std::uint8_t> wire) {
     if (wire.size() < kPacketNonceSize + kAeadTagSize + sizeof(session_id_) * 2 + kFixedBodySize) {
         return core::fail(packet_error("Shadowsocks 2022 UDP response is too short"));
     }
-    auto plaintext = xchacha20_poly1305_decrypt(psk_, wire.first(kPacketNonceSize),
-                                                wire.subspan(kPacketNonceSize));
+    auto plaintext = transport::proxy::xchacha20_poly1305_decrypt(
+        psk_, wire.first(kPacketNonceSize), wire.subspan(kPacketNonceSize));
     if (!plaintext) {
         return core::fail(plaintext.error());
     }
@@ -257,7 +259,7 @@ Shadowsocks2022DatagramCodec::decrypt(std::span<const std::uint8_t> wire) {
 std::size_t
 Shadowsocks2022DatagramCodec::max_datagram_size(std::size_t wire_limit,
                                                 std::size_t destination_limit) const noexcept {
-    const auto method_info = cipher_method(method_);
+    const auto method_info = transport::proxy::cipher_method(method_);
     if (!method_info || !method_info.value().shadowsocks_2022) {
         return 0;
     }
