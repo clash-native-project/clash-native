@@ -64,8 +64,9 @@ std::error_code to_std_error(const boost::system::error_code &error) {
 }
 
 // gRPC Transport session: resolve, TCP connect, TLS with enforced h2 ALPN,
-// then an HTTP/2 exchange session. Callback chain on shared state (no task:
-// freshly created tasks must not cross a scope-spawn boundary here).
+// then an HTTP/2 exchange session. Callback chain on shared state (a task
+// here would need an immediately-invoked capturing lambda, which is banned
+// by docs/async-pitfalls.md).
 io::AnySender<std::shared_ptr<io::ExchangeSession>>
 open_grpc_session(runtime::AsioRuntime &runtime, std::shared_ptr<dns::ResolverService> resolver,
                   TrojanOutboundConfig config) {

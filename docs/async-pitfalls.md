@@ -96,21 +96,23 @@ tasks; the following keep their shape deliberately:
 - Test-only APIs (e.g. the gRPC client): convert if and when a
   production caller appears.
 
-## Fresh tasks must not cross a scope-spawn boundary
+## Never create exec::task from an immediately-invoked capturing lambda
 
-A newly created `exec::task` carries its captures in the coroutine frame.
-Moving that task through intermediaries (`std::optional` boxes,
-`stdexec::then` pipes) into `async_scope::spawn` corrupted the frame on
-Windows clang-cl (observed: captures read back null, then AV/hang). The
-established `run()` shape works because the task is spawned directly.
-Rules:
+A coroutine frame built from an immediately-invoked capturing lambda
+(`[captures]() -> exec::task<T> { ... }()`) is corrupt on Windows
+clang-cl with this stdexec version (proven by minimal repro: captures
+read back null/garbage, bodies never run; AV/hang/stopped follow).
+Named functions, capture-free lambdas, and stored (named) lambdas
+invoked later are unaffected. Rules:
 
-- Spawn a task directly: `scope.spawn(run(...))` with captures bound at
-  creation. Do not ferry a task object through optionals or adaptors
-  first.
+- Tasks come from named functions (static members, free functions)
+  with explicit parameters, e.g. `scope.spawn(run(...))`, or from a
+  stored lambda variable invoked later. Never an immediately-invoked
+  `[captures]() -> exec::task` inline, however convenient.
+  `tests/transport/task_coroutine_test.cpp` pins the allowed shapes.
 - Drive a value-only chain to a callback with a plain shared state
-  machine (`start_with_receiver` + small receivers), not by adapting a
-  task into a bridge.
+  machine (`start_with_receiver` + small receivers) when no named
+  function shape fits, not by adapting an inline task into a bridge.
 - `exec::task` cannot be type-erased into `AnySender` either (sticky
   scheduler affinity fails `sender_to<any_receiver>`); expose chains as
   `bridge_sender` + `then`, like `async_tls_client_handshake`.

@@ -2332,3 +2332,13 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   and pool growth. Full suite: 251 passed.
 - Recorded the fresh-task scope-spawn corruption and the Guard
   temporary pitfalls in `docs/async-pitfalls.md`.
+
+## 2026-09-24
+
+- Pinned the coroutine-creation rule with minimal repros: tasks from
+  immediately-invoked capturing lambdas build corrupt frames on
+  Windows clang-cl (null/garbage captures), while named functions,
+  capture-free lambdas, and stored lambdas are fine.
+  `tests/transport/task_coroutine_test.cpp` pins the allowed shapes;
+  `docs/async-pitfalls.md` states the exact rule. Full suite: 255
+  passed.
