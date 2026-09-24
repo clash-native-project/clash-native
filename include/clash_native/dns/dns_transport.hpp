@@ -99,13 +99,16 @@ struct DnsExchangeRequest {
     std::chrono::steady_clock::time_point deadline;
 };
 
+// Internal exchange key for transports that multiplex queries over a
+// shared carrier. Not part of the public contract: dropping the
+// exchange sender aborts exactly that query.
+using DnsExchangeId = std::uint64_t;
+
+using DnsExchangeResult = core::Result<DnsPacket>;
+
 class DnsTransport {
   public:
-    using ExchangeId = std::uint64_t;
-    using Handler = std::function<void(core::Result<DnsPacket>)>;
-
-    virtual ExchangeId exchange(DnsExchangeRequest request, Handler handler) = 0;
-    virtual void cancel(ExchangeId exchange_id) noexcept = 0;
+    virtual io::AnySender<DnsExchangeResult> exchange(DnsExchangeRequest request) = 0;
     virtual void stop() noexcept = 0;
     virtual ~DnsTransport() = default;
 };

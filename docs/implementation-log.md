@@ -2365,3 +2365,12 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   removed) while siblings keep relaying. Session connection ids are
   now atomic for management-plane reads. New stage1 test proves
   one-session EOF plus sibling survival. Full suite: 258 passed.
+
+## 2026-09-24
+
+- Phase 2a: sender-based `DnsTransport::exchange` (all seven
+  transports plus bootstrap wrap their demux maps in bridge senders;
+  per-query abort survives at the true multiplex points).
+  `DnsUpstream` drives transport senders behind its id interface with
+  held op states. Direct transport tests drive senders now. Full
+  suite: 258 passed.

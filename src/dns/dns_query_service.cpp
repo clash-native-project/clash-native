@@ -174,7 +174,7 @@ class DnsQueryService::Operation final
     std::string key_;
     DnsPacket packet_;
     std::shared_ptr<DnsUpstreamGroup> upstream_;
-    DnsTransport::ExchangeId exchange_id_ = 0;
+    DnsUpstream::ExchangeId exchange_id_ = 0;
     std::vector<Waiter> waiters_;
     bool exchange_started_ = false;
     bool completed_ = false;

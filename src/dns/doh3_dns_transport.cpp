@@ -88,7 +88,7 @@ void QuicDnsTransport::Operation::submit_http3_exchange(const std::shared_ptr<Ex
     struct Http3Receiver {
         using receiver_concept = stdexec::receiver_tag;
         std::weak_ptr<Operation> weak;
-        ExchangeId exchange_id;
+        DnsExchangeId exchange_id;
         void set_value(io::ExchangeResponse response) && noexcept {
             if (const auto self = weak.lock()) {
                 self->on_http3_result(exchange_id, response);
@@ -118,7 +118,7 @@ void QuicDnsTransport::Operation::submit_http3_exchange(const std::shared_ptr<Ex
                                Http3Receiver{weak, id});
 }
 
-void QuicDnsTransport::Operation::on_http3_result(ExchangeId id,
+void QuicDnsTransport::Operation::on_http3_result(DnsExchangeId id,
                                                   core::Result<io::ExchangeResponse> result) {
     const auto found = exchanges_.find(id);
     if (found == exchanges_.end() || found->second->result) {

@@ -1,7 +1,9 @@
 #pragma once
 
+#include <clash_native/async/bridge.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/io/exchange_session.hpp>
+#include <clash_native/io/sender.hpp>
 #include <clash_native/transport/quic_client.hpp>
 
 #include <boost/asio/ip/udp.hpp>
@@ -42,28 +44,31 @@ class QuicDnsTransport final : public DnsTransport,
   public:
     QuicDnsTransport(runtime::AsioRuntime &runtime, DnsUpstreamConfig config);
 
-    ExchangeId exchange(DnsExchangeRequest request, Handler handler) override;
-    void cancel(ExchangeId exchange_id) noexcept override;
+    io::AnySender<DnsExchangeResult> exchange(DnsExchangeRequest request) override;
     void stop() noexcept override;
+    DnsExchangeId open_exchange(DnsExchangeRequest request,
+                                async::BridgeSender<DnsExchangeResult>::Handler handler);
+    void cancel_exchange(DnsExchangeId exchange_id) noexcept;
 
   private:
     struct ExchangeRegistration {
         std::shared_ptr<Operation> operation;
-        Handler handler;
+        async::BridgeSender<DnsExchangeResult>::Handler handler;
     };
 
-    void complete(ExchangeId exchange_id, core::Result<DnsPacket> result);
+    void complete(DnsExchangeId exchange_id, core::Result<DnsPacket> result);
     void session_idle(const std::shared_ptr<Operation> &operation);
     void session_retired(const Operation *operation) noexcept;
-    void add_new_exchange(ExchangeId id, DnsExchangeRequest request, Handler handler);
+    void add_new_exchange(DnsExchangeId id, DnsExchangeRequest request,
+                          async::BridgeSender<DnsExchangeResult>::Handler handler);
 
     runtime::AsioRuntime &runtime_;
     DnsUpstreamConfig config_;
     boost::asio::strand<boost::asio::io_context::executor_type> strand_;
-    std::unordered_map<ExchangeId, ExchangeRegistration> exchanges_;
+    std::unordered_map<DnsExchangeId, ExchangeRegistration> exchanges_;
     std::vector<std::shared_ptr<Operation>> active_sessions_;
     std::vector<std::shared_ptr<Operation>> idle_sessions_;
-    std::atomic<ExchangeId> next_exchange_id_ = 1;
+    std::atomic<DnsExchangeId> next_exchange_id_ = 1;
     bool stopped_ = false;
 
     friend class Operation;
@@ -72,12 +77,12 @@ class QuicDnsTransport final : public DnsTransport,
 class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Operation> {
   public:
     struct Exchange {
-        Exchange(ExchangeId exchange_id, DnsExchangeRequest exchange_request,
+        Exchange(DnsExchangeId exchange_id, DnsExchangeRequest exchange_request,
                  boost::asio::any_io_executor executor)
             : id(exchange_id), request(std::move(exchange_request)),
               deadline_timer(std::move(executor)) {}
 
-        ExchangeId id;
+        DnsExchangeId id;
         DnsExchangeRequest request;
         boost::asio::steady_timer deadline_timer;
         std::int64_t stream_id = -1;
@@ -100,8 +105,8 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
     friend class QuicDnsTransport;
 
     void start_on_strand();
-    void add_exchange(ExchangeId id, DnsExchangeRequest request);
-    void cancel_exchange(ExchangeId id, core::Error error);
+    void add_exchange(DnsExchangeId id, DnsExchangeRequest request);
+    void cancel_exchange(DnsExchangeId id, core::Error error);
     void cancel_all();
     void datagram_opened(std::unique_ptr<io::DatagramHandle> handle,
                          std::optional<core::Error> error);
@@ -119,12 +124,12 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
 
     void open_pending_http3_exchanges();
     void submit_http3_exchange(const std::shared_ptr<Exchange> &exchange);
-    void on_http3_result(ExchangeId id, core::Result<io::ExchangeResponse> result);
+    void on_http3_result(DnsExchangeId id, core::Result<io::ExchangeResponse> result);
 
     void decode_dns_response(Exchange &exchange, std::span<const std::uint8_t> wire);
     void set_exchange_error(Exchange &exchange, core::Error error);
     void drain_exchange_results();
-    void complete_exchange(ExchangeId id, core::Result<DnsPacket> result);
+    void complete_exchange(DnsExchangeId id, core::Result<DnsPacket> result);
     void enter_idle_or_retire();
     void retire_idle() noexcept;
     void retire_session() noexcept;
@@ -141,9 +146,9 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
     std::string path_;
     std::shared_ptr<transport::QuicClientConnection> quic_;
     std::shared_ptr<io::ExchangeSession> http3_;
-    std::unordered_map<ExchangeId, std::shared_ptr<Exchange>> exchanges_;
+    std::unordered_map<DnsExchangeId, std::shared_ptr<Exchange>> exchanges_;
     std::unordered_map<std::int64_t, std::shared_ptr<Exchange>> stream_exchanges_;
-    std::deque<ExchangeId> pending_exchanges_;
+    std::deque<DnsExchangeId> pending_exchanges_;
     bool started_ = false;
     bool handshake_completed_ = false;
     bool idle_ = false;

@@ -1,7 +1,9 @@
+#include <clash_native/async/bridge.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/io/exchange_session.hpp>
+#include <clash_native/io/sender.hpp>
 #include <clash_native/transport/http_sessions.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
@@ -96,10 +98,13 @@ std::string authority_for(const DnsUpstreamConfig &config,
 
 } // namespace
 
-class Doh2DnsTransport final : public DnsTransport {
+class Doh2DnsTransport final : public DnsTransport,
+                               public std::enable_shared_from_this<Doh2DnsTransport> {
   private:
     class Operation;
     class Session;
+
+    using OpenHandler = async::BridgeSender<DnsExchangeResult>::Handler;
 
   public:
     Doh2DnsTransport(runtime::AsioRuntime &runtime, DnsUpstreamConfig config)
@@ -109,21 +114,22 @@ class Doh2DnsTransport final : public DnsTransport {
         }
     }
 
-    ExchangeId exchange(DnsExchangeRequest request, Handler handler) override;
-    void cancel(ExchangeId exchange_id) noexcept override;
+    io::AnySender<DnsExchangeResult> exchange(DnsExchangeRequest request) override;
     void stop() noexcept override;
+    DnsExchangeId open_exchange(DnsExchangeRequest request, OpenHandler handler);
+    void cancel_exchange(DnsExchangeId exchange_id) noexcept;
 
   private:
-    void complete(ExchangeId exchange_id, core::Result<DnsPacket> result);
+    void complete(DnsExchangeId exchange_id, core::Result<DnsPacket> result);
     std::shared_ptr<Session> session();
     std::optional<std::uint16_t> next_query_id() noexcept;
 
     runtime::AsioRuntime &runtime_;
     DnsUpstreamConfig config_;
-    std::unordered_map<ExchangeId, std::shared_ptr<Operation>> operations_;
+    std::unordered_map<DnsExchangeId, std::shared_ptr<Operation>> operations_;
     std::shared_ptr<Session> session_;
     std::unordered_set<std::uint16_t> active_query_ids_;
-    ExchangeId next_exchange_id_ = 1;
+    DnsExchangeId next_exchange_id_ = 1;
     std::uint16_t next_query_id_ = 1;
     bool stopped_ = false;
 
@@ -448,8 +454,8 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
 class Doh2DnsTransport::Operation final
     : public std::enable_shared_from_this<Doh2DnsTransport::Operation> {
   public:
-    Operation(Doh2DnsTransport &owner, ExchangeId exchange_id, DnsExchangeRequest request,
-              Handler handler)
+    Operation(Doh2DnsTransport &owner, DnsExchangeId exchange_id, DnsExchangeRequest request,
+              OpenHandler handler)
         : owner_(owner), exchange_id_(exchange_id), request_(std::move(request)),
           handler_(std::move(handler)) {}
 
@@ -518,7 +524,7 @@ class Doh2DnsTransport::Operation final
         owner_.complete(exchange_id_, core::fail(cancelled_error()));
     }
 
-    Handler take_handler() { return std::move(handler_); }
+    OpenHandler take_handler() { return std::move(handler_); }
     std::uint16_t query_id() const noexcept { return query_id_; }
 
   private:
@@ -578,9 +584,9 @@ class Doh2DnsTransport::Operation final
     }
 
     Doh2DnsTransport &owner_;
-    ExchangeId exchange_id_;
+    DnsExchangeId exchange_id_;
     DnsExchangeRequest request_;
-    Handler handler_;
+    OpenHandler handler_;
     std::shared_ptr<Session> session_;
     std::uint16_t query_id_ = 0;
     bool exchange_started_ = false;
@@ -619,7 +625,24 @@ std::shared_ptr<Doh2DnsTransport::Session> Doh2DnsTransport::session() {
     return session_;
 }
 
-DnsTransport::ExchangeId Doh2DnsTransport::exchange(DnsExchangeRequest request, Handler handler) {
+io::AnySender<DnsExchangeResult> Doh2DnsTransport::exchange(DnsExchangeRequest request) {
+    auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
+    auto self = shared_from_this();
+    return async::bridge_sender<DnsExchangeResult>(
+        [self, box](async::BridgeSender<DnsExchangeResult>::Handler done) mutable {
+            if (!box || !*box) {
+                done(core::fail(cancelled_error()));
+                using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
+                return AbortFn{[] {}};
+            }
+            const auto exchange_id = self->open_exchange(std::move(**box), std::move(done));
+            box->reset();
+            using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
+            return AbortFn{[self, exchange_id] { self->cancel_exchange(exchange_id); }};
+        });
+}
+
+DnsExchangeId Doh2DnsTransport::open_exchange(DnsExchangeRequest request, OpenHandler handler) {
     const auto exchange_id = next_exchange_id_++;
     auto operation =
         std::make_shared<Operation>(*this, exchange_id, std::move(request), std::move(handler));
@@ -632,7 +655,7 @@ DnsTransport::ExchangeId Doh2DnsTransport::exchange(DnsExchangeRequest request, 
     return exchange_id;
 }
 
-void Doh2DnsTransport::cancel(ExchangeId exchange_id) noexcept {
+void Doh2DnsTransport::cancel_exchange(DnsExchangeId exchange_id) noexcept {
     const auto operation = operations_.find(exchange_id);
     if (operation != operations_.end()) {
         operation->second->cancel();
@@ -652,7 +675,7 @@ void Doh2DnsTransport::stop() noexcept {
     }
 }
 
-void Doh2DnsTransport::complete(ExchangeId exchange_id, core::Result<DnsPacket> result) {
+void Doh2DnsTransport::complete(DnsExchangeId exchange_id, core::Result<DnsPacket> result) {
     const auto operation = operations_.find(exchange_id);
     if (operation == operations_.end()) {
         return;

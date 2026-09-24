@@ -1,5 +1,10 @@
+#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/bootstrap_resolver.hpp>
 #include <clash_native/dns/dns_transport.hpp>
+#include <clash_native/io/sender.hpp>
+
+#include <stdexec/execution.hpp>
 
 #include <boost/asio/post.hpp>
 
@@ -37,7 +42,25 @@ class BootstrapDnsTransport final : public DnsTransport,
                          ? config_.bootstrap_resolver
                          : make_bootstrap_resolver(runtime_, config_.bootstrap_dns_servers)) {}
 
-    ExchangeId exchange(DnsExchangeRequest request, Handler handler) override {
+    io::AnySender<DnsExchangeResult> exchange(DnsExchangeRequest request) override {
+        auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
+        auto self = shared_from_this();
+        return async::bridge_sender<DnsExchangeResult>(
+            [self, box](async::BridgeSender<DnsExchangeResult>::Handler done) mutable {
+                if (!box || !*box) {
+                    done(core::fail(cancelled_error()));
+                    using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
+                    return AbortFn{[] {}};
+                }
+                const auto exchange_id = self->open_exchange(std::move(**box), std::move(done));
+                box->reset();
+                using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
+                return AbortFn{[self, exchange_id] { self->cancel_exchange(exchange_id); }};
+            });
+    }
+
+    DnsExchangeId open_exchange(DnsExchangeRequest request,
+                                async::BridgeSender<DnsExchangeResult>::Handler handler) {
         const auto exchange_id = next_exchange_id_++;
         auto pending = std::make_shared<Pending>();
         pending->request = std::move(request);
@@ -57,7 +80,7 @@ class BootstrapDnsTransport final : public DnsTransport,
         return exchange_id;
     }
 
-    void cancel(ExchangeId exchange_id) noexcept override {
+    void cancel_exchange(DnsExchangeId exchange_id) noexcept {
         const auto found = pending_.find(exchange_id);
         if (found == pending_.end()) {
             return;
@@ -66,10 +89,10 @@ class BootstrapDnsTransport final : public DnsTransport,
         if (pending->bootstrap_id != 0) {
             bootstrap_->cancel(pending->bootstrap_id);
         }
-        if (pending->inner_id != 0 && inner_) {
-            inner_->cancel(pending->inner_id);
-        }
+        // Complete first so the late inner terminal drops by map lookup,
+        // then destroy the op (its abort runs outside its own terminal).
         complete(exchange_id, core::fail(cancelled_error()));
+        abort_inner(exchange_id);
     }
 
     void stop() noexcept override {
@@ -82,7 +105,7 @@ class BootstrapDnsTransport final : public DnsTransport,
             inner_->stop();
         }
 
-        std::vector<ExchangeId> exchange_ids;
+        std::vector<DnsExchangeId> exchange_ids;
         exchange_ids.reserve(pending_.size());
         for (const auto &[exchange_id, pending] : pending_) {
             exchange_ids.push_back(exchange_id);
@@ -90,17 +113,84 @@ class BootstrapDnsTransport final : public DnsTransport,
         for (const auto exchange_id : exchange_ids) {
             complete(exchange_id, core::fail(cancelled_error()));
         }
+        inner_ops_.clear();
     }
 
   private:
-    struct Pending {
-        DnsExchangeRequest request;
-        Handler handler;
-        BootstrapResolver::RequestId bootstrap_id = 0;
-        DnsTransport::ExchangeId inner_id = 0;
+    // Inner drive state, held apart from Pending so terminal delivery
+    // never destroys its own operation state: the receiver completes the
+    // pending entry, and the op entry is erased (or aborted) separately.
+    struct InnerReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::weak_ptr<BootstrapDnsTransport> transport;
+        DnsExchangeId exchange_id;
+        void set_value(DnsExchangeResult result) noexcept {
+            if (auto self = transport.lock()) {
+                self->inner_finished(exchange_id, std::move(result));
+            }
+        }
+        void set_error(std::exception_ptr error) noexcept {
+            if (auto self = transport.lock()) {
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &failure) {
+                    self->inner_finished(exchange_id, core::fail(failure));
+                    return;
+                } catch (...) {
+                }
+                self->inner_finished(exchange_id,
+                                     core::fail(core::Error{core::ErrorCode::transport_io,
+                                                            "bootstrap inner exchange failed"}));
+            }
+        }
+        void set_stopped() noexcept {
+            if (auto self = transport.lock()) {
+                self->inner_finished(exchange_id, core::fail(cancelled_error()));
+            }
+        }
+    };
+    // Connected inner op. any_sender op states are immovable, so the
+    // holder constructs it in place (guaranteed prvalue elision into the
+    // member) and is itself heap-held and never moved. Destroying it
+    // aborts the inner exchange.
+    struct InnerDrive {
+        using Op = decltype(stdexec::connect(std::declval<io::AnySender<DnsExchangeResult>>(),
+                                             std::declval<InnerReceiver>()));
+        template <typename Sender>
+        InnerDrive(Sender &&sender, InnerReceiver receiver)
+            : op(static_cast<Sender &&>(sender).connect(std::move(receiver))) {}
+        Op op;
     };
 
-    void bootstrap_completed(ExchangeId exchange_id,
+    struct Pending {
+        DnsExchangeRequest request;
+        async::BridgeSender<DnsExchangeResult>::Handler handler;
+        BootstrapResolver::RequestId bootstrap_id = 0;
+    };
+
+    void abort_inner(DnsExchangeId exchange_id) {
+        const auto found = inner_ops_.find(exchange_id);
+        if (found == inner_ops_.end()) {
+            return;
+        }
+        // Erasing destroys the op state outside its own terminal, which
+        // runs the bridge aborter and cancels the inner exchange.
+        inner_ops_.erase(found);
+    }
+
+    void inner_finished(DnsExchangeId exchange_id, DnsExchangeResult result) {
+        const auto found = pending_.find(exchange_id);
+        if (found == pending_.end()) {
+            return;
+        }
+        // Schedule the op-state cleanup after delivery: complete() may run
+        // inside this terminal, so the entry must outlive this call.
+        const auto self = shared_from_this();
+        runtime_.scheduler().post([self, exchange_id] { self->inner_ops_.erase(exchange_id); });
+        complete(exchange_id, std::move(result));
+    }
+
+    void bootstrap_completed(DnsExchangeId exchange_id,
                              core::Result<std::vector<boost::asio::ip::address>> result) {
         const auto found = pending_.find(exchange_id);
         if (found == pending_.end() || stopped_) {
@@ -147,14 +237,19 @@ class BootstrapDnsTransport final : public DnsTransport,
             inner_ = make_asio_dns_transport(runtime_, std::move(resolved_config));
         }
 
+        // Drive the inner sender with a held op state so cancel aborts
+        // exactly this exchange; the terminal routes through
+        // inner_finished, which drops late results by map lookup.
         const auto self = shared_from_this();
-        pending->inner_id = inner_->exchange(
-            std::move(pending->request), [self, exchange_id](core::Result<DnsPacket> inner_result) {
-                self->complete(exchange_id, std::move(inner_result));
-            });
+        // NOTE: name the sender first; argument order is unspecified.
+        auto sender = inner_->exchange(std::move(pending->request));
+        auto drive =
+            std::make_shared<InnerDrive>(std::move(sender), InnerReceiver{self, exchange_id});
+        inner_ops_.emplace(exchange_id, std::move(drive));
+        stdexec::start(inner_ops_[exchange_id]->op);
     }
 
-    void complete(ExchangeId exchange_id, core::Result<DnsPacket> result) {
+    void complete(DnsExchangeId exchange_id, core::Result<DnsPacket> result) {
         const auto found = pending_.find(exchange_id);
         if (found == pending_.end()) {
             return;
@@ -174,8 +269,9 @@ class BootstrapDnsTransport final : public DnsTransport,
     DnsUpstreamConfig config_;
     std::shared_ptr<BootstrapResolver> bootstrap_;
     std::shared_ptr<DnsTransport> inner_;
-    std::unordered_map<ExchangeId, std::shared_ptr<Pending>> pending_;
-    ExchangeId next_exchange_id_ = 1;
+    std::unordered_map<DnsExchangeId, std::shared_ptr<Pending>> pending_;
+    std::unordered_map<DnsExchangeId, std::shared_ptr<InnerDrive>> inner_ops_;
+    DnsExchangeId next_exchange_id_ = 1;
     bool stopped_ = false;
 };
 

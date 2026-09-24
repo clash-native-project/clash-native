@@ -170,7 +170,7 @@ void QuicDnsTransport::Operation::start_on_strand() {
                                OpenReceiver{std::move(self)});
 }
 
-void QuicDnsTransport::Operation::add_exchange(ExchangeId id, DnsExchangeRequest request) {
+void QuicDnsTransport::Operation::add_exchange(DnsExchangeId id, DnsExchangeRequest request) {
     if (retired_) {
         owner_.complete(id, core::fail(transport_error("QUIC DNS session is retired")));
         return;
@@ -222,7 +222,7 @@ void QuicDnsTransport::Operation::add_exchange(ExchangeId id, DnsExchangeRequest
     start_on_strand();
 }
 
-void QuicDnsTransport::Operation::cancel_exchange(ExchangeId id, core::Error error) {
+void QuicDnsTransport::Operation::cancel_exchange(DnsExchangeId id, core::Error error) {
     const auto found = exchanges_.find(id);
     if (found == exchanges_.end() || found->second->result) {
         return;
@@ -232,7 +232,7 @@ void QuicDnsTransport::Operation::cancel_exchange(ExchangeId id, core::Error err
 }
 
 void QuicDnsTransport::Operation::cancel_all() {
-    std::vector<ExchangeId> ids;
+    std::vector<DnsExchangeId> ids;
     ids.reserve(exchanges_.size());
     for (const auto &[id, exchange] : exchanges_) {
         (void)exchange;
@@ -318,7 +318,7 @@ void QuicDnsTransport::Operation::set_exchange_error(Exchange &exchange, core::E
 }
 
 void QuicDnsTransport::Operation::drain_exchange_results() {
-    std::vector<std::pair<ExchangeId, core::Result<DnsPacket>>> completed;
+    std::vector<std::pair<DnsExchangeId, core::Result<DnsPacket>>> completed;
     for (auto &[id, exchange] : exchanges_) {
         if (exchange->result) {
             completed.emplace_back(id, std::move(*exchange->result));
@@ -330,7 +330,8 @@ void QuicDnsTransport::Operation::drain_exchange_results() {
     }
 }
 
-void QuicDnsTransport::Operation::complete_exchange(ExchangeId id, core::Result<DnsPacket> result) {
+void QuicDnsTransport::Operation::complete_exchange(DnsExchangeId id,
+                                                    core::Result<DnsPacket> result) {
     const auto found = exchanges_.find(id);
     if (found == exchanges_.end()) {
         return;
@@ -405,7 +406,7 @@ void QuicDnsTransport::Operation::fail_session(core::Error error) {
     if (retired_) {
         return;
     }
-    std::vector<ExchangeId> exchange_ids;
+    std::vector<DnsExchangeId> exchange_ids;
     exchange_ids.reserve(exchanges_.size());
     for (const auto &[id, exchange] : exchanges_) {
         exchange_ids.push_back(id);
@@ -431,7 +432,26 @@ void QuicDnsTransport::Operation::fail_session(core::Error error) {
     }
 }
 
-DnsTransport::ExchangeId QuicDnsTransport::exchange(DnsExchangeRequest request, Handler handler) {
+io::AnySender<DnsExchangeResult> QuicDnsTransport::exchange(DnsExchangeRequest request) {
+    auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
+    auto self = shared_from_this();
+    return async::bridge_sender<DnsExchangeResult>(
+        [self, box](async::BridgeSender<DnsExchangeResult>::Handler done) mutable {
+            if (!box || !*box) {
+                done(core::fail(cancelled_error()));
+                using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
+                return AbortFn{[] {}};
+            }
+            const auto id = self->open_exchange(std::move(**box), std::move(done));
+            box->reset();
+            using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
+            return AbortFn{[self, id] { self->cancel_exchange(id); }};
+        });
+}
+
+DnsExchangeId
+QuicDnsTransport::open_exchange(DnsExchangeRequest request,
+                                async::BridgeSender<DnsExchangeResult>::Handler handler) {
     const auto id = next_exchange_id_.fetch_add(1, std::memory_order_relaxed);
     const auto self = shared_from_this();
     boost::asio::post(
@@ -441,8 +461,8 @@ DnsTransport::ExchangeId QuicDnsTransport::exchange(DnsExchangeRequest request, 
     return id;
 }
 
-void QuicDnsTransport::add_new_exchange(ExchangeId id, DnsExchangeRequest request,
-                                        Handler handler) {
+void QuicDnsTransport::add_new_exchange(DnsExchangeId id, DnsExchangeRequest request,
+                                        async::BridgeSender<DnsExchangeResult>::Handler handler) {
     if (stopped_) {
         if (handler) {
             handler(core::fail(cancelled_error()));
@@ -471,7 +491,7 @@ void QuicDnsTransport::add_new_exchange(ExchangeId id, DnsExchangeRequest reques
     operation->add_exchange(id, std::move(request));
 }
 
-void QuicDnsTransport::cancel(ExchangeId exchange_id) noexcept {
+void QuicDnsTransport::cancel_exchange(DnsExchangeId exchange_id) noexcept {
     try {
         const auto self = shared_from_this();
         boost::asio::post(strand_, [self, exchange_id] {
@@ -534,7 +554,7 @@ void QuicDnsTransport::session_retired(const Operation *operation) noexcept {
                   [operation](const auto &candidate) { return candidate.get() == operation; });
 }
 
-void QuicDnsTransport::complete(ExchangeId exchange_id, core::Result<DnsPacket> result) {
+void QuicDnsTransport::complete(DnsExchangeId exchange_id, core::Result<DnsPacket> result) {
     const auto found = exchanges_.find(exchange_id);
     if (found == exchanges_.end()) {
         return;

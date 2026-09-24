@@ -1,3 +1,4 @@
+#include <clash_native/async/bridge.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_policy_router.hpp>
@@ -119,7 +120,35 @@ class FakeDnsTransport final : public clash_native::dns::DnsTransport,
           stats_(std::move(stats)), respond_(respond), fail_(fail), response_code_(response_code),
           return_query_(return_query), response_factory_(std::move(response_factory)) {}
 
-    ExchangeId exchange(clash_native::dns::DnsExchangeRequest request, Handler handler) override {
+    clash_native::io::AnySender<clash_native::core::Result<clash_native::dns::DnsPacket>>
+    exchange(clash_native::dns::DnsExchangeRequest request) override {
+        auto self = shared_from_this();
+        auto box = std::make_shared<std::optional<clash_native::dns::DnsExchangeRequest>>(
+            std::move(request));
+        return clash_native::async::bridge_sender<
+            clash_native::core::Result<clash_native::dns::DnsPacket>>(
+            [self,
+             box](clash_native::async::BridgeSender<
+                  clash_native::core::Result<clash_native::dns::DnsPacket>>::Handler done) mutable {
+                if (!box || !*box) {
+                    done(clash_native::core::fail(clash_native::core::Error{
+                        clash_native::core::ErrorCode::cancelled, "fake DNS cancelled"}));
+                    using AbortFn = clash_native::async::BridgeSender<
+                        clash_native::core::Result<clash_native::dns::DnsPacket>>::AbortFn;
+                    return AbortFn{[] {}};
+                }
+                self->open_exchange(std::move(**box), std::move(done));
+                box->reset();
+                using AbortFn = clash_native::async::BridgeSender<
+                    clash_native::core::Result<clash_native::dns::DnsPacket>>::AbortFn;
+                return AbortFn{[self] { self->cancel_exchange(); }};
+            });
+    }
+
+    void
+    open_exchange(clash_native::dns::DnsExchangeRequest request,
+                  clash_native::async::BridgeSender<
+                      clash_native::core::Result<clash_native::dns::DnsPacket>>::Handler handler) {
         ++stats_->exchanges;
         if (stats_->exchange_started) {
             stats_->exchange_started->set_value();
@@ -178,10 +207,9 @@ class FakeDnsTransport final : public clash_native::dns::DnsTransport,
                 handler(response);
             });
         }
-        return 1;
     }
 
-    void cancel(ExchangeId) noexcept override {
+    void cancel_exchange() noexcept {
         if (completed_) {
             return;
         }
@@ -196,7 +224,7 @@ class FakeDnsTransport final : public clash_native::dns::DnsTransport,
 
     void stop() noexcept override {
         if (started_) {
-            cancel(1);
+            cancel_exchange();
         }
     }
 
@@ -204,7 +232,8 @@ class FakeDnsTransport final : public clash_native::dns::DnsTransport,
     boost::asio::any_io_executor executor_;
     boost::asio::ip::address answer_address_;
     std::shared_ptr<FakeTransportStats> stats_;
-    Handler handler_;
+    clash_native::async::BridgeSender<
+        clash_native::core::Result<clash_native::dns::DnsPacket>>::Handler handler_;
     clash_native::dns::DnsPacket query_;
     clash_native::dns::DnsQuestion question_;
     bool respond_;
@@ -1293,6 +1322,45 @@ fake_config(std::shared_ptr<FakeTransportStats> default_stats,
 
 } // namespace
 
+namespace {
+// Drives one sender-based transport exchange into a completion.
+struct FnExchangeReceiver {
+    using receiver_concept = stdexec::receiver_tag;
+    std::function<void(clash_native::core::Result<clash_native::dns::DnsPacket>)> done;
+    void set_value(clash_native::core::Result<clash_native::dns::DnsPacket> result) && noexcept {
+        auto terminal = std::move(done);
+        terminal(std::move(result));
+    }
+    void set_error(std::exception_ptr error) && noexcept {
+        auto terminal = std::move(done);
+        try {
+            std::rethrow_exception(std::move(error));
+        } catch (const clash_native::core::Error &failure) {
+            terminal(clash_native::core::fail(failure));
+            return;
+        } catch (...) {
+        }
+        terminal(clash_native::core::fail(clash_native::core::Error{
+            clash_native::core::ErrorCode::transport_io, "test exchange failed"}));
+    }
+    void set_stopped() && noexcept {
+        auto terminal = std::move(done);
+        terminal(clash_native::core::fail(clash_native::core::Error{
+            clash_native::core::ErrorCode::cancelled, "test exchange cancelled"}));
+    }
+};
+
+void start_test_exchange(
+    const std::shared_ptr<clash_native::dns::DnsTransport> &transport,
+    clash_native::dns::DnsExchangeRequest request,
+    std::function<void(clash_native::core::Result<clash_native::dns::DnsPacket>)> done) {
+    // NOTE: name the sender first; argument order is unspecified.
+    auto sender = transport->exchange(std::move(request));
+    clash_native::async::start_with_receiver(std::move(sender),
+                                             FnExchangeReceiver{std::move(done)});
+}
+} // namespace
+
 TEST(ResolverServiceTransportTest, UsesInjectedTransportForPolicySelectedGroups) {
     auto &runtime = clash_native::runtime::AsioRuntime::instance();
     auto default_stats = std::make_shared<FakeTransportStats>();
@@ -2001,13 +2069,13 @@ TEST(DnsTransportTest, ReusesTcpSessionAndDispatchesOutOfOrderResponses) {
     const auto second_query = make_query("second.example", 0x2222);
     boost::asio::post(runtime.serialized_executor(), [transport, first_query, second_query,
                                                       deadline, first_done, second_done] {
-        transport->exchange(
-            {first_query, deadline},
+        start_test_exchange(
+            transport, {first_query, deadline},
             [first_done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
                 first_done->set_value(std::move(result));
             });
-        transport->exchange(
-            {second_query, deadline},
+        start_test_exchange(
+            transport, {second_query, deadline},
             [second_done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
                 second_done->set_value(std::move(result));
             });
@@ -2077,7 +2145,8 @@ TEST(DnsTransportTest, TimesOutWhenAnUpstreamReturnsAQueryInsteadOfAResponse) {
     auto done =
         std::make_shared<std::promise<clash_native::core::Result<clash_native::dns::DnsPacket>>>();
     auto future = done->get_future();
-    transport->exchange(
+    start_test_exchange(
+        transport,
         {query.value(), std::chrono::steady_clock::now() + std::chrono::milliseconds(250)},
         [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
             done->set_value(std::move(result));
@@ -2115,7 +2184,8 @@ TEST(DnsTransportTest, UsesTheConfiguredDialerForPlainTcp) {
     auto done =
         std::make_shared<std::promise<clash_native::core::Result<clash_native::dns::DnsPacket>>>();
     auto future = done->get_future();
-    transport->exchange({query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(1)},
+    start_test_exchange(transport,
+                        {query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(1)},
                         [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
                             done->set_value(std::move(result));
                         });
@@ -2157,7 +2227,8 @@ TEST(DnsTransportTest, ExchangesOverDotWithTlsAndTcpFraming) {
 
     auto done = std::make_shared<std::promise<void>>();
     auto future = done->get_future();
-    transport->exchange({query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(2)},
+    start_test_exchange(transport,
+                        {query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(2)},
                         [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
                             ASSERT_TRUE(result) << (result ? "" : result.error().context);
                             ASSERT_EQ(result.value().answers.size(), 1U);
@@ -2200,7 +2271,8 @@ TEST(DnsTransportTest, RejectsUntrustedDotCertificate) {
     auto done =
         std::make_shared<std::promise<clash_native::core::Result<clash_native::dns::DnsPacket>>>();
     auto future = done->get_future();
-    transport->exchange({query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(2)},
+    start_test_exchange(transport,
+                        {query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(2)},
                         [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
                             done->set_value(std::move(result));
                         });
@@ -2250,13 +2322,13 @@ TEST(DnsTransportTest, ReusesDotTlsSessionForMultipleExchanges) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     boost::asio::post(runtime.serialized_executor(), [transport, first_query, second_query,
                                                       deadline, first_done, second_done] {
-        transport->exchange(
-            {first_query, deadline},
+        start_test_exchange(
+            transport, {first_query, deadline},
             [first_done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
                 first_done->set_value(std::move(result));
             });
-        transport->exchange(
-            {second_query, deadline},
+        start_test_exchange(
+            transport, {second_query, deadline},
             [second_done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
                 second_done->set_value(std::move(result));
             });
@@ -2306,8 +2378,8 @@ TEST(DnsTransportTest, ExchangesOverDoh1WithContentLengthAndChunkedResponses) {
         auto done = std::make_shared<
             std::promise<clash_native::core::Result<clash_native::dns::DnsPacket>>>();
         auto future = done->get_future();
-        transport->exchange(
-            {query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(3)},
+        start_test_exchange(
+            transport, {query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(3)},
             [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
                 done->set_value(std::move(result));
             });
@@ -2353,8 +2425,8 @@ TEST(DnsTransportTest, RejectsInvalidDoh1StatusAndContentType) {
         auto done = std::make_shared<
             std::promise<clash_native::core::Result<clash_native::dns::DnsPacket>>>();
         auto future = done->get_future();
-        transport->exchange(
-            {query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(3)},
+        start_test_exchange(
+            transport, {query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(3)},
             [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
                 done->set_value(std::move(result));
             });
@@ -2393,7 +2465,8 @@ TEST(DnsTransportTest, RejectsUntrustedDoh1Certificate) {
     auto done =
         std::make_shared<std::promise<clash_native::core::Result<clash_native::dns::DnsPacket>>>();
     auto future = done->get_future();
-    transport->exchange({query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(3)},
+    start_test_exchange(transport,
+                        {query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(3)},
                         [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
                             done->set_value(std::move(result));
                         });
@@ -2436,7 +2509,8 @@ TEST(DnsTransportTest, ExchangesOverDoh2WithHttp2AndDnsMediaType) {
 
     auto done = std::make_shared<std::promise<void>>();
     auto future = done->get_future();
-    transport->exchange({query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(2)},
+    start_test_exchange(transport,
+                        {query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(2)},
                         [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
                             ASSERT_TRUE(result) << (result ? "" : result.error().context);
                             ASSERT_EQ(result.value().answers.size(), 1U);
@@ -2480,7 +2554,8 @@ TEST(DnsTransportTest, RejectsUntrustedDoh2Certificate) {
     auto done =
         std::make_shared<std::promise<clash_native::core::Result<clash_native::dns::DnsPacket>>>();
     auto future = done->get_future();
-    transport->exchange({query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(2)},
+    start_test_exchange(transport,
+                        {query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(2)},
                         [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
                             done->set_value(std::move(result));
                         });
@@ -2531,13 +2606,13 @@ TEST(DnsTransportTest, MultiplexesDoh2ExchangesOnOneHttp2Session) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     boost::asio::post(runtime.serialized_executor(), [transport, first_query, second_query,
                                                       deadline, first_done, second_done] {
-        transport->exchange(
-            {first_query, deadline},
+        start_test_exchange(
+            transport, {first_query, deadline},
             [first_done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
                 first_done->set_value(std::move(result));
             });
-        transport->exchange(
-            {second_query, deadline},
+        start_test_exchange(
+            transport, {second_query, deadline},
             [second_done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
                 second_done->set_value(std::move(result));
             });
@@ -2574,7 +2649,8 @@ TEST(DnsTransportTest, FailsWhenQuicDnsUpstreamIsUnavailable) {
     auto done =
         std::make_shared<std::promise<clash_native::core::Result<clash_native::dns::DnsPacket>>>();
     auto future = done->get_future();
-    transport->exchange({query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(1)},
+    start_test_exchange(transport,
+                        {query.value(), std::chrono::steady_clock::now() + std::chrono::seconds(1)},
                         [done](clash_native::core::Result<clash_native::dns::DnsPacket> result) {
                             done->set_value(std::move(result));
                         });
@@ -2597,19 +2673,39 @@ TEST(ResolverServiceTransportTest, CancellingOneQueryLeavesSiblingFlowing) {
     auto &runtime = clash_native::runtime::AsioRuntime::instance();
     struct Pending {
         clash_native::dns::DnsPacket query;
-        clash_native::dns::DnsTransport::Handler handler;
+        clash_native::async::BridgeSender<
+            clash_native::core::Result<clash_native::dns::DnsPacket>>::Handler handler;
     };
-    struct MultiFake final : public clash_native::dns::DnsTransport {
+    struct MultiFake final : public clash_native::dns::DnsTransport,
+                             public std::enable_shared_from_this<MultiFake> {
         boost::asio::any_io_executor executor;
-        std::map<ExchangeId, Pending> pending;
-        ExchangeId next = 1;
-        ExchangeId exchange(clash_native::dns::DnsExchangeRequest request,
-                            Handler handler) override {
-            const auto id = next++;
-            pending.emplace(id, Pending{std::move(request.query), std::move(handler)});
-            return id;
+        std::map<clash_native::dns::DnsExchangeId, Pending> pending;
+        clash_native::dns::DnsExchangeId next = 1;
+        clash_native::io::AnySender<clash_native::core::Result<clash_native::dns::DnsPacket>>
+        exchange(clash_native::dns::DnsExchangeRequest request) override {
+            auto self = shared_from_this();
+            auto box = std::make_shared<std::optional<clash_native::dns::DnsExchangeRequest>>(
+                std::move(request));
+            return clash_native::async::bridge_sender<
+                clash_native::core::Result<clash_native::dns::DnsPacket>>(
+                [self, box](clash_native::async::BridgeSender<clash_native::core::Result<
+                                clash_native::dns::DnsPacket>>::Handler done) mutable {
+                    if (!box || !*box) {
+                        done(clash_native::core::fail(clash_native::core::Error{
+                            clash_native::core::ErrorCode::cancelled, "multi-fake cancelled"}));
+                        using AbortFn = clash_native::async::BridgeSender<
+                            clash_native::core::Result<clash_native::dns::DnsPacket>>::AbortFn;
+                        return AbortFn{[] {}};
+                    }
+                    const auto id = self->next++;
+                    self->pending.emplace(id, Pending{std::move((*box)->query), std::move(done)});
+                    box->reset();
+                    using AbortFn = clash_native::async::BridgeSender<
+                        clash_native::core::Result<clash_native::dns::DnsPacket>>::AbortFn;
+                    return AbortFn{[self, id] { self->cancel_exchange(id); }};
+                });
         }
-        void answer(ExchangeId id) {
+        void answer(clash_native::dns::DnsExchangeId id) {
             auto found = pending.find(id);
             if (found == pending.end()) {
                 return;
@@ -2635,7 +2731,7 @@ TEST(ResolverServiceTransportTest, CancellingOneQueryLeavesSiblingFlowing) {
             }
             node.handler(response);
         }
-        void cancel(ExchangeId id) noexcept override {
+        void cancel_exchange(clash_native::dns::DnsExchangeId id) noexcept {
             auto found = pending.find(id);
             if (found == pending.end()) {
                 return;
