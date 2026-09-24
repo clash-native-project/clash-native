@@ -40,6 +40,7 @@
 #include <cstring>
 #include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -2586,5 +2587,123 @@ TEST(DnsTransportTest, FailsWhenQuicDnsUpstreamIsUnavailable) {
         << result.error().context;
 
     transport->stop();
+    runtime.stop();
+}
+
+// Phase 0 cancellation baseline: two concurrent queries share one
+// transport; cancelling the first completes it as cancelled while the
+// second still answers. The sender-per-query redesign must preserve this.
+TEST(ResolverServiceTransportTest, CancellingOneQueryLeavesSiblingFlowing) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    struct Pending {
+        clash_native::dns::DnsPacket query;
+        clash_native::dns::DnsTransport::Handler handler;
+    };
+    struct MultiFake final : public clash_native::dns::DnsTransport {
+        boost::asio::any_io_executor executor;
+        std::map<ExchangeId, Pending> pending;
+        ExchangeId next = 1;
+        ExchangeId exchange(clash_native::dns::DnsExchangeRequest request,
+                            Handler handler) override {
+            const auto id = next++;
+            pending.emplace(id, Pending{std::move(request.query), std::move(handler)});
+            return id;
+        }
+        void answer(ExchangeId id) {
+            auto found = pending.find(id);
+            if (found == pending.end()) {
+                return;
+            }
+            auto node = std::move(found->second);
+            pending.erase(found);
+            const auto &question = node.query.questions.front();
+            clash_native::dns::DnsAnswer answer;
+            answer.question = question;
+            answer.addresses.push_back(boost::asio::ip::make_address("192.0.2.9"));
+            answer.ttl_seconds = 60;
+            const clash_native::dns::DnsQuery query{node.query.id, question, true};
+            const auto encoded = clash_native::dns::DnsMessageCodec::encode_response(query, answer);
+            if (!encoded) {
+                node.handler(clash_native::core::fail(encoded.error()));
+                return;
+            }
+            const auto response =
+                clash_native::dns::DnsMessageCodec::decode_packet(encoded.value(), query.id);
+            if (!response) {
+                node.handler(clash_native::core::fail(response.error()));
+                return;
+            }
+            node.handler(response);
+        }
+        void cancel(ExchangeId id) noexcept override {
+            auto found = pending.find(id);
+            if (found == pending.end()) {
+                return;
+            }
+            auto handler = std::move(found->second.handler);
+            pending.erase(found);
+            handler(clash_native::core::fail(
+                {clash_native::core::ErrorCode::cancelled, "multi-fake cancelled"}));
+        }
+        void stop() noexcept override {}
+    };
+    auto transport = std::make_shared<MultiFake>();
+    transport->executor = runtime.serialized_executor();
+    clash_native::dns::DnsTransportFactory factory =
+        [transport](clash_native::runtime::AsioRuntime &, clash_native::dns::DnsUpstreamConfig) {
+            return std::static_pointer_cast<clash_native::dns::DnsTransport>(transport);
+        };
+    auto policy = std::make_shared<clash_native::dns::DnsPolicyRouter>("default");
+    clash_native::dns::DnsUpstreamConfig upstream;
+    upstream.endpoint =
+        boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 5300);
+    upstream.timeout = std::chrono::milliseconds(500);
+    clash_native::dns::ResolverService resolver(
+        runtime, clash_native::dns::DnsResolverConfig{
+                     std::move(upstream), {}, std::move(policy), std::move(factory)});
+    runtime.start();
+
+    auto first_done = std::make_shared<std::promise<void>>();
+    auto second_done = std::make_shared<std::promise<void>>();
+    boost::asio::post(
+        runtime.serialized_executor(), [&runtime, &resolver, first_done, second_done, transport] {
+            const auto first = resolver.resolve(
+                {"first.example", clash_native::dns::DnsRecordType::a, 1},
+                [first_done](clash_native::core::Result<clash_native::dns::DnsAnswer> result) {
+                    EXPECT_FALSE(result);
+                    if (!result) {
+                        EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::cancelled);
+                    }
+                    first_done->set_value();
+                });
+            const auto second = resolver.resolve(
+                {"second.example", clash_native::dns::DnsRecordType::a, 1},
+                [second_done](clash_native::core::Result<clash_native::dns::DnsAnswer> result) {
+                    EXPECT_TRUE(result);
+                    second_done->set_value();
+                });
+            (void)second;
+            // Let both queries reach the transport, then kill only the first.
+            // Cancel posts asynchronously, so observe the shrink instead of
+            // asserting it inline.
+            boost::asio::post(runtime.serialized_executor(), [&resolver, first, transport] {
+                EXPECT_EQ(transport->pending.size(), 2U);
+                resolver.cancel(first);
+            });
+        });
+    // Wait for the cancellation to propagate, then answer the survivor.
+    const auto start = std::chrono::steady_clock::now();
+    while (transport->pending.size() != 1U &&
+           std::chrono::steady_clock::now() - start < std::chrono::seconds(2)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_EQ(transport->pending.size(), 1U);
+    transport->answer(transport->pending.begin()->first);
+
+    ASSERT_EQ(first_done->get_future().wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    ASSERT_EQ(second_done->get_future().wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    resolver.stop();
     runtime.stop();
 }

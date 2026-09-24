@@ -71,6 +71,10 @@ class FakeSession final : public clash_native::io::ExchangeSession {
   public:
     explicit FakeSession(std::deque<std::vector<std::uint8_t>> response_chunks)
         : response_chunks_(std::move(response_chunks)) {}
+    // Shared-frame mode: every exchange gets its own copy, so sibling
+    // streams each see the full script.
+    explicit FakeSession(std::vector<std::vector<std::uint8_t>> frames)
+        : shared_frames_(std::move(frames)) {}
 
     clash_native::io::AnySender<clash_native::io::ExchangeResponse>
     exchange(clash_native::io::ExchangeRequest, std::chrono::steady_clock::time_point) override {
@@ -87,9 +91,15 @@ class FakeSession final : public clash_native::io::ExchangeSession {
         clash_native::io::ExchangeResponse head;
         head.status = 200;
         head.keep_alive = true;
+        std::deque<std::vector<std::uint8_t>> chunks;
+        if (!shared_frames_.empty()) {
+            chunks.assign(shared_frames_.begin(), shared_frames_.end());
+        } else {
+            chunks = std::move(response_chunks_);
+        }
         return clash_native::io::AnySender<clash_native::io::StreamingExchangeResponse>{
             stdexec::just(clash_native::io::StreamingExchangeResponse{
-                std::move(head), std::make_shared<ScriptBody>(std::move(response_chunks_))})};
+                std::move(head), std::make_shared<ScriptBody>(std::move(chunks))})};
     }
 
     clash_native::io::AnySender<clash_native::io::StreamUpgradeResponse>
@@ -111,6 +121,7 @@ class FakeSession final : public clash_native::io::ExchangeSession {
 
   private:
     std::deque<std::vector<std::uint8_t>> response_chunks_;
+    std::vector<std::vector<std::uint8_t>> shared_frames_;
     clash_native::io::ExchangeRequest last_request_;
     std::shared_ptr<clash_native::io::ExchangeBodyStream> last_body_;
 };
@@ -293,4 +304,36 @@ TEST(GunClientTest, GrowsTransportsPastMaxStreams) {
     first->close();
     second->close();
     client->close();
+}
+
+TEST(GunStreamTest, ClosingOneStreamLeavesSiblingFlowing) {
+    namespace gun = clash_native::transport::proxy::gun;
+    GunEnv env;
+    const std::string payload = "sibling";
+    auto frame =
+        gun::encode_frame({reinterpret_cast<const std::uint8_t *>(payload.data()), payload.size()});
+    auto session = std::make_shared<FakeSession>(std::vector<std::vector<std::uint8_t>>{frame});
+    gun::GunStreamOptions options;
+    options.host = "example.com";
+    options.executor = env.context.get_executor();
+    std::unique_ptr<clash_native::io::StreamHandle> first;
+    std::unique_ptr<clash_native::io::StreamHandle> second;
+    for (auto *slot : {&first, &second}) {
+        std::optional<clash_native::core::Result<std::unique_ptr<clash_native::io::StreamHandle>>>
+            opened;
+        gun::async_open_gun_stream(
+            session, options,
+            [&](clash_native::core::Result<std::unique_ptr<clash_native::io::StreamHandle>>
+                    result) { opened = std::move(result); });
+        ASSERT_TRUE(opened && *opened);
+        *slot = std::move(opened->value());
+    }
+    // Kill the first stream; the session and the sibling survive.
+    first->close();
+    first.reset();
+    std::array<std::uint8_t, 64> receive{};
+    const auto got = sync_get(second->async_read_some(boost::asio::buffer(receive)));
+    ASSERT_TRUE(got);
+    EXPECT_EQ(std::string(reinterpret_cast<const char *>(receive.data()), *got), payload);
+    second->close();
 }

@@ -2350,3 +2350,10 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   spawned directly into their scopes, now that the
   immediately-invoked-lambda rule is precise. The interim callback
   versions are gone. Full suite: 255 passed.
+
+## 2026-09-24
+
+- Started the precise-cancellation rewrite (docs/cancellation.md):
+  Phase 0 pins baselines with two isolation tests (DNS
+  cancel-one-of-two at the resolver, gun sibling-stream survival).
+  Full suite: 257 passed.
