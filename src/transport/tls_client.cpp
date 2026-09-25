@@ -1,5 +1,6 @@
 #include <clash_native/async/bridge.hpp>
 #include <clash_native/net/tls_stream.hpp>
+#include <clash_native/transport/cert_pin.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include "transport/builtin_ca_bundle.hpp"
@@ -377,78 +378,6 @@ bool base64url_decode(std::string_view input, std::string &out) {
     // A single trailing character (width 6) is an invalid length, and
     // trailing bits must be zero (canonical unpadded encoding).
     return width != 6 && (bits & ((1u << width) - 1)) == 0;
-}
-
-bool hex_decode(std::string_view input, std::string &out) {
-    if (input.size() % 2 != 0) {
-        return false;
-    }
-    out.clear();
-    auto nibble = [](char c) -> int {
-        if (c >= '0' && c <= '9') {
-            return c - '0';
-        }
-        if (c >= 'a' && c <= 'f') {
-            return c - 'a' + 10;
-        }
-        if (c >= 'A' && c <= 'F') {
-            return c - 'A' + 10;
-        }
-        return -1;
-    };
-    for (std::size_t i = 0; i < input.size(); i += 2) {
-        const int high = nibble(input[i]);
-        const int low = nibble(input[i + 1]);
-        if (high < 0 || low < 0) {
-            return false;
-        }
-        out.push_back(static_cast<char>((high << 4) | low));
-    }
-    return true;
-}
-
-// Parses a server certificate SHA-256 pin (Mihomo fingerprint = SSL
-// pinning). Browser profile names are rejected with a pointer to
-// client-fingerprint, mirroring Mihomo. Colons and whitespace are ignored.
-core::Result<std::array<std::uint8_t, 32>> parse_certificate_pin(const std::string &input) {
-    static constexpr const char *kBrowserNames[] = {
-        "chrome", "firefox", "safari", "ios",    "android",
-        "edge",   "360",     "qq",     "random", "randomized",
-    };
-    for (const char *name : kBrowserNames) {
-        if (input == name) {
-            return core::fail(configuration_error(
-                "`fingerprint` is used for TLS certificate pinning. If you need to specify "
-                "the browser fingerprint, use `client-fingerprint`"));
-        }
-    }
-    std::string cleaned;
-    cleaned.reserve(input.size());
-    for (const char c : input) {
-        if (c == ':' || std::isspace(static_cast<unsigned char>(c)) != 0) {
-            continue;
-        }
-        cleaned.push_back(c);
-    }
-    std::string raw;
-    if (!hex_decode(cleaned, raw) || raw.size() != 32) {
-        return core::fail(
-            configuration_error("TLS certificate pin is not a valid SHA-256 hex fingerprint"));
-    }
-    std::array<std::uint8_t, 32> pin{};
-    std::memcpy(pin.data(), raw.data(), pin.size());
-    return pin;
-}
-
-bool certificate_sha256(const X509 *certificate, std::uint8_t out[32]) {
-    uint8_t *der = nullptr;
-    const int length = i2d_X509(certificate, &der);
-    if (length <= 0 || der == nullptr) {
-        return false;
-    }
-    SHA256(der, static_cast<std::size_t>(length), out);
-    OPENSSL_free(der);
-    return true;
 }
 
 // REALITY client state shared between the ClientHello mutator (ticket
@@ -1274,7 +1203,10 @@ class TlsClientHandshakeOperationImpl final
             return false;
         }
         bssl::UniquePtr<X509_STORE> store(X509_STORE_new());
-        bssl::UniquePtr<STACK_OF(X509)> intermediates(sk_X509_new_null());
+        // Borrowed elements: free the container only (pop-free would eat a
+        // reference it never owned).
+        std::unique_ptr<STACK_OF(X509), decltype(&sk_X509_free)> intermediates(sk_X509_new_null(),
+                                                                               &sk_X509_free);
         bssl::UniquePtr<X509_STORE_CTX> verify(X509_STORE_CTX_new());
         if (!store || !intermediates || !verify) {
             return false;
@@ -1282,7 +1214,7 @@ class TlsClientHandshakeOperationImpl final
         if (X509_STORE_add_cert(store.get(), trusted) != 1) {
             return false;
         }
-        for (int index = 1; index <= matched; ++index) {
+        for (int index = 1; index < matched; ++index) {
             X509 *intermediate = sk_X509_value(chain, index);
             if (intermediate == nullptr || sk_X509_push(intermediates.get(), intermediate) == 0) {
                 return false;

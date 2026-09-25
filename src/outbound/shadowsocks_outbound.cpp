@@ -974,6 +974,8 @@ class ShadowsocksConnectOperation final
         options.password = self->config_.plugin_password;
         options.host = self->config_.plugin_host;
         options.skip_cert_verify = self->config_.plugin_skip_cert_verify;
+        options.fingerprint = self->config_.plugin_client_fingerprint;
+        options.certificate_pin = self->config_.plugin_fingerprint;
         if (!self->config_.plugin_alpn.empty()) {
             options.alpn_protocols = self->config_.plugin_alpn;
         }
@@ -1015,6 +1017,7 @@ class ShadowsocksConnectOperation final
         options.version_hint = self->config_.plugin_version_hint;
         options.restls_script = self->config_.plugin_restls_script;
         options.skip_cert_verify = self->config_.plugin_skip_cert_verify;
+        options.certificate_pin = self->config_.plugin_fingerprint;
         core::Result<std::unique_ptr<io::StreamHandle>> result;
         try {
             result = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(

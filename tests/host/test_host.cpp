@@ -120,6 +120,11 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
             config.plugin_skip_cert_verify =
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_SKIP_CERT_VERIFY")
                     .value_or("") == "1";
+            config.plugin_fingerprint =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_FINGERPRINT").value_or("");
+            config.plugin_client_fingerprint =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_CLIENT_FINGERPRINT")
+                    .value_or("");
             config.plugin_mux =
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_MUX").value_or("") == "1";
             if (const auto smux_version =
@@ -319,6 +324,15 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
         trojan_config.shadow_tls_options.skip_cert_verify =
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SHADOWTLS_SKIP_VERIFY")
                 .value_or("0") != "0";
+        // The inner camouflage TLS trusts the same test CA as the outer
+        // handshake; re-read it because the outer config moved its copy.
+        if (const auto ca_path = environment_value("CLASH_NATIVE_TEST_OUTBOUND_CA_FILE")) {
+            std::ifstream ca_file(*ca_path, std::ios::binary);
+            if (ca_file) {
+                trojan_config.shadow_tls_options.trusted_ca_pem.assign(
+                    std::istreambuf_iterator<char>(ca_file), std::istreambuf_iterator<char>());
+            }
+        }
         if (const auto version =
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SHADOWTLS_VERSION")) {
             trojan_config.shadow_tls_options.version = std::stoi(*version);

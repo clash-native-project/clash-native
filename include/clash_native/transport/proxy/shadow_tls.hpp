@@ -16,7 +16,14 @@ struct ShadowTlsClientOptions {
     std::string password;
     std::string host;
     bool skip_cert_verify = false;
+    // Extra trust roots for private camouflage servers, in addition to the
+    // embedded bundle.
+    std::string trusted_ca_pem;
     std::vector<std::string> alpn_protocols{"h2", "http/1.1"};
+    // Server certificate SHA-256 pin (Mihomo fingerprint).
+    std::string certificate_pin;
+    // ClientHello camouflage profile (Mihomo client-fingerprint).
+    std::string fingerprint;
 };
 
 using ShadowTlsOpenHandler = std::function<void(core::Result<std::unique_ptr<io::StreamHandle>>)>;

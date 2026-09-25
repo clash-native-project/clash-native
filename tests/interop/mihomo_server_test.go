@@ -62,6 +62,24 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
 		sum := sha256.Sum256(leaf.Raw)
 		return hex.EncodeToString(sum[:])
 	}()
+	trojanCaPin := func() string {
+		block, _ := pem.Decode(tlsMaterial.CACertificatePEM)
+		if block == nil {
+			t.Fatal("decode trojan test CA certificate")
+		}
+		ca, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(ca.Raw)
+		return hex.EncodeToString(sum[:])
+	}()
+	tlsChainEcho, err := endpoints.StartTLSChainEcho(tlsMaterial.CertificatePEM,
+		tlsMaterial.PrivateKeyPEM, tlsMaterial.CACertificatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tlsChainEcho.Close()
 
 	methods := []string{
 		"aes-128-gcm", "aes-192-gcm", "aes-256-gcm", "chacha20-ietf-poly1305",
@@ -261,16 +279,28 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	trojanShadowTLSLocalAddress := reserveMihomoTCPAddress(t)
+	_, trojanShadowTLSLocalPort, err := net.SplitHostPort(trojanShadowTLSLocalAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trojanRestlsLocalAddress := reserveMihomoTCPAddress(t)
+	_, trojanRestlsLocalPort, err := net.SplitHostPort(trojanRestlsLocalAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	home := t.TempDir()
 	caPath := filepath.Join(home, "test-ca.pem")
 	certificatePath := filepath.Join(home, "trojan-cert.pem")
+
 	privateKeyPath := filepath.Join(home, "trojan-key.pem")
 	configPath := filepath.Join(home, "config.yaml")
 	for path, data := range map[string][]byte{
 		caPath:          tlsMaterial.CACertificatePEM,
 		certificatePath: tlsMaterial.CertificatePEM,
-		privateKeyPath:  tlsMaterial.PrivateKeyPEM,
+
+		privateKeyPath: tlsMaterial.PrivateKeyPEM,
 	} {
 		if err := os.WriteFile(path, data, 0o600); err != nil {
 			t.Fatal(err)
@@ -409,6 +439,31 @@ listeners:%s
         - deadbeef
       server-names:
         - localhost
+  - name: test-trojan-shadow-tls-local
+    type: trojan
+    listen: 127.0.0.1
+    port: %s
+    users:
+      - username: test
+        password: '%s'
+    shadow-tls:
+      enable: true
+      version: 2
+      password: '%s'
+      handshake:
+        dest: %s
+  - name: test-trojan-restls-local
+    type: trojan
+    listen: 127.0.0.1
+    port: %s
+    users:
+      - username: test
+        password: '%s'
+    res-tls:
+      enable: true
+      dest: %s
+      password: '%s'
+      restls-script: "1000?100<1,500~100,350~100,600~100,400~200"
 `, listenerConfig.String(), trojanPort, mihomoTestPassword,
 		filepath.ToSlash(certificatePath), filepath.ToSlash(privateKeyPath), trojanWSSPort,
 		mihomoTestPassword, filepath.ToSlash(certificatePath), filepath.ToSlash(privateKeyPath),
@@ -418,7 +473,9 @@ listeners:%s
 		filepath.ToSlash(privateKeyPath), trojanShadowTLSPort, mihomoTestPassword,
 		shadowTlsPassword, trojanRestlsPort, mihomoTestPassword, restlsPassword,
 		trojanWSShadowTLSPort, mihomoTestPassword, shadowTlsPassword, trojanJLSPort, mihomoTestPassword,
-		jlsUsername, jlsPassword, trojanRealityPort, mihomoTestPassword, trojanPort)
+		jlsUsername, jlsPassword, trojanRealityPort, mihomoTestPassword, trojanPort,
+		trojanShadowTLSLocalPort, mihomoTestPassword, shadowTlsPassword, tlsChainEcho.Addr(),
+		trojanRestlsLocalPort, mihomoTestPassword, tlsChainEcho.Addr(), restlsPassword)
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -433,6 +490,8 @@ listeners:%s
 	}
 	listenerAddresses = append(listenerAddresses, restlsAddress)
 	listenerAddresses = append(listenerAddresses, jlsAddress)
+	listenerAddresses = append(listenerAddresses, trojanShadowTLSLocalAddress)
+	listenerAddresses = append(listenerAddresses, trojanRestlsLocalAddress)
 	mihomo := startMihomo(t, mihomoExecutable, home, configPath, listenerAddresses)
 	defer stopInteropProcess(t, mihomo)
 
@@ -885,6 +944,159 @@ listeners:%s
 		writeSocksConnectRequest(t, control, tcpEcho.Addr())
 		if code := readSocks5ReplyCode(t, control); code == 0 {
 			t.Fatal("C++ Trojan outbound accepted a wrong certificate pin")
+		}
+	})
+
+	t.Run("Trojan/shadow-tls-pin", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":                           "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":                    trojanShadowTLSLocalAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":                  mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":               "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SECURITY_MODE":      "shadow-tls",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SHADOWTLS_PASSWORD": shadowTlsPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SHADOWTLS_HOST":     "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SHADOWTLS_VERSION":  "2",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_FINGERPRINT":        trojanCertPin,
+		})
+		defer stopProxy()
+
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-trojan-shadow-pin-", 2048))
+		writeBytes(t, client, payload)
+		if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("half-close C++ to Mihomo Trojan stream: %v", err)
+			}
+		}
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo Trojan returned different bytes")
+		}
+	})
+
+	t.Run("Trojan/shadow-tls-client-fingerprint", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":                           "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":                    trojanShadowTLSLocalAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":                  mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":               "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SECURITY_MODE":      "shadow-tls",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SHADOWTLS_PASSWORD": shadowTlsPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SHADOWTLS_HOST":     "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SHADOWTLS_VERSION":  "2",
+			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":                   caPath,
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_CLIENT_FINGERPRINT": "firefox",
+		})
+		defer stopProxy()
+
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-trojan-shadow-fp-", 2048))
+		writeBytes(t, client, payload)
+		if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("half-close C++ to Mihomo Trojan stream: %v", err)
+			}
+		}
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo Trojan returned different bytes")
+		}
+	})
+
+	t.Run("Trojan/restls-pin", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":                           "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":                    trojanRestlsLocalAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":                  mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":               "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SECURITY_MODE":      "restls",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_RESTLS_SERVER_NAME": "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_RESTLS_PASSWORD":    restlsPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_RESTLS_SCRIPT":      "1000?100<1,500~100,350~100,600~100,400~200",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_FINGERPRINT":        trojanCertPin,
+		})
+		defer stopProxy()
+
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-trojan-restls-pin-", 2048))
+		writeBytes(t, client, payload)
+		if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("half-close C++ to Mihomo Trojan stream: %v", err)
+			}
+		}
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo Trojan returned different bytes")
+		}
+	})
+
+	t.Run("Trojan/restls-ca-pin", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":                           "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":                    trojanRestlsLocalAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":                  mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":               "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SECURITY_MODE":      "restls",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_RESTLS_SERVER_NAME": "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_RESTLS_PASSWORD":    restlsPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_RESTLS_SCRIPT":      "1000?100<1,500~100,350~100,600~100,400~200",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_FINGERPRINT":        trojanCaPin,
+		})
+		defer stopProxy()
+
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-trojan-restls-ca-pin-", 2048))
+		writeBytes(t, client, payload)
+		if os.Getenv("CLASH_NATIVE_SKIP_INTEROP_HALF_CLOSE") != "1" {
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatalf("half-close C++ to Mihomo Trojan stream: %v", err)
+			}
+		}
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo Trojan returned different bytes")
+		}
+	})
+
+	t.Run("Trojan/restls-wrong-pin", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":                           "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":                    trojanRestlsLocalAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":                  mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":               "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_SECURITY_MODE":      "restls",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_RESTLS_SERVER_NAME": "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_RESTLS_PASSWORD":    restlsPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_RESTLS_SCRIPT":      "1000?100<1,500~100,350~100,600~100,400~200",
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_FINGERPRINT":        strings.Repeat("0", 64),
+		})
+		defer stopProxy()
+
+		control, err := net.DialTimeout("tcp", proxyAddress, 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer control.Close()
+		_ = control.SetDeadline(time.Now().Add(5 * time.Second))
+		writeBytes(t, control, []byte{5, 1, 0})
+		method := make([]byte, 2)
+		readBytes(t, control, method)
+		if string(method) != string([]byte{5, 0}) {
+			t.Fatalf("unexpected SOCKS5 method response: %v", method)
+		}
+		writeSocksConnectRequest(t, control, tcpEcho.Addr())
+		if code := readSocks5ReplyCode(t, control); code == 0 {
+			t.Fatal("C++ Trojan restls outbound accepted a wrong certificate pin")
 		}
 	})
 

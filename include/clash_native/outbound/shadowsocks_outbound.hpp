@@ -47,6 +47,12 @@ struct ShadowsocksOutboundConfig {
     std::uint8_t udp_over_tcp_version = 1;
     std::string plugin_password;
     std::string plugin_username;
+    // Server certificate SHA-256 pin for shadow-tls/restls carriers
+    // (Mihomo plugin-opts fingerprint).
+    std::string plugin_fingerprint;
+    // ClientHello camouflage profile for the shadow-tls carrier
+    // (Mihomo client-fingerprint).
+    std::string plugin_client_fingerprint;
     int plugin_version = 2;
     std::vector<std::string> plugin_alpn;
     std::string plugin_version_hint = "tls12";

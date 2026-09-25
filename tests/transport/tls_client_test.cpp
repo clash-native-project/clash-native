@@ -19,6 +19,8 @@
 #include <openssl/sha.h>
 #include <openssl/ssl.h>
 
+#include <clash_native/transport/cert_pin.hpp>
+
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/read.hpp>
@@ -2107,4 +2109,37 @@ TEST(TlsClientTest, Rejects360WithReality) {
         test_base64url_encode(server_public, sizeof(server_public)), "deadbeef"};
     const auto failure = handshake_error(std::move(options));
     EXPECT_EQ(failure.code, clash_native::core::ErrorCode::configuration);
+}
+
+TEST(CertPinTest, DerMatchesPinRoundTripsCertificate) {
+    bssl::UniquePtr<BIO> cert_bio(
+        BIO_new_mem_buf(kCertificate.data(), static_cast<int>(kCertificate.size())));
+    bssl::UniquePtr<X509> certificate(PEM_read_bio_X509(cert_bio.get(), nullptr, nullptr, nullptr));
+    ASSERT_TRUE(certificate);
+    uint8_t *der = nullptr;
+    const int length = i2d_X509(certificate.get(), &der);
+    ASSERT_GT(length, 0);
+    ASSERT_NE(der, nullptr);
+    std::uint8_t digest[32] = {0};
+    ASSERT_TRUE(clash_native::transport::certificate_sha256(certificate.get(), digest));
+    std::array<std::uint8_t, 32> pin{};
+    std::memcpy(pin.data(), digest, pin.size());
+    EXPECT_TRUE(
+        clash_native::transport::der_matches_pin(der, static_cast<std::size_t>(length), pin));
+    std::array<std::uint8_t, 32> wrong{};
+    EXPECT_FALSE(
+        clash_native::transport::der_matches_pin(der, static_cast<std::size_t>(length), wrong));
+    EXPECT_FALSE(clash_native::transport::der_matches_pin(nullptr, 0, pin));
+    OPENSSL_free(der);
+}
+
+TEST(CertPinTest, ParseRejectsBrowserProfileNames) {
+    for (const char *name : {"chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq",
+                             "random", "randomized", "chrome120", "firefox120", "safari16"}) {
+        const auto pin = clash_native::transport::parse_certificate_pin(name);
+        EXPECT_FALSE(pin) << name;
+        if (!pin) {
+            EXPECT_EQ(pin.error().code, clash_native::core::ErrorCode::configuration);
+        }
+    }
 }

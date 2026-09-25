@@ -175,6 +175,7 @@ add_library(clash-native-core STATIC
     src/outbound/shadowsocks_legacy_datagram.cpp
     src/transport/endpoint_dialer.cpp
     src/transport/quic_client.cpp
+    src/transport/cert_pin.cpp
     src/transport/tls_client.cpp
     src/transport/trojan/packet_conn.cpp
     src/transport/trojan/ss_stream.cpp

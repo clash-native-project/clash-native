@@ -1,5 +1,7 @@
 #include <clash_native/transport/proxy/restls_client.hpp>
 
+#include <clash_native/transport/cert_pin.hpp>
+
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/proxy/restls.hpp>
@@ -318,9 +320,12 @@ class RestlsCallbacks final : public Botan::TLS::Callbacks {
 
     RestlsCallbacks(std::shared_ptr<Botan::RandomNumberGenerator> rng,
                     std::array<std::uint8_t, 32> secret, EmitHandler emit, RecordHandler record,
-                    bool skip_cert_verify, bool tls13)
+                    bool skip_cert_verify, bool tls13,
+                    std::optional<std::array<std::uint8_t, 32>> certificate_pin,
+                    std::string verify_name)
         : rng_(std::move(rng)), secret_(secret), emit_(std::move(emit)), record_(std::move(record)),
-          skip_cert_verify_(skip_cert_verify), tls13_(tls13) {
+          skip_cert_verify_(skip_cert_verify), tls13_(tls13),
+          certificate_pin_(std::move(certificate_pin)), verify_name_(std::move(verify_name)) {
         x25519_key_ = std::make_unique<RestlsX25519Key>(*rng_);
         p256_key_ = std::make_unique<Botan::ECDH_PrivateKey>(
             *rng_, Botan::EC_Group::from_name("secp256r1"));
@@ -382,16 +387,41 @@ class RestlsCallbacks final : public Botan::TLS::Callbacks {
                   session_id.begin());
     }
 
-    void tls_verify_cert_chain(const std::vector<Botan::X509_Certificate> &,
+    void tls_verify_cert_chain(const std::vector<Botan::X509_Certificate> &chain,
                                const std::vector<std::optional<Botan::OCSP::Response>> &,
                                const std::vector<Botan::Certificate_Store *> &, Botan::Usage_Type,
                                std::string_view, const Botan::TLS::Policy &) override {
+        // Mihomo fingerprint = certificate pin: a chain member match accepts,
+        // with a re-rooted path validation plus hostname check for non-leaf
+        // matches, mirroring the TLS client pin verifier.
+        if (certificate_pin_) {
+            for (std::size_t index = 0; index < chain.size(); ++index) {
+                const auto der = chain[index].BER_encode();
+                if (!transport::der_matches_pin(der.data(), der.size(), *certificate_pin_)) {
+                    continue;
+                }
+                if (index == 0) {
+                    return;
+                }
+                std::vector<std::vector<std::uint8_t>> ders;
+                ders.reserve(chain.size());
+                for (const auto &certificate : chain) {
+                    ders.push_back(certificate.BER_encode());
+                }
+                if (!transport::verify_der_pinned_chain(ders, index, verify_name_)) {
+                    throw Botan::TLS::TLS_Exception(Botan::TLS::Alert::BadCertificate,
+                                                    "ResTLS pinned chain validation failed");
+                }
+                return;
+            }
+            throw Botan::TLS::TLS_Exception(Botan::TLS::Alert::BadCertificate,
+                                            "ResTLS certificate pin mismatch");
+        }
         if (!skip_cert_verify_) {
             throw Botan::TLS::TLS_Exception(Botan::TLS::Alert::BadCertificate,
                                             "ResTLS native trust store is not configured");
         }
     }
-
     std::unique_ptr<Botan::PK_Key_Agreement_Key>
     tls12_generate_ephemeral_ecdh_key(Botan::TLS::Group_Params group,
                                       Botan::RandomNumberGenerator &rng,
@@ -471,6 +501,8 @@ class RestlsCallbacks final : public Botan::TLS::Callbacks {
     RecordHandler record_;
     bool skip_cert_verify_ = false;
     bool tls13_ = false;
+    std::optional<std::array<std::uint8_t, 32>> certificate_pin_;
+    std::string verify_name_;
     std::unique_ptr<RestlsX25519Key> x25519_key_;
     std::unique_ptr<Botan::ECDH_PrivateKey> p256_key_;
     std::unique_ptr<Botan::ECDH_PrivateKey> p384_key_;
@@ -938,6 +970,14 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
                                            "ResTLS server name and password are required")));
             return;
         }
+        if (!options_.certificate_pin.empty()) {
+            auto pin = transport::parse_certificate_pin(options_.certificate_pin);
+            if (!pin) {
+                finish(core::fail(restls_error(pin.error().code, pin.error().context)));
+                return;
+            }
+            certificate_pin_ = pin.value();
+        }
         if (options_.version_hint != "tls12" && options_.version_hint != "tls13") {
             finish(core::fail(
                 restls_error(core::ErrorCode::unsupported,
@@ -973,7 +1013,7 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
             callbacks_ = std::make_shared<RestlsCallbacks>(
                 rng_, secret_, [self](std::span<const std::uint8_t> data) { self->emit_tls(data); },
                 [self](std::span<const std::uint8_t> data) { self->record_received(data); },
-                options_.skip_cert_verify, tls13);
+                options_.skip_cert_verify, tls13, certificate_pin_, options_.server_name);
             Botan::TLS::Server_Information info(options_.server_name);
             const auto protocol_version = tls13 ? Botan::TLS::Protocol_Version::TLS_V13
                                                 : Botan::TLS::Protocol_Version::TLS_V12;
@@ -1219,6 +1259,7 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
 
     std::unique_ptr<io::StreamHandle> stream_;
     RestlsClientOptions options_;
+    std::optional<std::array<std::uint8_t, 32>> certificate_pin_;
     RestlsOpenHandler handler_;
     boost::asio::steady_timer timer_;
     std::shared_ptr<Botan::RandomNumberGenerator> rng_;

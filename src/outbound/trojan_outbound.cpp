@@ -332,8 +332,18 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 auto boxed = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(stream));
                 co_return co_await async::bridge_sender<Opened>(
                     [self, boxed](async::BridgeSender<Opened>::Handler done) mutable {
+                        // Mihomo forwards the proxy-level fingerprint (pin)
+                        // and client-fingerprint (hello) into the overlay;
+                        // explicit overlay options win.
+                        auto options = self->config_.shadow_tls_options;
+                        if (options.fingerprint.empty()) {
+                            options.fingerprint = self->config_.client_fingerprint;
+                        }
+                        if (options.certificate_pin.empty()) {
+                            options.certificate_pin = self->config_.fingerprint;
+                        }
                         transport::proxy::async_open_shadow_tls(
-                            std::move(*boxed), self->config_.shadow_tls_options,
+                            std::move(*boxed), std::move(options),
                             [done](Opened opened) mutable { done(std::move(opened)); });
                         using AbortFn = async::BridgeSender<Opened>::AbortFn;
                         return AbortFn{[self] { self->abort(); }};
@@ -343,8 +353,12 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 auto boxed = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(stream));
                 co_return co_await async::bridge_sender<Opened>(
                     [self, boxed](async::BridgeSender<Opened>::Handler done) mutable {
+                        auto options = self->config_.restls_options;
+                        if (options.certificate_pin.empty()) {
+                            options.certificate_pin = self->config_.fingerprint;
+                        }
                         transport::proxy::async_open_restls(
-                            std::move(*boxed), self->config_.restls_options,
+                            std::move(*boxed), std::move(options),
                             [done](Opened opened) mutable { done(std::move(opened)); });
                         using AbortFn = async::BridgeSender<Opened>::AbortFn;
                         return AbortFn{[self] { self->abort(); }};

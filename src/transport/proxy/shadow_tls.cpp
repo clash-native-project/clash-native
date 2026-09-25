@@ -481,7 +481,10 @@ class ShadowTlsOpenOperation final : public std::enable_shared_from_this<ShadowT
         transport::TlsClientOptions tls_options;
         tls_options.server_name = self->options_.host;
         tls_options.verify_peer = !self->options_.skip_cert_verify;
+        tls_options.trusted_ca_pem = self->options_.trusted_ca_pem;
         tls_options.alpn_protocols = self->options_.alpn_protocols;
+        tls_options.certificate_pin = self->options_.certificate_pin;
+        tls_options.fingerprint = self->options_.fingerprint;
         tls_options.handoff_raw_transport = true;
         if (self->options_.version == 1 || self->options_.version == 2) {
             tls_options.maximum_tls_version = TLS1_2_VERSION;

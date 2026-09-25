@@ -2558,3 +2558,20 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   Deprecated chrome_psk* variants intentionally out of scope. Full suite:
   307 passed; Trojan interop group green including six new fingerprint
   subtests against real Mihomo.
+
+## 2026-09-26
+
+- Overlay camouflage beyond REALITY: shadow-tls inner TLS now takes the
+  proxy-level client-fingerprint (hello) and fingerprint (pin) with
+  explicit overlay options winning; restls verifies the Mihomo
+  fingerprint pin (leaf accept, non-leaf re-rooted chain plus hostname
+  via shared transport/cert_pin helpers). Fixed a heap-corrupting
+  pop-free deleter on borrowed STACK_OF(X509) intermediates in both pin
+  verifiers (container-only free now). Trojan fallbacks plus SS
+  plugin_fingerprint/plugin_client_fingerprint wiring and test-host env.
+  Interop against real Mihomo with a local chain-presenting TLS echo:
+  shadow-tls pin/hello, restls leaf/CA/wrong pin. Full suite: 309
+  passed; Trojan interop group green. Deferred: restls chrome-hello
+  migration and JLS camouflage (both need BoringSSL-TLS/handshake-hook
+  work beyond Botan); JLS empty/unknown fingerprints already match
+  Mihomo's stdlib fallback (no camouflage either side).

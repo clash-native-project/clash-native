@@ -15,6 +15,8 @@ struct RestlsClientOptions {
     std::string password;
     std::string restls_script;
     bool skip_cert_verify = false;
+    // Server certificate SHA-256 pin (Mihomo fingerprint).
+    std::string certificate_pin;
     // The version hint selects a fixed Botan TLS handshaker and the matching
     // ResTLS ClientHello authentication layout.
     std::string version_hint = "tls12";
