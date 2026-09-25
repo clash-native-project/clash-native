@@ -2536,3 +2536,11 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   relay instead of rule fallback). Unit tests for both outbounds;
   Trojan/UDP positive and Trojan/udp-disabled negative interop against
   real Mihomo. Full suite: 293 passed; Trojan interop group green.
+
+## 2026-09-25
+
+- ECH resolver follows CNAME chains: in-response CNAME walk (mirroring
+  the address path, 8 hops max) plus follow-up queries for CNAME-only
+  responses (3 follow-ups max, visited-set loop guard). Unit tests for
+  in-response chains, cross-response chasing, and loop termination.
+  Full suite: 296 passed; Trojan interop group green.

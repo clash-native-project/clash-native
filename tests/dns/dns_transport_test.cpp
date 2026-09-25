@@ -2945,3 +2945,136 @@ TEST(EchResolverTest, FailsWhenNoEchParamIsPublished) {
     resolver.stop();
     runtime.stop();
 }
+
+namespace {
+
+clash_native::dns::DnsPacket make_cname_record(const std::string &owner,
+                                               const std::string &target) {
+    clash_native::dns::DnsResourceRecord record;
+    record.name = owner;
+    record.type = static_cast<std::uint16_t>(clash_native::dns::DnsRecordType::cname);
+    record.ttl_seconds = 60;
+    record.target_name = target;
+    clash_native::dns::DnsPacket packet;
+    packet.answers.push_back(std::move(record));
+    return packet;
+}
+
+clash_native::core::Result<std::vector<std::uint8_t>>
+run_ech_query_sync(clash_native::dns::ResolverService &resolver, const std::string &name,
+                   std::shared_ptr<FakeTransportStats> stats) {
+    std::promise<clash_native::core::Result<std::vector<std::uint8_t>>> completed;
+    auto future = completed.get_future();
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    boost::asio::post(runtime.serialized_executor(), [&resolver, &completed, name] {
+        run_ech_query(resolver, name,
+                      [&completed](auto result) { completed.set_value(std::move(result)); });
+    });
+    if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        return clash_native::core::fail(clash_native::core::Error{
+            clash_native::core::ErrorCode::timeout, "ECH query test timed out"});
+    }
+    (void)stats;
+    return future.get();
+}
+
+std::unique_ptr<clash_native::dns::ResolverService>
+make_cname_ech_resolver(std::uint16_t port, std::shared_ptr<FakeTransportStats> stats,
+                        FakeResponseFactory factory) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    const auto endpoint =
+        boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), port);
+    clash_native::dns::DnsTransportFactory transport_factory =
+        [endpoint, stats, factory = std::move(factory)](clash_native::runtime::AsioRuntime &runtime,
+                                                        clash_native::dns::DnsUpstreamConfig) {
+            return std::make_shared<FakeDnsTransport>(
+                runtime.serialized_executor(), boost::asio::ip::make_address("192.0.2.2"), stats,
+                true, false, 0, false, std::move(factory));
+        };
+    auto policy = std::make_shared<clash_native::dns::DnsPolicyRouter>("default");
+    return std::make_unique<clash_native::dns::ResolverService>(
+        runtime, clash_native::dns::DnsResolverConfig{{endpoint, std::chrono::milliseconds(500)},
+                                                      {},
+                                                      std::move(policy),
+                                                      std::move(transport_factory)});
+}
+
+} // namespace
+
+TEST(EchResolverTest, FollowsCnameChainWithinSingleResponse) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    auto stats = std::make_shared<FakeTransportStats>();
+    const std::vector<std::uint8_t> ech_config{0x00, 0x0a, 0x0d, 0x14};
+    auto resolver_ptr = make_cname_ech_resolver(
+        5312, stats, [ech_config](const clash_native::dns::DnsPacket &query) {
+            auto packet = make_ech_answer(query, {});
+            auto cname = make_cname_record("www.example", "cdn.example");
+            packet.answers.push_back(std::move(cname.answers.front()));
+            // Publish the ech param at the canonical name, not the alias.
+            packet.answers.front().svcb->params.clear();
+            auto canonical = make_ech_answer(query, ech_config);
+            canonical.answers.front().name = "cdn.example";
+            packet.answers.push_back(std::move(canonical.answers.front()));
+            return clash_native::core::Result<clash_native::dns::DnsPacket>{std::move(packet)};
+        });
+    runtime.start();
+    const auto result = run_ech_query_sync(*resolver_ptr, "www.example", stats);
+    resolver_ptr->stop();
+    runtime.stop();
+    ASSERT_TRUE(result) << (result ? "" : result.error().context);
+    EXPECT_EQ(result.value(), ech_config);
+    EXPECT_EQ(stats->exchanges.load(), 1);
+}
+
+TEST(EchResolverTest, ChasesCnameAcrossResponses) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    auto stats = std::make_shared<FakeTransportStats>();
+    const std::vector<std::uint8_t> ech_config{0xde, 0xad, 0xbe, 0xef};
+    auto resolver_ptr = make_cname_ech_resolver(
+        5313, stats, [ech_config](const clash_native::dns::DnsPacket &query) {
+            const auto &name = query.questions.front().name;
+            if (name == "cdn.example" || name == "cdn.example.") {
+                return clash_native::core::Result<clash_native::dns::DnsPacket>{
+                    make_ech_answer(query, ech_config)};
+            }
+            clash_native::dns::DnsPacket packet;
+            packet.id = query.id;
+            packet.wire = query.wire;
+            packet.questions = query.questions;
+            auto cname = make_cname_record(name, "cdn.example");
+            packet.answers.push_back(std::move(cname.answers.front()));
+            return clash_native::core::Result<clash_native::dns::DnsPacket>{std::move(packet)};
+        });
+    runtime.start();
+    const auto result = run_ech_query_sync(*resolver_ptr, "www.example", stats);
+    resolver_ptr->stop();
+    runtime.stop();
+    ASSERT_TRUE(result) << (result ? "" : result.error().context);
+    EXPECT_EQ(result.value(), ech_config);
+    EXPECT_EQ(stats->exchanges.load(), 2);
+}
+
+TEST(EchResolverTest, StopsOnCnameLoop) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    auto stats = std::make_shared<FakeTransportStats>();
+    auto resolver_ptr =
+        make_cname_ech_resolver(5314, stats, [](const clash_native::dns::DnsPacket &query) {
+            const auto &name = query.questions.front().name;
+            const std::string target =
+                (name == "a.example" || name == "a.example.") ? "b.example" : "a.example";
+            clash_native::dns::DnsPacket packet;
+            packet.id = query.id;
+            packet.wire = query.wire;
+            packet.questions = query.questions;
+            auto cname = make_cname_record(name, target);
+            packet.answers.push_back(std::move(cname.answers.front()));
+            return clash_native::core::Result<clash_native::dns::DnsPacket>{std::move(packet)};
+        });
+    runtime.start();
+    const auto result = run_ech_query_sync(*resolver_ptr, "a.example", stats);
+    resolver_ptr->stop();
+    runtime.stop();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, clash_native::core::ErrorCode::resolution);
+    EXPECT_LE(stats->exchanges.load(), 4);
+}
