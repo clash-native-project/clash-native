@@ -1735,3 +1735,376 @@ TEST(TlsClientTest, CertificatePinAcceptsMatchingServer) {
 TEST(TlsClientTest, CertificatePinRejectsMismatch) {
     EXPECT_FALSE(run_pin_handshake(std::string(64, '0'), true));
 }
+
+namespace {
+
+struct CapturedFingerprintHello {
+    ClientHello hello;
+    std::vector<std::uint8_t> record;
+    clash_native::core::Error failure{clash_native::core::ErrorCode::cancelled, "uncaptured"};
+};
+
+CapturedFingerprintHello capture_fingerprint_hello(
+    const std::string &fingerprint, std::vector<std::string> alpn_protocols,
+    std::optional<clash_native::transport::TlsRealityOptions> reality = std::nullopt) {
+    using boost::asio::ip::tcp;
+    boost::asio::io_context context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{
+        context.get_executor()};
+    std::thread runner([&] { context.run(); });
+
+    tcp::acceptor acceptor(context, tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+    tcp::socket server(context);
+    std::promise<void> accepted;
+    auto accepted_future = accepted.get_future();
+    acceptor.async_accept(server, [&](const boost::system::error_code &error) {
+        EXPECT_FALSE(error);
+        accepted.set_value();
+    });
+
+    tcp::socket peer(context);
+    peer.connect(
+        tcp::endpoint(boost::asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()));
+    if (accepted_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        context.stop();
+        runner.join();
+        return {};
+    }
+    auto stream = std::make_unique<clash_native::net::TcpStream>(std::move(peer));
+
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "example.com";
+    options.alpn_protocols = std::move(alpn_protocols);
+    options.fingerprint = fingerprint;
+    options.reality = std::move(reality);
+    options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto sender =
+        clash_native::transport::async_tls_client_handshake(std::move(stream), std::move(options));
+    HandshakeReceiver receiver;
+    auto completed = receiver.done.get_future();
+    auto op = stdexec::connect(std::move(sender), std::move(receiver));
+    stdexec::start(op);
+
+    const auto record = read_tls_record(context, server);
+    server.close();
+    CapturedFingerprintHello captured;
+    captured.record = record;
+    if (completed.wait_for(std::chrono::seconds(5)) == std::future_status::ready) {
+        captured.failure = completed.get();
+    }
+    if (!record.empty()) {
+        ClientHello hello;
+        if (parse_client_hello(record, hello)) {
+            captured.hello = std::move(hello);
+        }
+    }
+    context.stop();
+    runner.join();
+    return captured;
+}
+
+std::vector<std::uint16_t> normalized_extensions(const std::vector<std::uint16_t> &types,
+                                                 std::size_t &grease_count) {
+    std::vector<std::uint16_t> normalized;
+    grease_count = 0;
+    for (const auto type : types) {
+        if (is_grease(type)) {
+            grease_count += 1;
+            continue;
+        }
+        normalized.push_back(type);
+    }
+    std::sort(normalized.begin(), normalized.end());
+    return normalized;
+}
+
+} // namespace
+
+TEST(TlsClientTest, IosFingerprintMatchesIosClientHello) {
+    auto captured = capture_fingerprint_hello("ios", {"h2", "http/1.1"});
+    EXPECT_NE(captured.failure.code, clash_native::core::ErrorCode::configuration);
+    const auto &hello = captured.hello;
+    EXPECT_EQ(hello.server_name, "example.com");
+    EXPECT_EQ(hello.alpn, (std::vector<std::string>{"h2", "http/1.1"}));
+
+    // TLS 1.3 suites in Chrome order plus the 23 raw legacy suites.
+    const std::vector<std::uint16_t> expected_ciphers = {
+        0x1301, 0x1302, 0x1303, 0xc02c, 0xc02b, 0xcca9, 0xc030, 0xc02f, 0xcca8,
+        0xc024, 0xc023, 0xc00a, 0xc009, 0xc028, 0xc027, 0xc014, 0xc013, 0x009d,
+        0x009c, 0x003d, 0x003c, 0x0035, 0x002f, 0xc008, 0xc012, 0x000a};
+    EXPECT_EQ(hello.ciphers.size(), expected_ciphers.size() + 1);
+    if (hello.ciphers.size() == expected_ciphers.size() + 1) {
+        EXPECT_TRUE(is_grease(hello.ciphers[0]));
+        EXPECT_EQ(std::vector<std::uint16_t>(hello.ciphers.begin() + 1, hello.ciphers.end()),
+                  expected_ciphers);
+    } else {
+        EXPECT_EQ(hello.ciphers, expected_ciphers);
+    }
+
+    std::vector<std::uint16_t> extensions = hello.extension_types;
+    if (!extensions.empty() && extensions.back() == 21) {
+        extensions.pop_back();
+    }
+    std::size_t grease_count = 0;
+    const auto normalized = normalized_extensions(extensions, grease_count);
+    EXPECT_EQ(grease_count, 2u);
+    EXPECT_EQ(normalized,
+              (std::vector<std::uint16_t>{0, 5, 10, 11, 13, 16, 18, 23, 43, 45, 51, 65281}));
+
+    ASSERT_EQ(hello.groups.size(), 5u);
+    EXPECT_TRUE(is_grease(hello.groups[0]));
+    EXPECT_EQ(std::vector<std::uint16_t>(hello.groups.begin() + 1, hello.groups.end()),
+              (std::vector<std::uint16_t>{0x001d, 0x0017, 0x0018, 0x0019}));
+    ASSERT_EQ(hello.key_share_groups.size(), 2u);
+    EXPECT_TRUE(is_grease(hello.key_share_groups[0]));
+    EXPECT_EQ(hello.key_share_groups[1], 0x001d);
+    // The repeated PSS-SHA384 is dropped: BoringSSL rejects duplicate prefs.
+    EXPECT_EQ(hello.signature_algorithms,
+              (std::vector<std::uint16_t>{0x0403, 0x0804, 0x0401, 0x0503, 0x0203, 0x0805, 0x0501,
+                                          0x0806, 0x0601, 0x0201}));
+    ASSERT_EQ(hello.versions.size(), 5u);
+    EXPECT_TRUE(is_grease(hello.versions[0]));
+    EXPECT_EQ(std::vector<std::uint16_t>(hello.versions.begin() + 1, hello.versions.end()),
+              (std::vector<std::uint16_t>{0x0304, 0x0303, 0x0302, 0x0301}));
+    EXPECT_FALSE(hello.has_ech);
+    EXPECT_FALSE(hello.has_compress_brotli);
+    EXPECT_FALSE(hello.has_alps);
+}
+
+TEST(TlsClientTest, AndroidFingerprintMatchesOkHttpClientHello) {
+    auto captured = capture_fingerprint_hello("android", {});
+    EXPECT_NE(captured.failure.code, clash_native::core::ErrorCode::configuration);
+    const auto &hello = captured.hello;
+    EXPECT_TRUE(hello.alpn.empty());
+
+    // TLS 1.2 only, no GREASE anywhere.
+    const std::vector<std::uint16_t> expected_ciphers = {0xc02b, 0xc02c, 0xcca9, 0xc02f,
+                                                         0xc030, 0xcca8, 0xc013, 0xc014,
+                                                         0x009c, 0x009d, 0x002f, 0x0035};
+    EXPECT_EQ(hello.ciphers, expected_ciphers);
+    for (const auto cipher : hello.ciphers) {
+        EXPECT_FALSE(is_grease(cipher));
+    }
+    // Fixed order, no padding (suppressed by the patch).
+    EXPECT_EQ(hello.extension_types, (std::vector<std::uint16_t>{0, 23, 65281, 10, 11, 5, 13}));
+    for (const auto type : hello.extension_types) {
+        EXPECT_FALSE(is_grease(type));
+    }
+    EXPECT_EQ(hello.groups, (std::vector<std::uint16_t>{0x001d, 0x0017, 0x0018}));
+    EXPECT_TRUE(hello.key_share_groups.empty());
+    EXPECT_EQ(hello.signature_algorithms,
+              (std::vector<std::uint16_t>{0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806,
+                                          0x0601, 0x0201}));
+    EXPECT_TRUE(hello.versions.empty());
+    EXPECT_FALSE(hello.has_ech);
+}
+
+TEST(TlsClientTest, EdgeFingerprintMatchesEdgeClientHello) {
+    auto captured = capture_fingerprint_hello("edge", {"h2", "http/1.1"});
+    EXPECT_NE(captured.failure.code, clash_native::core::ErrorCode::configuration);
+    const auto &hello = captured.hello;
+    EXPECT_EQ(hello.alpn, (std::vector<std::string>{"h2", "http/1.1"}));
+
+    const std::vector<std::uint16_t> expected_ciphers = {0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f,
+                                                         0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013,
+                                                         0xc014, 0x009c, 0x009d, 0x002f, 0x0035};
+    ASSERT_EQ(hello.ciphers.size(), expected_ciphers.size() + 1);
+    EXPECT_TRUE(is_grease(hello.ciphers[0]));
+    EXPECT_EQ(std::vector<std::uint16_t>(hello.ciphers.begin() + 1, hello.ciphers.end()),
+              expected_ciphers);
+
+    std::vector<std::uint16_t> extensions = hello.extension_types;
+    if (!extensions.empty() && extensions.back() == 21) {
+        extensions.pop_back();
+    }
+    std::size_t grease_count = 0;
+    const auto normalized = normalized_extensions(extensions, grease_count);
+    EXPECT_EQ(grease_count, 2u);
+    EXPECT_EQ(normalized, (std::vector<std::uint16_t>{0, 5, 10, 11, 13, 16, 18, 23, 27, 35, 43, 45,
+                                                      51, 65281}));
+
+    ASSERT_EQ(hello.groups.size(), 4u);
+    EXPECT_TRUE(is_grease(hello.groups[0]));
+    EXPECT_EQ(std::vector<std::uint16_t>(hello.groups.begin() + 1, hello.groups.end()),
+              (std::vector<std::uint16_t>{0x001d, 0x0017, 0x0018}));
+    ASSERT_EQ(hello.key_share_groups.size(), 2u);
+    EXPECT_TRUE(is_grease(hello.key_share_groups[0]));
+    EXPECT_EQ(hello.key_share_groups[1], 0x001d);
+    EXPECT_EQ(hello.signature_algorithms,
+              (std::vector<std::uint16_t>{0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806,
+                                          0x0601}));
+    ASSERT_EQ(hello.versions.size(), 5u);
+    EXPECT_TRUE(is_grease(hello.versions[0]));
+    EXPECT_EQ(std::vector<std::uint16_t>(hello.versions.begin() + 1, hello.versions.end()),
+              (std::vector<std::uint16_t>{0x0304, 0x0303, 0x0302, 0x0301}));
+    EXPECT_TRUE(hello.has_compress_brotli);
+    EXPECT_FALSE(hello.has_alps);
+    EXPECT_FALSE(hello.has_ech);
+}
+
+TEST(TlsClientTest, QqFingerprintAddsAlpsToEdgeClientHello) {
+    auto captured = capture_fingerprint_hello("qq", {"h2", "http/1.1"});
+    EXPECT_NE(captured.failure.code, clash_native::core::ErrorCode::configuration);
+    const auto &hello = captured.hello;
+
+    const std::vector<std::uint16_t> expected_ciphers = {0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f,
+                                                         0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013,
+                                                         0xc014, 0x009c, 0x009d, 0x002f, 0x0035};
+    ASSERT_EQ(hello.ciphers.size(), expected_ciphers.size() + 1);
+    EXPECT_TRUE(is_grease(hello.ciphers[0]));
+    EXPECT_EQ(std::vector<std::uint16_t>(hello.ciphers.begin() + 1, hello.ciphers.end()),
+              expected_ciphers);
+
+    std::vector<std::uint16_t> extensions = hello.extension_types;
+    if (!extensions.empty() && extensions.back() == 21) {
+        extensions.pop_back();
+    }
+    std::size_t grease_count = 0;
+    const auto normalized = normalized_extensions(extensions, grease_count);
+    EXPECT_EQ(grease_count, 2u);
+    EXPECT_EQ(normalized, (std::vector<std::uint16_t>{0, 5, 10, 11, 13, 16, 18, 23, 27, 35, 43, 45,
+                                                      51, 17613, 65281}));
+    EXPECT_TRUE(hello.has_alps);
+    EXPECT_TRUE(hello.has_compress_brotli);
+    EXPECT_EQ(hello.signature_algorithms,
+              (std::vector<std::uint16_t>{0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806,
+                                          0x0601}));
+}
+
+TEST(TlsClientTest, TripleSixZeroFingerprintMatches360ClientHello) {
+    // The profile name starts with a digit, so the test name spells it out.
+    auto captured = capture_fingerprint_hello("360", {"h2", "http/1.1"});
+    EXPECT_NE(captured.failure.code, clash_native::core::ErrorCode::configuration);
+    const auto &hello = captured.hello;
+    // 360 pins its own SPDY-era ALPN, ignoring the caller's list.
+    EXPECT_EQ(hello.alpn, (std::vector<std::string>{"spdy/2", "spdy/3", "spdy/3.1", "http/1.1"}));
+
+    const std::vector<std::uint16_t> expected_ciphers = {
+        0xc00a, 0xc014, 0x0039, 0x006b, 0x0035, 0x003d, 0xc007, 0xc009, 0xc023, 0xc011,
+        0xc013, 0xc027, 0x0033, 0x0067, 0x0032, 0x0005, 0x0004, 0x002f, 0x003c, 0x000a};
+    EXPECT_EQ(hello.ciphers, expected_ciphers);
+    for (const auto cipher : hello.ciphers) {
+        EXPECT_FALSE(is_grease(cipher));
+    }
+    // Fixed order with empty NPN (13172) and the old channel ID (30031).
+    EXPECT_EQ(hello.extension_types,
+              (std::vector<std::uint16_t>{0, 65281, 10, 11, 35, 13172, 16, 30031, 5, 13}));
+    EXPECT_EQ(hello.groups, (std::vector<std::uint16_t>{0x0017, 0x0018, 0x0019}));
+    EXPECT_TRUE(hello.key_share_groups.empty());
+    EXPECT_EQ(hello.signature_algorithms,
+              (std::vector<std::uint16_t>{0x0401, 0x0501, 0x0201, 0x0403, 0x0503, 0x0203, 0x0402,
+                                          0x0202}));
+    EXPECT_TRUE(hello.versions.empty());
+    EXPECT_FALSE(hello.has_ech);
+}
+
+TEST(TlsClientTest, Chrome120FingerprintDropsPostQuantum) {
+    auto captured = capture_fingerprint_hello("chrome120", {"h2", "http/1.1"});
+    EXPECT_NE(captured.failure.code, clash_native::core::ErrorCode::configuration);
+    const auto &hello = captured.hello;
+    // Same suites as Chrome, but no PQ group or share.
+    ASSERT_EQ(hello.groups.size(), 4u);
+    EXPECT_TRUE(is_grease(hello.groups[0]));
+    EXPECT_EQ(std::vector<std::uint16_t>(hello.groups.begin() + 1, hello.groups.end()),
+              (std::vector<std::uint16_t>{0x001d, 0x0017, 0x0018}));
+    ASSERT_EQ(hello.key_share_groups.size(), 2u);
+    EXPECT_TRUE(is_grease(hello.key_share_groups[0]));
+    EXPECT_EQ(hello.key_share_groups[1], 0x001d);
+}
+
+TEST(TlsClientTest, VersionPinAliasesResolveToCurrentProfiles) {
+    auto firefox = capture_fingerprint_hello("firefox120", {"h2", "http/1.1"});
+    EXPECT_NE(firefox.failure.code, clash_native::core::ErrorCode::configuration);
+    EXPECT_EQ(firefox.hello.ciphers,
+              (std::vector<std::uint16_t>{0x1301, 0x1303, 0x1302, 0xc02b, 0xc02f, 0xcca9, 0xcca8,
+                                          0xc02c, 0xc030, 0xc00a, 0xc009, 0xc013, 0xc014, 0x009c,
+                                          0x009d, 0x002f, 0x0035}));
+    auto safari = capture_fingerprint_hello("safari16", {"h2", "http/1.1"});
+    EXPECT_NE(safari.failure.code, clash_native::core::ErrorCode::configuration);
+    ASSERT_GE(safari.hello.ciphers.size(), 3u);
+    EXPECT_EQ(std::vector<std::uint16_t>(safari.hello.ciphers.begin() + 1,
+                                         safari.hello.ciphers.begin() + 4),
+              (std::vector<std::uint16_t>{0x1301, 0x1302, 0x1303}));
+}
+
+TEST(TlsClientTest, RandomizedFingerprintVariesPerHandshake) {
+    const std::vector<std::uint16_t> chrome_ciphers = {0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f,
+                                                       0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013,
+                                                       0xc014, 0x009c, 0x009d, 0x002f, 0x0035};
+    auto sorted_copy = [](std::vector<std::uint16_t> values) {
+        std::sort(values.begin(), values.end());
+        return values;
+    };
+    std::vector<std::vector<std::uint16_t>> seen_ciphers;
+    for (int i = 0; i < 6; ++i) {
+        auto captured = capture_fingerprint_hello("randomized", {"h2", "http/1.1"});
+        EXPECT_NE(captured.failure.code, clash_native::core::ErrorCode::configuration);
+        const auto &hello = captured.hello;
+        // Chrome multiset regardless of the shuffle.
+        ASSERT_GE(hello.ciphers.size(), chrome_ciphers.size() + 1);
+        EXPECT_TRUE(is_grease(hello.ciphers[0]));
+        auto body = std::vector<std::uint16_t>(hello.ciphers.begin() + 1, hello.ciphers.end());
+        EXPECT_EQ(sorted_copy(body), sorted_copy(chrome_ciphers));
+        seen_ciphers.push_back(std::move(body));
+        // X25519 is always shared (leading, or second after a PQ prepend
+        // lottery win); TLS 1.3 is always offered.
+        ASSERT_GE(hello.key_share_groups.size(), 2u);
+        EXPECT_TRUE(is_grease(hello.key_share_groups[0]));
+        EXPECT_TRUE(hello.key_share_groups[1] == 0x001d || hello.key_share_groups[1] == 0x11ec);
+        EXPECT_NE(std::find(hello.key_share_groups.begin(), hello.key_share_groups.end(), 0x001d),
+                  hello.key_share_groups.end());
+        ASSERT_GE(hello.versions.size(), 2u);
+        EXPECT_EQ(hello.versions[1], 0x0304);
+        // The TLS 1.3-mandatory PSS-SHA256 is always present.
+        const auto &sigalgs = hello.signature_algorithms;
+        EXPECT_NE(std::find(sigalgs.begin(), sigalgs.end(), 0x0804), sigalgs.end());
+    }
+    // Six shuffles never repeat the same cipher order twice in a row.
+    for (std::size_t i = 1; i < seen_ciphers.size(); ++i) {
+        EXPECT_NE(seen_ciphers[i], seen_ciphers[i - 1]);
+    }
+}
+
+TEST(TlsClientTest, RandomFingerprintResolvesToAKnownProfile) {
+    auto captured = capture_fingerprint_hello("random", {"h2", "http/1.1"});
+    EXPECT_NE(captured.failure.code, clash_native::core::ErrorCode::configuration);
+    const auto &hello = captured.hello;
+    // One of chrome (15+GREASE), safari (20+GREASE), ios (26+GREASE), or
+    // firefox (17, no GREASE).
+    const bool known = (hello.ciphers.size() == 16 && is_grease(hello.ciphers[0])) ||
+                       (hello.ciphers.size() == 21 && is_grease(hello.ciphers[0])) ||
+                       (hello.ciphers.size() == 27 && is_grease(hello.ciphers[0])) ||
+                       (hello.ciphers.size() == 17 && !is_grease(hello.ciphers[0]));
+    EXPECT_TRUE(known);
+}
+
+TEST(TlsClientTest, RealityAppendsEd25519ToNonChromeProfiles) {
+    uint8_t server_public[32] = {0};
+    uint8_t server_private[32] = {0};
+    X25519_keypair(server_public, server_private);
+    clash_native::transport::TlsRealityOptions reality{
+        test_base64url_encode(server_public, sizeof(server_public)), "deadbeef"};
+    auto captured = capture_fingerprint_hello("edge", {"h2", "http/1.1"}, reality);
+    EXPECT_NE(captured.failure.code, clash_native::core::ErrorCode::configuration);
+    const auto &sigalgs = captured.hello.signature_algorithms;
+    ASSERT_EQ(sigalgs.size(), 9u);
+    EXPECT_EQ(sigalgs.back(), 0x0807);
+    EXPECT_EQ(std::vector<std::uint16_t>(sigalgs.begin(), sigalgs.end() - 1),
+              (std::vector<std::uint16_t>{0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806,
+                                          0x0601}));
+}
+
+TEST(TlsClientTest, Rejects360WithReality) {
+    uint8_t server_public[32] = {0};
+    uint8_t server_private[32] = {0};
+    X25519_keypair(server_public, server_private);
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "example.com";
+    options.fingerprint = "360";
+    options.reality = clash_native::transport::TlsRealityOptions{
+        test_base64url_encode(server_public, sizeof(server_public)), "deadbeef"};
+    const auto failure = handshake_error(std::move(options));
+    EXPECT_EQ(failure.code, clash_native::core::ErrorCode::configuration);
+}

@@ -2544,3 +2544,17 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   responses (3 follow-ups max, visited-set loop guard). Unit tests for
   in-response chains, cross-response chasing, and loop termination.
   Full suite: 296 passed; Trojan interop group green.
+
+## 2026-09-25
+
+- Remaining ClientHello fingerprints (Mihomo parity): ios, android
+  (OkHttp), edge, 360, qq, randomized, random, chrome120, firefox120,
+  safari16. Six new BoringSSL overlay patches (0007-0012, port-version 12)
+  plus tls_client profiles; JA3-anchored unit tests for each. Random is a
+  per-process weighted pick (6/3/2/1); randomized shuffles ciphers/curves/
+  sigalgs/extensions per handshake with Mihomo's lotteries. Non-Chrome
+  profiles append Ed25519 under REALITY (BoringSSL enforces offered
+  schemes); 360+REALITY is a configuration error (fixed raw sigalg list).
+  Deprecated chrome_psk* variants intentionally out of scope. Full suite:
+  307 passed; Trojan interop group green including six new fingerprint
+  subtests against real Mihomo.

@@ -1,0 +1,192 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index f4071c5..df99065 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -5591,6 +5591,13 @@ OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
+ // ClientHello aspects are controlled through the regular configuration APIs.
+ #define CLASH_NATIVE_CLIENT_HELLO_SAFARI 3
+ 
++// CLASH_NATIVE_CLIENT_HELLO_IOS selects the iOS 14 ClientHello emission
++// profile: TLS 1.3 suites in Chrome's fixed order, legacy suites as raw IDs
++// in iOS order (including CBC-SHA384 and 3DES suites BoringSSL does not
++// implement), and extensions in iOS's fixed order. All other ClientHello
++// aspects are controlled through the regular configuration APIs.
++#define CLASH_NATIVE_CLIENT_HELLO_IOS 4
++
+ // SSL_CTX_set_client_hello_profile configures the ClientHello emission
+ // profile for `ctx`. Returns 1 on success and 0 on unknown `profile`.
+ OPENSSL_EXPORT int SSL_CTX_set_client_hello_profile(SSL_CTX *ctx, int profile);
+diff --git a/ssl/extensions.cc b/ssl/extensions.cc
+index 4d71524..aebff66 100644
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -4460,7 +4460,37 @@ static const uint8_t kSafariExtensionOrder[] = {
+     1, 6, 10, 12, 13, 16, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+ };
+ 
++// kIosExtensionOrder lists kExtensions indices in the order iOS 14 emits
++// them. Entries that stay silent when unconfigured may appear in any trailing
++// order. GREASE (first and last) is added automatically when GREASE is
++// enabled; padding comes from the stock F5 workaround when the record would
++// otherwise land under 512 bytes.
++static const uint8_t kIosExtensionOrder[] = {
++    0,   // server_name
++    2,   // extended_master_secret
++    3,   // renegotiate
++    4,   // supported_groups
++    5,   // ec_point_formats
++    7,   // application_layer_protocol_negotiation
++    8,   // status_request
++    9,   // signature_algorithms
++    11,  // certificate_timestamp
++    14,  // key_share
++    15,  // psk_key_exchange_modes
++    17,  // supported_versions
++    1, 6, 10, 12, 13, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
++};
++
+ bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs) {
++  if (hs->config->client_hello_profile == CLASH_NATIVE_CLIENT_HELLO_IOS) {
++    static_assert(sizeof(kIosExtensionOrder) == kNumExtensions,
++                  "iOS extension order must cover every extension");
++    if (!hs->extension_permutation.CopyFrom(kIosExtensionOrder)) {
++      return false;
++    }
++    return true;
++  }
++
+   if (hs->config->client_hello_profile == CLASH_NATIVE_CLIENT_HELLO_SAFARI) {
+     static_assert(sizeof(kSafariExtensionOrder) == kNumExtensions,
+                   "Safari extension order must cover every extension");
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+index b40c2f8..af0cbe5 100644
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -165,6 +165,38 @@ static const uint16_t kSafariRawCiphers[] = {
+     0x000a,  // TLS_RSA_WITH_3DES_EDE_CBC_SHA
+ };
+ 
++// kIosRawCiphers lists the iOS 14 legacy cipher suites in emission order.
++// Suites BoringSSL does not implement (CBC-SHA384, 3DES, and possibly
++// CBC-SHA256) are emitted as raw IDs for fingerprint parity; a server
++// selecting an unimplemented suite cannot complete the handshake. Raw
++// emission is also functionally complete: servers negotiate by ID, so the
++// implemented suites remain negotiable.
++static const uint16_t kIosRawCiphers[] = {
++    0xc02c,  // TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
++    0xc02b,  // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
++    0xcca9,  // TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
++    0xc030,  // TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
++    0xc02f,  // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
++    0xcca8,  // TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
++    0xc024,  // DISABLED_TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384
++    0xc023,  // TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256
++    0xc00a,  // TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA
++    0xc009,  // TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA
++    0xc028,  // DISABLED_TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384
++    0xc027,  // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256
++    0xc014,  // TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA
++    0xc013,  // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA
++    0x009d,  // TLS_RSA_WITH_AES_256_GCM_SHA384
++    0x009c,  // TLS_RSA_WITH_AES_128_GCM_SHA256
++    0x003d,  // DISABLED_TLS_RSA_WITH_AES_256_CBC_SHA256
++    0x003c,  // TLS_RSA_WITH_AES_128_CBC_SHA256
++    0x0035,  // TLS_RSA_WITH_AES_256_CBC_SHA
++    0x002f,  // TLS_RSA_WITH_AES_128_CBC_SHA
++    0xc008,  // FAKE_TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA
++    0xc012,  // TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA
++    0x000a,  // TLS_RSA_WITH_3DES_EDE_CBC_SHA
++};
++
+ // is_cipher_selected reports whether `cipher` is in the configured cipher
+ // list of `ssl`.
+ static bool is_cipher_selected(const SSL *ssl, const SSL_CIPHER *cipher) {
+@@ -225,10 +257,11 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+         SSL_CIPHER_CHACHA20_POLY1305_SHA256,
+     };
+     const int hello_profile = ssl->config->client_hello_profile;
+-    // Safari emits the TLS 1.3 suites in Chrome's fixed order.
++    // Safari and iOS emit the TLS 1.3 suites in Chrome's fixed order.
+     const bool chrome_ordered =
+         hello_profile == CLASH_NATIVE_CLIENT_HELLO_CHROME ||
+-        hello_profile == CLASH_NATIVE_CLIENT_HELLO_SAFARI;
++        hello_profile == CLASH_NATIVE_CLIENT_HELLO_SAFARI ||
++        hello_profile == CLASH_NATIVE_CLIENT_HELLO_IOS;
+     const bssl::Span<const uint16_t> ciphers =
+         chrome_ordered
+             ? bssl::Span<const uint16_t>(kCiphersChrome)
+@@ -253,16 +286,25 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+   if (hs->min_version < TLS1_3_VERSION && type != ssl_client_hello_inner) {
+     bool any_enabled = false;
+     bssl::Span<const uint16_t> legacy_order;
+-    if (ssl->config->client_hello_profile == CLASH_NATIVE_CLIENT_HELLO_CHROME) {
++    const int legacy_profile = ssl->config->client_hello_profile;
++    if (legacy_profile == CLASH_NATIVE_CLIENT_HELLO_CHROME) {
+       legacy_order = kChromeLegacyCiphers;
+-    } else if (ssl->config->client_hello_profile ==
+-               CLASH_NATIVE_CLIENT_HELLO_FIREFOX) {
++    } else if (legacy_profile == CLASH_NATIVE_CLIENT_HELLO_FIREFOX) {
+       legacy_order = kFirefoxLegacyCiphers;
+-    } else if (ssl->config->client_hello_profile ==
+-               CLASH_NATIVE_CLIENT_HELLO_SAFARI) {
++    } else if (legacy_profile == CLASH_NATIVE_CLIENT_HELLO_SAFARI) {
+       legacy_order = kSafariLegacyCiphers;
+     }
+-    if (!legacy_order.empty()) {
++    // Profiles with suites BoringSSL does not implement emit raw IDs for
++    // fingerprint parity (see the k*RawCiphers tables). Safari keeps its
++    // implemented prefix plus the raw tail; raw-only profiles skip the
++    // configured-list loop entirely.
++    bssl::Span<const uint16_t> legacy_raw;
++    if (legacy_profile == CLASH_NATIVE_CLIENT_HELLO_SAFARI) {
++      legacy_raw = kSafariRawCiphers;
++    } else if (legacy_profile == CLASH_NATIVE_CLIENT_HELLO_IOS) {
++      legacy_raw = kIosRawCiphers;
++    }
++    if (!legacy_order.empty() || !legacy_raw.empty()) {
+       // Emit the legacy cipher suites in the profile's fixed order,
+       // restricted to the configured cipher list.
+       for (uint16_t id : legacy_order) {
+@@ -284,13 +326,12 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+           return false;
+         }
+       }
+-      if (ssl->config->client_hello_profile == CLASH_NATIVE_CLIENT_HELLO_SAFARI) {
+-        // Trailing 3DES suites as raw IDs (see kSafariRawCiphers).
+-        for (uint16_t id : kSafariRawCiphers) {
+-          if (!CBB_add_u16(&child, id)) {
+-            return false;
+-          }
++      for (uint16_t id : legacy_raw) {
++        if (!CBB_add_u16(&child, id)) {
++          return false;
+         }
++      }
++      if (!legacy_raw.empty()) {
+         any_enabled = true;
+       }
+     } else {
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index 2e49c6e..07bf1ec 100644
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -3299,7 +3299,8 @@ int SSL_CTX_set_client_hello_profile(SSL_CTX *ctx, int profile) {
+   if (profile != CLASH_NATIVE_CLIENT_HELLO_DEFAULT &&
+       profile != CLASH_NATIVE_CLIENT_HELLO_CHROME &&
+       profile != CLASH_NATIVE_CLIENT_HELLO_FIREFOX &&
+-      profile != CLASH_NATIVE_CLIENT_HELLO_SAFARI) {
++      profile != CLASH_NATIVE_CLIENT_HELLO_SAFARI &&
++      profile != CLASH_NATIVE_CLIENT_HELLO_IOS) {
+     return 0;
+   }
+   FromOpaque(ctx)->client_hello_profile = profile;
+@@ -3314,7 +3315,8 @@ int SSL_set_client_hello_profile(SSL *ssl, int profile) {
+   if (profile != CLASH_NATIVE_CLIENT_HELLO_DEFAULT &&
+       profile != CLASH_NATIVE_CLIENT_HELLO_CHROME &&
+       profile != CLASH_NATIVE_CLIENT_HELLO_FIREFOX &&
+-      profile != CLASH_NATIVE_CLIENT_HELLO_SAFARI) {
++      profile != CLASH_NATIVE_CLIENT_HELLO_SAFARI &&
++      profile != CLASH_NATIVE_CLIENT_HELLO_IOS) {
+     return 0;
+   }
+   ssl_impl->config->client_hello_profile = profile;

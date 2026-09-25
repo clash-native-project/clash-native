@@ -50,8 +50,11 @@ struct TrojanOutboundConfig {
     // fingerprint = SSL pinning). Empty disables pinning.
     std::string fingerprint;
     // ClientHello camouflage profile for every TLS handshake (Mihomo
-    // client-fingerprint). Empty means the default BoringSSL emission;
-    // "chrome" selects the Chrome profile. Required for REALITY.
+    // client-fingerprint). Empty means the default BoringSSL emission.
+    // Supported: chrome, chrome120, firefox, firefox120, safari, safari16,
+    // ios, android, edge, 360, qq, random, randomized. Required for REALITY
+    // (the 360 profile is rejected there: its fixed raw signature list has
+    // no Ed25519 slot).
     std::string client_fingerprint;
     // Trojan-SS (ss-opts): when enabled, the transport stream is wrapped
     // in classic Shadowsocks AEAD framing before the Trojan header is

@@ -185,6 +185,12 @@ def prepare_vcpkg_ports() -> Path:
         "0004-client-hello-mutator.patch",
         "0005-firefox-client-hello-profile.patch",
         "0006-safari-client-hello-profile.patch",
+        "0007-ios-client-hello-profile.patch",
+        "0008-android-client-hello-profile.patch",
+        "0009-edge-client-hello-profile.patch",
+        "0010-360-client-hello-profile.patch",
+        "0011-qq-client-hello-profile.patch",
+        "0012-randomized-client-hello-profile.patch",
     )
     missing = [name for name in required_files if not (boringssl_port / name).is_file()]
     if missing:

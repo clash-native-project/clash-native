@@ -27,6 +27,7 @@
 
 #include <brotli/decode.h>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -34,10 +35,13 @@
 #include <cstring>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
+
+#include <openssl/rand.h>
 #include <vector>
 
 namespace clash_native::transport {
@@ -105,10 +109,73 @@ constexpr char kFirefoxCipherRule[] = "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:"
                                       "TLS_RSA_WITH_AES_128_CBC_SHA:"
                                       "TLS_RSA_WITH_AES_256_CBC_SHA";
 
+// Sets signature algorithm prefs for a profile, appending Ed25519 when
+// REALITY camouflage needs it. REALITY certificates are Ed25519 and BoringSSL
+// refuses to verify a scheme that was not offered, so every non-Chrome
+// profile (Chrome always offers it) gains 0x0807 under REALITY. uTLS does not
+// enforce this, which is a documented wire delta, not a failure.
+core::Status set_profile_sigalgs(SSL *session, const uint16_t *base, std::size_t count,
+                                 bool ed25519_for_reality, const char *profile) {
+    if (!ed25519_for_reality) {
+        if (SSL_set_verify_algorithm_prefs(session, base, count) != 1) {
+            return core::fail(configuration_error(std::string("failed to configure ") + profile +
+                                                  " TLS signature algorithms"));
+        }
+        return {};
+    }
+    std::vector<uint16_t> prefs(base, base + count);
+    if (std::find(prefs.begin(), prefs.end(), SSL_SIGN_ED25519) == prefs.end()) {
+        prefs.push_back(SSL_SIGN_ED25519);
+    }
+    if (SSL_set_verify_algorithm_prefs(session, prefs.data(), prefs.size()) != 1) {
+        return core::fail(configuration_error(std::string("failed to configure ") + profile +
+                                              " TLS signature algorithms"));
+    }
+    return {};
+}
+
+// Fisher-Yates shuffle with RAND_bytes for per-connection lotteries
+// (randomized profile, random weights). Modulo bias is irrelevant here.
+void shuffle_u16(std::vector<uint16_t> &values) {
+    for (std::size_t i = values.size(); i > 1; --i) {
+        uint8_t byte = 0;
+        if (RAND_bytes(&byte, sizeof(byte)) != 1) {
+            return;
+        }
+        const std::size_t j = static_cast<std::size_t>(byte) % i;
+        std::swap(values[i - 1], values[j]);
+    }
+}
+
+bool flip_coin(double probability) {
+    uint8_t byte = 0;
+    if (RAND_bytes(&byte, sizeof(byte)) != 1) {
+        return false;
+    }
+    return static_cast<double>(byte) < probability * 256.0;
+}
+
+// Mihomo `random` picks one profile per process, weighted chrome 6 / safari 3
+// / ios 2 / firefox 1.
+std::string resolve_random_fingerprint() {
+    static std::once_flag flag;
+    static std::string picked;
+    std::call_once(flag, [] {
+        uint8_t byte = 0;
+        if (RAND_bytes(&byte, sizeof(byte)) != 1) {
+            picked = "chrome";
+            return;
+        }
+        const int roll = byte % 12;
+        picked = roll < 6 ? "chrome" : roll < 9 ? "safari" : roll < 11 ? "ios" : "firefox";
+    });
+    return picked;
+}
+
 // Applies the Firefox ClientHello profile: fixed extension order without
 // GREASE (except ECH), Firefox-only extensions from the overlay patch,
 // X25519+P-256 key shares, and FFDHE groups appended by the patch.
-core::Status apply_firefox_profile(SSL_CTX *context, SSL *session) {
+core::Status apply_firefox_profile(SSL_CTX *context, SSL *session, bool ed25519_for_reality) {
     if (SSL_set_client_hello_profile(session, CLASH_NATIVE_CLIENT_HELLO_FIREFOX) != 1) {
         return core::fail(configuration_error("failed to select Firefox TLS profile"));
     }
@@ -116,10 +183,11 @@ core::Status apply_firefox_profile(SSL_CTX *context, SSL *session) {
     SSL_CTX_set_permute_extensions(context, 0);
     SSL_set_enable_ech_grease(session, 1);
     SSL_set_tlsext_status_type(session, TLSEXT_STATUSTYPE_ocsp);
-    if (SSL_set_verify_algorithm_prefs(session, kFirefoxSignatureAlgorithms,
-                                       std::size(kFirefoxSignatureAlgorithms)) != 1) {
-        return core::fail(
-            configuration_error("failed to configure Firefox TLS signature algorithms"));
+    if (const auto status = set_profile_sigalgs(session, kFirefoxSignatureAlgorithms,
+                                                std::size(kFirefoxSignatureAlgorithms),
+                                                ed25519_for_reality, "Firefox");
+        !status) {
+        return status;
     }
     if (SSL_set_strict_cipher_list(session, kFirefoxCipherRule) != 1) {
         return core::fail(configuration_error("failed to configure Firefox TLS cipher list"));
@@ -197,7 +265,7 @@ int safari_zlib_decompress(SSL * /*ssl*/, CRYPTO_BUFFER **out, size_t uncompress
 
 // Applies the Safari ClientHello profile through the overlay BoringSSL
 // profile API plus the public configuration knobs Safari enables.
-core::Status apply_safari_profile(SSL_CTX *context, SSL *session) {
+core::Status apply_safari_profile(SSL_CTX *context, SSL *session, bool ed25519_for_reality) {
     if (SSL_set_client_hello_profile(session, CLASH_NATIVE_CLIENT_HELLO_SAFARI) != 1) {
         return core::fail(configuration_error("failed to select Safari TLS profile"));
     }
@@ -207,10 +275,11 @@ core::Status apply_safari_profile(SSL_CTX *context, SSL *session) {
     SSL_set_tlsext_status_type(session, TLSEXT_STATUSTYPE_ocsp);
     // Safari sends no session ticket extension.
     SSL_set_options(session, SSL_OP_NO_TICKET);
-    if (SSL_set_verify_algorithm_prefs(session, kSafariSignatureAlgorithms,
-                                       std::size(kSafariSignatureAlgorithms)) != 1) {
-        return core::fail(
-            configuration_error("failed to configure Safari TLS signature algorithms"));
+    if (const auto status = set_profile_sigalgs(session, kSafariSignatureAlgorithms,
+                                                std::size(kSafariSignatureAlgorithms),
+                                                ed25519_for_reality, "Safari");
+        !status) {
+        return status;
     }
     if (SSL_set_strict_cipher_list(session, kSafariCipherRule) != 1) {
         return core::fail(configuration_error("failed to configure Safari TLS cipher list"));
@@ -444,7 +513,7 @@ int reality_client_hello_mutator(SSL * /*ssl*/, uint8_t *hello, size_t hello_len
 
 // Applies the Chrome ClientHello profile through the overlay BoringSSL
 // profile API plus the public configuration knobs Chrome enables.
-core::Status apply_chrome_profile(SSL_CTX *context, SSL *session) {
+core::Status apply_chrome_profile(SSL_CTX *context, SSL *session, bool post_quantum = true) {
     if (SSL_set_client_hello_profile(session, CLASH_NATIVE_CLIENT_HELLO_CHROME) != 1) {
         return core::fail(configuration_error("failed to select Chrome TLS profile"));
     }
@@ -466,6 +535,17 @@ core::Status apply_chrome_profile(SSL_CTX *context, SSL *session) {
     if (SSL_set_min_proto_version(session, TLS1_2_VERSION) != 1) {
         return core::fail(configuration_error("failed to configure Chrome TLS minimum version"));
     }
+    if (!post_quantum) {
+        // Chrome 120 predates the PQ keyshare: X25519 only, no PQ group.
+        static constexpr uint16_t kNoPqShares[] = {SSL_GROUP_X25519};
+        if (SSL_set1_client_key_shares(session, kNoPqShares, std::size(kNoPqShares)) != 1) {
+            return core::fail(configuration_error("failed to configure Chrome 120 TLS key shares"));
+        }
+        static constexpr int kNoPqGroups[] = {NID_X25519, NID_X9_62_prime256v1, NID_secp384r1};
+        if (SSL_set1_groups(session, kNoPqGroups, std::size(kNoPqGroups)) != 1) {
+            return core::fail(configuration_error("failed to configure Chrome 120 TLS groups"));
+        }
+    }
     // Chrome offers ALPS with the new codepoint whenever ALPN is offered.
     SSL_set_alps_use_new_codepoint(session, 1);
     static constexpr uint8_t kHttp2Alpn[] = {'h', '2'};
@@ -477,6 +557,285 @@ core::Status apply_chrome_profile(SSL_CTX *context, SSL *session) {
     if (SSL_CTX_add_cert_compression_alg(context, 2, nullptr, chrome_brotli_decompress) != 1) {
         return core::fail(
             configuration_error("failed to configure Chrome TLS certificate compression"));
+    }
+    return {};
+}
+
+// iOS 14 signature algorithms in iOS order. iOS repeats PSS-SHA384 on the
+// wire, but BoringSSL rejects duplicate prefs, so the duplicate is dropped.
+constexpr uint16_t kIosSignatureAlgorithms[] = {
+    SSL_SIGN_ECDSA_SECP256R1_SHA256, SSL_SIGN_RSA_PSS_RSAE_SHA256, SSL_SIGN_RSA_PKCS1_SHA256,
+    SSL_SIGN_ECDSA_SECP384R1_SHA384, SSL_SIGN_ECDSA_SHA1,          SSL_SIGN_RSA_PSS_RSAE_SHA384,
+    SSL_SIGN_RSA_PKCS1_SHA384,       SSL_SIGN_RSA_PSS_RSAE_SHA512, SSL_SIGN_RSA_PKCS1_SHA512,
+    SSL_SIGN_RSA_PKCS1_SHA1,
+};
+
+core::Status apply_ios_profile(SSL_CTX *context, SSL *session, bool ed25519_for_reality) {
+    if (SSL_set_client_hello_profile(session, CLASH_NATIVE_CLIENT_HELLO_IOS) != 1) {
+        return core::fail(configuration_error("failed to select iOS TLS profile"));
+    }
+    SSL_CTX_set_grease_enabled(context, 1);
+    SSL_set_permute_extensions(session, 0);
+    SSL_enable_signed_cert_timestamps(session);
+    SSL_set_tlsext_status_type(session, TLSEXT_STATUSTYPE_ocsp);
+    // iOS sends no session ticket extension.
+    SSL_set_options(session, SSL_OP_NO_TICKET);
+    if (const auto status =
+            set_profile_sigalgs(session, kIosSignatureAlgorithms,
+                                std::size(kIosSignatureAlgorithms), ed25519_for_reality, "iOS");
+        !status) {
+        return status;
+    }
+    // Legacy suites go out as raw IDs (see kIosRawCiphers); no cipher rule.
+    if (SSL_set_min_proto_version(session, TLS1_VERSION) != 1) {
+        return core::fail(configuration_error("failed to configure iOS TLS minimum version"));
+    }
+    static constexpr int kIosGroups[] = {NID_X25519, NID_X9_62_prime256v1, NID_secp384r1,
+                                         NID_secp521r1};
+    if (SSL_set1_groups(session, kIosGroups, std::size(kIosGroups)) != 1) {
+        return core::fail(configuration_error("failed to configure iOS TLS groups"));
+    }
+    static constexpr uint16_t kIosKeyShares[] = {SSL_GROUP_X25519};
+    if (SSL_set1_client_key_shares(session, kIosKeyShares, std::size(kIosKeyShares)) != 1) {
+        return core::fail(configuration_error("failed to configure iOS TLS key shares"));
+    }
+    return {};
+}
+
+// Android 11 OkHttp signature algorithms in OkHttp order.
+constexpr uint16_t kAndroidSignatureAlgorithms[] = {
+    SSL_SIGN_ECDSA_SECP256R1_SHA256, SSL_SIGN_RSA_PSS_RSAE_SHA256, SSL_SIGN_RSA_PKCS1_SHA256,
+    SSL_SIGN_ECDSA_SECP384R1_SHA384, SSL_SIGN_RSA_PSS_RSAE_SHA384, SSL_SIGN_RSA_PKCS1_SHA384,
+    SSL_SIGN_RSA_PSS_RSAE_SHA512,    SSL_SIGN_RSA_PKCS1_SHA512,    SSL_SIGN_RSA_PKCS1_SHA1,
+};
+
+// Android 11 OkHttp legacy cipher suites as a BoringSSL cipher rule string.
+constexpr char kAndroidCipherRule[] = "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:"
+                                      "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:"
+                                      "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:"
+                                      "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:"
+                                      "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:"
+                                      "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:"
+                                      "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA:"
+                                      "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:"
+                                      "TLS_RSA_WITH_AES_128_GCM_SHA256:"
+                                      "TLS_RSA_WITH_AES_256_GCM_SHA384:"
+                                      "TLS_RSA_WITH_AES_128_CBC_SHA:"
+                                      "TLS_RSA_WITH_AES_256_CBC_SHA";
+
+core::Status apply_android_profile(SSL_CTX *context, SSL *session, bool ed25519_for_reality) {
+    if (SSL_set_client_hello_profile(session, CLASH_NATIVE_CLIENT_HELLO_ANDROID) != 1) {
+        return core::fail(configuration_error("failed to select Android TLS profile"));
+    }
+    SSL_CTX_set_grease_enabled(context, 0);
+    SSL_set_permute_extensions(session, 0);
+    // OkHttp sends no session ticket extension and no ALPN (suppressed by the
+    // caller); the stock F5 padding workaround is suppressed by the patch.
+    SSL_set_options(session, SSL_OP_NO_TICKET);
+    SSL_set_tlsext_status_type(session, TLSEXT_STATUSTYPE_ocsp);
+    if (const auto status = set_profile_sigalgs(session, kAndroidSignatureAlgorithms,
+                                                std::size(kAndroidSignatureAlgorithms),
+                                                ed25519_for_reality, "Android");
+        !status) {
+        return status;
+    }
+    if (SSL_set_strict_cipher_list(session, kAndroidCipherRule) != 1) {
+        return core::fail(configuration_error("failed to configure Android TLS cipher list"));
+    }
+    if (SSL_set_min_proto_version(session, TLS1_VERSION) != 1 ||
+        SSL_set_max_proto_version(session, TLS1_2_VERSION) != 1) {
+        return core::fail(configuration_error("failed to configure Android TLS version range"));
+    }
+    static constexpr int kAndroidGroups[] = {NID_X25519, NID_X9_62_prime256v1, NID_secp384r1};
+    if (SSL_set1_groups(session, kAndroidGroups, std::size(kAndroidGroups)) != 1) {
+        return core::fail(configuration_error("failed to configure Android TLS groups"));
+    }
+    return {};
+}
+
+// Edge 85 / QQ Browser signature algorithms in Edge order.
+constexpr uint16_t kEdgeSignatureAlgorithms[] = {
+    SSL_SIGN_ECDSA_SECP256R1_SHA256, SSL_SIGN_RSA_PSS_RSAE_SHA256, SSL_SIGN_RSA_PKCS1_SHA256,
+    SSL_SIGN_ECDSA_SECP384R1_SHA384, SSL_SIGN_RSA_PSS_RSAE_SHA384, SSL_SIGN_RSA_PKCS1_SHA384,
+    SSL_SIGN_RSA_PSS_RSAE_SHA512,    SSL_SIGN_RSA_PKCS1_SHA512,
+};
+
+// Edge 85 legacy cipher suites as a BoringSSL cipher rule string (shared with
+// QQ Browser, whose legacy order is identical).
+constexpr char kEdgeCipherRule[] = "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:"
+                                   "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:"
+                                   "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:"
+                                   "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:"
+                                   "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:"
+                                   "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:"
+                                   "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA:"
+                                   "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:"
+                                   "TLS_RSA_WITH_AES_128_GCM_SHA256:"
+                                   "TLS_RSA_WITH_AES_256_GCM_SHA384:"
+                                   "TLS_RSA_WITH_AES_128_CBC_SHA:"
+                                   "TLS_RSA_WITH_AES_256_CBC_SHA";
+
+core::Status apply_edge_profile(SSL_CTX *context, SSL *session, bool ed25519_for_reality,
+                                bool alps) {
+    const int profile = alps ? CLASH_NATIVE_CLIENT_HELLO_QQ : CLASH_NATIVE_CLIENT_HELLO_EDGE;
+    if (SSL_set_client_hello_profile(session, profile) != 1) {
+        return core::fail(configuration_error("failed to select Edge/QQ TLS profile"));
+    }
+    SSL_CTX_set_grease_enabled(context, 1);
+    SSL_set_permute_extensions(session, 0);
+    SSL_enable_signed_cert_timestamps(session);
+    SSL_set_tlsext_status_type(session, TLSEXT_STATUSTYPE_ocsp);
+    if (const auto status = set_profile_sigalgs(session, kEdgeSignatureAlgorithms,
+                                                std::size(kEdgeSignatureAlgorithms),
+                                                ed25519_for_reality, alps ? "QQ" : "Edge");
+        !status) {
+        return status;
+    }
+    if (SSL_set_strict_cipher_list(session, kEdgeCipherRule) != 1) {
+        return core::fail(configuration_error("failed to configure Edge TLS cipher list"));
+    }
+    if (SSL_set_min_proto_version(session, TLS1_VERSION) != 1) {
+        return core::fail(configuration_error("failed to configure Edge TLS minimum version"));
+    }
+    // No PQ group or share: Edge 85 predates post-quantum key exchange.
+    static constexpr int kEdgeGroups[] = {NID_X25519, NID_X9_62_prime256v1, NID_secp384r1};
+    if (SSL_set1_groups(session, kEdgeGroups, std::size(kEdgeGroups)) != 1) {
+        return core::fail(configuration_error("failed to configure Edge TLS groups"));
+    }
+    static constexpr uint16_t kEdgeKeyShares[] = {SSL_GROUP_X25519};
+    if (SSL_set1_client_key_shares(session, kEdgeKeyShares, std::size(kEdgeKeyShares)) != 1) {
+        return core::fail(configuration_error("failed to configure Edge TLS key shares"));
+    }
+    if (alps) {
+        // QQ offers ALPS with the new codepoint whenever ALPN is offered.
+        SSL_set_alps_use_new_codepoint(session, 1);
+        static constexpr uint8_t kHttp2Alpn[] = {'h', '2'};
+        if (SSL_add_application_settings(session, kHttp2Alpn, sizeof(kHttp2Alpn), nullptr, 0) !=
+            1) {
+            return core::fail(configuration_error("failed to configure QQ TLS ALPS"));
+        }
+    }
+    // TLS_CertCompressionBrotli (2), shared with Chrome.
+    if (SSL_CTX_add_cert_compression_alg(context, 2, nullptr, chrome_brotli_decompress) != 1) {
+        return core::fail(
+            configuration_error("failed to configure Edge TLS certificate compression"));
+    }
+    return {};
+}
+
+// Dummy NPN select callback: 360 Browser sends an empty NPN extension, which
+// stock BoringSSL only emits while a select callback is configured. No server
+// negotiates NPN anymore, so this is never meaningfully called.
+int refuse_next_proto_select(SSL * /*ssl*/, unsigned char ** /*out*/, unsigned char * /*outlen*/,
+                             const unsigned char * /*in*/, unsigned int /*inlen*/, void * /*arg*/) {
+    return SSL_TLSEXT_ERR_NOACK;
+}
+
+core::Status apply_360_profile(SSL_CTX *context, SSL *session) {
+    if (SSL_set_client_hello_profile(session, CLASH_NATIVE_CLIENT_HELLO_360) != 1) {
+        return core::fail(configuration_error("failed to select 360 TLS profile"));
+    }
+    SSL_CTX_set_grease_enabled(context, 0);
+    SSL_set_permute_extensions(session, 0);
+    SSL_set_tlsext_status_type(session, TLSEXT_STATUSTYPE_ocsp);
+    // Legacy suites and signature algorithms go out as raw IDs (see the
+    // k360 tables); the prefs below only satisfy the emission gate, the patch
+    // hook replaces the body.
+    static constexpr uint16_t k360GateSigalgs[] = {
+        SSL_SIGN_RSA_PKCS1_SHA256,       SSL_SIGN_RSA_PKCS1_SHA384,       SSL_SIGN_RSA_PKCS1_SHA1,
+        SSL_SIGN_ECDSA_SECP256R1_SHA256, SSL_SIGN_ECDSA_SECP384R1_SHA384, SSL_SIGN_ECDSA_SHA1,
+    };
+    if (SSL_set_verify_algorithm_prefs(session, k360GateSigalgs, std::size(k360GateSigalgs)) != 1) {
+        return core::fail(configuration_error("failed to configure 360 TLS signature algorithms"));
+    }
+    // No cipher rule: raw emission ignores the configured list.
+    if (SSL_set_min_proto_version(session, TLS1_VERSION) != 1 ||
+        SSL_set_max_proto_version(session, TLS1_2_VERSION) != 1) {
+        return core::fail(configuration_error("failed to configure 360 TLS version range"));
+    }
+    static constexpr int k360Groups[] = {NID_X9_62_prime256v1, NID_secp384r1, NID_secp521r1};
+    if (SSL_set1_groups(session, k360Groups, std::size(k360Groups)) != 1) {
+        return core::fail(configuration_error("failed to configure 360 TLS groups"));
+    }
+    SSL_CTX_set_next_proto_select_cb(context, refuse_next_proto_select, nullptr);
+    return {};
+}
+
+core::Status apply_randomized_profile(SSL_CTX *context, SSL *session, bool alps_allowed) {
+    if (SSL_set_client_hello_profile(session, CLASH_NATIVE_CLIENT_HELLO_RANDOMIZED) != 1) {
+        return core::fail(configuration_error("failed to select randomized TLS profile"));
+    }
+
+    SSL_CTX_set_grease_enabled(context, 1);
+    SSL_set_permute_extensions(session, 1);
+    SSL_set_enable_ech_grease(session, 0);
+    // Full Chrome suite selectedness: the default rule omits static RSA,
+    // but the shuffled legacy multiset includes it.
+    if (SSL_set_strict_cipher_list(session, kChromeCipherRule) != 1) {
+        return core::fail(configuration_error("failed to configure randomized TLS cipher list"));
+    }
+    // Mihomo forces TLS 1.3 max with a 1.0/1.2 minimum lottery.
+    if (SSL_set_min_proto_version(session, flip_coin(0.5) ? TLS1_VERSION : TLS1_2_VERSION) != 1) {
+        return core::fail(
+            configuration_error("failed to configure randomized TLS minimum version"));
+    }
+    // Curves stay ordered (uTLS only shuffles extensions); P-521 joins at 46%.
+    std::vector<int> groups = {NID_X25519, NID_X9_62_prime256v1, NID_secp384r1};
+    if (flip_coin(0.46)) {
+        groups.push_back(NID_secp521r1);
+    }
+    // X25519 first share always; P-256 and PQ prepends are 50% lotteries.
+    // The PQ share needs its group first in the list: BoringSSL validates
+    // shares as an ordered subsequence of groups. uTLS omits PQ from curves,
+    // a documented delta.
+    std::vector<uint16_t> shares = {SSL_GROUP_X25519};
+    if (flip_coin(0.5)) {
+        shares.push_back(SSL_GROUP_SECP256R1);
+    }
+    if (flip_coin(0.5)) {
+        shares.insert(shares.begin(), SSL_GROUP_X25519_MLKEM768);
+        groups.insert(groups.begin(), NID_X25519MLKEM768);
+    }
+    if (SSL_set1_groups(session, groups.data(), groups.size()) != 1) {
+        return core::fail(configuration_error("failed to configure randomized TLS groups"));
+    }
+    if (SSL_set1_client_key_shares(session, shares.data(), shares.size()) != 1) {
+        return core::fail(configuration_error("failed to configure randomized TLS key shares"));
+    }
+    // Signature lotteries around the TLS 1.3-mandatory PSS-SHA256, shuffled.
+    std::vector<uint16_t> sigalgs = {SSL_SIGN_ECDSA_SECP256R1_SHA256, SSL_SIGN_RSA_PKCS1_SHA256,
+                                     SSL_SIGN_ECDSA_SECP384R1_SHA384, SSL_SIGN_RSA_PKCS1_SHA384,
+                                     SSL_SIGN_RSA_PKCS1_SHA1,         SSL_SIGN_RSA_PKCS1_SHA512,
+                                     SSL_SIGN_RSA_PSS_RSAE_SHA256};
+    if (flip_coin(0.63)) {
+        sigalgs.push_back(SSL_SIGN_ECDSA_SHA1);
+    }
+    if (flip_coin(0.59)) {
+        sigalgs.push_back(SSL_SIGN_ECDSA_SECP521R1_SHA512);
+    }
+    if (flip_coin(0.9)) {
+        sigalgs.push_back(SSL_SIGN_RSA_PSS_RSAE_SHA384);
+        sigalgs.push_back(SSL_SIGN_RSA_PSS_RSAE_SHA512);
+    }
+    shuffle_u16(sigalgs);
+    if (SSL_set_verify_algorithm_prefs(session, sigalgs.data(), sigalgs.size()) != 1) {
+        return core::fail(
+            configuration_error("failed to configure randomized TLS signature algorithms"));
+    }
+    // Extension lotteries: OCSP 74%, SCT 46%, ALPS 33% (ALPS needs ALPN).
+    if (flip_coin(0.74)) {
+        SSL_set_tlsext_status_type(session, TLSEXT_STATUSTYPE_ocsp);
+    }
+    if (flip_coin(0.46)) {
+        SSL_enable_signed_cert_timestamps(session);
+    }
+    if (alps_allowed && flip_coin(0.33)) {
+        SSL_set_alps_use_new_codepoint(session, 1);
+        static constexpr uint8_t kHttp2Alpn[] = {'h', '2'};
+        if (SSL_add_application_settings(session, kHttp2Alpn, sizeof(kHttp2Alpn), nullptr, 0) !=
+            1) {
+            return core::fail(configuration_error("failed to configure randomized TLS ALPS"));
+        }
     }
     return {};
 }
@@ -613,21 +972,60 @@ class TlsClientHandshakeOperationImpl final
             }
         }
 
-        if (!options_.fingerprint.empty() && options_.fingerprint != "chrome" &&
-            options_.fingerprint != "firefox" && options_.fingerprint != "safari") {
+        std::string hello_profile = options_.fingerprint;
+        if (hello_profile == "random") {
+            hello_profile = resolve_random_fingerprint();
+        } else if (hello_profile == "firefox120") {
+            hello_profile = "firefox";
+        } else if (hello_profile == "safari16") {
+            hello_profile = "safari";
+        }
+        if (!hello_profile.empty() && hello_profile != "chrome" && hello_profile != "chrome120" &&
+            hello_profile != "firefox" && hello_profile != "safari" && hello_profile != "ios" &&
+            hello_profile != "android" && hello_profile != "edge" && hello_profile != "360" &&
+            hello_profile != "qq" && hello_profile != "randomized") {
             return core::fail(
                 configuration_error("unsupported TLS fingerprint: " + options_.fingerprint));
         }
-        if (!options_.fingerprint.empty()) {
+        // REALITY certificates are Ed25519: BoringSSL refuses schemes that
+        // were not offered, so non-Chrome profiles append Ed25519 below.
+        const bool ed25519_for_reality = options_.reality.has_value();
+        if (ed25519_for_reality && hello_profile == "360") {
+            return core::fail(configuration_error(
+                "the 360 fingerprint cannot do REALITY: its signature list is fixed raw IDs "
+                "without Ed25519"));
+        }
+        if (!hello_profile.empty()) {
             auto *native_context = context_->native_handle();
             auto *native_session = stream_->stream_->native_handle();
             core::Status profile = {};
-            if (options_.fingerprint == "chrome") {
+            if (hello_profile == "chrome") {
                 profile = apply_chrome_profile(native_context, native_session);
-            } else if (options_.fingerprint == "firefox") {
-                profile = apply_firefox_profile(native_context, native_session);
-            } else {
-                profile = apply_safari_profile(native_context, native_session);
+            } else if (hello_profile == "chrome120") {
+                profile = apply_chrome_profile(native_context, native_session, false);
+            } else if (hello_profile == "firefox") {
+                profile =
+                    apply_firefox_profile(native_context, native_session, ed25519_for_reality);
+            } else if (hello_profile == "safari") {
+                profile = apply_safari_profile(native_context, native_session, ed25519_for_reality);
+            } else if (hello_profile == "ios") {
+                profile = apply_ios_profile(native_context, native_session, ed25519_for_reality);
+            } else if (hello_profile == "android") {
+                profile =
+                    apply_android_profile(native_context, native_session, ed25519_for_reality);
+            } else if (hello_profile == "edge") {
+                profile =
+                    apply_edge_profile(native_context, native_session, ed25519_for_reality, false);
+            } else if (hello_profile == "qq") {
+                profile =
+                    apply_edge_profile(native_context, native_session, ed25519_for_reality, true);
+            } else if (hello_profile == "360") {
+                profile = apply_360_profile(native_context, native_session);
+            } else if (hello_profile == "randomized") {
+                // ALPN runs a 70% lottery; the caller below honors the draw.
+                randomized_alpn_allowed_ = flip_coin(0.7);
+                profile = apply_randomized_profile(native_context, native_session,
+                                                   randomized_alpn_allowed_);
             }
             if (!profile) {
                 return profile;
@@ -689,10 +1087,19 @@ class TlsClientHandshakeOperationImpl final
                 });
         }
 
-        if (!options_.alpn_protocols.empty()) {
+        std::vector<std::string> alpn_protocols = options_.alpn_protocols;
+        if (hello_profile == "android") {
+            // OkHttp sends no ALPN extension.
+            alpn_protocols.clear();
+        } else if (hello_profile == "360") {
+            alpn_protocols = {"spdy/2", "spdy/3", "spdy/3.1", "http/1.1"};
+        } else if (hello_profile == "randomized" && !randomized_alpn_allowed_) {
+            alpn_protocols.clear();
+        }
+        if (!alpn_protocols.empty()) {
             std::vector<unsigned char> wire;
             std::size_t wire_size = 0;
-            for (const auto &protocol : options_.alpn_protocols) {
+            for (const auto &protocol : alpn_protocols) {
                 if (protocol.empty() || protocol.size() > 255 ||
                     wire_size + protocol.size() + 1 > 65535) {
                     return core::fail(configuration_error("TLS ALPN protocol list is invalid"));
@@ -700,7 +1107,7 @@ class TlsClientHandshakeOperationImpl final
                 wire_size += protocol.size() + 1;
             }
             wire.reserve(wire_size);
-            for (const auto &protocol : options_.alpn_protocols) {
+            for (const auto &protocol : alpn_protocols) {
                 wire.push_back(static_cast<unsigned char>(protocol.size()));
                 wire.insert(wire.end(), protocol.begin(), protocol.end());
             }
@@ -852,6 +1259,7 @@ class TlsClientHandshakeOperationImpl final
     bool completed_ = false;
     RealityState reality_state_{};
     std::string reality_verify_name_;
+    bool randomized_alpn_allowed_ = true;
     std::array<std::uint8_t, 32> cert_pin_{};
     bool has_cert_pin_ = false;
     std::string pin_verify_name_;

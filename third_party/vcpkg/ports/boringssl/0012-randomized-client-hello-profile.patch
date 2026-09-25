@@ -1,0 +1,108 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 4195bba..fdbe8e3 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -5626,6 +5626,12 @@ OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
+ // and signature tables are shared with Edge; only the extension order differs.
+ #define CLASH_NATIVE_CLIENT_HELLO_QQ 8
+ 
++// CLASH_NATIVE_CLIENT_HELLO_RANDOMIZED selects the randomized ClientHello
++// emission profile: the Chrome cipher multiset in per-handshake shuffled
++// order with extensions permuted. Curve, signature, share, and extension
++// lotteries run in the caller through the regular configuration APIs.
++#define CLASH_NATIVE_CLIENT_HELLO_RANDOMIZED 9
++
+ // SSL_CTX_set_client_hello_profile configures the ClientHello emission
+ // profile for `ctx`. Returns 1 on success and 0 on unknown `profile`.
+ OPENSSL_EXPORT int SSL_CTX_set_client_hello_profile(SSL_CTX *ctx, int profile);
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+index 49a2e2e..8c52539 100644
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -91,6 +91,23 @@ static bool ssl_add_tls13_cipher(CBB *cbb, uint16_t cipher_id,
+   return true;
+ }
+ 
++// shuffle_cipher_order shuffles `count` cipher IDs in place (Fisher-Yates)
++// with randomness from RAND_bytes. The randomized profile varies the
++// ClientHello cipher order per handshake; modulo bias is irrelevant for
++// fingerprinting.
++static void shuffle_cipher_order(uint16_t *ciphers, size_t count) {
++  for (size_t i = count; i > 1; i--) {
++    uint8_t byte = 0;
++    if (RAND_bytes(&byte, sizeof(byte)) != 1) {
++      return;
++    }
++    const size_t j = byte % i;
++    const uint16_t tmp = ciphers[i - 1];
++    ciphers[i - 1] = ciphers[j];
++    ciphers[j] = tmp;
++  }
++}
++
+ // kChromeLegacyCiphers lists the TLS 1.2 cipher suites in the order emitted
+ // by Chrome, matching the Chrome ClientHello profile.
+ static const uint16_t kChromeLegacyCiphers[] = {
+@@ -339,7 +356,18 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+                                  : bssl::Span<const uint16_t>(
+                                        kCiphersNoAESHardware))));
+ 
+-    for (auto cipher : ciphers) {
++    // The randomized profile emits the Chrome TLS 1.3 multiset in
++    // per-handshake shuffled order.
++    uint16_t randomized_tls13[3];
++    bssl::Span<const uint16_t> selected_ciphers = ciphers;
++    if (hello_profile == CLASH_NATIVE_CLIENT_HELLO_RANDOMIZED) {
++      static_assert(sizeof(kCiphersChrome) / sizeof(kCiphersChrome[0]) == 3,
++                    "randomized TLS 1.3 shuffle expects three suites");
++      OPENSSL_memcpy(randomized_tls13, kCiphersChrome, sizeof(randomized_tls13));
++      shuffle_cipher_order(randomized_tls13, 3);
++      selected_ciphers = bssl::Span<const uint16_t>(randomized_tls13);
++    }
++    for (auto cipher : selected_ciphers) {
+       if (!ssl_add_tls13_cipher(&child, cipher,
+                                 ssl->config->compliance_policy)) {
+         return false;
+@@ -363,6 +391,18 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+                legacy_profile == CLASH_NATIVE_CLIENT_HELLO_QQ) {
+       legacy_order = kEdgeLegacyCiphers;
+     }
++    // The randomized profile emits the Chrome legacy multiset in
++    // per-handshake shuffled order through the configured-list loop below.
++    uint16_t randomized_legacy[12];
++    if (legacy_profile == CLASH_NATIVE_CLIENT_HELLO_RANDOMIZED) {
++      static_assert(
++          sizeof(kChromeLegacyCiphers) / sizeof(kChromeLegacyCiphers[0]) == 12,
++          "randomized legacy shuffle expects twelve suites");
++      OPENSSL_memcpy(randomized_legacy, kChromeLegacyCiphers,
++                     sizeof(randomized_legacy));
++      shuffle_cipher_order(randomized_legacy, 12);
++      legacy_order = randomized_legacy;
++    }
+     // Profiles with suites BoringSSL does not implement emit raw IDs for
+     // fingerprint parity (see the k*RawCiphers tables). Safari keeps its
+     // implemented prefix plus the raw tail; raw-only profiles skip the
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index 35a42be..97d7b03 100644
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -3304,7 +3304,8 @@ int SSL_CTX_set_client_hello_profile(SSL_CTX *ctx, int profile) {
+       profile != CLASH_NATIVE_CLIENT_HELLO_ANDROID &&
+       profile != CLASH_NATIVE_CLIENT_HELLO_EDGE &&
+       profile != CLASH_NATIVE_CLIENT_HELLO_360 &&
+-      profile != CLASH_NATIVE_CLIENT_HELLO_QQ) {
++      profile != CLASH_NATIVE_CLIENT_HELLO_QQ &&
++      profile != CLASH_NATIVE_CLIENT_HELLO_RANDOMIZED) {
+     return 0;
+   }
+   FromOpaque(ctx)->client_hello_profile = profile;
+@@ -3324,7 +3325,8 @@ int SSL_set_client_hello_profile(SSL *ssl, int profile) {
+       profile != CLASH_NATIVE_CLIENT_HELLO_ANDROID &&
+       profile != CLASH_NATIVE_CLIENT_HELLO_EDGE &&
+       profile != CLASH_NATIVE_CLIENT_HELLO_360 &&
+-      profile != CLASH_NATIVE_CLIENT_HELLO_QQ) {
++      profile != CLASH_NATIVE_CLIENT_HELLO_QQ &&
++      profile != CLASH_NATIVE_CLIENT_HELLO_RANDOMIZED) {
+     return 0;
+   }
+   ssl_impl->config->client_hello_profile = profile;

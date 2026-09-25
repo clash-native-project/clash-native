@@ -1,0 +1,97 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 5d9e466..4195bba 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -5621,6 +5621,11 @@ OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
+ // ClientHello aspects are controlled through the regular configuration APIs.
+ #define CLASH_NATIVE_CLIENT_HELLO_360 7
+ 
++// CLASH_NATIVE_CLIENT_HELLO_QQ selects the QQ Browser 11.1 ClientHello
++// emission profile: Edge 85 wire bytes plus the ALPS extension. The cipher
++// and signature tables are shared with Edge; only the extension order differs.
++#define CLASH_NATIVE_CLIENT_HELLO_QQ 8
++
+ // SSL_CTX_set_client_hello_profile configures the ClientHello emission
+ // profile for `ctx`. Returns 1 on success and 0 on unknown `profile`.
+ OPENSSL_EXPORT int SSL_CTX_set_client_hello_profile(SSL_CTX *ctx, int profile);
+diff --git a/ssl/extensions.cc b/ssl/extensions.cc
+index d9eebb0..617b892 100644
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -4576,7 +4576,38 @@ static const uint8_t k360ExtensionOrder[] = {
+     30, 31,
+ };
+ 
++// kQqExtensionOrder lists kExtensions indices in the order QQ Browser 11.1
++// emits them: Edge 85 order plus ALPS after certificate compression. Entries
++// that stay silent when unconfigured may appear in any trailing order.
++static const uint8_t kQqExtensionOrder[] = {
++    0,   // server_name
++    2,   // extended_master_secret
++    3,   // renegotiate
++    4,   // supported_groups
++    5,   // ec_point_formats
++    6,   // session_ticket
++    7,   // application_layer_protocol_negotiation
++    8,   // status_request
++    9,   // signature_algorithms
++    11,  // certificate_timestamp
++    14,  // key_share
++    15,  // psk_key_exchange_modes
++    17,  // supported_versions
++    21,  // cert_compression
++    23,  // application_settings
++    1, 10, 12, 13, 16, 18, 19, 20, 22, 24, 25, 26, 27, 28, 29, 30, 31,
++};
++
+ bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs) {
++  if (hs->config->client_hello_profile == CLASH_NATIVE_CLIENT_HELLO_QQ) {
++    static_assert(sizeof(kQqExtensionOrder) == kNumExtensions,
++                  "QQ extension order must cover every extension");
++    if (!hs->extension_permutation.CopyFrom(kQqExtensionOrder)) {
++      return false;
++    }
++    return true;
++  }
++
+   if (hs->config->client_hello_profile == CLASH_NATIVE_CLIENT_HELLO_360) {
+     static_assert(sizeof(k360ExtensionOrder) == kNumExtensions,
+                   "360 extension order must cover every extension");
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+index 6f52432..49a2e2e 100644
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -359,7 +359,8 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+       legacy_order = kSafariLegacyCiphers;
+     } else if (legacy_profile == CLASH_NATIVE_CLIENT_HELLO_ANDROID) {
+       legacy_order = kAndroidLegacyCiphers;
+-    } else if (legacy_profile == CLASH_NATIVE_CLIENT_HELLO_EDGE) {
++    } else if (legacy_profile == CLASH_NATIVE_CLIENT_HELLO_EDGE ||
++               legacy_profile == CLASH_NATIVE_CLIENT_HELLO_QQ) {
+       legacy_order = kEdgeLegacyCiphers;
+     }
+     // Profiles with suites BoringSSL does not implement emit raw IDs for
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index 4e88798..35a42be 100644
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -3303,7 +3303,8 @@ int SSL_CTX_set_client_hello_profile(SSL_CTX *ctx, int profile) {
+       profile != CLASH_NATIVE_CLIENT_HELLO_IOS &&
+       profile != CLASH_NATIVE_CLIENT_HELLO_ANDROID &&
+       profile != CLASH_NATIVE_CLIENT_HELLO_EDGE &&
+-      profile != CLASH_NATIVE_CLIENT_HELLO_360) {
++      profile != CLASH_NATIVE_CLIENT_HELLO_360 &&
++      profile != CLASH_NATIVE_CLIENT_HELLO_QQ) {
+     return 0;
+   }
+   FromOpaque(ctx)->client_hello_profile = profile;
+@@ -3322,7 +3323,8 @@ int SSL_set_client_hello_profile(SSL *ssl, int profile) {
+       profile != CLASH_NATIVE_CLIENT_HELLO_IOS &&
+       profile != CLASH_NATIVE_CLIENT_HELLO_ANDROID &&
+       profile != CLASH_NATIVE_CLIENT_HELLO_EDGE &&
+-      profile != CLASH_NATIVE_CLIENT_HELLO_360) {
++      profile != CLASH_NATIVE_CLIENT_HELLO_360 &&
++      profile != CLASH_NATIVE_CLIENT_HELLO_QQ) {
+     return 0;
+   }
+   ssl_impl->config->client_hello_profile = profile;
