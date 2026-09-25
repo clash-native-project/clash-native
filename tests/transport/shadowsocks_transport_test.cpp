@@ -1,4 +1,7 @@
 #include <clash_native/core/base64.hpp>
+#include <clash_native/core/outbound.hpp>
+#include <clash_native/outbound/shadowsocks_outbound.hpp>
+#include <clash_native/runtime/asio_runtime.hpp>
 #include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/proxy/jls.hpp>
 #include <clash_native/transport/proxy/restls.hpp>
@@ -482,3 +485,23 @@ TEST(ShadowsocksTransportTest, ZeroesJlsHelloAuthenticationFields) {
 }
 
 } // namespace
+
+TEST(ShadowsocksOutboundTest, DisabledUdpFailsDatagramOpen) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    clash_native::outbound::ShadowsocksOutboundConfig config;
+    config.id = "test-ss-no-udp";
+    config.server_host = "127.0.0.1";
+    config.server_port = 8388;
+    config.method = "aes-128-gcm";
+    config.password = "password";
+    config.udp_enabled = false;
+    clash_native::outbound::ShadowsocksOutbound outbound(runtime, std::move(config), nullptr);
+
+    EXPECT_EQ(outbound.capabilities().datagram, clash_native::core::DatagramSemantics::unsupported);
+    auto wait = stdexec::sync_wait(outbound.open_datagram({}));
+    ASSERT_TRUE(wait.has_value());
+    const auto result = std::move(std::get<0>(*wait));
+    EXPECT_EQ(result.status, clash_native::core::OpenStatus::failed);
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::configuration);
+}

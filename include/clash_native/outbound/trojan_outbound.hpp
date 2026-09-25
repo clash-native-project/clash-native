@@ -23,6 +23,9 @@ struct TrojanOutboundConfig {
     std::string server_host;
     std::uint16_t server_port = 0;
     std::string password;
+    // Mihomo `udp` option. When false, UDP opens fail and the outbound
+    // reports no datagram support.
+    bool udp_enabled = true;
     std::string server_name;
     std::string trusted_ca_pem;
     bool verify_peer = true;

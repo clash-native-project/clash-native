@@ -1876,6 +1876,9 @@ ShadowsocksOutbound::ShadowsocksOutbound(runtime::AsioRuntime &runtime,
                                          std::shared_ptr<dns::ResolverService> resolver)
     : runtime_(runtime), config_(std::move(config)), resolver_(std::move(resolver)),
       descriptor_{config_.id, "shadowsocks"} {
+    if (!config_.udp_enabled) {
+        capabilities_.datagram = core::DatagramSemantics::unsupported;
+    }
     if (config_.plugin == "kcptun") {
         kcptun_pool_ = std::make_shared<transport::shadowsocks::KcptunClientPool>(
             runtime_, config_.kcptun.value_or(transport::shadowsocks::KcptunClientOptions{}));
@@ -2044,6 +2047,10 @@ ShadowsocksOutbound::connect_stream(core::StreamRequest request) {
 io::AnySender<core::DatagramOpenResult>
 ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
     using ResultSender = io::AnySender<core::DatagramOpenResult>;
+    if (!config_.udp_enabled) {
+        return ResultSender{stdexec::just(core::DatagramOpenResult::failed(
+            {core::ErrorCode::configuration, "Shadowsocks outbound UDP is disabled"}))};
+    }
     if (const auto validation = validate(); !validation) {
         return ResultSender{stdexec::just(core::DatagramOpenResult::failed(validation.error()))};
     }

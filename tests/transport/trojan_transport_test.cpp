@@ -386,3 +386,35 @@ TEST(TrojanOutboundConfigTest, GrpcDialFailurePropagatesWithoutHanging) {
     ASSERT_TRUE(result.error);
     EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::endpoint_connection);
 }
+
+TEST(TrojanOutboundTest, DisabledUdpFailsDatagramOpen) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    clash_native::outbound::TrojanOutboundConfig config;
+    config.id = "test-trojan-no-udp";
+    config.server_host = "127.0.0.1";
+    config.server_port = 443;
+    config.password = "password";
+    config.udp_enabled = false;
+    clash_native::outbound::TrojanOutbound outbound(runtime, std::move(config), nullptr);
+
+    EXPECT_EQ(outbound.capabilities().datagram, clash_native::core::DatagramSemantics::unsupported);
+    auto wait = stdexec::sync_wait(outbound.open_datagram({}));
+    ASSERT_TRUE(wait.has_value());
+    const auto result = std::move(std::get<0>(*wait));
+    EXPECT_EQ(result.status, clash_native::core::OpenStatus::failed);
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::configuration);
+}
+
+TEST(TrojanOutboundTest, EnabledUdpKeepsDatagramSupport) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    clash_native::outbound::TrojanOutboundConfig config;
+    config.id = "test-trojan-udp";
+    config.server_host = "127.0.0.1";
+    config.server_port = 443;
+    config.password = "password";
+    clash_native::outbound::TrojanOutbound outbound(runtime, std::move(config), nullptr);
+
+    EXPECT_EQ(outbound.capabilities().datagram,
+              clash_native::core::DatagramSemantics::multi_destination);
+}

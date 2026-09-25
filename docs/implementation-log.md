@@ -2525,3 +2525,14 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   client-fingerprint for the hello. Interop updated plus cert-pin
   accept/reject cases against real Mihomo. Full suite: 290 passed;
   Trojan interop group green.
+
+## 2026-09-25
+
+- Per-outbound UDP switch (Mihomo `udp` proxy option; no global switch
+  exists upstream): added `udp_enabled` (default true) to trojan and
+  shadowsocks configs, reflected in capabilities, guarded in each
+  open_datagram, plus a central gate in proxy route_datagram mirroring
+  Mihomo tunnel's SupportUDP check (single-outbound router fails the
+  relay instead of rule fallback). Unit tests for both outbounds;
+  Trojan/UDP positive and Trojan/udp-disabled negative interop against
+  real Mihomo. Full suite: 293 passed; Trojan interop group green.

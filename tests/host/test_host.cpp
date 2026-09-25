@@ -105,6 +105,8 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
         }
         clash_native::outbound::ShadowsocksOutboundConfig config{"test-proxy", server.host,
                                                                  server.port, *method, password};
+        config.udp_enabled =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_SHADOWSOCKS_UDP").value_or("1") != "0";
         if (const auto plugin = environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN"); plugin) {
             config.plugin = *plugin;
             config.plugin_mode =
@@ -260,6 +262,7 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
                                                          server.host,
                                                          server.port,
                                                          password,
+                                                         true /* udp_enabled, overridden below */,
                                                          server_name.value_or(server.host),
                                                          std::move(ca_pem),
                                                          true};
@@ -290,6 +293,8 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_PATH").value_or("/");
         trojan_config.websocket_tls =
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_TLS").value_or("0") != "0";
+        trojan_config.udp_enabled =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_UDP").value_or("1") != "0";
         if (const auto early_data =
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_WS_MAX_EARLY_DATA")) {
             trojan_config.websocket_max_early_data = std::stoul(*early_data);

@@ -888,6 +888,37 @@ listeners:%s
 		}
 	})
 
+	t.Run("Trojan/UDP", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":             "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":      trojanAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":    mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME": "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":     caPath,
+		})
+		defer stopProxy()
+
+		udpPayload := []byte(strings.Repeat("cpp-to-mihomo-trojan-udp-", 8))
+		testShadowsocksUDPAssociateWithPayload(t, proxyAddress, udpEcho.Addr().String(),
+			udpEcho.Addr().IP, udpPayload)
+	})
+
+	t.Run("Trojan/udp-disabled", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":             "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":      trojanAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":    mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME": "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":     caPath,
+			"CLASH_NATIVE_TEST_OUTBOUND_TROJAN_UDP":  "0",
+		})
+		defer stopProxy()
+
+		udpPayload := []byte(strings.Repeat("cpp-to-mihomo-trojan-no-udp-", 8))
+		testShadowsocksUDPAssociateWithPayloadResult(t, proxyAddress, udpEcho.Addr().String(),
+			udpEcho.Addr().IP, udpPayload, false)
+	})
+
 	t.Run("Trojan/WSS", func(t *testing.T) {
 		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
 			"CLASH_NATIVE_TEST_OUTBOUND":                "trojan",

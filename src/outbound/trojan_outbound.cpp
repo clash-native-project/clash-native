@@ -741,6 +741,9 @@ TrojanOutbound::TrojanOutbound(runtime::AsioRuntime &runtime, TrojanOutboundConf
                                std::shared_ptr<dns::ResolverService> resolver)
     : runtime_(runtime), config_(std::move(config)), resolver_(std::move(resolver)),
       descriptor_{config_.id, "trojan"} {
+    if (!config_.udp_enabled) {
+        capabilities_.datagram = core::DatagramSemantics::unsupported;
+    }
     if (config_.network == "grpc") {
         transport::proxy::gun::GunClientOptions gun_options;
         gun_options.stream.service_name = config_.grpc_service_name;
@@ -824,6 +827,11 @@ io::AnySender<core::StreamOpenResult> TrojanOutbound::connect_stream(core::Strea
 
 io::AnySender<core::DatagramOpenResult>
 TrojanOutbound::open_datagram(core::DatagramRequest request) {
+    if (!config_.udp_enabled) {
+        return io::AnySender<core::DatagramOpenResult>{
+            stdexec::just(core::DatagramOpenResult::failed(
+                {core::ErrorCode::configuration, "Trojan outbound UDP is disabled"}))};
+    }
     auto &runtime = runtime_;
     auto resolver = resolver_;
     auto config = config_;

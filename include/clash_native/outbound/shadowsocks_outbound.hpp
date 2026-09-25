@@ -21,6 +21,9 @@ struct ShadowsocksOutboundConfig {
     std::uint16_t server_port = 0;
     std::string method;
     std::string password;
+    // Mihomo `udp` option. When false, UDP opens fail and the outbound
+    // reports no datagram support.
+    bool udp_enabled = true;
     // Optional Shadowsocks TCP plugin. simple-obfs supports HTTP and TLS;
     // v2ray-plugin and gost-plugin support WebSocket with optional TLS;
     // shadow-tls supports Shadow-TLS v1, v2, and v3 carriers; restls supports

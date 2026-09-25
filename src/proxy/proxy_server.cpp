@@ -758,6 +758,13 @@ ProxyServer::route_datagram(ProxyServer &server, runtime::RuntimeSnapshotPtr sna
         }
         break;
     }
+    // Mihomo's tunnel skips adapters without UDP support before dialing.
+    // Our router picks a single outbound without fallback iteration, so a
+    // disabled outbound fails the relay here instead of moving on.
+    if (outbound->capabilities().datagram == core::DatagramSemantics::unsupported) {
+        co_return failed(
+            {core::ErrorCode::configuration, "the selected outbound does not support UDP"}, target);
+    }
     try {
         co_return RoutedDatagram{co_await outbound->open_datagram(std::move(request)), target};
     } catch (const core::Error &failure) {
