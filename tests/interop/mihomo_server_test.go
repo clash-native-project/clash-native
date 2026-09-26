@@ -773,6 +773,69 @@ listeners:%s
 			udpEcho.Addr().String(), udpEcho.Addr().IP, udpPayload)
 	})
 
+	t.Run("Shadowsocks/via-trojan", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":              "shadowsocks",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":       shadowsocksAddresses["chacha20-ietf-poly1305"],
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":     mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_METHOD":       "chacha20-ietf-poly1305",
+			"CLASH_NATIVE_TEST_OUTBOUND_DIALER_PROXY": "chain-target",
+			"CLASH_NATIVE_TEST_CHAIN_KIND":            "trojan",
+			"CLASH_NATIVE_TEST_CHAIN_SERVER":          trojanAddress,
+			"CLASH_NATIVE_TEST_CHAIN_PASSWORD":        mihomoTestPassword,
+			"CLASH_NATIVE_TEST_CHAIN_SERVER_NAME":     "localhost",
+			"CLASH_NATIVE_TEST_CHAIN_CA_FILE":         caPath,
+			"CLASH_NATIVE_TEST_PROXY_HOST":            udpHost,
+		})
+		defer stopProxy()
+
+		// The Shadowsocks TCP connection travels inside the chained Trojan
+		// tunnel to the Mihomo Shadowsocks listener.
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-ss-via-trojan-", 2048))
+		writeBytes(t, client, payload)
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Shadowsocks via Trojan returned different bytes")
+		}
+	})
+
+	t.Run("Shadowsocks/dialer-proxy-cycle", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":              "shadowsocks",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":       "127.0.0.1:1",
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":     mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_METHOD":       "chacha20-ietf-poly1305",
+			"CLASH_NATIVE_TEST_OUTBOUND_DIALER_PROXY": "chain-target",
+			"CLASH_NATIVE_TEST_CHAIN_KIND":            "shadowsocks",
+			"CLASH_NATIVE_TEST_CHAIN_SERVER":          "127.0.0.1:1",
+			"CLASH_NATIVE_TEST_CHAIN_PASSWORD":        mihomoTestPassword,
+			"CLASH_NATIVE_TEST_CHAIN_METHOD":          "chacha20-ietf-poly1305",
+			"CLASH_NATIVE_TEST_CHAIN_DIALER_PROXY":    "test-proxy",
+			"CLASH_NATIVE_TEST_PROXY_HOST":            udpHost,
+		})
+		defer stopProxy()
+
+		control, err := net.DialTimeout("tcp", proxyAddress, 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer control.Close()
+		_ = control.SetDeadline(time.Now().Add(5 * time.Second))
+		writeBytes(t, control, []byte{5, 1, 0})
+		method := make([]byte, 2)
+		readBytes(t, control, method)
+		if string(method) != string([]byte{5, 0}) {
+			t.Fatalf("unexpected SOCKS5 method response: %v", method)
+		}
+		writeSocksConnectRequest(t, control, tcpEcho.Addr())
+		if code := readSocks5ReplyCode(t, control); code == 0 {
+			t.Fatal("C++ outbound accepted a dialer-proxy cycle")
+		}
+	})
+
 	t.Run("Trojan/TLS", func(t *testing.T) {
 		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
 			"CLASH_NATIVE_TEST_OUTBOUND":             "trojan",
@@ -2126,7 +2189,11 @@ listeners:%s
 func startMihomo(t *testing.T, executable, home, config string, listeners []string) *harness.Process {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	process, err := harness.Start(ctx, executable, "-d", home, "-f", config)
+	// Dialer-proxy tests relay through two listeners of this same fixture
+	// instance; Mihomo's loopback detector would mistake that controlled
+	// relay for a loop and reject it.
+	process, err := harness.StartWithEnv(ctx, executable,
+		map[string]string{"DISABLE_LOOPBACK_DETECTOR": "true"}, "-d", home, "-f", config)
 	if err != nil {
 		cancel()
 		t.Fatalf("start Mihomo server: %v", err)

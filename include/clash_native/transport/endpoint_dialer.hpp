@@ -47,6 +47,13 @@ class EndpointDialPlan final {
     friend class EndpointDialer;
 };
 
+// Extends a dial trace with one outbound hop, rejecting cycles and
+// over-deep chains. Chaining outbounds extend with their own ID before
+// dialing through a nested EndpointDialer (which extends with the target).
+core::Result<std::shared_ptr<const core::EndpointDialTrace>>
+extend_endpoint_trace(const std::shared_ptr<const core::EndpointDialTrace> &trace,
+                      std::string_view outbound_id);
+
 // Executes a prebound endpoint plan. Each request can carry a trace through
 // nested outbound calls so accidental recursive chains fail before dialing.
 class EndpointDialer final {

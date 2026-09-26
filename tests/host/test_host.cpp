@@ -91,6 +91,74 @@ HostPort parse_host_port(std::string_view text) {
     return {std::string(host), static_cast<std::uint16_t>(port)};
 }
 
+// Minimal chained-outbound builder for dialer-proxy tests: kind, server,
+// password, plus the TLS essentials for trojan and the cipher for
+// shadowsocks. Controlled by CLASH_NATIVE_TEST_CHAIN_* variables.
+void build_chain_outbound(
+    clash_native::runtime::AsioRuntime &runtime,
+    const std::shared_ptr<clash_native::dns::ResolverService> &resolver,
+    const std::shared_ptr<clash_native::outbound::OutboundRegistry> &registry) {
+    const auto chain_kind = environment_value("CLASH_NATIVE_TEST_CHAIN_KIND");
+    if (!chain_kind || chain_kind->empty()) {
+        return;
+    }
+    const auto chain_server_text = environment_value("CLASH_NATIVE_TEST_CHAIN_SERVER");
+    const auto chain_password = environment_value("CLASH_NATIVE_TEST_CHAIN_PASSWORD");
+    if (!chain_server_text || !chain_password) {
+        throw std::runtime_error("CLASH_NATIVE_TEST_CHAIN_SERVER/PASSWORD are required");
+    }
+    const auto chain_server = parse_host_port(*chain_server_text);
+    const auto chain_id = environment_value("CLASH_NATIVE_TEST_CHAIN_ID").value_or("chain-target");
+    if (*chain_kind == "trojan") {
+        std::string ca_pem;
+        if (const auto ca_path = environment_value("CLASH_NATIVE_TEST_CHAIN_CA_FILE"); ca_path) {
+            std::ifstream file(*ca_path, std::ios::binary);
+            if (!file) {
+                throw std::runtime_error("failed to read chain test CA file");
+            }
+            ca_pem.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+        }
+        clash_native::outbound::TrojanOutboundConfig config{chain_id, chain_server.host,
+                                                            chain_server.port, *chain_password};
+        config.server_name =
+            environment_value("CLASH_NATIVE_TEST_CHAIN_SERVER_NAME").value_or("localhost");
+        config.trusted_ca_pem = std::move(ca_pem);
+        if (const auto dialer_proxy = environment_value("CLASH_NATIVE_TEST_CHAIN_DIALER_PROXY");
+            dialer_proxy && !dialer_proxy->empty()) {
+            throw std::runtime_error("chain trojan dialer-proxy is not supported in tests");
+        }
+        auto outbound = std::make_shared<clash_native::outbound::TrojanOutbound>(
+            runtime, std::move(config), resolver);
+        if (const auto result = outbound->validate(); !result) {
+            throw std::runtime_error(result.error().context);
+        }
+        if (const auto result = registry->add_outbound(chain_id, std::move(outbound)); !result) {
+            throw std::runtime_error(result.error().context);
+        }
+    } else if (*chain_kind == "shadowsocks") {
+        const auto method = environment_value("CLASH_NATIVE_TEST_CHAIN_METHOD");
+        if (!method) {
+            throw std::runtime_error("CLASH_NATIVE_TEST_CHAIN_METHOD is required");
+        }
+        clash_native::outbound::ShadowsocksOutboundConfig config{
+            chain_id, chain_server.host, chain_server.port, *method, *chain_password};
+        if (const auto dialer_proxy = environment_value("CLASH_NATIVE_TEST_CHAIN_DIALER_PROXY");
+            dialer_proxy && !dialer_proxy->empty()) {
+            config.dialer_proxy = *dialer_proxy;
+        }
+        auto outbound = std::make_shared<clash_native::outbound::ShadowsocksOutbound>(
+            runtime, std::move(config), resolver);
+        if (const auto result = outbound->validate(); !result) {
+            throw std::runtime_error(result.error().context);
+        }
+        if (const auto result = registry->add_outbound(chain_id, std::move(outbound)); !result) {
+            throw std::runtime_error(result.error().context);
+        }
+    } else {
+        throw std::runtime_error("unsupported CLASH_NATIVE_TEST_CHAIN_KIND");
+    }
+}
+
 std::shared_ptr<clash_native::outbound::OutboundRegistry>
 test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
                        std::shared_ptr<clash_native::dns::ResolverService> resolver,
@@ -98,6 +166,7 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
                        const std::string &password) {
     const auto server = parse_host_port(server_text);
     auto registry = std::make_shared<clash_native::outbound::OutboundRegistry>();
+    build_chain_outbound(runtime, resolver, registry);
     if (kind == "shadowsocks") {
         const auto method = environment_value("CLASH_NATIVE_TEST_OUTBOUND_METHOD");
         if (!method) {
@@ -105,6 +174,8 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
         }
         clash_native::outbound::ShadowsocksOutboundConfig config{"test-proxy", server.host,
                                                                  server.port, *method, password};
+        config.dialer_proxy =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_DIALER_PROXY").value_or("");
         config.udp_enabled =
             environment_value("CLASH_NATIVE_TEST_OUTBOUND_SHADOWSOCKS_UDP").value_or("1") != "0";
         if (const auto plugin = environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN"); plugin) {
@@ -454,6 +525,21 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
         }
     } else {
         throw std::runtime_error("unsupported CLASH_NATIVE_TEST_OUTBOUND protocol");
+    }
+    // Snapshots freeze the registry: wire chain registries after every
+    // outbound (primary plus chain) is registered.
+    const auto snapshot = registry->snapshot();
+    for (const auto &id : registry->ids()) {
+        const auto selected = registry->select(id);
+        if (!selected) {
+            continue;
+        }
+        if (auto shadowsocks =
+                std::dynamic_pointer_cast<clash_native::outbound::ShadowsocksOutbound>(
+                    selected.value());
+            shadowsocks) {
+            shadowsocks->set_chain_registry(snapshot);
+        }
     }
     return registry;
 }

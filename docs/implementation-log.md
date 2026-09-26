@@ -2604,3 +2604,18 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   associates to the simple-obfs, shadow-tls v1/v2/v3, restls tls12/tls13,
   and jls client cases. All pass; an isolated shadow-tls-v3 group-run
   failure re-passed solo (public-dest load flake, unrelated).
+
+## 2026-09-26
+
+- dialer-proxy phase 1 (TCP): Shadowsocks outbound can chain its server
+  connection through another registry outbound (Mihomo dialer-proxy).
+  Shared trace helper (cycle/depth guard), chained StreamHandle feeds
+  every TCP carrier via take_connected_stream/carrier assembly;
+  kcptun/mux/simple-obfs rejected as unchainable for now. UDP chaining
+  and Trojan chaining remain for phase 2.
+- Fixture: test-host builds an optional chain target plus snapshot
+  wiring; Mihomo fixture runs with DISABLE_LOOPBACK_DETECTOR (its
+  same-process relay guard trips on controlled trojan-to-shadowsocks
+  chains).
+- Tests: 316 passed (chain validation cases); Shadowsocks/via-trojan
+  and dialer-proxy-cycle interop green; SS/WS/Trojan groups re-green.

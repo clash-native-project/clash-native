@@ -96,8 +96,8 @@ EndpointDialer::EndpointDialer(boost::asio::any_io_executor executor, EndpointDi
     : executor_(std::move(executor)), plan_(std::move(plan)) {}
 
 core::Result<std::shared_ptr<const core::EndpointDialTrace>>
-EndpointDialer::extend_trace(const std::shared_ptr<const core::EndpointDialTrace> &trace,
-                             std::string_view outbound_id) const {
+extend_endpoint_trace(const std::shared_ptr<const core::EndpointDialTrace> &trace,
+                      std::string_view outbound_id) {
     if (outbound_id.empty()) {
         return core::fail(configuration_error("selected outbound has no stable ID"));
     }
@@ -112,6 +112,12 @@ EndpointDialer::extend_trace(const std::shared_ptr<const core::EndpointDialTrace
     }
     next.outbound_ids.emplace_back(outbound_id);
     return std::make_shared<const core::EndpointDialTrace>(std::move(next));
+}
+
+core::Result<std::shared_ptr<const core::EndpointDialTrace>>
+EndpointDialer::extend_trace(const std::shared_ptr<const core::EndpointDialTrace> &trace,
+                             std::string_view outbound_id) const {
+    return extend_endpoint_trace(trace, outbound_id);
 }
 
 io::AnySender<core::StreamOpenResult>

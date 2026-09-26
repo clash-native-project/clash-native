@@ -559,6 +559,79 @@ TEST(ShadowsocksOutboundTest, WebSocketPluginEchRejectsInvalidStaticConfig) {
     EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::configuration);
 }
 
+TEST(ShadowsocksOutboundTest, DialerProxyRejectsUnchainableCarriers) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    for (const auto plugin : {"kcptun", "obfs"}) {
+        clash_native::outbound::ShadowsocksOutboundConfig config;
+        config.id = "test-ss-chain-reject";
+        config.server_host = "127.0.0.1";
+        config.server_port = 8388;
+        config.method = "aes-128-gcm";
+        config.password = "password";
+        config.plugin = plugin;
+        if (plugin == std::string("obfs")) {
+            config.plugin_mode = "http";
+            config.plugin_host = "bing.com";
+        }
+        config.dialer_proxy = "chain-target";
+        clash_native::outbound::ShadowsocksOutbound outbound(runtime, std::move(config), nullptr);
+
+        auto wait = stdexec::sync_wait(outbound.connect_stream(
+            {clash_native::core::Destination::domain("example.test", 443), std::nullopt}));
+        ASSERT_TRUE(wait.has_value());
+        const auto result = std::move(std::get<0>(*wait));
+        EXPECT_EQ(result.status, clash_native::core::OpenStatus::failed);
+        ASSERT_TRUE(result.error);
+        EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::unsupported);
+    }
+}
+
+TEST(ShadowsocksOutboundTest, DialerProxyRejectsMultiplexedCarriers) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    clash_native::outbound::ShadowsocksOutboundConfig config;
+    config.id = "test-ss-chain-mux";
+    config.server_host = "127.0.0.1";
+    config.server_port = 8388;
+    config.method = "aes-128-gcm";
+    config.password = "password";
+    config.plugin = "v2ray-plugin";
+    config.plugin_mode = "websocket";
+    config.plugin_mux = true;
+    config.dialer_proxy = "chain-target";
+    clash_native::outbound::ShadowsocksOutbound outbound(runtime, std::move(config), nullptr);
+
+    auto wait = stdexec::sync_wait(outbound.connect_stream(
+        {clash_native::core::Destination::domain("example.test", 443), std::nullopt}));
+    ASSERT_TRUE(wait.has_value());
+    const auto result = std::move(std::get<0>(*wait));
+    EXPECT_EQ(result.status, clash_native::core::OpenStatus::failed);
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::unsupported);
+}
+
+TEST(ShadowsocksOutboundTest, DialerProxyWithoutRegistryFailsFast) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    clash_native::outbound::ShadowsocksOutboundConfig config;
+    config.id = "test-ss-chain-noregistry";
+    config.server_host = "127.0.0.1";
+    config.server_port = 8388;
+    config.method = "aes-128-gcm";
+    config.password = "password";
+    config.dialer_proxy = "chain-target";
+    // The runtime loop must turn: the failure surfaces after the chained
+    // dial attempt, not synchronously in validation.
+    runtime.start();
+    clash_native::outbound::ShadowsocksOutbound outbound(runtime, std::move(config), nullptr);
+
+    auto wait = stdexec::sync_wait(outbound.connect_stream(
+        {clash_native::core::Destination::domain("example.test", 443), std::nullopt}));
+    ASSERT_TRUE(wait.has_value());
+    const auto result = std::move(std::get<0>(*wait));
+    EXPECT_EQ(result.status, clash_native::core::OpenStatus::failed);
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::configuration);
+}
+
 TEST(ShadowsocksOutboundTest, DisabledUdpFailsDatagramOpen) {
     auto &runtime = clash_native::runtime::AsioRuntime::instance();
     clash_native::outbound::ShadowsocksOutboundConfig config;

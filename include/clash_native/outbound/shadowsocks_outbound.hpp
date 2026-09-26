@@ -2,6 +2,7 @@
 
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/dns/resolver_service.hpp>
+#include <clash_native/outbound/outbound_registry.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 #include <clash_native/transport/shadowsocks/kcptun.hpp>
 #include <clash_native/transport/shadowsocks/kcptun_session.hpp>
@@ -75,6 +76,10 @@ struct ShadowsocksOutboundConfig {
     std::vector<std::string> plugin_alpn;
     std::string plugin_version_hint = "tls12";
     std::string plugin_restls_script;
+    // Optional chained outbound (registry ID or group) carrying the TCP
+    // connection to the server (Mihomo dialer-proxy). Empty disables.
+    // kcptun and WebSocket mux open their own carriers and cannot chain.
+    std::string dialer_proxy;
 };
 
 class ShadowsocksOutbound final : public core::Outbound {
@@ -88,10 +93,18 @@ class ShadowsocksOutbound final : public core::Outbound {
     io::AnySender<core::StreamOpenResult> connect_stream(core::StreamRequest request) override;
     io::AnySender<core::DatagramOpenResult> open_datagram(core::DatagramRequest request) override;
 
+  public:
+    // Registry snapshot resolving dialer_proxy chain targets. Set after all
+    // outbounds are registered; chaining stays disabled without it.
+    void set_chain_registry(OutboundRegistry::Snapshot registry) {
+        chain_registry_ = std::move(registry);
+    }
+
   private:
     runtime::AsioRuntime &runtime_;
     ShadowsocksOutboundConfig config_;
     std::shared_ptr<dns::ResolverService> resolver_;
+    OutboundRegistry::Snapshot chain_registry_;
     std::shared_ptr<transport::shadowsocks::KcptunClientPool> kcptun_pool_;
     std::shared_ptr<transport::shadowsocks::WebSocketPluginMuxPool> websocket_mux_pool_;
     core::OutboundDescriptor descriptor_;

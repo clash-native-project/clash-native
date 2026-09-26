@@ -8,6 +8,7 @@
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
+#include <clash_native/transport/endpoint_dialer.hpp>
 #include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/proxy/jls_client.hpp>
 #include <clash_native/transport/proxy/restls_client.hpp>
@@ -180,6 +181,41 @@ fetch_ss_plugin_ech_config(std::shared_ptr<dns::ResolverService> resolver,
     }
     co_return core::Result<std::vector<std::uint8_t>>{std::move(ech.value())};
 }
+
+// Drives a chained stream open into the bridge handler.
+struct ChainedDialReceiver {
+    using receiver_concept = stdexec::receiver_tag;
+    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler handler;
+    void set_value(core::StreamOpenResult result) && noexcept {
+        auto done = std::move(handler);
+        if (result.status == core::OpenStatus::opened && result.handle) {
+            done(core::Result<std::unique_ptr<io::StreamHandle>>{std::move(result.handle)});
+            return;
+        }
+        if (result.error) {
+            done(core::fail(result.error.value()));
+            return;
+        }
+        done(core::fail(
+            core::Error{core::ErrorCode::endpoint_connection, "chained outbound dial failed", {}}));
+    }
+    void set_error(std::exception_ptr error) && noexcept {
+        auto done = std::move(handler);
+        try {
+            std::rethrow_exception(std::move(error));
+        } catch (const core::Error &failure) {
+            done(core::fail(failure));
+        } catch (...) {
+            done(core::fail(core::Error{
+                core::ErrorCode::endpoint_connection, "chained outbound dial failed", {}}));
+        }
+    }
+    void set_stopped() && noexcept {
+        auto done = std::move(handler);
+        done(core::fail(
+            core::Error{core::ErrorCode::cancelled, "chained outbound dial was cancelled", {}}));
+    }
+};
 
 struct CarrierWriteBridge {
     using receiver_concept = stdexec::receiver_tag;
@@ -649,11 +685,13 @@ class ShadowsocksConnectOperation final
   public:
     ShadowsocksConnectOperation(runtime::AsioRuntime &runtime,
                                 std::shared_ptr<dns::ResolverService> resolver,
+                                OutboundRegistry::Snapshot chain_registry,
                                 std::shared_ptr<ss::KcptunClientPool> kcptun_pool,
                                 std::shared_ptr<ss::WebSocketPluginMuxPool> websocket_mux_pool,
                                 ShadowsocksOutboundConfig config, core::StreamRequest request,
                                 core::StreamOpenHandler handler)
-        : runtime_(runtime), resolver_(std::move(resolver)), config_(std::move(config)),
+        : runtime_(runtime), resolver_(std::move(resolver)),
+          chain_registry_(std::move(chain_registry)), config_(std::move(config)),
           kcptun_pool_(std::move(kcptun_pool)), websocket_mux_pool_(std::move(websocket_mux_pool)),
           request_(std::move(request)),
           socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.serialized_executor())),
@@ -692,6 +730,28 @@ class ShadowsocksConnectOperation final
     // terminal funnels through finish(), so the spawned task always ends
     // with a value.
     static exec::task<void> run(std::shared_ptr<ShadowsocksConnectOperation> self) {
+        // Chained dials skip local resolution: the chain resolves the server.
+        if (!self->config_.dialer_proxy.empty()) {
+            co_await dial_chained_transport(self);
+            if (self->completed_ || !self->chained_transport_) {
+                co_return;
+            }
+            co_await resolve_plugin_ech(self);
+            if (self->completed_) {
+                co_return;
+            }
+            // StreamHandle-native plugin carriers consume the chained
+            // transport directly; cipher opens use it via the carrier.
+            const bool stream_plugin = self->shadow_tls_plugin() || self->restls_plugin() ||
+                                       self->jls_plugin() ||
+                                       (self->websocket_plugin() && !self->config_.plugin_mux);
+            if (!stream_plugin) {
+                self->carrier_ =
+                    std::make_shared<ss::StreamCarrier>(std::move(self->chained_transport_));
+            }
+            co_await dispatch_connected(self);
+            co_return;
+        }
         core::Result<detail::AddressList> resolved;
         try {
             resolved = co_await async::bridge_sender<core::Result<detail::AddressList>>(
@@ -714,19 +774,9 @@ class ShadowsocksConnectOperation final
             self->finish(core::StreamOpenResult::failed(resolved.error()));
             co_return;
         }
-        if (self->websocket_plugin() && self->config_.plugin_tls &&
-            self->config_.plugin_ech_enabled) {
-            auto ech = co_await fetch_ss_plugin_ech_config(
-                self->resolver_, self->config_,
-                self->config_.plugin_host.empty() ? "bing.com" : self->config_.plugin_host);
-            if (self->completed_) {
-                co_return;
-            }
-            if (!ech) {
-                self->finish(core::StreamOpenResult::failed(ech.error()));
-                co_return;
-            }
-            self->plugin_ech_config_ = std::move(ech.value());
+        co_await resolve_plugin_ech(self);
+        if (self->completed_) {
+            co_return;
         }
         if (self->kcptun_plugin()) {
             if (resolved.value().empty()) {
@@ -814,6 +864,105 @@ class ShadowsocksConnectOperation final
 
     // TCP connect plus plugin/cipher tail, shared by run(). Throws
     // core::Error on transport failures; finish() terminals stay inline.
+    // Plugin dispatch shared by the direct and chained transports.
+    static exec::task<void> dispatch_connected(std::shared_ptr<ShadowsocksConnectOperation> self) {
+        if (self->shadow_tls_plugin()) {
+            co_await open_shadow_tls(self);
+            co_return;
+        }
+        if (self->restls_plugin()) {
+            co_await open_restls(self);
+            co_return;
+        }
+        if (self->jls_plugin()) {
+            co_await open_jls(self);
+            co_return;
+        }
+        co_await send_initial_request(self);
+    }
+
+    // ECH config fetch shared by the direct and chained transports. Finishes
+    // the operation on failure; callers check completed_ afterwards.
+    static exec::task<void> resolve_plugin_ech(std::shared_ptr<ShadowsocksConnectOperation> self) {
+        if (self->websocket_plugin() && self->config_.plugin_tls &&
+            self->config_.plugin_ech_enabled) {
+            auto ech = co_await fetch_ss_plugin_ech_config(
+                self->resolver_, self->config_,
+                self->config_.plugin_host.empty() ? "bing.com" : self->config_.plugin_host);
+            if (self->completed_) {
+                co_return;
+            }
+            if (!ech) {
+                self->finish(core::StreamOpenResult::failed(ech.error()));
+                co_return;
+            }
+            self->plugin_ech_config_ = std::move(ech.value());
+        }
+        co_return;
+    }
+
+    // Dials the server through the dialer_proxy chain, delivering a ready
+    // StreamHandle. The trace carries our own ID so chain cycles fail fast.
+    // NOTE: named function per the coroutine creation rules; never an
+    // immediately-invoked capturing lambda.
+    static exec::task<void>
+    dial_chained_transport(std::shared_ptr<ShadowsocksConnectOperation> self) {
+        const auto fail = [self](core::Error error) {
+            self->finish(core::StreamOpenResult::failed(std::move(error)));
+        };
+        if (!self->chain_registry_) {
+            fail({core::ErrorCode::configuration,
+                  "Shadowsocks dialer-proxy requires a chain registry",
+                  {}});
+            co_return;
+        }
+        const auto trace =
+            transport::extend_endpoint_trace(self->request_.dial_trace, self->config_.id);
+        if (!trace) {
+            fail(trace.error());
+            co_return;
+        }
+        const transport::EndpointDialRequirements requirements{true, false};
+        const auto plan = transport::EndpointDialPlan::from_registry(
+            self->chain_registry_, self->config_.dialer_proxy, requirements);
+        if (!plan) {
+            fail(plan.error());
+            co_return;
+        }
+        boost::system::error_code ignored;
+        const auto numeric = boost::asio::ip::make_address(self->config_.server_host, ignored);
+        core::Destination destination =
+            ignored
+                ? core::Destination::domain(self->config_.server_host, self->config_.server_port)
+                : core::Destination::address(numeric, self->config_.server_port);
+        core::StreamRequest chained_request{std::move(destination), std::nullopt, trace.value()};
+        core::Result<std::unique_ptr<io::StreamHandle>> opened;
+        try {
+            opened = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
+                [self, plan = std::move(plan.value()),
+                 chained_request = std::move(chained_request)](
+                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                        done) mutable {
+                    transport::EndpointDialer dialer(self->runtime_.serialized_executor(),
+                                                     std::move(plan));
+                    async::start_with_receiver(dialer.connect_stream(std::move(chained_request)),
+                                               ChainedDialReceiver{std::move(done)});
+                    return [self] { self->abort(); };
+                });
+        } catch (...) {
+            fail({core::ErrorCode::transport_io, "Shadowsocks chained dial failed", {}});
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        if (!opened) {
+            fail(opened.error());
+            co_return;
+        }
+        self->chained_transport_ = std::move(opened.value());
+    }
+
     static exec::task<void>
     connect_tcp(std::shared_ptr<ShadowsocksConnectOperation> self,
                 std::shared_ptr<std::vector<boost::asio::ip::tcp::endpoint>> endpoints) {
@@ -845,19 +994,7 @@ class ShadowsocksConnectOperation final
             if (self->completed_) {
                 co_return;
             }
-            if (self->shadow_tls_plugin()) {
-                co_await open_shadow_tls(self);
-                co_return;
-            }
-            if (self->restls_plugin()) {
-                co_await open_restls(self);
-                co_return;
-            }
-            if (self->jls_plugin()) {
-                co_await open_jls(self);
-                co_return;
-            }
-            co_await send_initial_request(self);
+            co_await dispatch_connected(self);
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
                 {core::ErrorCode::transport_io, "Shadowsocks connect chain failed"}));
@@ -916,6 +1053,24 @@ class ShadowsocksConnectOperation final
             return core::fail({core::ErrorCode::configuration,
                                "Shadowsocks kcptun does not use WebSocket plugin options",
                                {}});
+        }
+        if (!config_.dialer_proxy.empty()) {
+            if (config_.plugin == "kcptun") {
+                return core::fail({core::ErrorCode::unsupported,
+                                   "Shadowsocks dialer-proxy cannot chain kcptun carriers",
+                                   {}});
+            }
+            if (config_.plugin_mux) {
+                return core::fail({core::ErrorCode::unsupported,
+                                   "Shadowsocks dialer-proxy cannot chain multiplexed plugin "
+                                   "carriers",
+                                   {}});
+            }
+            if (config_.plugin == "obfs") {
+                return core::fail({core::ErrorCode::unsupported,
+                                   "Shadowsocks dialer-proxy cannot chain simple-obfs carriers",
+                                   {}});
+            }
         }
         if (config_.plugin == "shadow-tls") {
             if (!config_.plugin_mode.empty() || !config_.plugin_path.empty() ||
@@ -1029,6 +1184,16 @@ class ShadowsocksConnectOperation final
 
     bool jls_plugin() const noexcept { return config_.plugin == "jls"; }
 
+    // Returns the connected transport: the chained StreamHandle when
+    // dialer_proxy is set, otherwise the directly connected socket wrapped
+    // for the plugin carriers.
+    std::unique_ptr<io::StreamHandle> take_connected_stream() {
+        if (chained_transport_) {
+            return std::move(chained_transport_);
+        }
+        return std::make_unique<net::TcpStream>(std::move(*socket_));
+    }
+
     ss::WebSocketPluginOptions websocket_options() const {
         ss::WebSocketPluginOptions options;
         options.host = config_.plugin_host.empty() ? "bing.com" : config_.plugin_host;
@@ -1051,8 +1216,8 @@ class ShadowsocksConnectOperation final
     }
 
     static exec::task<void> open_shadow_tls(std::shared_ptr<ShadowsocksConnectOperation> self) {
-        auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
-            std::make_unique<net::TcpStream>(std::move(*self->socket_)));
+        auto stream =
+            std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         transport::proxy::ShadowTlsClientOptions options;
         options.version = self->config_.plugin_version;
         options.password = self->config_.plugin_password;
@@ -1093,8 +1258,8 @@ class ShadowsocksConnectOperation final
     }
 
     static exec::task<void> open_restls(std::shared_ptr<ShadowsocksConnectOperation> self) {
-        auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
-            std::make_unique<net::TcpStream>(std::move(*self->socket_)));
+        auto stream =
+            std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         transport::proxy::RestlsClientOptions options;
         options.server_name = self->config_.plugin_host;
         options.password = self->config_.plugin_password;
@@ -1132,8 +1297,8 @@ class ShadowsocksConnectOperation final
     }
 
     static exec::task<void> open_jls(std::shared_ptr<ShadowsocksConnectOperation> self) {
-        auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
-            std::make_unique<net::TcpStream>(std::move(*self->socket_)));
+        auto stream =
+            std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         transport::proxy::JlsClientOptions options;
         options.server_name = self->config_.plugin_host;
         options.username = self->config_.plugin_username;
@@ -1333,8 +1498,8 @@ class ShadowsocksConnectOperation final
     static exec::task<void>
     open_websocket_classic(std::shared_ptr<ShadowsocksConnectOperation> self,
                            std::vector<std::uint8_t> wire, std::vector<std::uint8_t> key) {
-        auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
-            std::make_unique<net::TcpStream>(std::move(*self->socket_)));
+        auto stream =
+            std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         core::Result<std::unique_ptr<io::StreamHandle>> plugin;
         try {
             plugin = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
@@ -1385,8 +1550,8 @@ class ShadowsocksConnectOperation final
 
     static exec::task<void> open_websocket_2022(std::shared_ptr<ShadowsocksConnectOperation> self,
                                                 std::vector<std::uint8_t> destination) {
-        auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
-            std::make_unique<net::TcpStream>(std::move(*self->socket_)));
+        auto stream =
+            std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         core::Result<std::unique_ptr<io::StreamHandle>> plugin;
         try {
             plugin = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
@@ -1565,8 +1730,8 @@ class ShadowsocksConnectOperation final
                           transport::proxy::LegacyStreamCipher write_cipher) {
         auto cipher =
             std::make_shared<transport::proxy::LegacyStreamCipher>(std::move(write_cipher));
-        auto stream = std::make_shared<std::unique_ptr<net::TcpStream>>(
-            std::make_unique<net::TcpStream>(std::move(*self->socket_)));
+        auto stream =
+            std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         core::Result<std::unique_ptr<io::StreamHandle>> plugin;
         try {
             plugin = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
@@ -1670,12 +1835,16 @@ class ShadowsocksConnectOperation final
 
     runtime::AsioRuntime &runtime_;
     std::shared_ptr<dns::ResolverService> resolver_;
+    OutboundRegistry::Snapshot chain_registry_;
     std::shared_ptr<ss::KcptunClientPool> kcptun_pool_;
     std::shared_ptr<ss::WebSocketPluginMuxPool> websocket_mux_pool_;
     ShadowsocksOutboundConfig config_;
     core::StreamRequest request_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
     std::shared_ptr<ss::StreamCarrier> carrier_;
+    // Chained transport when dialer_proxy is set: the chain delivers a
+    // ready StreamHandle instead of a raw socket.
+    std::unique_ptr<io::StreamHandle> chained_transport_;
     // ECH config bytes resolved once per connect for the WebSocket plugin
     // TLS layer; injected into every plugin open via websocket_options().
     std::optional<std::vector<std::uint8_t>> plugin_ech_config_;
@@ -2118,17 +2287,19 @@ io::AnySender<core::StreamOpenResult>
 ShadowsocksOutbound::connect_stream(core::StreamRequest request) {
     auto &runtime = runtime_;
     auto resolver = resolver_;
+    auto chain_registry = chain_registry_;
     auto kcptun_pool = kcptun_pool_;
     auto websocket_mux_pool = websocket_mux_pool_;
     auto config = config_;
     return async::bridge_sender<core::StreamOpenResult>(
-        [&runtime, resolver = std::move(resolver), kcptun_pool = std::move(kcptun_pool),
-         websocket_mux_pool = std::move(websocket_mux_pool), config = std::move(config),
-         request = std::move(request)](
+        [&runtime, resolver = std::move(resolver), chain_registry = std::move(chain_registry),
+         kcptun_pool = std::move(kcptun_pool), websocket_mux_pool = std::move(websocket_mux_pool),
+         config = std::move(config), request = std::move(request)](
             async::BridgeSender<core::StreamOpenResult>::Handler terminal) mutable {
             auto operation = std::make_shared<ShadowsocksConnectOperation>(
-                runtime, std::move(resolver), std::move(kcptun_pool), std::move(websocket_mux_pool),
-                std::move(config), std::move(request), std::move(terminal));
+                runtime, std::move(resolver), std::move(chain_registry), std::move(kcptun_pool),
+                std::move(websocket_mux_pool), std::move(config), std::move(request),
+                std::move(terminal));
             operation->start();
             return [operation] { operation->abort(); };
         });
@@ -2151,7 +2322,7 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
     // itself may die before the open completes.
     return async::bridge_sender<
         core::DatagramOpenResult>([runtime = &runtime_, resolver = resolver_,
-                                   kcptun_pool = kcptun_pool_,
+                                   chain_registry = chain_registry_, kcptun_pool = kcptun_pool_,
                                    websocket_mux_pool = websocket_mux_pool_, config = config_,
                                    request = std::move(request)](
                                       async::BridgeSender<core::DatagramOpenResult>::Handler
@@ -2163,7 +2334,7 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
             core::StreamRequest stream_request{core::Destination::domain(std::string(magic), 0),
                                                std::nullopt, request.dial_trace};
             auto operation = std::make_shared<ShadowsocksConnectOperation>(
-                *runtime, resolver, kcptun_pool, websocket_mux_pool, config,
+                *runtime, resolver, chain_registry, kcptun_pool, websocket_mux_pool, config,
                 std::move(stream_request),
                 [handler = std::move(handler), initial_destination = request.initial_destination,
                  version,
