@@ -2595,3 +2595,12 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   TestShadowsocksWebSocketPluginTLSOptions interop cases against a real
   Shadowsocks-over-WebSocket peer; Trojan group re-green after the
   tls_client change.
+
+## 2026-09-26
+
+- Shadowsocks-over-plugin UDP verification: plugin carriers only wrap
+  TCP while native UDP stays direct (matching Mihomo). Enabled UDP on
+  the shadow-tls/restls/jls interop listeners and appended UDP
+  associates to the simple-obfs, shadow-tls v1/v2/v3, restls tls12/tls13,
+  and jls client cases. All pass; an isolated shadow-tls-v3 group-run
+  failure re-passed solo (public-dest load flake, unrelated).

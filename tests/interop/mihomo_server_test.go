@@ -156,6 +156,7 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
     type: shadowsocks
     listen: %s
     port: %s
+    udp: true
     password: '%s'
     cipher: chacha20-ietf-poly1305
 `, version, udpHost, port, mihomoTestPassword)
@@ -197,6 +198,7 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
     type: shadowsocks
     listen: %s
     port: %s
+    udp: true
     password: '%s'
     cipher: chacha20-ietf-poly1305
     res-tls:
@@ -217,6 +219,7 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
     type: shadowsocks
     listen: %s
     port: %s
+    udp: true
     password: '%s'
     cipher: chacha20-ietf-poly1305
     jls-config:
@@ -563,6 +566,13 @@ listeners:%s
 		if string(echoed) != string(payload) {
 			t.Fatal("Mihomo Shadowsocks HTTP obfs returned different bytes")
 		}
+
+		udpPayload := make([]byte, mihomoInteropUDPPayloadSize)
+		for index := range udpPayload {
+			udpPayload[index] = byte(index % 251)
+		}
+		testShadowsocksUDPAssociateWithPayload(t, proxyAddress,
+			udpEcho.Addr().String(), udpEcho.Addr().IP, udpPayload)
 	})
 
 	t.Run("Shadowsocks/simple-obfs-tls", func(t *testing.T) {
@@ -592,6 +602,13 @@ listeners:%s
 		if string(echoed) != string(payload) {
 			t.Fatal("Mihomo Shadowsocks TLS obfs returned different bytes")
 		}
+
+		udpPayload := make([]byte, mihomoInteropUDPPayloadSize)
+		for index := range udpPayload {
+			udpPayload[index] = byte(index % 251)
+		}
+		testShadowsocksUDPAssociateWithPayload(t, proxyAddress,
+			udpEcho.Addr().String(), udpEcho.Addr().IP, udpPayload)
 	})
 
 	for _, version := range []int{1, 2, 3} {
@@ -631,6 +648,13 @@ listeners:%s
 			if string(echoed) != string(payload) {
 				t.Fatalf("Mihomo Shadow-TLS v%d returned different bytes", version)
 			}
+
+			udpPayload := make([]byte, mihomoInteropUDPPayloadSize)
+			for index := range udpPayload {
+				udpPayload[index] = byte(index % 251)
+			}
+			testShadowsocksUDPAssociateWithPayload(t, proxyAddress,
+				udpEcho.Addr().String(), udpEcho.Addr().IP, udpPayload)
 		})
 	}
 
@@ -664,6 +688,13 @@ listeners:%s
 		if string(echoed) != string(payload) {
 			t.Fatal("Mihomo ResTLS returned different bytes")
 		}
+
+		udpPayload := make([]byte, mihomoInteropUDPPayloadSize)
+		for index := range udpPayload {
+			udpPayload[index] = byte(index % 251)
+		}
+		testShadowsocksUDPAssociateWithPayload(t, proxyAddress,
+			udpEcho.Addr().String(), udpEcho.Addr().IP, udpPayload)
 	})
 
 	t.Run("Shadowsocks/restls-tls13", func(t *testing.T) {
@@ -696,6 +727,13 @@ listeners:%s
 		if string(echoed) != string(payload) {
 			t.Fatal("Mihomo ResTLS TLS 1.3 returned different bytes")
 		}
+
+		udpPayload := make([]byte, mihomoInteropUDPPayloadSize)
+		for index := range udpPayload {
+			udpPayload[index] = byte(index % 251)
+		}
+		testShadowsocksUDPAssociateWithPayload(t, proxyAddress,
+			udpEcho.Addr().String(), udpEcho.Addr().IP, udpPayload)
 	})
 
 	t.Run("Shadowsocks/jls", func(t *testing.T) {
@@ -726,6 +764,13 @@ listeners:%s
 		if string(echoed) != string(payload) {
 			t.Fatal("Mihomo JLS returned different bytes")
 		}
+
+		udpPayload := make([]byte, mihomoInteropUDPPayloadSize)
+		for index := range udpPayload {
+			udpPayload[index] = byte(index % 251)
+		}
+		testShadowsocksUDPAssociateWithPayload(t, proxyAddress,
+			udpEcho.Addr().String(), udpEcho.Addr().IP, udpPayload)
 	})
 
 	t.Run("Trojan/TLS", func(t *testing.T) {
