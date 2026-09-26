@@ -2619,3 +2619,20 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   chains).
 - Tests: 316 passed (chain validation cases); Shadowsocks/via-trojan
   and dialer-proxy-cycle interop green; SS/WS/Trojan groups re-green.
+
+## 2026-09-26
+
+- dialer-proxy phase 2 (Trojan TCP plus both-side UDP): trojan chains
+  its TCP through the registry like Shadowsocks; native SS UDP opens
+  through the chain with the cipher session layered on the chain
+  DatagramHandle (legacy stream ciphers rejected as socket-bound).
+  Trojan UDP rides the chained TCP associate for free. Shared
+  ChainedStream/ChainedDatagram receivers hoisted to endpoint_dialer.
+- Fixed chained-UDP sender filter: relays report the ultimate sender,
+  not the SS server; AEAD still authenticates every packet.
+- Tests: 318 passed; new Trojan/via-ss, SS/UDP-via-trojan,
+  Trojan/UDP-via-ss interop green; SS/WS/Trojan groups re-green except
+  the documented environmental shadow-tls-v3-public failure.
+- Added Shadowsocks/shadow-tls-v3-local (fixture echo) as the
+  deterministic v3 gate; recorded the public-dest Chrome-TLS1.3
+  rejection in known-issues.md with the bisection evidence.

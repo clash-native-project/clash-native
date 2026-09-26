@@ -187,6 +187,28 @@ func TestMihomoActualServerInteroperability(t *testing.T) {
 `, shadowTlsPassword)
 		}
 	}
+	shadowTlsV3LocalAddress := reserveMihomoShadowsocksAddressOnHost(t, udpHost)
+	_, shadowTlsV3LocalPort, err := net.SplitHostPort(shadowTlsV3LocalAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(&listenerConfig, `
+  - name: test-shadowsocks-shadow-tls-v3-local
+    type: shadowsocks
+    listen: %s
+    port: %s
+    udp: true
+    password: '%s'
+    cipher: chacha20-ietf-poly1305
+    shadow-tls:
+      enable: true
+      version: 3
+      users:
+        - name: test
+          password: '%s'
+      handshake:
+        dest: %s
+`, udpHost, shadowTlsV3LocalPort, mihomoTestPassword, shadowTlsPassword, tlsChainEcho.Addr())
 	const restlsPassword = "clash-native-restls-password"
 	restlsAddress := reserveMihomoShadowsocksAddressOnHost(t, udpHost)
 	_, restlsPort, err := net.SplitHostPort(restlsAddress)
@@ -491,6 +513,7 @@ listeners:%s
 	for _, address := range shadowTlsAddresses {
 		listenerAddresses = append(listenerAddresses, address)
 	}
+	listenerAddresses = append(listenerAddresses, shadowTlsV3LocalAddress)
 	listenerAddresses = append(listenerAddresses, restlsAddress)
 	listenerAddresses = append(listenerAddresses, jlsAddress)
 	listenerAddresses = append(listenerAddresses, trojanShadowTLSLocalAddress)
@@ -657,6 +680,34 @@ listeners:%s
 				udpEcho.Addr().String(), udpEcho.Addr().IP, udpPayload)
 		})
 	}
+
+	t.Run("Shadowsocks/shadow-tls-v3-local", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":                         "shadowsocks",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":                  shadowTlsV3LocalAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":                mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_METHOD":                  "chacha20-ietf-poly1305",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN":                  "shadow-tls",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_HOST":             "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_VERSION":          "3",
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_PASSWORD":         shadowTlsPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_SKIP_CERT_VERIFY": "1",
+			"CLASH_NATIVE_TEST_PROXY_HOST":                       udpHost,
+		})
+		defer stopProxy()
+
+		// Local v3 coverage: the handshake terminates at the fixture echo
+		// instead of a public destination.
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-shadow-tls-v3-local-", 2048))
+		writeBytes(t, client, payload)
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Mihomo Shadow-TLS v3 local returned different bytes")
+		}
+	})
 
 	t.Run("Shadowsocks/restls-tls12", func(t *testing.T) {
 		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
@@ -834,6 +885,85 @@ listeners:%s
 		if code := readSocks5ReplyCode(t, control); code == 0 {
 			t.Fatal("C++ outbound accepted a dialer-proxy cycle")
 		}
+	})
+
+	t.Run("Trojan/via-ss", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":              "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":       trojanAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":     mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":  "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":      caPath,
+			"CLASH_NATIVE_TEST_OUTBOUND_DIALER_PROXY": "chain-target",
+			"CLASH_NATIVE_TEST_CHAIN_KIND":            "shadowsocks",
+			"CLASH_NATIVE_TEST_CHAIN_SERVER":          shadowsocksAddresses["chacha20-ietf-poly1305"],
+			"CLASH_NATIVE_TEST_CHAIN_PASSWORD":        mihomoTestPassword,
+			"CLASH_NATIVE_TEST_CHAIN_METHOD":          "chacha20-ietf-poly1305",
+			"CLASH_NATIVE_TEST_PROXY_HOST":            udpHost,
+		})
+		defer stopProxy()
+
+		client := socks5Connect(t, proxyAddress, tcpEcho.Addr())
+		defer client.Close()
+		payload := []byte(strings.Repeat("cpp-to-mihomo-trojan-via-ss-", 2048))
+		writeBytes(t, client, payload)
+		echoed := make([]byte, len(payload))
+		readBytes(t, client, echoed)
+		if string(echoed) != string(payload) {
+			t.Fatal("Trojan via Shadowsocks returned different bytes")
+		}
+	})
+
+	t.Run("Shadowsocks/udp-via-trojan", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":              "shadowsocks",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":       shadowsocksAddresses["chacha20-ietf-poly1305"],
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":     mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_METHOD":       "chacha20-ietf-poly1305",
+			"CLASH_NATIVE_TEST_OUTBOUND_DIALER_PROXY": "chain-target",
+			"CLASH_NATIVE_TEST_CHAIN_KIND":            "trojan",
+			"CLASH_NATIVE_TEST_CHAIN_SERVER":          trojanAddress,
+			"CLASH_NATIVE_TEST_CHAIN_PASSWORD":        mihomoTestPassword,
+			"CLASH_NATIVE_TEST_CHAIN_SERVER_NAME":     "localhost",
+			"CLASH_NATIVE_TEST_CHAIN_CA_FILE":         caPath,
+			"CLASH_NATIVE_TEST_PROXY_HOST":            udpHost,
+		})
+		defer stopProxy()
+
+		// Native UDP relayed by the chained Trojan tunnel.
+
+		udpPayload := make([]byte, mihomoInteropUDPPayloadSize)
+		for index := range udpPayload {
+			udpPayload[index] = byte(index % 251)
+		}
+		testShadowsocksUDPAssociateWithPayload(t, proxyAddress,
+			udpEcho.Addr().String(), udpEcho.Addr().IP, udpPayload)
+	})
+
+	t.Run("Trojan/udp-via-ss", func(t *testing.T) {
+		proxyAddress, stopProxy := startOutboundTestHost(t, map[string]string{
+			"CLASH_NATIVE_TEST_OUTBOUND":              "trojan",
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER":       trojanAddress,
+			"CLASH_NATIVE_TEST_OUTBOUND_PASSWORD":     mihomoTestPassword,
+			"CLASH_NATIVE_TEST_OUTBOUND_SERVER_NAME":  "localhost",
+			"CLASH_NATIVE_TEST_OUTBOUND_CA_FILE":      caPath,
+			"CLASH_NATIVE_TEST_OUTBOUND_DIALER_PROXY": "chain-target",
+			"CLASH_NATIVE_TEST_CHAIN_KIND":            "shadowsocks",
+			"CLASH_NATIVE_TEST_CHAIN_SERVER":          shadowsocksAddresses["chacha20-ietf-poly1305"],
+			"CLASH_NATIVE_TEST_CHAIN_PASSWORD":        mihomoTestPassword,
+			"CLASH_NATIVE_TEST_CHAIN_METHOD":          "chacha20-ietf-poly1305",
+			"CLASH_NATIVE_TEST_PROXY_HOST":            udpHost,
+		})
+		defer stopProxy()
+
+		// The Trojan UDP associate stream itself travels the chain.
+
+		udpPayload := make([]byte, mihomoInteropUDPPayloadSize)
+		for index := range udpPayload {
+			udpPayload[index] = byte(index % 251)
+		}
+		testShadowsocksUDPAssociateWithPayload(t, proxyAddress,
+			udpEcho.Addr().String(), udpEcho.Addr().IP, udpPayload)
 	})
 
 	t.Run("Trojan/TLS", func(t *testing.T) {

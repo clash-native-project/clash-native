@@ -125,7 +125,7 @@ void build_chain_outbound(
         config.trusted_ca_pem = std::move(ca_pem);
         if (const auto dialer_proxy = environment_value("CLASH_NATIVE_TEST_CHAIN_DIALER_PROXY");
             dialer_proxy && !dialer_proxy->empty()) {
-            throw std::runtime_error("chain trojan dialer-proxy is not supported in tests");
+            config.dialer_proxy = *dialer_proxy;
         }
         auto outbound = std::make_shared<clash_native::outbound::TrojanOutbound>(
             runtime, std::move(config), resolver);
@@ -488,6 +488,8 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_TROJAN_GRPC_PING_INTERVAL")) {
             trojan_config.grpc_ping_interval = std::chrono::seconds(std::stoi(*ping));
         }
+        trojan_config.dialer_proxy =
+            environment_value("CLASH_NATIVE_TEST_OUTBOUND_DIALER_PROXY").value_or("");
         auto outbound = std::make_shared<clash_native::outbound::TrojanOutbound>(
             runtime, std::move(trojan_config), std::move(resolver));
         if (const auto result = outbound->validate(); !result) {
@@ -539,6 +541,11 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
                     selected.value());
             shadowsocks) {
             shadowsocks->set_chain_registry(snapshot);
+        }
+        if (auto trojan =
+                std::dynamic_pointer_cast<clash_native::outbound::TrojanOutbound>(selected.value());
+            trojan) {
+            trojan->set_chain_registry(snapshot);
         }
     }
     return registry;

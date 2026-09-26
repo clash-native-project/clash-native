@@ -182,41 +182,6 @@ fetch_ss_plugin_ech_config(std::shared_ptr<dns::ResolverService> resolver,
     co_return core::Result<std::vector<std::uint8_t>>{std::move(ech.value())};
 }
 
-// Drives a chained stream open into the bridge handler.
-struct ChainedDialReceiver {
-    using receiver_concept = stdexec::receiver_tag;
-    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler handler;
-    void set_value(core::StreamOpenResult result) && noexcept {
-        auto done = std::move(handler);
-        if (result.status == core::OpenStatus::opened && result.handle) {
-            done(core::Result<std::unique_ptr<io::StreamHandle>>{std::move(result.handle)});
-            return;
-        }
-        if (result.error) {
-            done(core::fail(result.error.value()));
-            return;
-        }
-        done(core::fail(
-            core::Error{core::ErrorCode::endpoint_connection, "chained outbound dial failed", {}}));
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto done = std::move(handler);
-        try {
-            std::rethrow_exception(std::move(error));
-        } catch (const core::Error &failure) {
-            done(core::fail(failure));
-        } catch (...) {
-            done(core::fail(core::Error{
-                core::ErrorCode::endpoint_connection, "chained outbound dial failed", {}}));
-        }
-    }
-    void set_stopped() && noexcept {
-        auto done = std::move(handler);
-        done(core::fail(
-            core::Error{core::ErrorCode::cancelled, "chained outbound dial was cancelled", {}}));
-    }
-};
-
 struct CarrierWriteBridge {
     using receiver_concept = stdexec::receiver_tag;
     StreamWriteHandler handler;
@@ -946,7 +911,7 @@ class ShadowsocksConnectOperation final
                     transport::EndpointDialer dialer(self->runtime_.serialized_executor(),
                                                      std::move(plan));
                     async::start_with_receiver(dialer.connect_stream(std::move(chained_request)),
-                                               ChainedDialReceiver{std::move(done)});
+                                               transport::ChainedStreamReceiver{std::move(done)});
                     return [self] { self->abort(); };
                 });
         } catch (...) {
@@ -1863,9 +1828,9 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
                                                io::DatagramAddress)>;
         using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
 
-        State(std::shared_ptr<net::UdpStream> socket, boost::asio::ip::udp::endpoint server,
+        State(std::shared_ptr<io::DatagramHandle> link, boost::asio::ip::udp::endpoint server,
               std::string method, std::string password)
-            : socket(std::move(socket)), server(std::move(server)), method(std::move(method)),
+            : transport_(std::move(link)), server(std::move(server)), method(std::move(method)),
               password(std::move(password)) {
             const auto method_info = transport::proxy::cipher_method(this->method);
             if (method_info && method_info.value().shadowsocks_2022) {
@@ -1880,7 +1845,7 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
             auto address = detail::encode_proxy_address(detail::to_core_destination(target));
             const auto method_info = transport::proxy::cipher_method(method);
             if (!address || !method_info) {
-                boost::asio::post(socket->executor(), [handler = std::move(handler)]() mutable {
+                boost::asio::post(transport_->executor(), [handler = std::move(handler)]() mutable {
                     handler(protocol_error(), 0);
                 });
                 return;
@@ -1891,9 +1856,10 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
                 auto wire = ss2022_codec->encrypt(
                     address.value(), std::span<const std::uint8_t>(payload, payload_size));
                 if (!wire || wire.value().size() > kMaxEncryptedUdpDatagramSize) {
-                    boost::asio::post(socket->executor(), [handler = std::move(handler)]() mutable {
-                        handler(boost::asio::error::message_size, 0);
-                    });
+                    boost::asio::post(transport_->executor(),
+                                      [handler = std::move(handler)]() mutable {
+                                          handler(boost::asio::error::message_size, 0);
+                                      });
                     return;
                 }
                 auto packet = std::make_shared<std::vector<std::uint8_t>>(std::move(wire.value()));
@@ -1904,8 +1870,8 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
                     handler(error, error ? 0 : payload_size);
                 };
                 // NOTE: name the sender first; argument order is unspecified.
-                auto sender = socket->async_send_to(boost::asio::buffer(*packet),
-                                                    io::DatagramAddress::from_endpoint(server));
+                auto sender = transport_->async_send_to(boost::asio::buffer(*packet),
+                                                        io::DatagramAddress::from_endpoint(server));
                 async::start_with_receiver(std::move(sender),
                                            CarrierWriteBridge{std::move(completion)});
                 return;
@@ -1914,7 +1880,7 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
             plaintext.insert(plaintext.end(), payload, payload + payload_size);
             auto encoded = ss::encrypt_aead_datagram(method, password, plaintext);
             if (!encoded || encoded.value().size() > kMaxEncryptedUdpDatagramSize) {
-                boost::asio::post(socket->executor(), [handler = std::move(handler)]() mutable {
+                boost::asio::post(transport_->executor(), [handler = std::move(handler)]() mutable {
                     handler(boost::asio::error::message_size, 0);
                 });
                 return;
@@ -1927,15 +1893,15 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
                 handler(error, error ? 0 : payload_size);
             };
             // NOTE: name the sender first; argument order is unspecified.
-            auto sender = socket->async_send_to(boost::asio::buffer(*wire),
-                                                io::DatagramAddress::from_endpoint(server));
+            auto sender = transport_->async_send_to(boost::asio::buffer(*wire),
+                                                    io::DatagramAddress::from_endpoint(server));
             async::start_with_receiver(std::move(sender),
                                        CarrierWriteBridge{std::move(completion)});
         }
 
         void receive(boost::asio::mutable_buffer buffer, ReadHandler handler) {
             if (receive_in_progress) {
-                boost::asio::post(socket->executor(), [handler = std::move(handler)]() mutable {
+                boost::asio::post(transport_->executor(), [handler = std::move(handler)]() mutable {
                     handler(boost::asio::error::already_started, 0, {});
                 });
                 return;
@@ -1954,15 +1920,19 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
                     self->finish_receive(error, 0, {});
                     return;
                 }
-                if (!sender.is_address() || sender.address() != self->server.address() ||
-                    sender.port() != self->server.port()) {
+                // Chained relays report the ultimate sender rather than the
+                // Shadowsocks server; the chain is point-to-point and the
+                // AEAD layers still authenticate every packet.
+                if (self->filter_server_endpoint &&
+                    (!sender.is_address() || sender.address() != self->server.address() ||
+                     sender.port() != self->server.port())) {
                     self->receive_next();
                     return;
                 }
                 self->decode_response(size);
             };
             // NOTE: name the sender first; argument order is unspecified.
-            auto sender = socket->async_receive_from(boost::asio::buffer(receive_buffer));
+            auto sender = transport_->async_receive_from(boost::asio::buffer(receive_buffer));
             async::start_with_receiver(std::move(sender),
                                        SocketDatagramBridge{std::move(completion)});
         }
@@ -2027,7 +1997,7 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
             }
         }
 
-        void close() noexcept { socket->close(); }
+        void close() noexcept { transport_->close(); }
 
         std::size_t max_datagram_size() const noexcept {
             if (ss2022_codec) {
@@ -2046,8 +2016,11 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
                 kMaxUdpWireSize);
         }
 
-        std::shared_ptr<net::UdpStream> socket;
+        std::shared_ptr<io::DatagramHandle> transport_;
         boost::asio::ip::udp::endpoint server;
+        // Drop packets whose source is not the server. Disabled for chained
+        // transports, which report the ultimate sender instead.
+        bool filter_server_endpoint = true;
         std::string method;
         std::string password;
         std::unique_ptr<ss::Shadowsocks2022DatagramCodec> ss2022_codec;
@@ -2116,7 +2089,9 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
             })};
     }
 
-    boost::asio::any_io_executor executor() noexcept override { return state_->socket->executor(); }
+    boost::asio::any_io_executor executor() noexcept override {
+        return state_->transport_->executor();
+    }
 
     std::size_t max_datagram_size() const noexcept override { return state_->max_datagram_size(); }
 
@@ -2305,6 +2280,136 @@ ShadowsocksOutbound::connect_stream(core::StreamRequest request) {
         });
 }
 
+// Completes a chained native-UDP open by layering the cipher session on
+// the chain's DatagramHandle.
+struct ChainedDatagramOpen {
+    using receiver_concept = stdexec::receiver_tag;
+    async::BridgeSender<core::DatagramOpenResult>::Handler handler;
+    boost::asio::ip::udp::endpoint server;
+    ShadowsocksOutboundConfig config;
+    void set_value(core::DatagramOpenResult result) && noexcept {
+        auto done = std::move(handler);
+        if (result.status != core::OpenStatus::opened || !result.handle) {
+            if (result.error) {
+                done(core::DatagramOpenResult::failed(result.error.value()));
+                return;
+            }
+            done(core::DatagramOpenResult::failed(
+                {core::ErrorCode::endpoint_connection, "chained datagram open failed", {}}));
+            return;
+        }
+        std::shared_ptr<io::DatagramHandle> link{std::move(result.handle)};
+        auto state = std::make_shared<ShadowsocksDatagramHandle::State>(
+            std::move(link), server, config.method, config.password);
+        state->filter_server_endpoint = false;
+        done(core::DatagramOpenResult::opened(
+            std::make_unique<ShadowsocksDatagramHandle>(std::move(state)),
+            core::DatagramSemantics::multi_destination));
+    }
+    void set_error(std::exception_ptr error) && noexcept {
+        auto done = std::move(handler);
+        try {
+            std::rethrow_exception(std::move(error));
+        } catch (const core::Error &failure) {
+            done(core::DatagramOpenResult::failed(failure));
+        } catch (...) {
+            done(core::DatagramOpenResult::failed(
+                {core::ErrorCode::endpoint_connection, "chained datagram open failed", {}}));
+        }
+    }
+    void set_stopped() && noexcept {
+        auto done = std::move(handler);
+        done(core::DatagramOpenResult::failed(
+            {core::ErrorCode::cancelled, "chained datagram open was cancelled", {}}));
+    }
+};
+
+// Opens native UDP through the dialer_proxy chain: the chain delivers a
+// DatagramHandle relaying the server, wrapped in the usual cipher session.
+// Stream-kind (legacy) ciphers stay socket-bound and cannot chain.
+void open_chained_datagram_dial(runtime::AsioRuntime &runtime, transport::EndpointDialPlan plan,
+                                ShadowsocksOutboundConfig config,
+                                std::shared_ptr<const core::EndpointDialTrace> trace,
+                                boost::asio::ip::udp::endpoint server,
+                                async::BridgeSender<core::DatagramOpenResult>::Handler handler) {
+    boost::system::error_code ignored;
+    const auto numeric = boost::asio::ip::make_address(config.server_host, ignored);
+    core::Destination destination =
+        ignored ? core::Destination::domain(config.server_host, config.server_port)
+                : core::Destination::address(numeric, config.server_port);
+    core::DatagramRequest chained_request{std::move(destination), std::move(trace)};
+    transport::EndpointDialer dialer(runtime.serialized_executor(), std::move(plan));
+    auto opener = dialer.open_datagram(std::move(chained_request));
+    async::start_with_receiver(std::move(opener),
+                               ChainedDatagramOpen{std::move(handler), server, std::move(config)});
+}
+
+void open_chained_datagram(runtime::AsioRuntime &runtime,
+                           std::shared_ptr<dns::ResolverService> resolver,
+                           OutboundRegistry::Snapshot registry, ShadowsocksOutboundConfig config,
+                           core::DatagramRequest request,
+                           async::BridgeSender<core::DatagramOpenResult>::Handler handler) {
+    auto fail = [handler](core::Error error) mutable {
+        handler(core::DatagramOpenResult::failed(std::move(error)));
+    };
+    if (!registry) {
+        fail({core::ErrorCode::configuration,
+              "Shadowsocks dialer-proxy requires a chain registry",
+              {}});
+        return;
+    }
+    const auto trace = transport::extend_endpoint_trace(request.dial_trace, config.id);
+    if (!trace) {
+        fail(trace.error());
+        return;
+    }
+    const transport::EndpointDialRequirements requirements{false, true};
+    const auto plan =
+        transport::EndpointDialPlan::from_registry(registry, config.dialer_proxy, requirements);
+    if (!plan) {
+        fail(plan.error());
+        return;
+    }
+    const auto method = transport::proxy::cipher_method(config.method);
+    if (!method) {
+        fail(method.error());
+        return;
+    }
+    if (method.value().kind == transport::proxy::CipherKind::stream) {
+        fail({core::ErrorCode::unsupported,
+              "Shadowsocks dialer-proxy cannot chain legacy stream-cipher UDP",
+              {}});
+        return;
+    }
+    // The server endpoint feeds the sender filter; routing itself stays
+    // with the chain. Numeric literals skip the resolver outright.
+    boost::system::error_code numeric_error;
+    const auto numeric_host = boost::asio::ip::make_address(config.server_host, numeric_error);
+    if (!numeric_error) {
+        open_chained_datagram_dial(
+            runtime, std::move(plan.value()), std::move(config), trace.value(),
+            boost::asio::ip::udp::endpoint(numeric_host, config.server_port), std::move(handler));
+        return;
+    }
+    detail::resolve_host(
+        runtime, resolver, config.server_host,
+        [&runtime, plan = std::move(plan.value()), config = std::move(config),
+         trace = trace.value(),
+         handler = std::move(handler)](core::Result<detail::AddressList> result) mutable {
+            if (!result || result.value().empty()) {
+                handler(core::DatagramOpenResult::failed(
+                    result ? core::Error{core::ErrorCode::resolution,
+                                         "Shadowsocks server hostname resolved to no addresses"}
+                           : result.error()));
+                return;
+            }
+            open_chained_datagram_dial(
+                runtime, std::move(plan), std::move(config), std::move(trace),
+                boost::asio::ip::udp::endpoint(result.value().front(), config.server_port),
+                std::move(handler));
+        });
+}
+
 io::AnySender<core::DatagramOpenResult>
 ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
     using ResultSender = io::AnySender<core::DatagramOpenResult>;
@@ -2320,6 +2425,23 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
     // into a sender. Final core:: handles adapt at the edge; delete with
     // the datagram-handle plane. Only values are captured: the outbound
     // itself may die before the open completes.
+    // Native UDP through the dialer_proxy chain (UDP-over-TCP rides the
+    // chained TCP carrier via the branch below).
+    if (!config_.dialer_proxy.empty() && !config_.udp_over_tcp && config_.plugin != "kcptun") {
+        auto &runtime = runtime_;
+        auto resolver = resolver_;
+        auto chain_registry = chain_registry_;
+        auto config = config_;
+        auto chained_request = request;
+        return async::bridge_sender<core::DatagramOpenResult>(
+            [&runtime, resolver = std::move(resolver), chain_registry = std::move(chain_registry),
+             config = std::move(config), request = std::move(chained_request)](
+                async::BridgeSender<core::DatagramOpenResult>::Handler terminal) mutable {
+                open_chained_datagram(runtime, std::move(resolver), std::move(chain_registry),
+                                      std::move(config), std::move(request), std::move(terminal));
+                return async::BridgeSender<core::DatagramOpenResult>::AbortFn{};
+            });
+    }
     return async::bridge_sender<
         core::DatagramOpenResult>([runtime = &runtime_, resolver = resolver_,
                                    chain_registry = chain_registry_, kcptun_pool = kcptun_pool_,

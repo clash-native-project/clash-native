@@ -210,3 +210,29 @@ implementation change is made as part of this issue record.
 The shared HTTP/3 client session supports buffered and streaming HTTP exchanges, CONNECT, and Extended CONNECT over QUIC. It is used by DoH/3 and has independent Go QUIC interoperability coverage, including concurrent streamed request and response bodies with trailers. This transport support does not make the local proxy listener or the HTTP proxy outbound speak HTTP/3.
 
 The local proxy listener currently accepts HTTP/1.1 over TCP. The HTTP proxy outbound uses HTTP/1.1 over TCP for plaintext endpoints, and negotiates HTTP/2 or HTTP/1.1 over TLS for TLS endpoints. It does not use QUIC or HTTP/3. Consequently, clients cannot connect to this project as an HTTP/3 proxy, and an HTTP/3 upstream proxy cannot currently be selected as an outbound. DoH/3 support is separate from both proxy paths.
+
+## Shadow-TLS v3 against public destinations rejects the Chrome TLS 1.3 hello
+
+- **Status:** Open, environmental; project code exonerated by bisection.
+- **Scope:** `Shadowsocks/shadow-tls-v3` (and any path sending our Chrome
+  TLS 1.3 ClientHello to itunes.apple.com / www.google.com) on the
+  Windows x64 sandbox profile. First seen 2026-09-26.
+- **Evidence chain (all on the same binary):**
+  - v3 against the fixture-local TLS echo passes
+    (`Shadowsocks/shadow-tls-v3-local`).
+  - v3 against public destinations passes with the `firefox`/`safari`
+    hello profiles but fails with `chrome`/`chrome120`.
+  - v1/v2 (TLS 1.2-capped, same profile machinery) pass against the same
+    destinations; Botan TLS 1.3 (restls) passes too.
+  - The failure predates dialer-proxy work: it already appeared in the
+    item-3 group run and re-passed solo once, so it is intermittent,
+    not a deterministic regression.
+- **Suspected cause:** filtering on the sandbox egress path (or the
+  front-ends) against a Chrome-TLS-1.3-specific hello feature
+  (GREASE/shuffle/ECH-grease/ALPS set; post-quantum Kyber share already
+  ruled out by the `chrome120` negative). Our hello bytes are unchanged
+  (JA3 unit pins pass) and Mihomo's own Chrome-shape hello would face
+  the same wall from this network.
+- **Next step:** re-run when the sandbox egress profile changes; do not
+  "fix" the hello to placate one network (that would break camouflage
+  parity everywhere else).

@@ -6,6 +6,7 @@
 #include <clash_native/dns/ech_resolver.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/outbound/trojan_outbound.hpp>
+#include <clash_native/transport/endpoint_dialer.hpp>
 #include <clash_native/transport/http_sessions.hpp>
 #include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/tls_client.hpp>
@@ -268,10 +269,12 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
   public:
     TrojanConnectOperation(runtime::AsioRuntime &runtime,
                            std::shared_ptr<dns::ResolverService> resolver,
-                           TrojanOutboundConfig config, core::StreamRequest request,
-                           core::StreamOpenHandler handler, std::uint8_t command = 0x01,
+                           OutboundRegistry::Snapshot chain_registry, TrojanOutboundConfig config,
+                           core::StreamRequest request, core::StreamOpenHandler handler,
+                           std::uint8_t command = 0x01,
                            std::shared_ptr<transport::proxy::gun::GunClient> gun_pool = nullptr)
-        : runtime_(runtime), resolver_(std::move(resolver)), config_(std::move(config)),
+        : runtime_(runtime), resolver_(std::move(resolver)),
+          chain_registry_(std::move(chain_registry)), config_(std::move(config)),
           request_(std::move(request)), command_(command), gun_pool_(std::move(gun_pool)),
           socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.serialized_executor())),
           timer_(runtime.serialized_executor()), handler_(std::move(handler)) {}
@@ -304,6 +307,12 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                  "Trojan security mode must be shadow-tls, restls, or jls"}));
             return;
         }
+        if (!config_.dialer_proxy.empty() && config_.network == "grpc") {
+            finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::unsupported,
+                 "Trojan dialer-proxy cannot chain pooled gRPC sessions"}));
+            return;
+        }
         deadline_ = std::chrono::steady_clock::now() + kConnectTimeout;
         timer_.expires_at(deadline_);
         timer_.async_wait([self = shared_from_this()](const boost::system::error_code &error) {
@@ -312,6 +321,12 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                     {core::ErrorCode::timeout, "timed out opening Trojan stream"}));
             }
         });
+        // Chained dials skip local resolution: the chain resolves the server.
+        if (!config_.dialer_proxy.empty()) {
+            scope_.spawn(run(shared_from_this(),
+                             std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>()));
+            return;
+        }
         detail::resolve_host(runtime_, resolver_, config_.server_host,
                              [self = shared_from_this()](core::Result<detail::AddressList> result) {
                                  self->resolved(std::move(result));
@@ -385,6 +400,76 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         }
     }
 
+    // Returns the connected transport: the chained StreamHandle when
+    // dialer_proxy is set, otherwise the directly connected socket.
+    std::unique_ptr<io::StreamHandle> take_connected_stream() {
+        if (chained_transport_) {
+            return std::move(chained_transport_);
+        }
+        return std::make_unique<net::TcpStream>(std::move(*socket_));
+    }
+
+    // Dials the server through the dialer_proxy chain, delivering a ready
+    // StreamHandle. The trace carries our own ID so chain cycles fail fast.
+    // NOTE: named function per the coroutine creation rules; never an
+    // immediately-invoked capturing lambda.
+    static exec::task<void> dial_chained_transport(std::shared_ptr<TrojanConnectOperation> self) {
+        const auto fail = [self](core::Error error) {
+            self->finish(core::StreamOpenResult::failed(std::move(error)));
+        };
+        if (!self->chain_registry_) {
+            fail({core::ErrorCode::configuration,
+                  "Trojan dialer-proxy requires a chain registry",
+                  {}});
+            co_return;
+        }
+        const auto trace =
+            transport::extend_endpoint_trace(self->request_.dial_trace, self->config_.id);
+        if (!trace) {
+            fail(trace.error());
+            co_return;
+        }
+        const transport::EndpointDialRequirements requirements{true, false};
+        const auto plan = transport::EndpointDialPlan::from_registry(
+            self->chain_registry_, self->config_.dialer_proxy, requirements);
+        if (!plan) {
+            fail(plan.error());
+            co_return;
+        }
+        boost::system::error_code ignored;
+        const auto numeric = boost::asio::ip::make_address(self->config_.server_host, ignored);
+        core::Destination destination =
+            ignored
+                ? core::Destination::domain(self->config_.server_host, self->config_.server_port)
+                : core::Destination::address(numeric, self->config_.server_port);
+        core::StreamRequest chained_request{std::move(destination), std::nullopt, trace.value()};
+        core::Result<std::unique_ptr<io::StreamHandle>> opened;
+        try {
+            opened = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
+                [self, plan = std::move(plan.value()),
+                 chained_request = std::move(chained_request)](
+                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                        done) mutable {
+                    transport::EndpointDialer dialer(self->runtime_.serialized_executor(),
+                                                     std::move(plan));
+                    async::start_with_receiver(dialer.connect_stream(std::move(chained_request)),
+                                               transport::ChainedStreamReceiver{std::move(done)});
+                    return [self] { self->abort(); };
+                });
+        } catch (...) {
+            fail({core::ErrorCode::transport_io, "Trojan chained dial failed", {}});
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        if (!opened) {
+            fail(opened.error());
+            co_return;
+        }
+        self->chained_transport_ = std::move(opened.value());
+    }
+
     // Straight-line connect chain: TCP connect, TLS or WebSocket transport,
     // Trojan request write. Every terminal funnels through finish(), so the
     // spawned task always ends with a value.
@@ -394,8 +479,14 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         // gRPC dials its own pooled sessions; the direct TCP connect below
         // only serves the tcp/ws/wss transports.
         const bool direct_connect = self->config_.network != "grpc";
+        const bool chained = !self->config_.dialer_proxy.empty();
         try {
-            if (direct_connect) {
+            if (chained) {
+                co_await dial_chained_transport(self);
+                if (self->completed_ || !self->chained_transport_) {
+                    co_return;
+                }
+            } else if (direct_connect) {
                 try {
                     co_await (boost::asio::async_connect(*self->socket_, *endpoints,
                                                          exec::asio::use_sender) |
@@ -508,8 +599,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                     ws_options.initial_payload = std::move(header.value());
                     header_sent = true;
                 }
-                std::unique_ptr<io::StreamHandle> ws_base =
-                    std::make_unique<net::TcpStream>(std::move(*self->socket_));
+                std::unique_ptr<io::StreamHandle> ws_base = self->take_connected_stream();
                 self->socket_.reset();
                 if (overlayed) {
                     auto overlay = co_await open_security_overlay(self, std::move(ws_base));
@@ -586,7 +676,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                     tls_options.ech_config_list = std::move(ech.value());
                 }
                 tls_options.deadline = self->deadline_;
-                auto plain_stream = std::make_unique<net::TcpStream>(std::move(*self->socket_));
+                auto plain_stream = self->take_connected_stream();
                 self->socket_.reset();
                 std::unique_ptr<io::StreamHandle> camouflaged = std::move(plain_stream);
                 // The camouflage layers carry their own TLS handshake and
@@ -735,11 +825,15 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
 
     runtime::AsioRuntime &runtime_;
     std::shared_ptr<dns::ResolverService> resolver_;
+    OutboundRegistry::Snapshot chain_registry_;
     TrojanOutboundConfig config_;
     core::StreamRequest request_;
     std::uint8_t command_ = 0x01;
     std::shared_ptr<transport::proxy::gun::GunClient> gun_pool_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
+    // Chained transport when dialer_proxy is set: the chain delivers a
+    // ready StreamHandle instead of a raw socket.
+    std::unique_ptr<io::StreamHandle> chained_transport_;
     std::unique_ptr<io::StreamHandle> transport_stream_;
     boost::asio::steady_timer timer_;
     core::StreamOpenHandler handler_;
@@ -825,15 +919,16 @@ core::OutboundCapabilities TrojanOutbound::capabilities() const noexcept { retur
 io::AnySender<core::StreamOpenResult> TrojanOutbound::connect_stream(core::StreamRequest request) {
     auto &runtime = runtime_;
     auto resolver = resolver_;
+    auto chain_registry = chain_registry_;
     auto config = config_;
     auto gun_pool = gun_pool_;
     return async::bridge_sender<core::StreamOpenResult>(
-        [&runtime, resolver = std::move(resolver), config = std::move(config),
-         gun_pool = std::move(gun_pool), request = std::move(request)](
+        [&runtime, resolver = std::move(resolver), chain_registry = std::move(chain_registry),
+         config = std::move(config), gun_pool = std::move(gun_pool), request = std::move(request)](
             async::BridgeSender<core::StreamOpenResult>::Handler terminal) mutable {
             auto operation = std::make_shared<TrojanConnectOperation>(
-                runtime, std::move(resolver), std::move(config), std::move(request),
-                std::move(terminal), 0x01, std::move(gun_pool));
+                runtime, std::move(resolver), std::move(chain_registry), std::move(config),
+                std::move(request), std::move(terminal), 0x01, std::move(gun_pool));
             operation->start();
             return [operation] { operation->abort(); };
         });
@@ -848,11 +943,12 @@ TrojanOutbound::open_datagram(core::DatagramRequest request) {
     }
     auto &runtime = runtime_;
     auto resolver = resolver_;
+    auto chain_registry = chain_registry_;
     auto config = config_;
     auto gun_pool = gun_pool_;
     return async::bridge_sender<core::DatagramOpenResult>(
-        [&runtime, resolver = std::move(resolver), config = std::move(config),
-         gun_pool = std::move(gun_pool), request = std::move(request)](
+        [&runtime, resolver = std::move(resolver), chain_registry = std::move(chain_registry),
+         config = std::move(config), gun_pool = std::move(gun_pool), request = std::move(request)](
             async::BridgeSender<core::DatagramOpenResult>::Handler terminal) mutable {
             auto handler = std::move(terminal);
             if (!request.initial_destination) {
@@ -866,7 +962,8 @@ TrojanOutbound::open_datagram(core::DatagramRequest request) {
             // NOTE: no SS wrap here: the shared connect path already layers
             // Shadowsocks before the trojan header for every command.
             auto operation = std::make_shared<TrojanConnectOperation>(
-                runtime, std::move(resolver), std::move(config), std::move(stream_request),
+                runtime, std::move(resolver), std::move(chain_registry), std::move(config),
+                std::move(stream_request),
                 [handler = std::move(handler)](core::StreamOpenResult result) mutable {
                     if (!result.succeeded()) {
                         handler(core::DatagramOpenResult::failed(result.error.value_or(

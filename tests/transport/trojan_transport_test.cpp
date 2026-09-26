@@ -387,6 +387,48 @@ TEST(TrojanOutboundConfigTest, GrpcDialFailurePropagatesWithoutHanging) {
     EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::endpoint_connection);
 }
 
+TEST(TrojanOutboundTest, DialerProxyRejectsPooledGrpc) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    clash_native::outbound::TrojanOutboundConfig config;
+    config.id = "test-trojan-chain-grpc";
+    config.server_host = "127.0.0.1";
+    config.server_port = 443;
+    config.password = "password";
+    config.network = "grpc";
+    config.dialer_proxy = "chain-target";
+    clash_native::outbound::TrojanOutbound outbound(runtime, std::move(config), nullptr);
+
+    auto wait = stdexec::sync_wait(outbound.connect_stream(
+        {clash_native::core::Destination::domain("example.test", 443), std::nullopt}));
+    ASSERT_TRUE(wait.has_value());
+    const auto result = std::move(std::get<0>(*wait));
+    EXPECT_EQ(result.status, clash_native::core::OpenStatus::failed);
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::unsupported);
+}
+
+TEST(TrojanOutboundTest, DialerProxyWithoutRegistryFailsFast) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    clash_native::outbound::TrojanOutboundConfig config;
+    config.id = "test-trojan-chain-noregistry";
+    config.server_host = "127.0.0.1";
+    config.server_port = 443;
+    config.password = "password";
+    config.dialer_proxy = "chain-target";
+    // The runtime loop must turn: the failure surfaces after the chained
+    // dial attempt, not synchronously in validation.
+    runtime.start();
+    clash_native::outbound::TrojanOutbound outbound(runtime, std::move(config), nullptr);
+
+    auto wait = stdexec::sync_wait(outbound.connect_stream(
+        {clash_native::core::Destination::domain("example.test", 443), std::nullopt}));
+    ASSERT_TRUE(wait.has_value());
+    const auto result = std::move(std::get<0>(*wait));
+    EXPECT_EQ(result.status, clash_native::core::OpenStatus::failed);
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::configuration);
+}
+
 TEST(TrojanOutboundTest, DisabledUdpFailsDatagramOpen) {
     auto &runtime = clash_native::runtime::AsioRuntime::instance();
     clash_native::outbound::TrojanOutboundConfig config;

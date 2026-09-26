@@ -3,6 +3,7 @@
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/dns/resolver_service.hpp>
 #include <clash_native/io/exchange_session.hpp>
+#include <clash_native/outbound/outbound_registry.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 #include <clash_native/transport/proxy/gun_client.hpp>
 #include <clash_native/transport/proxy/jls_client.hpp>
@@ -88,6 +89,10 @@ struct TrojanOutboundConfig {
     int grpc_max_connections = 0;
     int grpc_min_streams = 0;
     int grpc_max_streams = 0;
+    // Optional chained outbound (registry ID or group) carrying the TCP
+    // connection to the server (Mihomo dialer-proxy). Empty disables.
+    // gRPC pools open their own sessions and cannot chain.
+    std::string dialer_proxy;
 };
 
 class TrojanOutbound final : public core::Outbound {
@@ -101,10 +106,17 @@ class TrojanOutbound final : public core::Outbound {
     io::AnySender<core::StreamOpenResult> connect_stream(core::StreamRequest request) override;
     io::AnySender<core::DatagramOpenResult> open_datagram(core::DatagramRequest request) override;
 
+    // Registry snapshot resolving dialer_proxy chain targets. Set after all
+    // outbounds are registered; chaining stays disabled without it.
+    void set_chain_registry(OutboundRegistry::Snapshot registry) {
+        chain_registry_ = std::move(registry);
+    }
+
   private:
     runtime::AsioRuntime &runtime_;
     TrojanOutboundConfig config_;
     std::shared_ptr<dns::ResolverService> resolver_;
+    OutboundRegistry::Snapshot chain_registry_;
     std::shared_ptr<transport::proxy::gun::GunClient> gun_pool_;
     core::OutboundDescriptor descriptor_;
     core::OutboundCapabilities capabilities_{true, core::DatagramSemantics::multi_destination,
