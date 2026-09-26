@@ -1740,6 +1740,79 @@ TEST(TlsClientTest, CertificatePinRejectsMismatch) {
 
 namespace {
 
+int always_accept_peer_cert(int, X509_STORE_CTX *) { return 1; }
+
+} // namespace
+
+TEST(TlsClientTest, MutualTlsSendsClientCertificate) {
+    using boost::asio::ip::tcp;
+    boost::asio::io_context context;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{
+        context.get_executor()};
+    std::thread runner([&] { context.run(); });
+
+    tcp::acceptor acceptor(context, tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+    tcp::socket server(context);
+    std::promise<void> accepted;
+    auto accepted_future = accepted.get_future();
+    acceptor.async_accept(server, [&](const boost::system::error_code &error) {
+        EXPECT_FALSE(error);
+        accepted.set_value();
+    });
+
+    tcp::socket peer(context);
+    peer.connect(
+        tcp::endpoint(boost::asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()));
+    ASSERT_EQ(accepted_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto stream = std::make_unique<clash_native::net::TcpStream>(std::move(peer));
+
+    clash_native::transport::TlsClientOptions options;
+    options.verify_peer = false;
+    options.server_name = "localhost";
+    options.client_certificate_pem = std::string(kCertificate);
+    options.client_private_key_pem = std::string(kPrivateKey);
+    options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto sender =
+        clash_native::transport::async_tls_client_handshake(std::move(stream), std::move(options));
+    SuccessReceiver receiver;
+    auto completed = receiver.done.get_future();
+    auto op = stdexec::connect(std::move(sender), std::move(receiver));
+    stdexec::start(op);
+
+    bssl::UniquePtr<SSL_CTX> server_context(SSL_CTX_new(TLS_server_method()));
+    ASSERT_TRUE(server_context);
+    bssl::UniquePtr<BIO> cert_bio(
+        BIO_new_mem_buf(kCertificate.data(), static_cast<int>(kCertificate.size())));
+    bssl::UniquePtr<X509> certificate(PEM_read_bio_X509(cert_bio.get(), nullptr, nullptr, nullptr));
+    bssl::UniquePtr<BIO> key_bio(
+        BIO_new_mem_buf(kPrivateKey.data(), static_cast<int>(kPrivateKey.size())));
+    bssl::UniquePtr<EVP_PKEY> private_key(
+        PEM_read_bio_PrivateKey(key_bio.get(), nullptr, nullptr, nullptr));
+    ASSERT_TRUE(certificate);
+    ASSERT_TRUE(private_key);
+    ASSERT_EQ(SSL_CTX_use_certificate(server_context.get(), certificate.get()), 1);
+    ASSERT_EQ(SSL_CTX_use_PrivateKey(server_context.get(), private_key.get()), 1);
+    SSL_CTX_set_verify(server_context.get(), SSL_VERIFY_PEER, always_accept_peer_cert);
+    bssl::UniquePtr<SSL> server_ssl(SSL_new(server_context.get()));
+    ASSERT_TRUE(server_ssl);
+    BIO *socket_bio = BIO_new_socket(server.native_handle(), BIO_NOCLOSE);
+    ASSERT_NE(socket_bio, nullptr);
+    SSL_set_bio(server_ssl.get(), socket_bio, socket_bio);
+    EXPECT_EQ(SSL_accept(server_ssl.get()), 1);
+    bssl::UniquePtr<X509> peer_certificate(SSL_get_peer_certificate(server_ssl.get()));
+    EXPECT_TRUE(peer_certificate);
+    server.close();
+
+    ASSERT_TRUE(completed.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    auto established = completed.get();
+    EXPECT_TRUE(established.has_value());
+
+    context.stop();
+    runner.join();
+}
+
+namespace {
+
 struct CapturedFingerprintHello {
     ClientHello hello;
     std::vector<std::uint8_t> record;

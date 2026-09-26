@@ -21,6 +21,18 @@ struct WebSocketPluginOptions {
     std::string path = "/";
     bool tls = false;
     bool skip_cert_verify = false;
+    // Additional WebSocket handshake headers (Mihomo plugin-opts headers).
+    std::vector<io::ExchangeField> headers;
+    // Server certificate SHA-256 pin (Mihomo plugin-opts fingerprint).
+    std::string certificate_pin;
+    // Hostname verification target override (Mihomo name-cert-verify).
+    std::string name_cert_verify;
+    // Mutual-TLS client identity (Mihomo certificate/private-key). Only
+    // sent when the server requests a client certificate.
+    std::string client_certificate_pem;
+    std::string client_private_key_pem;
+    // Resolved ECH config list bytes (Mihomo ech-opts), empty disables ECH.
+    std::vector<std::uint8_t> ech_config_list;
     bool mux = false;
     WebSocketMuxProtocol mux_protocol = WebSocketMuxProtocol::v2ray;
     std::uint8_t smux_version = 1;

@@ -47,9 +47,27 @@ struct ShadowsocksOutboundConfig {
     std::uint8_t udp_over_tcp_version = 1;
     std::string plugin_password;
     std::string plugin_username;
-    // Server certificate SHA-256 pin for shadow-tls/restls carriers
-    // (Mihomo plugin-opts fingerprint).
+    // Server certificate SHA-256 pin for shadow-tls/restls carriers and
+    // the v2ray-plugin/gost-plugin TLS layer (Mihomo plugin-opts
+    // fingerprint).
     std::string plugin_fingerprint;
+    // Additional WebSocket handshake headers for v2ray-plugin/gost-plugin
+    // (Mihomo plugin-opts headers).
+    std::vector<io::ExchangeField> plugin_headers;
+    // Hostname verification target override for the
+    // v2ray-plugin/gost-plugin TLS layer (Mihomo name-cert-verify).
+    std::string plugin_name_cert_verify;
+    // Mutual-TLS client identity for the v2ray-plugin/gost-plugin TLS
+    // layer (Mihomo certificate/private-key). Only sent when the server
+    // requests a client certificate.
+    std::string plugin_certificate;
+    std::string plugin_private_key;
+    // ECH for the v2ray-plugin/gost-plugin TLS layer (Mihomo ech-opts): a
+    // static base64 ECHConfigList, or an HTTPS-record lookup with an
+    // optional query-server-name override. DNS failure fails closed.
+    bool plugin_ech_enabled = false;
+    std::string plugin_ech_config;
+    std::string plugin_ech_query_server_name;
     // ClientHello camouflage profile for the shadow-tls carrier
     // (Mihomo client-fingerprint).
     std::string plugin_client_fingerprint;

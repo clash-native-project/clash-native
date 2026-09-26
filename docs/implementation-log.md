@@ -2575,3 +2575,23 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   migration and JLS camouflage (both need BoringSSL-TLS/handshake-hook
   work beyond Botan); JLS empty/unknown fingerprints already match
   Mihomo's stdlib fallback (no camouflage either side).
+
+## 2026-09-26
+
+- Shadowsocks v2ray-plugin/gost-plugin TLS parity: custom handshake
+  headers, certificate pin (plugin-opts fingerprint), hostname override
+  (name-cert-verify), mutual-TLS identity, and ECH (static config or
+  fail-closed DNS lookup) now flow from outbound config through the
+  WebSocket plugin to the TLS client, mirroring Mihomo plugin-opts.
+- Fixed a real mTLS bug: the client certificate was loaded onto the
+  SSL_CTX after the SSL object had snapshotted it, so BoringSSL always
+  sent an empty Certificate. Identity is now installed on the SSL
+  handle; covered by a new TlsClientTest unit test.
+- Leaf pins skip hostname checks (verified against Mihomo
+  component/ca/fingerprint.go: only non-leaf matches re-verify with a
+  DNSName); name-verify interop therefore pins the CA.
+- Tests: 313 passed (new validation cases for mTLS pairing,
+  non-plugin option rejection, bad ECH config); 7 new
+  TestShadowsocksWebSocketPluginTLSOptions interop cases against a real
+  Shadowsocks-over-WebSocket peer; Trojan group re-green after the
+  tls_client change.

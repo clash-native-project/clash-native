@@ -814,7 +814,11 @@ class TlsClientHandshakeOperationImpl final
                 configuration_error("TLS client certificate and private key must be set together"));
         }
         if (!options_.client_certificate_pem.empty()) {
-            auto *native_context = context_->native_handle();
+            // NOTE: the SSL object was already created from the context in
+            // the constructor, and BoringSSL snapshots the certificate
+            // store at SSL creation. A context-level use_certificate here
+            // would arrive too late, so configure the SSL handle itself.
+            auto *native_ssl = stream_->stream_->native_handle();
             using BioPtr = std::unique_ptr<BIO, decltype(&BIO_free)>;
             BioPtr cert_bio(
                 BIO_new_mem_buf(options_.client_certificate_pem.data(),
@@ -828,7 +832,7 @@ class TlsClientHandshakeOperationImpl final
             if (!certificate) {
                 return core::fail(configuration_error("TLS client certificate is not valid PEM"));
             }
-            if (SSL_CTX_use_certificate(native_context, certificate.get()) != 1) {
+            if (SSL_use_certificate(native_ssl, certificate.get()) != 1) {
                 return core::fail(
                     configuration_error("failed to configure TLS client certificate"));
             }
@@ -844,11 +848,11 @@ class TlsClientHandshakeOperationImpl final
             if (!private_key) {
                 return core::fail(configuration_error("TLS client private key is not valid PEM"));
             }
-            if (SSL_CTX_use_PrivateKey(native_context, private_key.get()) != 1) {
+            if (SSL_use_PrivateKey(native_ssl, private_key.get()) != 1) {
                 return core::fail(
                     configuration_error("failed to configure TLS client private key"));
             }
-            if (SSL_CTX_check_private_key(native_context) != 1) {
+            if (SSL_check_private_key(native_ssl) != 1) {
                 return core::fail(
                     configuration_error("TLS client private key does not match the certificate"));
             }

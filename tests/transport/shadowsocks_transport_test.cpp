@@ -486,6 +486,79 @@ TEST(ShadowsocksTransportTest, ZeroesJlsHelloAuthenticationFields) {
 
 } // namespace
 
+TEST(ShadowsocksOutboundTest, WebSocketPluginMtlsRequiresBothHalves) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    clash_native::outbound::ShadowsocksOutboundConfig config;
+    config.id = "test-ss-ws-mtls-half";
+    config.server_host = "127.0.0.1";
+    config.server_port = 8388;
+    config.method = "aes-128-gcm";
+    config.password = "password";
+    config.plugin = "v2ray-plugin";
+    config.plugin_mode = "websocket";
+    config.plugin_certificate = "certificate-without-key";
+    clash_native::outbound::ShadowsocksOutbound outbound(runtime, std::move(config), nullptr);
+
+    auto wait = stdexec::sync_wait(outbound.connect_stream(
+        {clash_native::core::Destination::domain("example.test", 443), std::nullopt}));
+    ASSERT_TRUE(wait.has_value());
+    const auto result = std::move(std::get<0>(*wait));
+    EXPECT_EQ(result.status, clash_native::core::OpenStatus::failed);
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::configuration);
+}
+
+TEST(ShadowsocksOutboundTest, WebSocketTlsOptionsRejectedForOtherPlugins) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    clash_native::outbound::ShadowsocksOutboundConfig config;
+    config.id = "test-ss-obfs-headers";
+    config.server_host = "127.0.0.1";
+    config.server_port = 8388;
+    config.method = "aes-128-gcm";
+    config.password = "password";
+    config.plugin = "obfs";
+    config.plugin_mode = "http";
+    config.plugin_host = "bing.com";
+    config.plugin_headers.push_back({"X-Test", "value"});
+    clash_native::outbound::ShadowsocksOutbound outbound(runtime, std::move(config), nullptr);
+
+    auto wait = stdexec::sync_wait(outbound.connect_stream(
+        {clash_native::core::Destination::domain("example.test", 443), std::nullopt}));
+    ASSERT_TRUE(wait.has_value());
+    const auto result = std::move(std::get<0>(*wait));
+    EXPECT_EQ(result.status, clash_native::core::OpenStatus::failed);
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::configuration);
+}
+
+TEST(ShadowsocksOutboundTest, WebSocketPluginEchRejectsInvalidStaticConfig) {
+    auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    clash_native::outbound::ShadowsocksOutboundConfig config;
+    config.id = "test-ss-ws-ech-bad";
+    config.server_host = "127.0.0.1";
+    config.server_port = 8388;
+    config.method = "aes-128-gcm";
+    config.password = "password";
+    config.plugin = "v2ray-plugin";
+    config.plugin_mode = "websocket";
+    config.plugin_tls = true;
+    config.plugin_ech_enabled = true;
+    config.plugin_ech_config = "not-valid-base64!!!";
+    // The static ECH config is only checked after the (numeric, resolver-free)
+    // resolve step, so the runtime loop must be turning for the failure to
+    // surface.
+    runtime.start();
+    clash_native::outbound::ShadowsocksOutbound outbound(runtime, std::move(config), nullptr);
+
+    auto wait = stdexec::sync_wait(outbound.connect_stream(
+        {clash_native::core::Destination::domain("example.test", 443), std::nullopt}));
+    ASSERT_TRUE(wait.has_value());
+    const auto result = std::move(std::get<0>(*wait));
+    EXPECT_EQ(result.status, clash_native::core::OpenStatus::failed);
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->code, clash_native::core::ErrorCode::configuration);
+}
+
 TEST(ShadowsocksOutboundTest, DisabledUdpFailsDatagramOpen) {
     auto &runtime = clash_native::runtime::AsioRuntime::instance();
     clash_native::outbound::ShadowsocksOutboundConfig config;

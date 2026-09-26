@@ -82,9 +82,17 @@ class WebSocketPluginOperation final
                     WebSocketClientOptions options;
                     options.host = self->options_.host;
                     options.target = self->options_.path;
+                    options.headers = self->options_.headers;
                     options.tls = self->options_.tls;
                     options.tls_server_name = self->options_.host;
                     options.tls_verify_peer = !self->options_.skip_cert_verify;
+                    options.tls_verify_hostname = self->options_.name_cert_verify;
+                    options.tls_client_certificate_pem = self->options_.client_certificate_pem;
+                    options.tls_client_private_key_pem = self->options_.client_private_key_pem;
+                    options.tls_certificate_pin = self->options_.certificate_pin;
+                    if (!self->options_.ech_config_list.empty()) {
+                        options.tls_ech_config_list = self->options_.ech_config_list;
+                    }
                     options.tls_alpn_protocols = {"http/1.1"};
                     self->websocket_ = async_websocket_client_handshake(
                         std::move(self->stream_), std::move(options),

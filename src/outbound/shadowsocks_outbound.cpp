@@ -3,6 +3,8 @@
 #include <clash_native/async/bridge.hpp>
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/core/base64.hpp>
+#include <clash_native/dns/ech_resolver.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
@@ -136,6 +138,48 @@ struct SocketDatagramBridge {
         callback(boost::asio::error::operation_aborted, 0, {});
     }
 };
+
+// Resolves ECH configs for the WebSocket plugin TLS layer (Mihomo
+// ech-opts): a static base64 ECHConfigList, or an HTTPS-record lookup
+// with an optional query-server-name override. DNS failure fails closed.
+// NOTE: named function per the coroutine creation rules; never an
+// immediately-invoked capturing lambda.
+exec::task<core::Result<std::vector<std::uint8_t>>>
+fetch_ss_plugin_ech_config(std::shared_ptr<dns::ResolverService> resolver,
+                           const ShadowsocksOutboundConfig &config,
+                           const std::string &server_name) {
+    if (!config.plugin_ech_config.empty()) {
+        const auto decoded = core::base64_decode(config.plugin_ech_config);
+        if (!decoded || decoded->empty()) {
+            co_return core::fail(core::Error{core::ErrorCode::configuration,
+                                             "Shadowsocks plugin ECH config is not valid base64"});
+        }
+        co_return core::Result<std::vector<std::uint8_t>>{
+            std::vector<std::uint8_t>(decoded->begin(), decoded->end())};
+    }
+    if (!resolver) {
+        co_return core::fail(core::Error{core::ErrorCode::configuration,
+                                         "Shadowsocks plugin ECH lookup requires a DNS resolver"});
+    }
+    std::optional<std::string> query_name;
+    if (!config.plugin_ech_query_server_name.empty()) {
+        query_name = config.plugin_ech_query_server_name;
+    }
+    core::Result<std::vector<std::uint8_t>> ech;
+    try {
+        ech = co_await dns::async_query_ech_config(resolver->query_service(), server_name,
+                                                   std::move(query_name));
+    } catch (const core::Error &failure) {
+        co_return core::fail(failure);
+    } catch (...) {
+        co_return core::fail(core::Error{core::ErrorCode::endpoint_connection,
+                                         "failed to resolve Shadowsocks plugin ECH config"});
+    }
+    if (!ech) {
+        co_return core::fail(ech.error());
+    }
+    co_return core::Result<std::vector<std::uint8_t>>{std::move(ech.value())};
+}
 
 struct CarrierWriteBridge {
     using receiver_concept = stdexec::receiver_tag;
@@ -670,6 +714,20 @@ class ShadowsocksConnectOperation final
             self->finish(core::StreamOpenResult::failed(resolved.error()));
             co_return;
         }
+        if (self->websocket_plugin() && self->config_.plugin_tls &&
+            self->config_.plugin_ech_enabled) {
+            auto ech = co_await fetch_ss_plugin_ech_config(
+                self->resolver_, self->config_,
+                self->config_.plugin_host.empty() ? "bing.com" : self->config_.plugin_host);
+            if (self->completed_) {
+                co_return;
+            }
+            if (!ech) {
+                self->finish(core::StreamOpenResult::failed(ech.error()));
+                co_return;
+            }
+            self->plugin_ech_config_ = std::move(ech.value());
+        }
         if (self->kcptun_plugin()) {
             if (resolved.value().empty()) {
                 self->finish(core::StreamOpenResult::failed(
@@ -835,6 +893,24 @@ class ShadowsocksConnectOperation final
                                "Shadowsocks WebSocket plugins require websocket mode",
                                {}});
         }
+        if ((config_.plugin == "v2ray-plugin" || config_.plugin == "gost-plugin") &&
+            config_.plugin_certificate.empty() != config_.plugin_private_key.empty()) {
+            return core::fail(
+                {core::ErrorCode::configuration,
+                 "Shadowsocks WebSocket plugin mTLS requires both certificate and private-key",
+                 {}});
+        }
+        const bool websocket_tls_plugin =
+            config_.plugin == "v2ray-plugin" || config_.plugin == "gost-plugin";
+        if (!websocket_tls_plugin &&
+            (!config_.plugin_headers.empty() || !config_.plugin_name_cert_verify.empty() ||
+             !config_.plugin_certificate.empty() || !config_.plugin_private_key.empty() ||
+             config_.plugin_ech_enabled)) {
+            return core::fail({core::ErrorCode::configuration,
+                               "Shadowsocks WebSocket TLS options require v2ray-plugin or "
+                               "gost-plugin",
+                               {}});
+        }
         if (config_.plugin == "kcptun" &&
             (config_.plugin_mode != "" || config_.plugin_tls || config_.plugin_skip_cert_verify)) {
             return core::fail({core::ErrorCode::configuration,
@@ -959,6 +1035,14 @@ class ShadowsocksConnectOperation final
         options.path = config_.plugin_path.empty() ? "/" : config_.plugin_path;
         options.tls = config_.plugin_tls;
         options.skip_cert_verify = config_.plugin_skip_cert_verify;
+        options.headers = config_.plugin_headers;
+        options.certificate_pin = config_.plugin_fingerprint;
+        options.name_cert_verify = config_.plugin_name_cert_verify;
+        options.client_certificate_pem = config_.plugin_certificate;
+        options.client_private_key_pem = config_.plugin_private_key;
+        if (plugin_ech_config_) {
+            options.ech_config_list = *plugin_ech_config_;
+        }
         options.mux = config_.plugin_mux;
         options.mux_protocol = config_.plugin == "gost-plugin" ? ss::WebSocketMuxProtocol::smux
                                                                : ss::WebSocketMuxProtocol::v2ray;
@@ -1592,6 +1676,9 @@ class ShadowsocksConnectOperation final
     core::StreamRequest request_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
     std::shared_ptr<ss::StreamCarrier> carrier_;
+    // ECH config bytes resolved once per connect for the WebSocket plugin
+    // TLS layer; injected into every plugin open via websocket_options().
+    std::optional<std::vector<std::uint8_t>> plugin_ech_config_;
     boost::asio::steady_timer timer_;
     core::StreamOpenHandler handler_;
     std::vector<std::uint8_t> write_nonce_;

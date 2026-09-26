@@ -122,6 +122,58 @@ test_outbound_registry(clash_native::runtime::AsioRuntime &runtime,
                     .value_or("") == "1";
             config.plugin_fingerprint =
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_FINGERPRINT").value_or("");
+            if (const auto headers = environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_HEADERS");
+                headers && !headers->empty()) {
+                std::size_t offset = 0;
+                while (offset <= headers->size()) {
+                    const auto separator = headers->find(';', offset);
+                    const auto length = separator == std::string::npos ? headers->size() - offset
+                                                                       : separator - offset;
+                    const auto field = headers->substr(offset, length);
+                    const auto colon = field.find(':');
+                    if (colon == std::string::npos) {
+                        throw std::runtime_error(
+                            "invalid CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_HEADERS");
+                    }
+                    config.plugin_headers.push_back(
+                        {field.substr(0, colon), field.substr(colon + 1)});
+                    if (separator == std::string::npos) {
+                        break;
+                    }
+                    offset = separator + 1;
+                }
+            }
+            config.plugin_name_cert_verify =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_NAME_CERT_VERIFY")
+                    .value_or("");
+            if (const auto certificate =
+                    environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_CERTIFICATE_FILE");
+                certificate && !certificate->empty()) {
+                std::ifstream certificate_file(*certificate, std::ios::binary);
+                if (!certificate_file) {
+                    throw std::runtime_error("failed to read plugin certificate file");
+                }
+                config.plugin_certificate.assign(std::istreambuf_iterator<char>(certificate_file),
+                                                 std::istreambuf_iterator<char>());
+            }
+            if (const auto private_key =
+                    environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_PRIVATE_KEY_FILE");
+                private_key && !private_key->empty()) {
+                std::ifstream key_file(*private_key, std::ios::binary);
+                if (!key_file) {
+                    throw std::runtime_error("failed to read plugin private key file");
+                }
+                config.plugin_private_key.assign(std::istreambuf_iterator<char>(key_file),
+                                                 std::istreambuf_iterator<char>());
+            }
+            config.plugin_ech_enabled =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_ECH_ENABLED").value_or("") ==
+                "1";
+            config.plugin_ech_config =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_ECH_CONFIG").value_or("");
+            config.plugin_ech_query_server_name =
+                environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_ECH_QUERY_SERVER_NAME")
+                    .value_or("");
             config.plugin_client_fingerprint =
                 environment_value("CLASH_NATIVE_TEST_OUTBOUND_PLUGIN_CLIENT_FINGERPRINT")
                     .value_or("");
