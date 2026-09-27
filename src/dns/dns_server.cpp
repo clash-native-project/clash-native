@@ -28,6 +28,22 @@ core::Error listener_error(std::string operation, const boost::system::error_cod
             std::error_code(error.value(), std::system_category())};
 }
 
+// Logs a wire I/O failure at the awaiting coroutine site. use_sender
+// surfaces Asio errors as exception_ptr (system_error); stopped (abort)
+// arrives here too and is logged the same way before the loop bails to
+// close(). Kept at debug: shutdown/EOF races are routine, not warnings.
+void log_wire_error(std::string_view operation, const std::exception_ptr &error) {
+    try {
+        std::rethrow_exception(error);
+    } catch (const core::Error &failure) {
+        spdlog::debug("DNS TCP connection {} failed: {}", operation, failure.context);
+    } catch (const std::exception &failure) {
+        spdlog::debug("DNS TCP connection {} failed: {}", operation, failure.what());
+    } catch (...) {
+        spdlog::debug("DNS TCP connection {} failed with unknown error", operation);
+    }
+}
+
 std::size_t udp_payload_limit(const DnsPacket &query) {
     const auto opt = std::find_if(
         query.additionals.begin(), query.additionals.end(), [](const DnsResourceRecord &record) {
@@ -342,6 +358,7 @@ exec::task<void> DnsServer::TcpConnection::run(std::shared_ptr<TcpConnection> se
                                                   exec::asio::use_sender) |
                           stdexec::then([](std::size_t) {}));
             } catch (...) {
+                log_wire_error("read length", std::current_exception());
                 break;
             }
             if (self->completed_) {
@@ -357,6 +374,7 @@ exec::task<void> DnsServer::TcpConnection::run(std::shared_ptr<TcpConnection> se
                                                   exec::asio::use_sender) |
                           stdexec::then([](std::size_t) {}));
             } catch (...) {
+                log_wire_error("read body", std::current_exception());
                 break;
             }
             if (self->completed_) {
@@ -383,6 +401,7 @@ exec::task<void> DnsServer::TcpConnection::run(std::shared_ptr<TcpConnection> se
                                                    exec::asio::use_sender) |
                           stdexec::then([](std::size_t) {}));
             } catch (...) {
+                log_wire_error("write response", std::current_exception());
                 break;
             }
         }
