@@ -2749,3 +2749,23 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   `ProxyServer::accept` twin stay callback-shaped: the proxy twin
   segfaults at teardown under ctest (passes standalone) and is parked
   until the session-close lifetime is untangled.
+
+### 2026-09-27 — DnsServer TCP query path migrates to TcpConnection tasks
+
+- New `DnsServer::TcpConnection` (socket + `exec::async_scope` + completed
+  guard): `run` loops `async_read(length, use_sender)` /
+  `async_read(body, use_sender)` / `resolve` / `async_write(frame,
+  use_sender)`, every terminal funnels to `close()` (erases from
+  `tcp_connections_`), so the scope never fails. `abort()` closes the
+  socket; in-flight wire waits complete aborted and the loop bails.
+- New `DnsQueryService::query_sender`: `bridge_sender` over `query()`
+  with a real aborter (`cancel(id)`; spin-waits the id because `query()`
+  only posts). `TcpConnection::resolve` awaits it, so connection stop
+  composes with the upstream wait instead of leaking to timeout.
+- `accept_tcp` spawns connections into `tcp_connections_`;
+  `stop_on_owner` aborts each connection. `read_tcp_query` /
+  `resolve_tcp` / `close_tcp_socket` shrink to thin forwarders routing
+  through the owning connection. UDP path (`resolve_udp`) untouched.
+- Validation: Release build clean, 315/315 CTest pass (the known
+  `UsesTheConfiguredDialerForPlainTcp` failure from earlier runs did not
+  reproduce in this run); `format-check` and `git diff --check` pass.

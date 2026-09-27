@@ -54,6 +54,30 @@ class DnsServer final {
     boost::asio::ip::tcp::endpoint tcp_endpoint() const noexcept;
 
   private:
+    // One executor-driven TCP connection: owns its socket, query-loop
+    // task, and in-flight query drives. abort() closes the socket (the
+    // in-flight read/write completes aborted) and drops query drives;
+    // close() additionally erases from the server set. Late completions
+    // drop at completed_, never at the server gate.
+    struct TcpConnection : public std::enable_shared_from_this<TcpConnection> {
+        TcpConnection(DnsServer &server, std::shared_ptr<boost::asio::ip::tcp::socket> socket);
+        void start();
+        void abort() noexcept;
+        void close() noexcept;
+        // Query loop: read length, read body, resolve, write back, repeat.
+        // Every terminal funnels through close(), so the task always ends
+        // with a value and the scope never fails.
+        static exec::task<void> run(std::shared_ptr<TcpConnection> self);
+        // Resolve one query through query_sender: stop composes with the
+        // read/write awaits instead of leaking until the upstream answers.
+        static exec::task<core::Result<std::vector<std::uint8_t>>>
+        resolve(std::shared_ptr<TcpConnection> self, DnsPacket query);
+        DnsServer &server;
+        std::shared_ptr<boost::asio::ip::tcp::socket> socket;
+        exec::async_scope scope;
+        bool completed_ = false;
+    };
+
     void receive_udp();
     void send_udp_response(boost::asio::ip::udp::endpoint recipient,
                            std::shared_ptr<std::vector<std::uint8_t>> payload);
@@ -84,7 +108,7 @@ class DnsServer final {
     std::shared_ptr<std::atomic_bool> callback_gate_;
     std::unordered_map<std::uint64_t, PendingQuery> query_requests_;
     std::uint64_t next_query_request_id_ = 1;
-    std::unordered_set<std::shared_ptr<boost::asio::ip::tcp::socket>> tcp_sockets_;
+    std::unordered_set<std::shared_ptr<TcpConnection>> tcp_connections_;
     // Owns the accept-loop task; stop requests stop so the in-flight accept
     // completes stopped and the loop exits without re-arming.
     exec::async_scope accept_scope_;

@@ -1,10 +1,10 @@
+#include <boost/asio/dispatch.hpp>
+#include <boost/asio/post.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/held_operation.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_query_service.hpp>
 #include <clash_native/io/sender.hpp>
-
-#include <boost/asio/dispatch.hpp>
-#include <boost/asio/post.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -535,6 +535,44 @@ DnsQueryService::RequestId DnsQueryService::query(DnsPacket packet, Handler hand
                        std::move(completion_scheduler));
     });
     return request_id;
+}
+
+io::AnySender<core::Result<DnsPacket>> DnsQueryService::query_sender(DnsPacket packet) {
+    struct Shared {
+        DnsQueryService *service = nullptr;
+        // Set once query() returns; the aborter spins until then because
+        // the request id is the only cancel handle and stop may race start.
+        std::atomic<RequestId> id{0};
+        std::atomic_bool started{false};
+    };
+    auto shared = std::make_shared<Shared>();
+    shared->service = this;
+    // NOTE: query() posts to the owner strand; the starter must stay
+    // copyable, so the packet lives in a shared box for re-invocation.
+    auto box = std::make_shared<std::optional<DnsPacket>>(std::move(packet));
+    return async::bridge_sender<core::Result<DnsPacket>>(
+        [shared, box](async::BridgeHandler<core::Result<DnsPacket>> done) mutable {
+            if (!box || !*box) {
+                done(core::fail(cancelled_error()));
+                return async::CallbackAbortFn{};
+            }
+            const auto id = shared->service->query(
+                std::move(**box),
+                [done](core::Result<DnsPacket> result) mutable { done(std::move(result)); });
+            box->reset();
+            shared->id.store(id, std::memory_order_release);
+            shared->started.store(true, std::memory_order_release);
+            return async::CallbackAbortFn{[shared] {
+                // Wait for the id: query() only posts; without this the
+                // aborter could run before the request exists and leak it.
+                for (int spins = 0;
+                     !shared->started.load(std::memory_order_acquire) && spins < 10000; ++spins) {
+                }
+                if (const auto id = shared->id.load(std::memory_order_acquire)) {
+                    shared->service->cancel(id);
+                }
+            }};
+        });
 }
 
 void DnsQueryService::query_on_owner(RequestId request_id, DnsPacket packet, Handler handler,

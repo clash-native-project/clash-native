@@ -1,13 +1,12 @@
 #pragma once
 
+#include <boost/asio/ip/udp.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/core/result.hpp>
 #include <clash_native/dns/dns_policy_router.hpp>
 #include <clash_native/dns/dns_upstream.hpp>
 #include <clash_native/dns/resolver_graph.hpp>
-#include <clash_native/outbound/outbound_registry.hpp>
-#include <clash_native/router/traffic_router.hpp>
-
-#include <boost/asio/ip/udp.hpp>
+#include <clash_native/io/sender.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -79,6 +78,10 @@ class DnsQueryService final {
     RequestId query(DnsPacket packet, Handler handler,
                     CompletionScheduler completion_scheduler = std::nullopt);
     void cancel(RequestId request_id) noexcept;
+    // Sender-native query: the bridge aborter cancels the waiter (and the
+    // shared exchange when the last waiter leaves), so caller stop composes
+    // with racing adaptors instead of leaking until the upstream answers.
+    io::AnySender<core::Result<DnsPacket>> query_sender(DnsPacket packet);
     void stop() noexcept;
     void clear_cache() noexcept;
     std::size_t cache_size() const noexcept;
