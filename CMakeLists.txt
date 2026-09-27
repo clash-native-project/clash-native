@@ -365,6 +365,7 @@ if(BUILD_TESTING)
         tests/transport/gun_transport_test.cpp
         tests/transport/http2_streaming_test.cpp
         tests/transport/task_coroutine_test.cpp
+        tests/core/timer_test.cpp
     )
 
     target_include_directories(clash-native-tests
