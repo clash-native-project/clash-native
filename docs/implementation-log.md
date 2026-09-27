@@ -2734,3 +2734,18 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   `format-check` and `git diff --check` pass. Remaining gaps (not touched):
   ss/trojan chained + UDP datagram resolve bridges, DNS `!box` inline
   stubs (legit), tls/websocket inline stubs (legit).
+
+### 2026-09-27 — DnsServer accept_tcp migrates to task loop
+
+- `DnsServer::accept_tcp` stops self-rearming `async_accept` callbacks and
+  spawns `run_accept_loop` in a new `accept_scope_`: `co_await
+  tcp_acceptor_.async_accept(use_sender)` per iteration, socket insert +
+  `read_tcp_query` unchanged. `stop_on_owner` calls
+  `accept_scope_.request_stop()` first so the in-flight accept completes
+  stopped and the loop exits; acceptor/socket close stays the I/O abort.
+- Validation: Release build clean, 315/315 CTest pass (excluding the known
+  `UsesTheConfiguredDialerForPlainTcp` SEGV); `format-check` and
+  `git diff --check` pass. `read_tcp_query`/`resolve_tcp` chains and the
+  `ProxyServer::accept` twin stay callback-shaped: the proxy twin
+  segfaults at teardown under ctest (passes standalone) and is parked
+  until the session-close lifetime is untangled.

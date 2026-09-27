@@ -14,6 +14,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 #include <functional>
 #include <memory>
 #include <string_view>
@@ -56,6 +58,7 @@ class DnsServer final {
     void send_udp_response(boost::asio::ip::udp::endpoint recipient,
                            std::shared_ptr<std::vector<std::uint8_t>> payload);
     void accept_tcp();
+    static exec::task<void> run_accept_loop(DnsServer *server);
     void read_tcp_query(std::shared_ptr<boost::asio::ip::tcp::socket> socket);
     void close_tcp_socket(const std::shared_ptr<boost::asio::ip::tcp::socket> &socket) noexcept;
     void resolve_udp(DnsPacket query, boost::asio::ip::udp::endpoint sender);
@@ -82,6 +85,9 @@ class DnsServer final {
     std::unordered_map<std::uint64_t, PendingQuery> query_requests_;
     std::uint64_t next_query_request_id_ = 1;
     std::unordered_set<std::shared_ptr<boost::asio::ip::tcp::socket>> tcp_sockets_;
+    // Owns the accept-loop task; stop requests stop so the in-flight accept
+    // completes stopped and the loop exits without re-arming.
+    exec::async_scope accept_scope_;
     std::shared_ptr<FakeIpStore> fake_ip_store_;
     std::function<bool(std::string_view)> fake_ip_filter_;
 };

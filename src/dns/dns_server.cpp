@@ -7,6 +7,7 @@
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 
+#include <exec/asio/use_sender.hpp>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -181,6 +182,13 @@ void DnsServer::set_fake_ip_store(std::shared_ptr<FakeIpStore> store,
 }
 
 void DnsServer::stop_on_owner() noexcept {
+    // Stop the accept loop first: the in-flight accept completes stopped
+    // and the task exits without re-arming. Acceptor/socket close below
+    // is retained as the I/O-level abort.
+    try {
+        accept_scope_.request_stop();
+    } catch (...) {
+    }
     for (const auto &[token, request] : query_requests_) {
         (void)token;
         if (request.query_service != nullptr && request.request_id != 0) {
@@ -260,24 +268,31 @@ void DnsServer::send_udp_response(boost::asio::ip::udp::endpoint recipient,
 }
 
 void DnsServer::accept_tcp() {
-    if (!running_.load(std::memory_order_acquire)) {
-        return;
+    // The accept loop is a task, not a self-rearming callback: stop (via
+    // accept_scope_ request_stop on shutdown) completes the in-flight
+    // accept as stopped and the loop exits without re-arming. No gate
+    // check is needed: stop owns teardown through the scope.
+    accept_scope_.spawn(run_accept_loop(this));
+}
+
+exec::task<void> DnsServer::run_accept_loop(DnsServer *server) {
+    while (server->running_.load(std::memory_order_acquire)) {
+        auto socket =
+            std::make_shared<boost::asio::ip::tcp::socket>(server->runtime_.serialized_executor());
+        try {
+            co_await server->tcp_acceptor_.async_accept(*socket, exec::asio::use_sender);
+        } catch (...) {
+            // Stopped (shutdown cancel/close) or accept failure: stop owns
+            // teardown, so just exit the loop without re-arming.
+            co_return;
+        }
+        if (!server->running_.load(std::memory_order_acquire)) {
+            co_return;
+        }
+        server->tcp_sockets_.insert(socket);
+        server->read_tcp_query(socket);
     }
-    const auto gate = callback_gate_;
-    auto socket = std::make_shared<boost::asio::ip::tcp::socket>(runtime_.serialized_executor());
-    tcp_acceptor_.async_accept(*socket,
-                               [this, gate, socket](const boost::system::error_code &error) {
-                                   if (!gate->load(std::memory_order_acquire)) {
-                                       return;
-                                   }
-                                   if (!error && running_.load(std::memory_order_acquire)) {
-                                       tcp_sockets_.insert(socket);
-                                       read_tcp_query(socket);
-                                   }
-                                   if (gate->load(std::memory_order_acquire)) {
-                                       accept_tcp();
-                                   }
-                               });
+    co_return;
 }
 
 void DnsServer::read_tcp_query(std::shared_ptr<boost::asio::ip::tcp::socket> socket) {
