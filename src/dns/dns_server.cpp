@@ -1,4 +1,3 @@
-#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_server.hpp>
 
@@ -95,7 +94,7 @@ DnsServer::DnsServer(runtime::AsioRuntime &runtime, DnsQueryService &query_servi
                      boost::asio::ip::tcp::endpoint tcp_endpoint)
     : runtime_(runtime), query_service_(&query_service), udp_socket_(runtime.serialized_executor()),
       tcp_acceptor_(runtime.serialized_executor()), udp_endpoint_(udp_endpoint),
-      tcp_endpoint_(tcp_endpoint), callback_gate_(std::make_shared<std::atomic_bool>(false)) {}
+      tcp_endpoint_(tcp_endpoint) {}
 
 DnsServer::DnsServer(runtime::AsioRuntime &runtime,
                      std::shared_ptr<runtime::RuntimeSnapshotStore> snapshot_store,
@@ -103,8 +102,7 @@ DnsServer::DnsServer(runtime::AsioRuntime &runtime,
                      boost::asio::ip::tcp::endpoint tcp_endpoint)
     : runtime_(runtime), snapshot_store_(std::move(snapshot_store)),
       udp_socket_(runtime.serialized_executor()), tcp_acceptor_(runtime.serialized_executor()),
-      udp_endpoint_(udp_endpoint), tcp_endpoint_(tcp_endpoint),
-      callback_gate_(std::make_shared<std::atomic_bool>(false)) {
+      udp_endpoint_(udp_endpoint), tcp_endpoint_(tcp_endpoint) {
     if (!snapshot_store_) {
         throw std::invalid_argument("DNS server requires a runtime snapshot store");
     }
@@ -157,7 +155,6 @@ core::Status DnsServer::start() {
         return core::fail(listener_error("query the local DNS server endpoint", error));
     }
 
-    callback_gate_ = std::make_shared<std::atomic_bool>(true);
     running_.store(true, std::memory_order_release);
     spdlog::info("DNS server listening on UDP {}:{} and TCP {}:{}",
                  udp_endpoint_.address().to_string(), udp_endpoint_.port(),
@@ -173,7 +170,6 @@ void DnsServer::stop() noexcept {
         return;
     }
     spdlog::debug("Stopping DNS server");
-    callback_gate_->store(false, std::memory_order_release);
 
     if (!runtime_.running()) {
         stop_on_owner();
@@ -198,20 +194,18 @@ void DnsServer::set_fake_ip_store(std::shared_ptr<FakeIpStore> store,
 }
 
 void DnsServer::stop_on_owner() noexcept {
-    // Stop the accept loop first: the in-flight accept completes stopped
-    // and the task exits without re-arming. Acceptor/socket close below
-    // is retained as the I/O-level abort.
+    // Stop the UDP and accept loops first: the in-flight receive/accept
+    // completes stopped and the loops exit without re-arming. In-flight
+    // UDP resolves abort through query_sender stop; socket close below is
+    // retained as the I/O-level abort.
+    try {
+        udp_scope_.request_stop();
+    } catch (...) {
+    }
     try {
         accept_scope_.request_stop();
     } catch (...) {
     }
-    for (const auto &[token, request] : query_requests_) {
-        (void)token;
-        if (request.query_service != nullptr && request.request_id != 0) {
-            request.query_service->cancel(request.request_id);
-        }
-    }
-    query_requests_.clear();
 
     boost::system::error_code ignored;
     udp_socket_.close();
@@ -240,51 +234,116 @@ runtime::RuntimeSnapshotPtr DnsServer::current_snapshot() const noexcept {
 }
 
 void DnsServer::receive_udp() {
-    if (!running_.load(std::memory_order_acquire)) {
-        return;
+    // Single-outstanding-pull UDP pump as a task loop: one co_awaited
+    // receive at a time, each answer fanned out to its own resolve task.
+    // Socket close aborts the in-flight receive (stopped) and the loop
+    // exits; the task always ends with a value so the scope never fails.
+    udp_scope_.spawn(run_udp_loop(this));
+}
+
+exec::task<void> DnsServer::run_udp_loop(DnsServer *server) {
+    while (server->running_.load(std::memory_order_acquire)) {
+        io::DatagramPacket received;
+        try {
+            auto sender =
+                server->udp_socket_.async_receive_from(boost::asio::buffer(server->udp_buffer_));
+            received = co_await std::move(sender);
+        } catch (...) {
+            // Stopped (shutdown close) or receive failure: stop owns
+            // teardown, so just exit the loop without re-arming.
+            co_return;
+        }
+        if (!server->running_.load(std::memory_order_acquire)) {
+            co_return;
+        }
+        if (!received.address.is_address()) {
+            continue;
+        }
+        const auto query = DnsMessageCodec::decode_packet(
+            std::span<const std::uint8_t>(server->udp_buffer_.data(), received.size));
+        if (!query) {
+            continue;
+        }
+        const auto sender_endpoint =
+            boost::asio::ip::udp::endpoint(received.address.address(), received.address.port());
+        server->udp_scope_.spawn(
+            run_udp_resolve(server, std::move(query.value()), sender_endpoint));
     }
-    struct ReceiveReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        DnsServer *server;
-        std::shared_ptr<std::atomic_bool> gate;
-        void set_value(io::DatagramPacket packet) && noexcept {
-            if (!gate->load(std::memory_order_acquire)) {
-                return;
-            }
-            const auto query = DnsMessageCodec::decode_packet(
-                std::span<const std::uint8_t>(server->udp_buffer_.data(), packet.size));
-            if (query && packet.address.is_address()) {
-                server->resolve_udp(std::move(query.value()),
-                                    boost::asio::ip::udp::endpoint(packet.address.address(),
-                                                                   packet.address.port()));
-            }
-            if (gate->load(std::memory_order_acquire)) {
-                server->receive_udp();
-            }
+    co_return;
+}
+
+exec::task<void> DnsServer::run_udp_resolve(DnsServer *server, DnsPacket query,
+                                            boost::asio::ip::udp::endpoint sender) {
+    const auto snapshot = server->current_snapshot();
+    const auto &fake_store = snapshot ? snapshot->fake_ip_store : server->fake_ip_store_;
+    const auto &fake_filter = snapshot ? snapshot->fake_ip_filter : server->fake_ip_filter_;
+    if (const auto fake_response = fake_ip_response(query, fake_store, fake_filter)) {
+        const auto response = limit_udp_response(query, *fake_response);
+        if (response && response.value().size() <= 0xffff) {
+            auto payload = std::make_shared<std::vector<std::uint8_t>>(response.value());
+            server->send_udp_response(sender, std::move(payload));
         }
-        void set_error(std::exception_ptr) && noexcept {
-            if (gate->load(std::memory_order_acquire)) {
-                server->receive_udp();
-            }
+        co_return;
+    }
+    auto resolver_owner = snapshot ? snapshot->resolver : server->resolver_owner_;
+    auto *query_service = snapshot && resolver_owner != nullptr ? &resolver_owner->query_service()
+                                                                : server->query_service_;
+    if (query_service == nullptr) {
+        const auto response =
+            limit_udp_response(query, DnsMessageCodec::encode_error_response(query, 2));
+        if (response) {
+            auto payload = std::make_shared<std::vector<std::uint8_t>>(response.value());
+            server->send_udp_response(sender, std::move(payload));
         }
-        void set_stopped() && noexcept {}
+        co_return;
+    }
+    const auto error_response = [&]() -> core::Result<DnsPacket> {
+        const auto encoded = DnsMessageCodec::encode_error_response(query, 2);
+        if (encoded) {
+            return DnsMessageCodec::decode_packet(encoded.value(), query.id);
+        }
+        return core::fail(core::Error{core::ErrorCode::transport_io, "DNS UDP query failed"});
     };
-    auto sender = udp_socket_.async_receive_from(boost::asio::buffer(udp_buffer_));
-    async::start_with_receiver(std::move(sender), ReceiveReceiver{this, callback_gate_});
+    core::Result<DnsPacket> answered = error_response();
+    try {
+        // Composable wait: server stop aborts the query await through the
+        // scope, so the task never leaks until the upstream answers.
+        // NOTE: query_sender takes the packet by value; the limit/encode
+        // below still need the original, so move a copy.
+        answered = co_await query_service->query_sender(query);
+    } catch (...) {
+        answered = error_response();
+    }
+    if (!answered) {
+        answered = error_response();
+    }
+    const auto response =
+        limit_udp_response(query, core::Result<std::vector<std::uint8_t>>(answered.value().wire));
+    if (!response || response.value().size() > 0xffff) {
+        co_return;
+    }
+    auto payload = std::make_shared<std::vector<std::uint8_t>>(response.value());
+    server->send_udp_response(sender, std::move(payload));
+    co_return;
 }
 
 void DnsServer::send_udp_response(boost::asio::ip::udp::endpoint recipient,
                                   std::shared_ptr<std::vector<std::uint8_t>> payload) {
-    struct DropReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<std::vector<std::uint8_t>> payload;
-        void set_value(std::size_t) && noexcept {}
-        void set_error(std::exception_ptr) && noexcept {}
-        void set_stopped() && noexcept {}
-    };
-    auto sender = udp_socket_.async_send_to(boost::asio::buffer(*payload),
-                                            io::DatagramAddress::from_endpoint(recipient));
-    async::start_with_receiver(std::move(sender), DropReceiver{std::move(payload)});
+    // Fire-and-forget send task: completion (sent, failed, stopped) is
+    // terminal by itself, so the task always ends with a value.
+    udp_scope_.spawn(run_udp_send(this, recipient, std::move(payload)));
+}
+
+exec::task<void> DnsServer::run_udp_send(DnsServer *server,
+                                         boost::asio::ip::udp::endpoint recipient,
+                                         std::shared_ptr<std::vector<std::uint8_t>> payload) {
+    try {
+        auto sender = server->udp_socket_.async_send_to(
+            boost::asio::buffer(*payload), io::DatagramAddress::from_endpoint(recipient));
+        co_await (std::move(sender) | stdexec::then([](std::size_t) {}));
+    } catch (...) {
+    }
+    co_return;
 }
 
 void DnsServer::accept_tcp() {
@@ -446,102 +505,6 @@ DnsServer::TcpConnection::resolve(std::shared_ptr<TcpConnection> self, DnsPacket
         co_return DnsMessageCodec::encode_error_response(query, 2);
     }
     co_return core::Result<std::vector<std::uint8_t>>(answered.value().wire);
-}
-
-void DnsServer::resolve_udp(DnsPacket query, boost::asio::ip::udp::endpoint sender) {
-    const auto gate = callback_gate_;
-    const auto snapshot = current_snapshot();
-    const auto &fake_store = snapshot ? snapshot->fake_ip_store : fake_ip_store_;
-    const auto &fake_filter = snapshot ? snapshot->fake_ip_filter : fake_ip_filter_;
-    if (const auto fake_response = fake_ip_response(query, fake_store, fake_filter)) {
-        const auto response = limit_udp_response(query, *fake_response);
-        if (!response || response.value().size() > 0xffff) {
-            return;
-        }
-        auto payload = std::make_shared<std::vector<std::uint8_t>>(response.value());
-        send_udp_response(sender, std::move(payload));
-        return;
-    }
-    auto resolver_owner = snapshot ? snapshot->resolver : resolver_owner_;
-    auto *query_service =
-        snapshot && resolver_owner != nullptr ? &resolver_owner->query_service() : query_service_;
-    if (query_service == nullptr) {
-        const auto response =
-            limit_udp_response(query, DnsMessageCodec::encode_error_response(query, 2));
-        if (response) {
-            auto payload = std::make_shared<std::vector<std::uint8_t>>(response.value());
-            send_udp_response(sender, std::move(payload));
-        }
-        return;
-    }
-    const auto token = next_query_request_id_++;
-    query_requests_.emplace(token, PendingQuery{resolver_owner, query_service, 0});
-    const auto request_id = std::make_shared<DnsQueryService::RequestId>();
-    const auto query_copy = query;
-    *request_id = query_service->query(
-        std::move(query),
-        [this, gate, token, resolver_owner, query = query_copy,
-         sender](core::Result<DnsPacket> result) mutable {
-            (void)resolver_owner;
-            if (!gate->load(std::memory_order_acquire)) {
-                return;
-            }
-            query_requests_.erase(token);
-            const auto response = limit_udp_response(
-                query, result ? core::Result<std::vector<std::uint8_t>>(result.value().wire)
-                              : DnsMessageCodec::encode_error_response(query, 2));
-            if (!response || response.value().size() > 0xffff) {
-                return;
-            }
-            auto payload = std::make_shared<std::vector<std::uint8_t>>(response.value());
-            send_udp_response(sender, std::move(payload));
-        },
-        runtime_.scheduler());
-    if (const auto pending = query_requests_.find(token); pending != query_requests_.end()) {
-        pending->second.request_id = *request_id;
-    }
-}
-
-void DnsServer::read_tcp_query(std::shared_ptr<boost::asio::ip::tcp::socket> socket) {
-    // Migrated: connections run TcpConnection::run. Retained only so old
-    // resolve_tcp writeback re-arm keeps compiling during the transition;
-    // live sockets always route through their owning connection.
-    for (const auto &connection : tcp_connections_) {
-        if (connection->socket == socket && !connection->completed_) {
-            return;
-        }
-    }
-    close_tcp_socket(socket);
-}
-
-void DnsServer::close_tcp_socket(
-    const std::shared_ptr<boost::asio::ip::tcp::socket> &socket) noexcept {
-    if (!socket) {
-        return;
-    }
-    // Routes through the owning connection (erases from the set).
-    // Unknown sockets fall back to direct cancel/close.
-    for (const auto &connection : tcp_connections_) {
-        if (connection->socket == socket) {
-            connection->close();
-            return;
-        }
-    }
-    boost::system::error_code ignored;
-    socket->cancel(ignored);
-    socket->close(ignored);
-}
-
-void DnsServer::resolve_tcp(std::shared_ptr<boost::asio::ip::tcp::socket> socket, DnsPacket query) {
-    // Migrated: TcpConnection::run + resolve own the TCP query path.
-    // Retained as a thin forwarder so external callers keep compiling.
-    (void)query;
-    for (const auto &connection : tcp_connections_) {
-        if (connection->socket == socket) {
-            return;
-        }
-    }
-    close_tcp_socket(socket);
 }
 
 } // namespace clash_native::dns

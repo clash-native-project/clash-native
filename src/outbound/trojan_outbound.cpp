@@ -1,5 +1,6 @@
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/timer.hpp>
 
 #include <clash_native/core/base64.hpp>
 #include <clash_native/dns/ech_resolver.hpp>
@@ -302,23 +303,36 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
             return;
         }
         deadline_ = std::chrono::steady_clock::now() + kConnectTimeout;
-        timer_.expires_at(deadline_);
-        timer_.async_wait([self = shared_from_this()](const boost::system::error_code &error) {
-            if (!error) {
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::timeout, "timed out opening Trojan stream"}));
-            }
-        });
+        scope_.spawn(run_deadline(shared_from_this()));
         // Chained dials skip local resolution: the chain resolves the server.
         if (!config_.dialer_proxy.empty()) {
             scope_.spawn(run(shared_from_this(),
                              std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>()));
             return;
         }
-        detail::resolve_host(runtime_, resolver_, config_.server_host,
-                             [self = shared_from_this()](core::Result<detail::AddressList> result) {
-                                 self->resolved(std::move(result));
-                             });
+        scope_.spawn(run_resolve(shared_from_this()));
+    }
+
+    // Deadline watchdog: fails the operation if the chain task has not
+    // finished first. The sleep sender is aborted when the scope drains.
+    static exec::task<void> run_deadline(std::shared_ptr<TrojanConnectOperation> self) {
+        try {
+            co_await async::sleep_until(self->runtime_.serialized_executor(), self->deadline_);
+        } catch (...) {
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        self->finish(core::StreamOpenResult::failed(
+            {core::ErrorCode::timeout, "timed out opening Trojan stream"}));
+    }
+
+    // Hostname resolution as a task: co_awaits the sender-native resolve,
+    // then spawns the connect chain. Replaces the callback resolve_host.
+    static exec::task<void> run_resolve(std::shared_ptr<TrojanConnectOperation> self) {
+        auto result = co_await detail::resolve_host_sender(self->runtime_, self->resolver_,
+                                                           self->config_.server_host);
+        self->resolved(std::move(result));
     }
 
   private:

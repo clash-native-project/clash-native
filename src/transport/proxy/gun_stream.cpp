@@ -1,10 +1,8 @@
 #include <clash_native/transport/proxy/gun_stream.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
-#include <clash_native/io/sender.hpp>
-#include <clash_native/net/stream_handle_adapter.hpp>
-
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 #include <stdexec/execution.hpp>
 
 #include <boost/asio/buffer.hpp>
@@ -26,28 +24,6 @@
 namespace clash_native::transport::proxy::gun {
 
 namespace {
-
-// Bridges one exchange pull/push back into a legacy (error, size) handler.
-struct BodyReadBridge {
-    using receiver_concept = stdexec::receiver_tag;
-    std::function<void(const boost::system::error_code &, std::size_t)> handler;
-    void set_value(std::optional<std::size_t> size) && noexcept {
-        auto callback = std::move(handler);
-        if (size) {
-            callback({}, *size);
-        } else {
-            callback(boost::asio::error::eof, 0);
-        }
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto callback = std::move(handler);
-        callback(net::unpack_error(std::move(error)), 0);
-    }
-    void set_stopped() && noexcept {
-        auto callback = std::move(handler);
-        callback(boost::asio::error::operation_aborted, 0);
-    }
-};
 
 constexpr std::size_t kMaxFramePayload = 8 * 1024 * 1024;
 // Caps queued request bytes; writers park past this until the session drains.
@@ -296,6 +272,33 @@ class GunStreamState final : public std::enable_shared_from_this<GunStreamState>
                    boost::asio::any_io_executor executor)
         : request_body_(std::move(request_body)), executor_(std::move(executor)) {}
 
+    // Resolves the streaming head as a task: attach on 200, poison
+    // otherwise. Cancellation races via stop (scope stop/abort poison):
+    // co_await on the head sender settles promptly when the aborter fires,
+    // and stop settlement poisons so parked reads fail fast either way.
+    // Scope-owned (not detached): the state's scope joins the head task so
+    // close/abort waits out the exchange instead of leaking it.
+    static exec::task<void> run_resolve_head(std::shared_ptr<GunStreamState> self,
+                                             io::AnySender<io::StreamingExchangeResponse> head) {
+        try {
+            auto response = co_await std::move(head);
+            if (response.response.status != 200) {
+                self->poison({core::ErrorCode::protocol_framing,
+                              "gun handshake saw unexpected HTTP status"});
+                co_return;
+            }
+            self->attach_response_body(std::move(response.body));
+        } catch (const core::Error &failure) {
+            self->poison(failure);
+        } catch (...) {
+            self->poison({core::ErrorCode::transport_io, "gun handshake failed"});
+        }
+    }
+
+    void resolve_head(io::AnySender<io::StreamingExchangeResponse> head) {
+        scope_.spawn(run_resolve_head(shared_from_this(), std::move(head)));
+    }
+
     // Attaches the response body once the head arrives; resumes a
     // parked read if any.
     void attach_response_body(std::shared_ptr<io::ExchangeBodyStream> body) {
@@ -304,7 +307,6 @@ class GunStreamState final : public std::enable_shared_from_this<GunStreamState>
             read_frame_prefix();
         }
     }
-
     // Poisons the stream: pending and future reads/writes fail.
     void poison(core::Error error) {
         (void)error;
@@ -474,45 +476,50 @@ class GunStreamState final : public std::enable_shared_from_this<GunStreamState>
         });
     }
 
-    void read_exact(std::shared_ptr<std::vector<std::uint8_t>> buffer, std::size_t offset,
-                    std::function<void(const boost::system::error_code &)> completion) {
-        auto guarded = std::make_shared<std::function<void(const boost::system::error_code &)>>(
-            std::move(completion));
-        read_exact_guarded(std::move(buffer), offset, std::move(guarded));
+    // Task-shaped exact read: each body pull is a direct co_await on the
+    // response body sender (cancellable via stop/abort). Late completions
+    // after cancel_receive still drop at the receive_handler_ guard in the
+    // caller chain.
+    static exec::task<boost::system::error_code>
+    read_exact_task(std::shared_ptr<GunStreamState> self,
+                    std::shared_ptr<std::vector<std::uint8_t>> buffer, std::size_t offset) {
+        while (offset < buffer->size()) {
+            boost::asio::mutable_buffer piece(buffer->data() + offset, buffer->size() - offset);
+            std::optional<std::size_t> got;
+            try {
+                got = co_await self->response_body_->async_read_some(piece);
+            } catch (...) {
+                co_return boost::asio::error::fault;
+            }
+            if (!self->receive_handler_) {
+                // Late body completion after cancel_receive retired the op.
+                self->read_in_progress_ = false;
+                co_return boost::asio::error::operation_aborted;
+            }
+            if (!got) {
+                co_return boost::asio::error::eof;
+            }
+            if (*got == 0) {
+                co_return boost::asio::error::eof;
+            }
+            offset += *got;
+        }
+        co_return boost::system::error_code{};
     }
 
-    void read_exact_guarded(
-        std::shared_ptr<std::vector<std::uint8_t>> buffer, std::size_t offset,
-        std::shared_ptr<std::function<void(const boost::system::error_code &)>> completion) {
+    void read_exact(std::shared_ptr<std::vector<std::uint8_t>> buffer, std::size_t offset,
+                    std::function<void(const boost::system::error_code &)> completion) {
         auto self = shared_from_this();
-        auto read_buffer =
-            boost::asio::mutable_buffer(buffer->data() + offset, buffer->size() - offset);
-        std::function<void(const boost::system::error_code &, std::size_t)> pull =
-            [self, buffer = std::move(buffer), offset, completion = std::move(completion)](
-                const boost::system::error_code &error, std::size_t size) mutable {
-                if (!self->receive_handler_) {
-                    // Late body completion after cancel_receive retired the op.
-                    self->read_in_progress_ = false;
-                    return;
-                }
-                if (error) {
-                    (*completion)(error);
-                    return;
-                }
-                if (size == 0) {
-                    (*completion)(boost::asio::error::eof);
-                    return;
-                }
-                const auto next = offset + size;
-                if (next == buffer->size()) {
-                    (*completion)({});
-                    return;
-                }
-                self->read_exact_guarded(std::move(buffer), next, std::move(completion));
-            };
-        // NOTE: name the sender first; argument order is unspecified.
-        auto sender = response_body_->async_read_some(read_buffer);
-        async::start_with_receiver(std::move(sender), BodyReadBridge{std::move(pull)});
+        scope_.spawn(
+            run_read_exact(std::move(self), std::move(buffer), offset, std::move(completion)));
+    }
+
+    static exec::task<void>
+    run_read_exact(std::shared_ptr<GunStreamState> self,
+                   std::shared_ptr<std::vector<std::uint8_t>> buffer, std::size_t offset,
+                   std::function<void(const boost::system::error_code &)> completion) {
+        const auto error = co_await read_exact_task(std::move(self), std::move(buffer), offset);
+        completion(error);
     }
 
     // Delivers the parked remainder first, like gun's remain handling.
@@ -612,6 +619,7 @@ class GunStreamState final : public std::enable_shared_from_this<GunStreamState>
     std::shared_ptr<io::ExchangeBodyStream> response_body_;
     std::shared_ptr<GunRequestBody> request_body_;
     boost::asio::any_io_executor executor_;
+    exec::async_scope scope_;
     boost::asio::mutable_buffer output_buffer_;
     ReadHandler receive_handler_;
     WriteHandler send_handler_;
@@ -760,36 +768,7 @@ void async_open_gun_stream(std::shared_ptr<io::ExchangeSession> session, GunStre
         io::ExchangeRequest head;
         std::shared_ptr<GunRequestBody> request_body;
         std::shared_ptr<GunStreamState> state;
-        struct OpenBridge {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<Opener> opener;
-            void set_value(io::StreamingExchangeResponse response) && noexcept {
-                auto self = std::move(opener);
-                if (response.response.status != 200) {
-                    self->state->poison({core::ErrorCode::protocol_framing,
-                                         "gun handshake saw unexpected HTTP status"});
-                    return;
-                }
-                self->state->attach_response_body(std::move(response.body));
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                auto self = std::move(opener);
-                core::Error failure{core::ErrorCode::transport_io, "gun handshake failed"};
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &open_failure) {
-                    failure = open_failure;
-                } catch (...) {
-                }
-                self->state->poison(failure);
-            }
-            void set_stopped() && noexcept {
-                auto self = std::move(opener);
-                self->state->poison({core::ErrorCode::cancelled, "gun handshake cancelled"});
-            }
-        };
         void start() {
-            auto self = shared_from_this();
             request_body = std::make_shared<GunRequestBody>(options.executor);
             state = std::make_shared<GunStreamState>(request_body, options.executor);
             handler(std::unique_ptr<io::StreamHandle>(std::make_unique<GunStreamHandle>(state)));
@@ -798,9 +777,10 @@ void async_open_gun_stream(std::shared_ptr<io::ExchangeSession> session, GunStre
             streaming.body = request_body;
             streaming.content_length = std::nullopt;
             streaming.head_deadline_only = true;
-            // NOTE: name the sender first; argument order is unspecified.
+            // Task-shaped head: eager handle stays usable while the head flies;
+            // non-200/error/stop poisons parked and future reads/writes.
             auto sender = session->exchange_streaming(std::move(streaming), options.deadline);
-            async::start_with_receiver(std::move(sender), OpenBridge{self});
+            state->resolve_head(std::move(sender));
         }
     };
     io::ExchangeRequest head;
@@ -838,59 +818,20 @@ void async_open_gun_stream_abortable(std::shared_ptr<io::ExchangeSession> sessio
             }
             std::weak_ptr<GunStreamState> state_;
         };
-        struct OpenBridge {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<Opener> opener;
-            void set_value(io::StreamingExchangeResponse response) && noexcept {
-                auto self = std::move(opener);
-                if (response.response.status != 200) {
-                    self->state->poison({core::ErrorCode::protocol_framing,
-                                         "gun handshake saw unexpected HTTP status"});
-                    return;
-                }
-                self->state->attach_response_body(std::move(response.body));
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                auto self = std::move(opener);
-                core::Error failure{core::ErrorCode::transport_io, "gun handshake failed"};
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &open_failure) {
-                    failure = open_failure;
-                } catch (...) {
-                }
-                self->state->poison(failure);
-            }
-            void set_stopped() && noexcept {
-                auto self = std::move(opener);
-                self->state->poison({core::ErrorCode::cancelled, "gun handshake cancelled"});
-            }
-        };
         void start(std::shared_ptr<GunStreamOpenAborter> *aborter_out) {
-            auto self = shared_from_this();
             request_body = std::make_shared<GunRequestBody>(options.executor);
             state = std::make_shared<GunStreamState>(request_body, options.executor);
             if (aborter_out) {
                 *aborter_out = std::make_shared<Handle>(state);
             }
-            auto state_copy = state;
-            auto user_handler = std::move(handler);
-            handler = [user_handler = std::move(user_handler),
-                       state_copy](core::Result<std::unique_ptr<io::StreamHandle>> result) mutable {
-                // The state is already poisoned on the abort path; the open
-                // below only re-delivers the eager handle.
-                (void)state_copy;
-                user_handler(std::move(result));
-            };
             handler(std::unique_ptr<io::StreamHandle>(std::make_unique<GunStreamHandle>(state)));
             io::StreamingExchangeRequest streaming;
             streaming.request = std::move(head);
             streaming.body = request_body;
             streaming.content_length = std::nullopt;
             streaming.head_deadline_only = true;
-            // NOTE: name the sender first; argument order is unspecified.
             auto sender = session->exchange_streaming(std::move(streaming), options.deadline);
-            async::start_with_receiver(std::move(sender), OpenBridge{self});
+            state->resolve_head(std::move(sender));
         }
     };
     if (!session) {

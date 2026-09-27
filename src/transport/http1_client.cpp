@@ -1,5 +1,5 @@
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/oneshot.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/async/watch.hpp>
 #include <clash_native/core/result.hpp>
 #include <clash_native/io/exchange_body_stream.hpp>
@@ -12,7 +12,6 @@
 #include <boost/asio/async_result.hpp>
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
 #include <boost/beast/core/flat_buffer.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/system/error_code.hpp>
@@ -60,16 +59,48 @@ using HttpOpSigs = stdexec::completion_signatures<stdexec::set_value_t(HttpOpRes
                                                   stdexec::set_error_t(std::exception_ptr),
                                                   stdexec::set_stopped_t()>;
 
-// Beast's composed HTTP operations copy their stream and accept buffer
-// sequences, while StreamHandle exposes a unique owner and single buffers.
+// Adapter drive tasks: Beast needs an Asio-style (error, size) handler while
+// the bytes ride sender terminals. Each drive task co_awaits the StreamHandle
+// op (so stop composes) and translates the terminal into the handler in band
+// as an error_code; the spawned task therefore always ends with a value.
+template <typename Handler>
+exec::task<void> run_adapter_read(std::shared_ptr<io::StreamHandle> handle,
+                                  boost::asio::mutable_buffer buffer, Handler handler) {
+    try {
+        auto count = co_await handle->async_read_some(buffer);
+        if (count) {
+            std::move(handler)(boost::system::error_code{}, *count);
+        } else {
+            std::move(handler)(boost::asio::error::eof, std::size_t{0});
+        }
+    } catch (...) {
+        std::move(handler)(net::unpack_error(std::current_exception()), std::size_t{0});
+    }
+    co_return;
+}
+
+template <typename Handler>
+exec::task<void> run_adapter_write(std::shared_ptr<io::StreamHandle> handle,
+                                   std::shared_ptr<std::vector<std::uint8_t>> bytes,
+                                   Handler handler) {
+    try {
+        const auto count = co_await handle->async_write(boost::asio::buffer(*bytes));
+        (void)bytes;
+        std::move(handler)(boost::system::error_code{}, count);
+    } catch (...) {
+        std::move(handler)(net::unpack_error(std::current_exception()), std::size_t{0});
+    }
+    co_return;
+}
+
 class Http1StreamAdapter {
   public:
     using executor_type = boost::asio::any_io_executor;
 
     explicit Http1StreamAdapter(std::unique_ptr<io::StreamHandle> handle)
-        : handle_(std::shared_ptr<io::StreamHandle>(std::move(handle))) {}
+        : handle_(std::make_shared<AdapterState>(std::move(handle))) {}
 
-    executor_type get_executor() const noexcept { return handle_->executor(); }
+    executor_type get_executor() const noexcept { return handle_->handle->executor(); }
 
     template <class MutableBufferSequence, class CompletionToken>
     auto async_read_some(const MutableBufferSequence &buffers, CompletionToken &&token) {
@@ -85,30 +116,19 @@ class Http1StreamAdapter {
         auto handle = handle_;
         return boost::asio::async_initiate<CompletionToken,
                                            void(boost::system::error_code, std::size_t)>(
-            [handle = std::move(handle), buffer](auto completion_handler) mutable {
-                using Handler = std::decay_t<decltype(completion_handler)>;
-                struct Receiver {
-                    Handler handler;
-                    void set_value(std::optional<std::size_t> count) noexcept {
-                        if (count) {
-                            std::move(handler)(boost::system::error_code{}, *count);
-                        } else {
-                            std::move(handler)(boost::asio::error::eof, std::size_t{0});
-                        }
-                    }
-                    void set_error(std::exception_ptr error) noexcept {
-                        std::move(handler)(net::unpack_error(std::move(error)), std::size_t{0});
-                    }
-                    void set_stopped() noexcept {
-                        std::move(handler)(boost::asio::error::operation_aborted, std::size_t{0});
-                    }
-                };
-                async::start_with_receiver(handle->async_read_some(buffer),
-                                           Receiver{std::move(completion_handler)});
+            [state = handle, buffer](auto completion_handler) mutable {
+                // Thin Beast boundary: Beast needs an Asio-style (error,
+                // size) handler, so the sender is driven by a task that
+                // co_awaits the StreamHandle op and translates the terminal
+                // into the handler. Terminals stay in band as error_codes,
+                // so the spawned task always ends with a value. The task is
+                // owned by the adapter state scope, which outlives the ops
+                // via the shared handle.
+                state->scope.spawn(
+                    run_adapter_read(state->handle, buffer, std::move(completion_handler)));
             },
             token);
     }
-
     template <class ConstBufferSequence, class CompletionToken>
     auto async_write_some(const ConstBufferSequence &buffers, CompletionToken &&token) {
         auto bytes = std::make_shared<std::vector<std::uint8_t>>(boost::asio::buffer_size(buffers));
@@ -116,43 +136,36 @@ class Http1StreamAdapter {
         auto handle = handle_;
         return boost::asio::async_initiate<CompletionToken,
                                            void(boost::system::error_code, std::size_t)>(
-            [handle = std::move(handle),
-             bytes = std::move(bytes)](auto completion_handler) mutable {
-                using Handler = std::decay_t<decltype(completion_handler)>;
-                struct Receiver {
-                    Handler handler;
-                    std::shared_ptr<std::vector<std::uint8_t>> lifetime;
-                    void set_value(std::size_t count) noexcept {
-                        std::move(handler)(boost::system::error_code{}, count);
-                    }
-                    void set_error(std::exception_ptr error) noexcept {
-                        std::move(handler)(net::unpack_error(std::move(error)), std::size_t{0});
-                    }
-                    void set_stopped() noexcept {
-                        std::move(handler)(boost::asio::error::operation_aborted, std::size_t{0});
-                    }
-                };
-                // Split sender creation from the move below: function argument
-                // evaluation order is unspecified, so dereferencing bytes for
-                // the sender while moving it into the receiver in one call
-                // risks use-after-move.
-                auto sender = handle->async_write(boost::asio::buffer(*bytes));
-                async::start_with_receiver(
-                    std::move(sender), Receiver{std::move(completion_handler), std::move(bytes)});
+            [state = std::move(handle), bytes = std::move(bytes)](auto completion_handler) mutable {
+                // Same thin boundary as the read path: the sender is driven
+                // by a task; the shared bytes outlive the write.
+                state->scope.spawn(
+                    run_adapter_write(state->handle, bytes, std::move(completion_handler)));
             },
             token);
     }
 
     void close() noexcept {
-        if (handle_) {
-            handle_->close();
+        if (handle_ && handle_->handle) {
+            handle_->handle->close();
         }
     }
 
-    std::shared_ptr<io::StreamHandle> take_handle() noexcept { return std::exchange(handle_, {}); }
+    std::shared_ptr<io::StreamHandle> take_handle() noexcept {
+        return handle_ ? std::exchange(handle_->handle, {}) : std::shared_ptr<io::StreamHandle>{};
+    }
 
   private:
-    std::shared_ptr<io::StreamHandle> handle_;
+    // Shared adapter state: the handle plus the scope owning in-flight
+    // drive tasks. Never stopped; tasks are bounded by the Beast op and
+    // always complete with a value.
+    struct AdapterState {
+        explicit AdapterState(std::unique_ptr<io::StreamHandle> stream)
+            : handle(std::shared_ptr<io::StreamHandle>(std::move(stream))) {}
+        std::shared_ptr<io::StreamHandle> handle;
+        exec::async_scope scope;
+    };
+    std::shared_ptr<AdapterState> handle_;
 };
 
 class Http1TunnelState final : public std::enable_shared_from_this<Http1TunnelState> {
@@ -648,19 +661,17 @@ class Http1ClientSession final : public io::ExchangeSession,
             return wrap_result(exchange_id, std::move(channel.receiver));
         }
 
-        auto pending = std::make_shared<Pending>(executor_);
+        auto pending = std::make_shared<Pending>();
         pending->request = std::move(request);
         pending->message = std::move(message.value());
         pending->handler = std::move(channel.sender);
-        pending->timer.expires_at(deadline);
-        const auto self = shared_from_this();
-        pending->timer.async_wait([self, exchange_id](const boost::system::error_code &error) {
-            if (!error) {
-                self->expire(exchange_id);
-            }
-        });
-        pending_.emplace(exchange_id, std::move(pending));
+        pending->deadline = deadline;
+        pending_.emplace(exchange_id, pending);
         queue_.push_back(exchange_id);
+        // Deadline races the exchange task: whichever finishes first wins
+        // via the timer_done guard + map lookup in expire(); the loser
+        // drops. No when_any over tasks.
+        scope_.spawn(run_deadline(shared_from_this(), exchange_id, pending, deadline));
         start_next();
         return wrap_result(exchange_id, std::move(channel.receiver));
     }
@@ -685,20 +696,16 @@ class Http1ClientSession final : public io::ExchangeSession,
             return wrap_streaming(exchange_id, std::move(channel.receiver));
         }
 
-        auto pending = std::make_shared<Pending>(executor_);
+        auto pending = std::make_shared<Pending>();
         pending->is_streaming = true;
         pending->streaming_request = std::move(request);
         pending->streaming_message = std::move(message.value());
         pending->streaming_handler = std::move(channel.sender);
-        pending->timer.expires_at(deadline);
-        const auto self = shared_from_this();
-        pending->timer.async_wait([self, exchange_id](const boost::system::error_code &error) {
-            if (!error) {
-                self->expire(exchange_id);
-            }
-        });
+        pending->deadline = deadline;
         pending_.emplace(exchange_id, std::move(pending));
         queue_.push_back(exchange_id);
+        scope_.spawn(
+            run_deadline(shared_from_this(), exchange_id, pending_.at(exchange_id), deadline));
         start_next();
         return wrap_streaming(exchange_id, std::move(channel.receiver));
     }
@@ -723,20 +730,16 @@ class Http1ClientSession final : public io::ExchangeSession,
             return wrap_tunnel(exchange_id, std::move(channel.receiver));
         }
 
-        auto pending = std::make_shared<Pending>(executor_);
+        auto pending = std::make_shared<Pending>();
         pending->is_tunnel = true;
         pending->tunnel_request = std::move(request);
         pending->message = std::move(message.value());
         pending->tunnel_handler = std::move(channel.sender);
-        pending->timer.expires_at(deadline);
-        const auto self = shared_from_this();
-        pending->timer.async_wait([self, exchange_id](const boost::system::error_code &error) {
-            if (!error) {
-                self->expire(exchange_id);
-            }
-        });
+        pending->deadline = deadline;
         pending_.emplace(exchange_id, std::move(pending));
         queue_.push_back(exchange_id);
+        scope_.spawn(
+            run_deadline(shared_from_this(), exchange_id, pending_.at(exchange_id), deadline));
         start_next();
         return wrap_tunnel(exchange_id, std::move(channel.receiver));
     }
@@ -771,7 +774,7 @@ class Http1ClientSession final : public io::ExchangeSession,
 
   private:
     struct Pending {
-        explicit Pending(boost::asio::any_io_executor executor) : timer(std::move(executor)) {}
+        Pending() = default;
 
         bool is_tunnel = false;
         bool is_streaming = false;
@@ -804,7 +807,12 @@ class Http1ClientSession final : public io::ExchangeSession,
         async::oneshot::Sender<BufferedTerminal> handler;
         async::oneshot::Sender<StreamingTerminal> streaming_handler;
         async::oneshot::Sender<TunnelTerminal> tunnel_handler;
-        boost::asio::steady_timer timer;
+        std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::time_point::max();
+        // Set when the exchange leaves its terminal state: completion,
+        // cancel, expire, retire. The deadline task rechecks it after the
+        // sleep and drops instead of firing into a recycled exchange id.
+        bool timer_done = false;
     };
 
     ExchangeId next_exchange_id() noexcept {
@@ -1303,8 +1311,7 @@ class Http1ClientSession final : public io::ExchangeSession,
         const bool request_keep_alive = pending->streaming_request.request.keep_alive;
         const bool response_keep_alive = pending->streaming_parser->get().keep_alive();
         const bool reusable = request_keep_alive && response_keep_alive;
-        pending_.erase(found);
-        (void)pending->timer.cancel();
+        pending->timer_done = true;
         active_id_.reset();
         if (!reusable) {
             retired_ = true;
@@ -1328,8 +1335,7 @@ class Http1ClientSession final : public io::ExchangeSession,
         retired_ = true;
         close_stream();
         active_id_.reset();
-        pending_.erase(exchange_id);
-        (void)pending->timer.cancel();
+        pending->timer_done = true;
         retire_queued("HTTP/1.1 connection closed before queued exchange after streaming response "
                       "read failure (" +
                       std::to_string(error.value()) + ": " + error.message() + ")");
@@ -1542,6 +1548,25 @@ class Http1ClientSession final : public io::ExchangeSession,
         co_return;
     }
 
+    // Per-exchange deadline task: fires once at the deadline; the map
+    // lookup + timer_done guard drop it when the exchange already won.
+    // Bounded by the deadline, so no stop is ever requested.
+    static exec::task<void> run_deadline(std::shared_ptr<Http1ClientSession> self,
+                                         ExchangeId exchange_id, std::shared_ptr<Pending> pending,
+                                         std::chrono::steady_clock::time_point deadline) {
+        auto executor = self->executor_;
+        try {
+            co_await async::sleep_until(executor, deadline);
+        } catch (...) {
+            co_return;
+        }
+        if (pending->timer_done) {
+            co_return;
+        }
+        self->expire(exchange_id);
+        co_return;
+    }
+
     void expire(ExchangeId exchange_id) {
         if (!pending_.contains(exchange_id)) {
             return;
@@ -1601,10 +1626,10 @@ class Http1ClientSession final : public io::ExchangeSession,
         if (found == pending_.end()) {
             return;
         }
-        auto pending = std::move(found->second);
+        auto completed = std::move(found->second);
         pending_.erase(found);
-        (void)pending->timer.cancel();
-        auto handler = std::move(pending->handler);
+        completed->timer_done = true;
+        auto handler = std::move(completed->handler);
         if (handler) {
             handler.send(std::move(result));
         }
@@ -1615,10 +1640,10 @@ class Http1ClientSession final : public io::ExchangeSession,
         if (found == pending_.end()) {
             return;
         }
-        auto pending = std::move(found->second);
+        auto completed = std::move(found->second);
         pending_.erase(found);
-        (void)pending->timer.cancel();
-        auto handler = std::move(pending->tunnel_handler);
+        completed->timer_done = true;
+        auto handler = std::move(completed->tunnel_handler);
         if (handler) {
             handler.send(std::move(result));
         }
@@ -1634,19 +1659,19 @@ class Http1ClientSession final : public io::ExchangeSession,
         // that never park.
         found->second->space.sender.send(true);
         if (found->second->is_streaming) {
-            auto pending = std::move(found->second);
+            auto completed = std::move(found->second);
             pending_.erase(found);
-            (void)pending->timer.cancel();
-            if (pending->streaming_headers_delivered && pending->streaming_response_body) {
+            completed->timer_done = true;
+            if (completed->streaming_headers_delivered && completed->streaming_response_body) {
                 boost::system::error_code body_error = boost::asio::error::connection_reset;
                 if (error.code == core::ErrorCode::timeout) {
                     body_error = boost::asio::error::timed_out;
                 } else if (error.code == core::ErrorCode::cancelled) {
                     body_error = boost::asio::error::operation_aborted;
                 }
-                pending->streaming_response_body->fail(body_error);
+                completed->streaming_response_body->fail(body_error);
             } else {
-                post_streaming_result(std::move(pending->streaming_handler),
+                post_streaming_result(std::move(completed->streaming_handler),
                                       core::fail(std::move(error)));
             }
             return;

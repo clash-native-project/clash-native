@@ -16,6 +16,7 @@
 #include <boost/asio/ip/udp.hpp>
 #include <boost/asio/ssl/context.hpp>
 
+#include <exec/async_scope.hpp>
 #include <exec/task.hpp>
 
 #include <atomic>
@@ -98,6 +99,7 @@ class ProxyServer {
     };
 
     void accept();
+    static exec::task<void> run_accept_loop(ProxyServer *server);
     core::Status start_socks5_udp_listener();
     exec::task<core::StreamOpenResult>
     open_stream(core::ConnectionMetadata metadata,
@@ -146,6 +148,7 @@ class ProxyServer {
     std::function<bool(std::string_view)> fake_ip_filter_;
     std::shared_ptr<std::atomic_bool> callback_gate_;
     std::unordered_set<dns::ResolverService::RequestId> resolver_requests_;
+    exec::async_scope accept_scope_;
 };
 
 } // namespace clash_native::proxy

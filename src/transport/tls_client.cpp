@@ -1,17 +1,21 @@
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/net/tls_stream.hpp>
 #include <clash_native/transport/cert_pin.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include "transport/builtin_ca_bundle.hpp"
+#include <exec/asio/use_sender.hpp>
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
+
+#include <stdexec/execution.hpp>
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/ssl/host_name_verification.hpp>
-#include <boost/asio/steady_timer.hpp>
-
 #include <openssl/aead.h>
 #include <openssl/bio.h>
 #include <openssl/crypto.h>
@@ -783,8 +787,7 @@ class TlsClientHandshakeOperationImpl final
         : executor_(stream->executor()), options_(std::move(options)), handler_(std::move(handler)),
           context_(
               std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_client)),
-          stream_(std::make_unique<net::TlsStream>(context_, std::move(stream))),
-          timer_(executor_) {}
+          stream_(std::make_unique<net::TlsStream>(context_, std::move(stream))) {}
 
     void start() {
         const auto self = shared_from_this();
@@ -1063,58 +1066,85 @@ class TlsClientHandshakeOperationImpl final
         if (completed_) {
             return;
         }
-        if (options_.deadline) {
-            if (*options_.deadline <= std::chrono::steady_clock::now()) {
-                finish(core::fail(timeout_error()));
-                return;
-            }
-            timer_.expires_at(*options_.deadline);
-            const auto self = shared_from_this();
-            timer_.async_wait([self](const boost::system::error_code &error) {
-                if (!error) {
-                    self->finish(core::fail(timeout_error()));
-                }
-            });
-        }
-        const auto configured = configure();
+        scope_.spawn(run_handshake(shared_from_this()));
+    }
+
+    static exec::task<void> run_handshake(std::shared_ptr<TlsClientHandshakeOperationImpl> self) {
+        const auto configured = self->configure();
         if (!configured) {
-            finish(core::fail(configured.error()));
-            return;
+            self->finish(core::fail(configured.error()));
+            co_return;
         }
-        const auto self = shared_from_this();
-        stream_->stream_->async_handshake(
-            boost::asio::ssl::stream_base::client, [self](const boost::system::error_code &error) {
-                if (self->completed_) {
-                    return;
-                }
-                if (error) {
-                    self->finish(core::fail(handshake_error(error)));
-                    return;
-                }
-                const unsigned char *protocol = nullptr;
-                unsigned int protocol_length = 0;
-                SSL_get0_alpn_selected(self->stream_->stream_->native_handle(), &protocol,
-                                       &protocol_length);
-                std::string negotiated_alpn;
-                if (protocol_length != 0) {
-                    negotiated_alpn.assign(reinterpret_cast<const char *>(protocol),
-                                           protocol_length);
-                }
-                std::unique_ptr<io::StreamHandle> stream;
-                if (self->options_.handoff_raw_transport) {
-                    stream = self->stream_->take_transport();
-                } else {
-                    stream = std::move(self->stream_);
-                }
-                if (!stream) {
-                    self->finish(core::fail(
-                        transport_error("TLS client handshake lost its underlying stream",
-                                        boost::asio::error::operation_aborted)));
-                    return;
-                }
-                TlsClientConnection connection{std::move(stream), std::move(negotiated_alpn)};
-                self->finish(std::move(connection));
-            });
+        if (!self->options_.deadline) {
+            co_await do_handshake(self);
+            co_return;
+        }
+        if (*self->options_.deadline <= std::chrono::steady_clock::now()) {
+            self->finish(core::fail(timeout_error()));
+            co_return;
+        }
+        // Deadline is a sleep_until task racing the handshake: whichever
+        // finishes first wins via the completed_ guard in finish(); the
+        // loser observes completed_ and drops. No when_any over tasks.
+        auto deadline = *self->options_.deadline;
+        auto executor = self->executor_;
+        self->scope_.spawn(run_deadline(self, executor, deadline));
+        co_await do_handshake(self);
+    }
+
+    static exec::task<void> run_deadline(std::shared_ptr<TlsClientHandshakeOperationImpl> self,
+                                         boost::asio::any_io_executor executor,
+                                         std::chrono::steady_clock::time_point deadline) {
+        try {
+            co_await async::sleep_until(executor, deadline);
+        } catch (...) {
+            co_return;
+        }
+        self->finish(core::fail(timeout_error()));
+    }
+
+    static exec::task<void> do_handshake(std::shared_ptr<TlsClientHandshakeOperationImpl> self) {
+        try {
+            co_await self->stream_->stream_->async_handshake(boost::asio::ssl::stream_base::client,
+                                                             exec::asio::use_sender);
+        } catch (...) {
+            if (self->completed_) {
+                co_return;
+            }
+            try {
+                std::rethrow_exception(std::current_exception());
+            } catch (const boost::system::system_error &failure) {
+                self->finish(core::fail(handshake_error(failure.code())));
+            } catch (...) {
+                self->finish(core::fail(handshake_error(boost::asio::error::operation_aborted)));
+            }
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        const unsigned char *protocol = nullptr;
+        unsigned int protocol_length = 0;
+        SSL_get0_alpn_selected(self->stream_->stream_->native_handle(), &protocol,
+                               &protocol_length);
+        std::string negotiated_alpn;
+        if (protocol_length != 0) {
+            negotiated_alpn.assign(reinterpret_cast<const char *>(protocol), protocol_length);
+        }
+        std::unique_ptr<io::StreamHandle> stream;
+        if (self->options_.handoff_raw_transport) {
+            stream = self->stream_->take_transport();
+        } else {
+            stream = std::move(self->stream_);
+        }
+        if (!stream) {
+            self->finish(
+                core::fail(transport_error("TLS client handshake lost its underlying stream",
+                                           boost::asio::error::operation_aborted)));
+            co_return;
+        }
+        TlsClientConnection connection{std::move(stream), std::move(negotiated_alpn)};
+        self->finish(std::move(connection));
     }
 
     void finish(core::Result<TlsClientConnection> result) {
@@ -1122,7 +1152,6 @@ class TlsClientHandshakeOperationImpl final
             return;
         }
         completed_ = true;
-        (void)timer_.cancel();
         if (!result && stream_) {
             stream_->close();
             stream_.reset();
@@ -1188,7 +1217,7 @@ class TlsClientHandshakeOperationImpl final
     TlsClientHandler handler_;
     std::shared_ptr<boost::asio::ssl::context> context_;
     std::unique_ptr<net::TlsStream> stream_;
-    boost::asio::steady_timer timer_;
+    exec::async_scope scope_;
     bool completed_ = false;
     RealityState reality_state_{};
     std::string reality_verify_name_;

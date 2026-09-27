@@ -1,6 +1,5 @@
 #include "quic_dns_transport_internal.hpp"
 
-#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/transport/http_sessions.hpp>
 
@@ -83,39 +82,43 @@ void QuicDnsTransport::Operation::submit_http3_exchange(const std::shared_ptr<Ex
     request.body = exchange->request.query.wire;
     request.response_body_limit = 0xffff;
 
-    const auto id = exchange->id;
-    const auto weak = weak_from_this();
-    struct Http3Receiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::weak_ptr<Operation> weak;
-        DnsExchangeId exchange_id;
-        void set_value(io::ExchangeResponse response) && noexcept {
-            if (const auto self = weak.lock()) {
-                self->on_http3_result(exchange_id, response);
-            }
-        }
-        void set_error(std::exception_ptr error) && noexcept {
-            if (const auto self = weak.lock()) {
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->on_http3_result(exchange_id, core::fail(failure));
-                } catch (...) {
-                    self->on_http3_result(
-                        exchange_id, core::fail(core::Error{core::ErrorCode::endpoint_connection,
-                                                            "DoH3 exchange failed"}));
-                }
-            }
-        }
-        void set_stopped() && noexcept {
-            if (const auto self = weak.lock()) {
-                self->on_http3_result(exchange_id, core::fail(http3_cancelled_error()));
-            }
-        }
-    };
     exchange->http_exchange_started = true;
-    async::start_with_receiver(http3_->exchange(std::move(request), exchange->request.deadline),
-                               Http3Receiver{weak, id});
+    // Guarded emission pump: one exchange task per request, co_awaiting
+    // the io:: sender. The task always ends with a value; on_http3_result
+    // drops late terminals when the exchange is already gone. Cancelled
+    // via the session (close path shuts the stream down).
+    scope_.spawn(run_http3_exchange(shared_from_this(), exchange->id, std::move(request),
+                                    exchange->request.deadline));
+}
+
+exec::task<void>
+QuicDnsTransport::Operation::run_http3_exchange(std::shared_ptr<Operation> self, DnsExchangeId id,
+                                                io::ExchangeRequest request,
+                                                std::chrono::steady_clock::time_point deadline) {
+    core::Result<io::ExchangeResponse> result = core::fail(http3_cancelled_error());
+    try {
+        auto session = self->http3_;
+        if (session == nullptr) {
+            self->on_http3_result(id, core::fail(http3_cancelled_error()));
+            co_return;
+        }
+        try {
+            result = co_await session->exchange(std::move(request), deadline);
+        } catch (const core::Error &failure) {
+            self->on_http3_result(id, core::fail(failure));
+            co_return;
+        } catch (...) {
+            self->on_http3_result(id, core::fail(core::Error{core::ErrorCode::endpoint_connection,
+                                                             "DoH3 exchange failed"}));
+            co_return;
+        }
+    } catch (...) {
+        self->on_http3_result(id, core::fail(core::Error{core::ErrorCode::endpoint_connection,
+                                                         "DoH3 exchange failed"}));
+        co_return;
+    }
+    self->on_http3_result(id, std::move(result));
+    co_return;
 }
 
 void QuicDnsTransport::Operation::on_http3_result(DnsExchangeId id,

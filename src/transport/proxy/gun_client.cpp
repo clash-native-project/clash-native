@@ -1,8 +1,6 @@
 #include <clash_native/transport/proxy/gun_client.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/held_operation.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
 
 #include <stdexec/execution.hpp>
 
@@ -63,61 +61,27 @@ exec::task<void> GunClient::run_open(std::shared_ptr<GunClient> client,
     OpenResult result = core::fail({core::ErrorCode::transport_io, "gun dial failed"});
     try {
         if (!entry->session) {
-            auto session =
-                co_await async::bridge_sender<core::Result<std::shared_ptr<io::ExchangeSession>>>(
-                    [maker](async::BridgeHandler<core::Result<std::shared_ptr<io::ExchangeSession>>>
-                                open) mutable {
-                        // The bridge starter must be copyable: drive the
-                        // maker sender straight into the terminal. The held
-                        // drive is destroyed on abort, cancelling the maker
-                        // exchange per its own abort semantics.
-                        struct MakerReceiver {
-                            using receiver_concept = stdexec::receiver_tag;
-                            async::BridgeHandler<core::Result<std::shared_ptr<io::ExchangeSession>>>
-                                open;
-                            void set_value(std::shared_ptr<io::ExchangeSession> session) noexcept {
-                                auto terminal = std::move(open);
-                                terminal(core::Result<std::shared_ptr<io::ExchangeSession>>{
-                                    std::move(session)});
-                            }
-                            void set_error(std::exception_ptr error) noexcept {
-                                auto terminal = std::move(open);
-                                try {
-                                    std::rethrow_exception(std::move(error));
-                                } catch (const core::Error &failure) {
-                                    terminal(core::fail(failure));
-                                    return;
-                                } catch (...) {
-                                }
-                                terminal(core::fail(
-                                    {core::ErrorCode::transport_io, "gun session open failed"}));
-                            }
-                            void set_stopped() noexcept {
-                                auto terminal = std::move(open);
-                                terminal(core::fail(
-                                    {core::ErrorCode::cancelled, "gun session open cancelled"}));
-                            }
-                        };
-                        struct Drive {
-                            std::shared_ptr<async::HeldOperation<
-                                io::AnySender<std::shared_ptr<io::ExchangeSession>>, MakerReceiver>>
-                                held;
-                        };
-                        auto drive = std::make_shared<Drive>();
-                        // NOTE: name the sender first; argument order is unspecified.
-                        auto sender = maker();
-                        drive->held = async::hold_operation(std::move(sender),
-                                                            MakerReceiver{std::move(open)});
-                        drive->held->start();
-                        using AbortFn = async::CallbackAbortFn;
-                        return AbortFn{[drive] { drive->held.reset(); }};
-                    });
-            if (!session) {
-                result = core::fail(session.error());
+            // Task-shaped session open: direct co_await on the maker sender
+            // (cancellable via scope stop), replacing the HeldOperation +
+            // MakerReceiver drive. Errors normalize to core::Error results.
+            std::shared_ptr<io::ExchangeSession> opened;
+            try {
+                opened = co_await maker();
+            } catch (const core::Error &failure) {
+                result = core::fail(failure);
+                done(std::move(result));
+                co_return;
+            } catch (...) {
+                result = core::fail({core::ErrorCode::transport_io, "gun session open failed"});
                 done(std::move(result));
                 co_return;
             }
-            entry->session = std::move(session.value());
+            if (!opened) {
+                result = core::fail({core::ErrorCode::transport_io, "gun session open failed"});
+                done(std::move(result));
+                co_return;
+            }
+            entry->session = std::move(opened);
         }
         auto stream =
             co_await async::bridge_sender<OpenResult>([entry, options](OpenHandler open) mutable {

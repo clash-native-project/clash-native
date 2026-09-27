@@ -6,10 +6,13 @@
 #include <boost/asio/ip/tcp.hpp>
 
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace clash_native::dns {
+
+struct SystemResolverState;
 
 class SystemResolver final {
   public:
@@ -22,6 +25,7 @@ class SystemResolver final {
 
   private:
     boost::asio::ip::tcp::resolver resolver_;
+    std::shared_ptr<SystemResolverState> state_;
 };
 
 } // namespace clash_native::dns

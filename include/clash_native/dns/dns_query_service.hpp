@@ -8,6 +8,9 @@
 #include <clash_native/dns/resolver_graph.hpp>
 #include <clash_native/io/sender.hpp>
 
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
+
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -82,6 +85,7 @@ class DnsQueryService final {
     // shared exchange when the last waiter leaves), so caller stop composes
     // with racing adaptors instead of leaking until the upstream answers.
     io::AnySender<core::Result<DnsPacket>> query_sender(DnsPacket packet);
+    runtime::AsioRuntime &runtime() noexcept { return runtime_; }
     void stop() noexcept;
     void clear_cache() noexcept;
     std::size_t cache_size() const noexcept;

@@ -1,7 +1,6 @@
 #include <clash_native/transport/shadowsocks/ss2022_stream.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/proxy/crypto.hpp>
 
@@ -36,45 +35,6 @@ namespace {
 
 using StreamReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
 using StreamWriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
-
-// Bridges one carrier pull/push back into a legacy (error, size) handler.
-struct CarrierReadBridge {
-    using receiver_concept = stdexec::receiver_tag;
-    StreamReadHandler handler;
-    void set_value(std::optional<std::size_t> size) && noexcept {
-        auto callback = std::move(handler);
-        if (size) {
-            callback({}, *size);
-        } else {
-            callback(boost::asio::error::eof, 0);
-        }
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto callback = std::move(handler);
-        callback(net::unpack_error(std::move(error)), 0);
-    }
-    void set_stopped() && noexcept {
-        auto callback = std::move(handler);
-        callback(boost::asio::error::operation_aborted, 0);
-    }
-};
-
-struct CarrierWriteBridge {
-    using receiver_concept = stdexec::receiver_tag;
-    StreamWriteHandler handler;
-    void set_value(std::size_t size) && noexcept {
-        auto callback = std::move(handler);
-        callback({}, size);
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto callback = std::move(handler);
-        callback(net::unpack_error(std::move(error)), 0);
-    }
-    void set_stopped() && noexcept {
-        auto callback = std::move(handler);
-        callback(boost::asio::error::operation_aborted, 0);
-    }
-};
 
 constexpr std::size_t kMaxChunkPayload = 0x3fff;
 constexpr std::size_t kFixedHeaderSize = 1 + sizeof(std::uint64_t) + sizeof(std::uint16_t);
@@ -271,7 +231,7 @@ class Shadowsocks2022StreamState final
             };
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = carrier_->async_write(boost::asio::buffer(*wire));
-        async::start_with_receiver(std::move(sender), CarrierWriteBridge{std::move(completion)});
+        net::start_write_for_handler(std::move(sender), std::move(completion));
     }
 
     boost::asio::any_io_executor executor() noexcept { return carrier_->executor(); }
@@ -288,7 +248,7 @@ class Shadowsocks2022StreamState final
     // read_in_progress_/read_handler_, so a cancel racing terminal delivery
     // either preempts it (late completion then drops in finish_read) or finds
     // no parked handler and is a no-op. The lower carrier pulls stay detached
-    // through CarrierReadBridge; their late completions funnel into
+    // through start_read_for_handler; their late completions funnel into
     // finish_read and are dropped once the parked handler is gone.
     void cancel_read() noexcept {
         try {
@@ -652,7 +612,7 @@ class Shadowsocks2022StreamState final
             };
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = carrier_->async_read_some(buffer);
-        async::start_with_receiver(std::move(sender), CarrierReadBridge{std::move(completion)});
+        net::start_read_for_handler(std::move(sender), std::move(completion));
     }
 
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;

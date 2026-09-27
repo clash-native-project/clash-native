@@ -1,7 +1,6 @@
 #include <clash_native/transport/trojan/ss_stream.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/proxy/crypto.hpp>
@@ -28,45 +27,9 @@ namespace clash_native::transport::trojan {
 
 namespace {
 
-// Bridges one stream push/pull back into a legacy (error, size) handler.
-struct StreamWriteBridge {
-    using receiver_concept = stdexec::receiver_tag;
-    std::function<void(const boost::system::error_code &, std::size_t)> handler;
-    void set_value(std::size_t size) && noexcept {
-        auto callback = std::move(handler);
-        callback({}, size);
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto callback = std::move(handler);
-        callback(net::unpack_error(std::move(error)), 0);
-    }
-    void set_stopped() && noexcept {
-        auto callback = std::move(handler);
-        callback(boost::asio::error::operation_aborted, 0);
-    }
-};
-
-struct StreamReadBridge {
-    using receiver_concept = stdexec::receiver_tag;
-    std::function<void(const boost::system::error_code &, std::size_t)> handler;
-    void set_value(std::optional<std::size_t> size) && noexcept {
-        auto callback = std::move(handler);
-        if (size) {
-            callback({}, *size);
-        } else {
-            callback(boost::asio::error::eof, 0);
-        }
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto callback = std::move(handler);
-        callback(net::unpack_error(std::move(error)), 0);
-    }
-    void set_stopped() && noexcept {
-        auto callback = std::move(handler);
-        callback(boost::asio::error::operation_aborted, 0);
-    }
-};
-
+// Stream pushes/pulls drive straight into (error, size) handlers via
+// net::start_write/read_for_handler; late completions drop once the parked
+// handler is gone.
 constexpr std::size_t kMaxChunkPayload = 0x3fff;
 
 boost::system::error_code protocol_error() {
@@ -140,12 +103,11 @@ class TrojanSsStreamState final : public std::enable_shared_from_this<TrojanSsSt
         auto self = shared_from_this();
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = stream_->async_write(boost::asio::buffer(*wire));
-        async::start_with_receiver(
+        net::start_write_for_handler(
             std::move(sender),
-            StreamWriteBridge{
-                [wire, self](const boost::system::error_code &error, std::size_t) mutable {
-                    self->finish_send(error, error ? 0 : self->send_size_);
-                }});
+            [wire, self](const boost::system::error_code &error, std::size_t) mutable {
+                self->finish_send(error, error ? 0 : self->send_size_);
+            });
     }
 
     void receive(boost::asio::mutable_buffer buffer, ReadHandler handler) {
@@ -289,7 +251,7 @@ class TrojanSsStreamState final : public std::enable_shared_from_this<TrojanSsSt
             };
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = stream_->async_read_some(read_buffer);
-        async::start_with_receiver(std::move(sender), StreamReadBridge{std::move(pull)});
+        net::start_read_for_handler(std::move(sender), std::move(pull));
     }
 
     void read_peer_salt() {

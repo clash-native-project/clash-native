@@ -1,6 +1,6 @@
 #include "proxy_session.hpp"
 
-#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 
 #include <boost/asio/read.hpp>
@@ -8,7 +8,11 @@
 #include <fmt/format.h>
 #include <spdlog/spdlog.h>
 
+#include <exec/asio/use_sender.hpp>
+#include <exec/when_any.hpp>
+
 #include <chrono>
+#include <stdexec/execution.hpp>
 #include <utility>
 
 namespace clash_native::proxy {
@@ -16,24 +20,85 @@ namespace clash_native::proxy {
 ProxySession::ProxySession(ProxyServer &owner, boost::asio::ip::tcp::socket client,
                            CloseHandler close_handler)
     : owner_(owner), client_(std::move(client), owner.tls_context_),
-      handshake_timer_(client_.executor()), close_handler_(std::move(close_handler)) {}
+      close_handler_(std::move(close_handler)) {}
 
 void ProxySession::start() {
-    reset_handshake_timer();
+    // Handshake phase runs as one task: TLS handshake races the handshake
+    // timeout (sleep_after + when_any) instead of a steady_timer.async_wait
+    // leaf, then the protocol dispatch runs inline. Timeout closes the
+    // session; stop closes the socket, which aborts the in-flight I/O.
     auto self = shared_from_this();
-    client_.async_server_handshake([self](const boost::system::error_code &error) {
-        if (error) {
-            spdlog::debug("Local proxy TLS handshake failed: {}", error.message());
+    scope_.spawn(run_handshake(self));
+}
+
+exec::task<void> ProxySession::run_handshake(std::shared_ptr<ProxySession> self) {
+    const auto executor = self->client_.get_executor();
+    try {
+        // Tri-state race: true = handshake done, false = timeout; a
+        // stopped outer scope throws out of the co_await instead.
+        const bool finished = co_await async::with_timeout<bool>(
+            executor, kHandshakeTimeout,
+            self->client_.async_server_handshake() | stdexec::then([] { return true; }),
+            [] { return false; });
+        if (self->closed_.load(std::memory_order_acquire)) {
+            co_return;
+        }
+        if (!finished) {
+            spdlog::debug("Local proxy handshake timed out");
             self->close();
-            return;
+            co_return;
         }
+    } catch (const boost::system::system_error &failure) {
+        spdlog::debug("Local proxy TLS handshake failed: {}", failure.code().message());
+        self->close();
+        co_return;
+    } catch (...) {
+        self->close();
+        co_return;
+    }
+    // TLS done (or disabled): read the protocol byte inline, then dispatch.
+    // Transport failures close; the timeout above already fired only for
+    // the TLS phase, while later phases are bounded by close()/relay.
+    try {
+        co_await (boost::asio::async_read(self->client_, boost::asio::buffer(self->protocol_byte_),
+                                          exec::asio::use_sender) |
+                  stdexec::then([](std::size_t) {}));
+    } catch (...) {
+        self->close();
+        co_return;
+    }
+    if (self->closed_.load(std::memory_order_acquire)) {
+        co_return;
+    }
+    if (self->protocol_byte_[0] == 0x04) {
         if (self->owner_.inbound_mode_ == ProxyInboundMode::http) {
-            self->protocol_ = Protocol::http;
-            self->read_http_headers();
-        } else {
-            self->read_protocol_byte();
+            self->close();
+            co_return;
         }
-    });
+        self->protocol_ = Protocol::socks4;
+        self->socks4_request_[0] = self->protocol_byte_[0];
+        self->scope_.spawn(run_socks4_request(self));
+        co_return;
+    }
+    if (self->protocol_byte_[0] == kSocksVersion) {
+        if (self->owner_.inbound_mode_ == ProxyInboundMode::http) {
+            self->close();
+            co_return;
+        }
+        self->protocol_ = Protocol::socks5;
+        self->method_header_[0] = self->protocol_byte_[0];
+        self->scope_.spawn(run_socks5_handshake(self));
+        co_return;
+    }
+    if (self->owner_.inbound_mode_ == ProxyInboundMode::socks) {
+        self->close();
+        co_return;
+    }
+    self->protocol_ = Protocol::http;
+    auto prepared = self->http_buffer_.prepare(1);
+    boost::asio::buffer_copy(prepared, boost::asio::buffer(self->protocol_byte_));
+    self->http_buffer_.commit(1);
+    self->read_http_headers();
 }
 
 void ProxySession::stop() noexcept { close(); }
@@ -45,63 +110,6 @@ ProxySession::connection_id() const noexcept {
         return std::nullopt;
     }
     return id;
-}
-
-void ProxySession::reset_handshake_timer() {
-    handshake_timer_.expires_after(kHandshakeTimeout);
-    auto self = shared_from_this();
-    handshake_timer_.async_wait([self](const boost::system::error_code &error) {
-        if (!error) {
-            self->close();
-        }
-    });
-}
-
-void ProxySession::cancel_handshake_timer() noexcept { handshake_timer_.cancel(); }
-
-void ProxySession::read_protocol_byte() {
-    auto self = shared_from_this();
-    boost::asio::async_read(client_, boost::asio::buffer(protocol_byte_),
-                            [self](const boost::system::error_code &error, std::size_t) {
-                                if (error) {
-                                    self->close();
-                                    return;
-                                }
-
-                                if (self->protocol_byte_[0] == 0x04) {
-                                    if (self->owner_.inbound_mode_ == ProxyInboundMode::http) {
-                                        self->close();
-                                        return;
-                                    }
-                                    self->protocol_ = Protocol::socks4;
-                                    self->socks4_request_[0] = self->protocol_byte_[0];
-                                    self->scope_.spawn(self->run_socks4_request(self));
-                                    return;
-                                }
-
-                                if (self->protocol_byte_[0] == kSocksVersion) {
-                                    if (self->owner_.inbound_mode_ == ProxyInboundMode::http) {
-                                        self->close();
-                                        return;
-                                    }
-                                    self->protocol_ = Protocol::socks5;
-                                    self->method_header_[0] = self->protocol_byte_[0];
-                                    self->scope_.spawn(self->run_socks5_handshake(self));
-                                    return;
-                                }
-
-                                if (self->owner_.inbound_mode_ == ProxyInboundMode::socks) {
-                                    self->close();
-                                    return;
-                                }
-
-                                self->protocol_ = Protocol::http;
-                                auto prepared = self->http_buffer_.prepare(1);
-                                boost::asio::buffer_copy(prepared,
-                                                         boost::asio::buffer(self->protocol_byte_));
-                                self->http_buffer_.commit(1);
-                                self->read_http_headers();
-                            });
 }
 
 void ProxySession::open_target(core::Destination destination) {
@@ -154,7 +162,6 @@ void ProxySession::handle_open_result(core::StreamOpenResult result) {
     if (closed_.load(std::memory_order_acquire)) {
         return;
     }
-    cancel_handshake_timer();
     if (!result.succeeded()) {
         if (result.error) {
             spdlog::warn("Proxy outbound stream open failed ({}): {}{}",
@@ -198,7 +205,6 @@ void ProxySession::start_relay() {
     if (closed_.load(std::memory_order_acquire)) {
         return;
     }
-    cancel_handshake_timer();
     if (!remote_) {
         close();
         return;
@@ -226,7 +232,6 @@ void ProxySession::close() noexcept {
     if (relay_) {
         relay_->stop();
     }
-    cancel_handshake_timer();
     if (remote_) {
         remote_->close();
     }

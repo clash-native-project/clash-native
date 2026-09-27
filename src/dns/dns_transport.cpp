@@ -1,5 +1,6 @@
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/oneshot.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/io/sender.hpp>
@@ -8,7 +9,9 @@
 
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
-#include <boost/asio/steady_timer.hpp>
+
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include <algorithm>
 #include <array>
@@ -276,23 +279,19 @@ class AsioDnsTransport::TcpSession final
             return;
         }
 
-        auto pending = std::make_shared<Pending>(runtime_.serialized_executor());
+        auto pending = std::make_shared<Pending>();
         pending->frame.reserve(2 + query.size());
         pending->frame.push_back(static_cast<std::uint8_t>(query.size() >> 8));
         pending->frame.push_back(static_cast<std::uint8_t>(query.size() & 0xff));
         pending->frame.insert(pending->frame.end(), query.begin(), query.end());
         pending->handler = std::move(handler);
-        pending->timer.expires_at(deadline);
-        auto self = shared_from_this();
-        pending->timer.async_wait([self, query_id](const boost::system::error_code &error) {
-            if (!error) {
-                self->fail_request(query_id, timeout_error());
-            }
-        });
         pending_.emplace(query_id, pending);
         write_queue_.push_back(query_id);
         connect_if_needed();
         flush_writes();
+        // The scope only owns chain tasks (merge-shaped usage); teardown
+        // stays guard-driven, so no stop is ever requested.
+        scope_.spawn(run_deadline(shared_from_this(), query_id, deadline));
     }
 
     void cancel(std::uint16_t query_id) noexcept { fail_request(query_id, cancelled_error()); }
@@ -308,12 +307,23 @@ class AsioDnsTransport::TcpSession final
 
   private:
     struct Pending {
-        explicit Pending(boost::asio::any_io_executor executor) : timer(std::move(executor)) {}
-
         std::vector<std::uint8_t> frame;
         Handler handler;
-        boost::asio::steady_timer timer;
     };
+
+    // Per-request deadline task: fires once at the deadline; the map lookup
+    // in fail_request drops it when the response already won. Bounded by the
+    // deadline, so no stop is ever requested.
+    static exec::task<void> run_deadline(std::shared_ptr<TcpSession> self, std::uint16_t query_id,
+                                         std::chrono::steady_clock::time_point deadline) {
+        try {
+            co_await async::sleep_until(self->runtime_.serialized_executor(), deadline);
+        } catch (...) {
+            co_return;
+        }
+        self->fail_request(query_id, timeout_error());
+        co_return;
+    }
 
     using PendingPtr = std::shared_ptr<Pending>;
     using ReadCompletion = std::function<void(const boost::system::error_code &)>;
@@ -327,6 +337,48 @@ class AsioDnsTransport::TcpSession final
             });
     }
 
+    // Straight-line connect chain: dial the stream, then start the read
+    // pump and flush queued writes. Every terminal funnels through
+    // connection_failed() or the pump starters, so the spawned task always
+    // ends with a value.
+    static exec::task<void> run_connect(std::shared_ptr<TcpSession> self,
+                                        std::uint64_t generation) {
+        if (!self->dialer_) {
+            self->connection_failed(
+                {core::ErrorCode::configuration, "DNS upstream stream dialer is not configured"},
+                generation);
+            co_return;
+        }
+        core::StreamOpenResult opened;
+        try {
+            opened = co_await self->dialer_->connect_stream(
+                {core::Destination::address(self->endpoint_.address(), self->endpoint_.port()),
+                 std::nullopt});
+        } catch (const core::Error &failure) {
+            if (generation == self->connection_generation_ && !self->stopped_) {
+                self->connection_failed(failure, generation);
+            }
+            co_return;
+        } catch (...) {
+            if (generation == self->connection_generation_ && !self->stopped_) {
+                self->connection_failed(core::Error{core::ErrorCode::endpoint_connection,
+                                                    "DNS upstream dialer failed to open a stream"},
+                                        generation);
+            }
+            co_return;
+        }
+        if (!opened.succeeded()) {
+            self->connection_failed(
+                opened.error.value_or(core::Error{core::ErrorCode::endpoint_connection,
+                                                  "DNS upstream dialer failed to open a stream"}),
+                generation);
+            co_return;
+        }
+        self->stream_ = std::move(opened.handle);
+        self->on_connected(generation);
+        co_return;
+    }
+
     void connect_if_needed() {
         if (stopped_ || connected_ || connecting_ || pending_.empty()) {
             return;
@@ -334,54 +386,10 @@ class AsioDnsTransport::TcpSession final
 
         connecting_ = true;
         const auto generation = connection_generation_;
-        if (!dialer_) {
-            connection_failed(
-                {core::ErrorCode::configuration, "DNS upstream stream dialer is not configured"},
-                generation);
-            return;
-        }
         auto self = shared_from_this();
-        struct ConnectReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<TcpSession> self;
-            std::uint64_t generation;
-            void set_value(core::StreamOpenResult result) && noexcept {
-                if (generation != self->connection_generation_ || self->stopped_) {
-                    if (result.handle) {
-                        result.handle->close();
-                    }
-                    return;
-                }
-                if (!result.succeeded()) {
-                    self->connection_failed(result.error.value_or(core::Error{
-                                                core::ErrorCode::endpoint_connection,
-                                                "DNS upstream dialer failed to open a stream"}),
-                                            generation);
-                    return;
-                }
-                self->stream_ = std::move(result.handle);
-                self->on_connected(generation);
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                if (generation != self->connection_generation_ || self->stopped_) {
-                    return;
-                }
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->connection_failed(failure, generation);
-                } catch (...) {
-                    self->connection_failed(core::Error{core::ErrorCode::endpoint_connection,
-                                                        "DNS upstream dialer failed"},
-                                            generation);
-                }
-            }
-            void set_stopped() && noexcept {}
-        };
-        async::start_with_receiver(
-            dialer_->connect_stream(
-                {core::Destination::address(endpoint_.address(), endpoint_.port()), std::nullopt}),
-            ConnectReceiver{self, generation});
+        // The scope only owns chain tasks (merge-shaped usage); teardown
+        // stays guard-driven, so no stop is ever requested.
+        scope_.spawn(run_connect(self, generation));
     }
 
     void on_connected(std::uint64_t generation) {
@@ -520,7 +528,6 @@ class AsioDnsTransport::TcpSession final
         if (const auto found = pending_.find(query_id); found != pending_.end()) {
             auto pending = std::move(found->second);
             pending_.erase(found);
-            pending->timer.cancel();
             handler = std::move(pending->handler);
         }
         if (handler) {
@@ -538,7 +545,6 @@ class AsioDnsTransport::TcpSession final
         pending_.erase(found);
         write_queue_.erase(std::remove(write_queue_.begin(), write_queue_.end(), query_id),
                            write_queue_.end());
-        pending->timer.cancel();
         if (pending->handler) {
             auto handler = std::move(pending->handler);
             handler(core::fail(std::move(error)));
@@ -549,7 +555,7 @@ class AsioDnsTransport::TcpSession final
         std::vector<Handler> handlers;
         handlers.reserve(pending_.size());
         for (auto &[query_id, pending] : pending_) {
-            pending->timer.cancel();
+            (void)query_id;
             if (pending->handler) {
                 handlers.push_back(std::move(pending->handler));
             }
@@ -585,6 +591,8 @@ class AsioDnsTransport::TcpSession final
     boost::asio::ip::tcp::endpoint endpoint_;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
     std::unique_ptr<io::StreamHandle> stream_;
+    // Owns the connect/deadline chain tasks, which always end with a value.
+    exec::async_scope scope_;
     std::unordered_map<std::uint16_t, PendingPtr> pending_;
     std::deque<std::uint16_t> write_queue_;
     std::uint64_t connection_generation_ = 0;
@@ -601,8 +609,7 @@ class AsioDnsTransport::Operation final
     Operation(AsioDnsTransport &owner, DnsExchangeId exchange_id, DnsExchangeRequest request,
               async::BridgeHandler<DnsExchangeResult> handler)
         : owner_(owner), exchange_id_(exchange_id), request_(std::move(request)),
-          handler_(std::move(handler)), timeout_timer_(owner.runtime_.serialized_executor()),
-          udp_endpoint_(owner.config_.endpoint) {}
+          handler_(std::move(handler)), udp_endpoint_(owner.config_.endpoint) {}
 
     void start() {
         const auto query_id = owner_.next_query_id();
@@ -619,15 +626,13 @@ class AsioDnsTransport::Operation final
             return;
         }
         query_ = encoded.value();
-
-        timeout_timer_.expires_at(request_.deadline);
         auto self = shared_from_this();
-        timeout_timer_.async_wait([self](const boost::system::error_code &error) {
-            if (!error && !self->completed_) {
-                self->retry_or_finish(timeout_error());
-            }
-        });
-        start_attempt();
+        // The scope only owns this exchange task (merge-shaped usage);
+        // teardown is guard-driven, so no stop is ever requested: the
+        // request deadline bounds any orphaned chain, and the map lookup in
+        // complete() drops late terminals.
+        scope_.spawn(run(shared_from_this()));
+        scope_.spawn(run_deadline(self, request_.deadline));
     }
 
     void cancel() {
@@ -643,207 +648,173 @@ class AsioDnsTransport::Operation final
     std::uint16_t query_id() const noexcept { return query_id_; }
 
   private:
-    void start_attempt() {
-        if (completed_) {
-            return;
+    // Straight-line exchange chain: datagram (or TCP) send/receive, then
+    // decode. Every terminal funnels through finish(), so the spawned task
+    // always ends with a value.
+    static exec::task<void> run(std::shared_ptr<Operation> self) {
+        if (std::chrono::steady_clock::now() >= self->request_.deadline) {
+            self->finish(core::fail(timeout_error()));
+            co_return;
         }
-        if (std::chrono::steady_clock::now() >= request_.deadline) {
-            finish(core::fail(timeout_error()));
-            return;
+        if (self->owner_.config_.prefer_tcp) {
+            co_await run_tcp(self);
+            co_return;
         }
-
-        const auto generation = ++attempt_generation_;
-        if (owner_.config_.prefer_tcp) {
-            start_tcp(generation);
-            return;
+        if (!self->owner_.config_.dialer) {
+            self->finish(core::fail(
+                {core::ErrorCode::configuration, "DNS upstream datagram dialer is not available"}));
+            co_return;
         }
-
-        auto self = shared_from_this();
-        if (!owner_.config_.dialer) {
-            retry_or_finish(
-                {core::ErrorCode::configuration, "DNS upstream datagram dialer is not available"});
-            return;
+        core::DatagramOpenResult opened;
+        try {
+            opened =
+                co_await self->owner_.config_.dialer->open_datagram({core::Destination::address(
+                    self->udp_endpoint_.address(), self->udp_endpoint_.port())});
+        } catch (const core::Error &failure) {
+            self->finish(core::fail(failure));
+            co_return;
+        } catch (...) {
+            self->finish(core::fail(core::Error{core::ErrorCode::endpoint_connection,
+                                                "DNS upstream datagram dialer failed to open "
+                                                "a handle"}));
+            co_return;
         }
-        struct ConnectReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<Operation> self;
-            std::uint64_t generation;
-
-            void set_value(core::DatagramOpenResult result) && noexcept {
-                auto operation = std::move(self);
-                if (generation != operation->attempt_generation_ || operation->completed_) {
-                    if (result.handle) {
-                        result.handle->close();
-                    }
-                    return;
-                }
-                if (!result.succeeded()) {
-                    operation->retry_or_finish(result.error.value_or(
-                        core::Error{core::ErrorCode::endpoint_connection,
-                                    "DNS upstream datagram dialer failed to open a handle"}));
-                    return;
-                }
-                operation->datagram_ = std::move(result.handle);
-                operation->send_udp(generation);
+        if (self->completed_) {
+            if (opened.handle) {
+                opened.handle->close();
             }
-
-            void set_error(std::exception_ptr error) && noexcept {
-                auto operation = std::move(self);
-                if (generation != operation->attempt_generation_ || operation->completed_) {
-                    return;
-                }
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    operation->retry_or_finish(failure);
-                    return;
-                } catch (...) {
-                    operation->retry_or_finish(
-                        core::Error{core::ErrorCode::endpoint_connection,
-                                    "DNS upstream datagram dialer failed to open a handle"});
-                }
-            }
-
-            void set_stopped() && noexcept {
-                auto operation = std::move(self);
-                if (generation != operation->attempt_generation_ || operation->completed_) {
-                    return;
-                }
-                operation->retry_or_finish(core::Error{core::ErrorCode::cancelled,
-                                                       "DNS upstream datagram open was "
-                                                       "cancelled"});
-            }
-        };
-        async::start_with_receiver(owner_.config_.dialer->open_datagram({core::Destination::address(
-                                       udp_endpoint_.address(), udp_endpoint_.port())}),
-                                   ConnectReceiver{shared_from_this(), generation});
+            co_return;
+        }
+        if (!opened.succeeded()) {
+            self->finish(core::fail(opened.error.value_or(
+                core::Error{core::ErrorCode::endpoint_connection,
+                            "DNS upstream datagram dialer failed to open a handle"})));
+            co_return;
+        }
+        self->datagram_ = std::move(opened.handle);
+        co_await run_udp(self);
+        co_return;
     }
 
-    void send_udp(std::uint64_t generation) {
-        if (completed_ || generation != attempt_generation_ || !datagram_) {
-            return;
+    // Deadline task: fires once at the deadline; the completed_ guard in
+    // finish() drops it when the exchange already won. Bounded by the
+    // deadline, so no stop is ever requested.
+    static exec::task<void> run_deadline(std::shared_ptr<Operation> self,
+                                         std::chrono::steady_clock::time_point deadline) {
+        try {
+            co_await async::sleep_until(self->owner_.runtime_.serialized_executor(), deadline);
+        } catch (...) {
+            co_return;
         }
-        struct SendReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<Operation> self;
-            std::uint64_t generation;
-            void set_value(std::size_t) && noexcept {
-                if (generation != self->attempt_generation_ || self->completed_) {
-                    return;
-                }
-                self->receive_udp(generation);
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                if (generation != self->attempt_generation_ || self->completed_) {
-                    return;
-                }
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->retry_or_finish(failure);
-                } catch (...) {
-                    self->retry_or_finish(
-                        {core::ErrorCode::transport_io, "failed to send DNS UDP query", {}});
-                }
-            }
-            void set_stopped() && noexcept {}
-        };
-        auto sender = datagram_->async_send_to(boost::asio::buffer(query_),
-                                               io::DatagramAddress::from_endpoint(udp_endpoint_));
-        async::start_with_receiver(std::move(sender), SendReceiver{shared_from_this(), generation});
+        self->finish(core::fail(timeout_error()));
+        co_return;
     }
 
-    void receive_udp(std::uint64_t generation) {
-        if (completed_ || generation != attempt_generation_) {
-            return;
+    // UDP send/receive loop in one task: mismatched packets re-arm the
+    // receive await; truncation falls through to the TCP task.
+    static exec::task<void> run_udp(std::shared_ptr<Operation> self) {
+        try {
+            co_await self->datagram_->async_send_to(
+                boost::asio::buffer(self->query_),
+                io::DatagramAddress::from_endpoint(self->udp_endpoint_));
+        } catch (const core::Error &failure) {
+            self->finish(core::fail(failure));
+            co_return;
+        } catch (...) {
+            self->finish(core::fail(
+                core::Error{core::ErrorCode::transport_io, "failed to send DNS UDP query"}));
+            co_return;
         }
-        struct ReceiveReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<Operation> self;
-            std::uint64_t generation;
-            void set_value(io::DatagramPacket packet) && noexcept {
-                if (generation != self->attempt_generation_ || self->completed_) {
-                    return;
-                }
-                const auto size = packet.size;
-                if (!packet.address.is_address() ||
-                    packet.address.address() != self->udp_endpoint_.address() ||
-                    packet.address.port() != self->udp_endpoint_.port() || size < 2 ||
-                    static_cast<std::uint16_t>(self->response_buffer_[0] << 8 |
-                                               self->response_buffer_[1]) != self->query_id_) {
-                    self->receive_udp(generation);
-                    return;
-                }
-
-                const auto response = DnsMessageCodec::decode_packet(
-                    std::span<const std::uint8_t>(self->response_buffer_.data(), size),
-                    self->query_id_);
-                if (!response) {
-                    self->finish(core::fail(response.error()));
-                    return;
-                }
-                if (!self->matches_question(response.value())) {
-                    self->receive_udp(generation);
-                    return;
-                }
-                if (response.value().truncated()) {
-                    self->start_tcp(generation);
-                    return;
-                }
-                self->finish(response);
+        if (self->completed_) {
+            co_return;
+        }
+        while (!self->completed_) {
+            io::DatagramPacket packet;
+            try {
+                packet = co_await self->datagram_->async_receive_from(
+                    boost::asio::buffer(self->response_buffer_));
+            } catch (const core::Error &failure) {
+                self->finish(core::fail(failure));
+                co_return;
+            } catch (...) {
+                self->finish(core::fail(core::Error{core::ErrorCode::transport_io,
+                                                    "failed to receive DNS UDP response"}));
+                co_return;
             }
-            void set_error(std::exception_ptr error) && noexcept {
-                if (generation != self->attempt_generation_ || self->completed_) {
-                    return;
-                }
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->retry_or_finish(failure);
-                } catch (...) {
-                    self->retry_or_finish(
-                        {core::ErrorCode::transport_io, "failed to receive DNS UDP response", {}});
-                }
+            if (self->completed_) {
+                co_return;
             }
-            void set_stopped() && noexcept {}
-        };
-        auto sender = datagram_->async_receive_from(boost::asio::buffer(response_buffer_));
-        async::start_with_receiver(std::move(sender),
-                                   ReceiveReceiver{shared_from_this(), generation});
+            const auto size = packet.size;
+            if (!packet.address.is_address() ||
+                packet.address.address() != self->udp_endpoint_.address() ||
+                packet.address.port() != self->udp_endpoint_.port() || size < 2 ||
+                static_cast<std::uint16_t>(self->response_buffer_[0] << 8 |
+                                           self->response_buffer_[1]) != self->query_id_) {
+                continue;
+            }
+            const auto response = DnsMessageCodec::decode_packet(
+                std::span<const std::uint8_t>(self->response_buffer_.data(), size),
+                self->query_id_);
+            if (!response) {
+                self->finish(core::fail(response.error()));
+                co_return;
+            }
+            if (!self->matches_question(response.value())) {
+                continue;
+            }
+            if (response.value().truncated()) {
+                co_await run_tcp(self);
+                co_return;
+            }
+            self->finish(response);
+            co_return;
+        }
+        co_return;
     }
 
-    void start_tcp(std::uint64_t generation) {
-        if (completed_ || generation != attempt_generation_) {
-            return;
+    // TCP fallback: register on the shared session with a oneshot terminal,
+    // then await it. cancel() (or the deadline) aborts the session entry so
+    // a late response drops by map lookup.
+    static exec::task<void> run_tcp(std::shared_ptr<Operation> self) {
+        if (self->completed_) {
+            co_return;
         }
-        if (datagram_) {
-            datagram_->close();
-            datagram_.reset();
+        if (self->datagram_) {
+            self->datagram_->close();
+            self->datagram_.reset();
         }
-        tcp_session_ = owner_.tcp_session();
-        if (!tcp_session_) {
-            retry_or_finish({core::ErrorCode::configuration, "DNS TCP session is not available"});
-            return;
+        auto session = self->owner_.tcp_session();
+        if (!session) {
+            self->finish(
+                core::fail({core::ErrorCode::configuration, "DNS TCP session is not available"}));
+            co_return;
         }
-        auto self = shared_from_this();
-        tcp_session_->exchange(
-            query_id_, query_, request_.deadline,
-            [self, generation](core::Result<std::vector<std::uint8_t>> result) {
-                if (generation != self->attempt_generation_ || self->completed_) {
-                    return;
-                }
-                if (!result) {
-                    self->retry_or_finish(result.error());
-                    return;
-                }
-                self->complete_tcp_response(generation, std::move(result.value()));
-            });
+        self->tcp_session_ = session;
+        auto channel = async::oneshot::channel<core::Result<std::vector<std::uint8_t>>>();
+        auto sender =
+            std::make_shared<async::oneshot::Sender<core::Result<std::vector<std::uint8_t>>>>(
+                std::move(channel.sender));
+        session->exchange(self->query_id_, self->query_, self->request_.deadline,
+                          [sender](core::Result<std::vector<std::uint8_t>> result) mutable {
+                              sender->send(std::move(result));
+                          });
+        auto outcome = co_await std::move(channel.receiver);
+        if (self->completed_) {
+            co_return;
+        }
+        if (!outcome) {
+            self->finish(core::fail(cancelled_error()));
+            co_return;
+        }
+        if (!*outcome) {
+            self->finish(core::fail(outcome->error()));
+            co_return;
+        }
+        self->complete_tcp_response(std::move(outcome->value()));
+        co_return;
     }
 
-    void complete_tcp_response(std::uint64_t generation, std::vector<std::uint8_t> response_wire) {
-        if (generation != attempt_generation_ || completed_) {
-            return;
-        }
+    void complete_tcp_response(std::vector<std::uint8_t> response_wire) {
         const auto response = DnsMessageCodec::decode_packet(response_wire, query_id_);
         if (!response) {
             finish(core::fail(response.error()));
@@ -857,10 +828,7 @@ class AsioDnsTransport::Operation final
         finish(response);
     }
 
-    void retry_or_finish(core::Error error) { finish(core::fail(std::move(error))); }
-
     void close_sockets() noexcept {
-        timeout_timer_.cancel();
         if (datagram_) {
             datagram_->cancel();
             datagram_->close();
@@ -897,7 +865,6 @@ class AsioDnsTransport::Operation final
     DnsExchangeId exchange_id_;
     DnsExchangeRequest request_;
     async::BridgeHandler<DnsExchangeResult> handler_;
-    boost::asio::steady_timer timeout_timer_;
     boost::asio::ip::udp::endpoint udp_endpoint_;
     std::vector<std::uint8_t> response_buffer_ = std::vector<std::uint8_t>(65535);
     std::vector<std::uint8_t> query_;
@@ -905,7 +872,8 @@ class AsioDnsTransport::Operation final
     std::shared_ptr<AsioDnsTransport::TcpSession> tcp_session_;
     std::uint16_t query_id_ = 0;
     bool completed_ = false;
-    std::uint64_t attempt_generation_ = 0;
+    // Owns the exchange/deadline chain tasks, which always end with a value.
+    exec::async_scope scope_;
 };
 
 std::optional<std::uint16_t> AsioDnsTransport::next_query_id() noexcept {

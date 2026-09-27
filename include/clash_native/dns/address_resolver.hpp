@@ -3,6 +3,9 @@
 #include <clash_native/core/result.hpp>
 #include <clash_native/dns/dns_query_service.hpp>
 
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
+
 #include <atomic>
 #include <cstdint>
 #include <functional>

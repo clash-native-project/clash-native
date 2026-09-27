@@ -79,20 +79,17 @@ class DnsServer final {
     };
 
     void receive_udp();
+    static exec::task<void> run_udp_loop(DnsServer *server);
+    static exec::task<void> run_udp_resolve(DnsServer *server, DnsPacket query,
+                                            boost::asio::ip::udp::endpoint sender);
     void send_udp_response(boost::asio::ip::udp::endpoint recipient,
                            std::shared_ptr<std::vector<std::uint8_t>> payload);
+    static exec::task<void> run_udp_send(DnsServer *server,
+                                         boost::asio::ip::udp::endpoint recipient,
+                                         std::shared_ptr<std::vector<std::uint8_t>> payload);
     void accept_tcp();
     static exec::task<void> run_accept_loop(DnsServer *server);
-    void read_tcp_query(std::shared_ptr<boost::asio::ip::tcp::socket> socket);
-    void close_tcp_socket(const std::shared_ptr<boost::asio::ip::tcp::socket> &socket) noexcept;
-    void resolve_udp(DnsPacket query, boost::asio::ip::udp::endpoint sender);
-    void resolve_tcp(std::shared_ptr<boost::asio::ip::tcp::socket> socket, DnsPacket query);
     runtime::RuntimeSnapshotPtr current_snapshot() const noexcept;
-    struct PendingQuery {
-        std::shared_ptr<ResolverService> resolver;
-        DnsQueryService *query_service = nullptr;
-        DnsQueryService::RequestId request_id = 0;
-    };
     void stop_on_owner() noexcept;
 
     runtime::AsioRuntime &runtime_;
@@ -105,10 +102,11 @@ class DnsServer final {
     boost::asio::ip::tcp::endpoint tcp_endpoint_;
     std::array<std::uint8_t, 65535> udp_buffer_{};
     std::atomic_bool running_{false};
-    std::shared_ptr<std::atomic_bool> callback_gate_;
-    std::unordered_map<std::uint64_t, PendingQuery> query_requests_;
-    std::uint64_t next_query_request_id_ = 1;
     std::unordered_set<std::shared_ptr<TcpConnection>> tcp_connections_;
+    // Owns the UDP pump plus per-query resolve/send tasks. Stop closes the
+    // socket: the in-flight receive completes stopped and the loop exits
+    // without re-arming; in-flight resolves abort through query_sender.
+    exec::async_scope udp_scope_;
     // Owns the accept-loop task; stop requests stop so the in-flight accept
     // completes stopped and the loop exits without re-arming.
     exec::async_scope accept_scope_;

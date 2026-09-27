@@ -3,6 +3,7 @@
 #include <clash_native/io/stream_handle.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -10,7 +11,6 @@
 #include <mutex>
 #include <vector>
 
-#include <boost/asio/steady_timer.hpp>
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
 
@@ -37,27 +37,40 @@ class TcpRelay final : public std::enable_shared_from_this<TcpRelay> {
              CompletionHandler handler);
 
     void launch(std::vector<std::uint8_t> initial_left_data);
+    // Supervises the relay: races the joined pump pair against the idle
+    // watchdog and delivers the final stats through the completion handler,
+    // which stays a plain value callback (not a pump). Always terminates
+    // with a value so the scope spawn is safe; pump failures surface as
+    // early termination and still deliver stats below.
+    static exec::task<void> run(std::shared_ptr<TcpRelay> self,
+                                std::vector<std::uint8_t> initial_left_data);
+    static exec::task<void> join_pumps(std::shared_ptr<TcpRelay> self,
+                                       std::vector<std::uint8_t> initial_left_data);
     // One direction of the relay. Always terminates with a value: clean EOF
-    // shuts down the peer send side and returns, failures request scope
-    // stop (aborting the peer promptly) and return. Never lets failures
-    // escape: a spawned sender completing with error would terminate.
-    // Cancellation unwinds past the catch and completes stopped.
-    exec::task<void> pump(std::shared_ptr<TcpRelay> self, bool left_to_right,
-                          std::vector<std::uint8_t> first_payload);
-    void note_done() noexcept;
-    void poke();
+    // shuts down the peer send side and returns (the sibling keeps going
+    // until its own EOF), failures close the relay to abort the peer
+    // promptly and return. Never lets failures escape: an error-terminated
+    // branch would unwind the whole race. Cancellation unwinds past the
+    // catch and completes stopped.
+    static exec::task<void> pump(std::shared_ptr<TcpRelay> self, bool left_to_right,
+                                 std::vector<std::uint8_t> first_payload);
+    // Completes once no bytes have flowed for the idle timeout. Recomputes
+    // the deadline from the pumps' activity stamps instead of re-arming a
+    // callback timer, so the whole relay composes with stop/when_any.
+    static exec::task<void> idle_watchdog(std::shared_ptr<TcpRelay> self);
+    void touch();
     void finish() noexcept;
 
     std::unique_ptr<io::StreamHandle> left_;
     std::unique_ptr<io::StreamHandle> right_;
-    boost::asio::steady_timer idle_timer_;
-    // Asio timers are not thread-safe: pumps poke from whatever thread
-    // completes each transfer while finish() cancels from the stop path.
-    std::mutex timer_mutex_;
+    // Written by the pumps on every successful transfer, read by the
+    // watchdog. Plain mutex: only touched around transfers, never held
+    // across an await.
+    std::mutex activity_mutex_;
+    std::chrono::steady_clock::time_point last_activity_{std::chrono::steady_clock::now()};
     exec::async_scope scope_;
     CompletionHandler completion_handler_;
     RelayStats stats_;
-    std::atomic<int> outstanding_{0};
     std::atomic_bool finished_{false};
 };
 

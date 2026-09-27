@@ -1,5 +1,6 @@
 #pragma once
 
+#include <clash_native/core/metadata.hpp>
 #include <clash_native/io/datagram_handle.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/runtime/runtime_snapshot.hpp>
@@ -41,7 +42,9 @@ class Socks5UdpListener final : public std::enable_shared_from_this<Socks5UdpLis
         std::vector<std::uint8_t> receive_buffer;
     };
 
-    void receive();
+    static exec::task<void> run_receive(std::shared_ptr<Socks5UdpListener> self);
+    static std::string path_key(const boost::asio::ip::udp::endpoint &client,
+                                const core::Destination &destination);
     void process(std::size_t size, boost::asio::ip::udp::endpoint client);
     static exec::task<void> run_route(std::shared_ptr<Socks5UdpListener> self,
                                       runtime::RuntimeSnapshotPtr snapshot,
@@ -49,12 +52,22 @@ class Socks5UdpListener final : public std::enable_shared_from_this<Socks5UdpLis
                                       boost::asio::ip::udp::endpoint client);
     void send_payload(const std::shared_ptr<Path> &path,
                       std::shared_ptr<std::vector<std::uint8_t>> payload);
-    // Single-pull response loop, re-armed per completion; no task needed.
+    static exec::task<void> run_send(std::shared_ptr<Socks5UdpListener> self,
+                                     std::shared_ptr<Path> path,
+                                     std::shared_ptr<std::vector<std::uint8_t>> payload);
     void receive_response(const std::shared_ptr<Path> &path);
+    static exec::task<void> run_response_loop(std::shared_ptr<Socks5UdpListener> self,
+                                              std::shared_ptr<Path> path);
+    static void retire_path(std::shared_ptr<Socks5UdpListener> self,
+                            const std::shared_ptr<Path> &path);
     void send_response(const std::shared_ptr<Path> &path, io::DatagramAddress source,
                        std::span<const std::uint8_t> payload);
-    static std::string path_key(const boost::asio::ip::udp::endpoint &client,
-                                const core::Destination &destination);
+    static std::shared_ptr<std::vector<std::uint8_t>>
+    build_response_packet(const std::shared_ptr<Path> &path, io::DatagramAddress source,
+                          std::span<const std::uint8_t> payload);
+    static exec::task<void> run_respond(std::shared_ptr<Socks5UdpListener> self,
+                                        std::shared_ptr<Path> path,
+                                        std::shared_ptr<std::vector<std::uint8_t>> packet);
 
     ProxyServer &owner_;
     std::shared_ptr<net::UdpStream> socket_;

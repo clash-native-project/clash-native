@@ -1,9 +1,9 @@
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/held_operation.hpp>
 #include <clash_native/dns/dns_upstream.hpp>
 #include <clash_native/io/sender.hpp>
 
-#include <stdexec/execution.hpp>
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include <boost/asio/post.hpp>
 
@@ -39,42 +39,49 @@ std::chrono::milliseconds DnsUpstream::timeout() const noexcept { return timeout
 
 DnsUpstream::~DnsUpstream() { stop(); }
 
-// Drives one transport sender behind the upstream sender edge, hopping
-// the terminal onto the runtime scheduler like the old contract. The
-// held drive is destroyed on abort, cancelling exactly this exchange.
-struct DriveReceiver {
-    using receiver_concept = stdexec::receiver_tag;
-    runtime::AsioRuntime *runtime;
+// Drives one transport sender behind the upstream sender edge through a
+// scope-owned task: co_await the transport sender, then hop the terminal
+// onto the runtime scheduler like the old contract. The scope (on the
+// shared abort state) is request_stop()ed on abort, cancelling exactly
+// this exchange; the late task terminal drops on the settled guard.
+struct DriveShared : public std::enable_shared_from_this<DriveShared> {
+    runtime::AsioRuntime *runtime = nullptr;
+    std::optional<io::AnySender<DnsExchangeResult>> sender;
     async::BridgeHandler<DnsExchangeResult> done;
-    void set_value(DnsExchangeResult result) noexcept {
-        auto terminal = std::move(done);
-        runtime->scheduler().post(
-            [terminal = std::move(terminal), result = std::move(result)]() mutable {
-                terminal(std::move(result));
-            });
-    }
-    void set_error(std::exception_ptr error) noexcept {
-        auto terminal = std::move(done);
-        DnsExchangeResult result;
+    exec::async_scope scope;
+    std::atomic_bool settled{false};
+
+    static exec::task<void> run(std::shared_ptr<DriveShared> self) {
+        DnsExchangeResult result =
+            core::fail(core::Error{core::ErrorCode::cancelled, "DNS upstream exchange cancelled"});
         try {
-            std::rethrow_exception(std::move(error));
+            auto sender = std::move(*self->sender) | stdexec::stopped_as_optional();
+            auto outcome = co_await std::move(sender);
+            if (outcome) {
+                result = std::move(*outcome);
+            }
         } catch (const core::Error &failure) {
             result = core::fail(failure);
         } catch (...) {
-            result = core::fail(
-                core::Error{core::ErrorCode::transport_io, "DNS upstream exchange failed"});
+            try {
+                std::rethrow_exception(std::current_exception());
+            } catch (const core::Error &failure) {
+                result = core::fail(failure);
+            } catch (...) {
+                result = core::fail(
+                    core::Error{core::ErrorCode::transport_io, "DNS upstream exchange failed"});
+            }
         }
+        if (self->settled.exchange(true, std::memory_order_acq_rel)) {
+            co_return;
+        }
+        auto *runtime = self->runtime;
+        auto terminal = std::move(self->done);
         runtime->scheduler().post(
             [terminal = std::move(terminal), result = std::move(result)]() mutable {
                 terminal(std::move(result));
             });
-    }
-    void set_stopped() noexcept {
-        auto terminal = std::move(done);
-        runtime->scheduler().post([terminal = std::move(terminal)]() mutable {
-            terminal(core::fail(
-                core::Error{core::ErrorCode::cancelled, "DNS upstream exchange cancelled"}));
-        });
+        co_return;
     }
 };
 
@@ -83,23 +90,26 @@ DnsUpstream::exchange(DnsPacket query, std::chrono::steady_clock::time_point dea
     if (!transport_) {
         return io::AnySender<DnsExchangeResult>{stdexec::just(core::fail(configuration_error()))};
     }
-    struct Shared {
-        std::shared_ptr<async::HeldOperation<io::AnySender<DnsExchangeResult>, DriveReceiver>>
-            drive;
-    };
-    auto shared = std::make_shared<Shared>();
-    auto transport = transport_;
-    auto *runtime = &runtime_;
-    return async::bridge_sender<DnsExchangeResult>(
-        [shared, transport, runtime, query = std::move(query),
-         deadline](async::BridgeHandler<DnsExchangeResult> done) mutable {
-            // NOTE: name the sender first; argument order is unspecified.
-            auto sender = transport->exchange({std::move(query), deadline});
-            shared->drive =
-                async::hold_operation(std::move(sender), DriveReceiver{runtime, std::move(done)});
-            shared->drive->start();
-            return async::CallbackAbortFn{[shared] { shared->drive.reset(); }};
-        });
+    using Signatures = async::BridgeSignatures<DnsExchangeResult>;
+    auto shared = std::make_shared<DriveShared>();
+    shared->runtime = &runtime_;
+    shared->sender = transport_->exchange({std::move(query), deadline});
+    return async::callback_sender<Signatures>(
+        [shared](auto terminal) mutable -> async::CallbackAbortFn {
+            shared->done = [terminal = std::move(terminal)](DnsExchangeResult result) mutable {
+                terminal(std::move(result));
+            };
+            shared->scope.spawn(DriveShared::run(shared));
+            return async::CallbackAbortFn{[shared] {
+                if (!shared->settled.exchange(true, std::memory_order_acq_rel)) {
+                    try {
+                        shared->scope.request_stop();
+                    } catch (...) {
+                    }
+                }
+            }};
+        },
+        async::BridgeTranslate<DnsExchangeResult>{});
 }
 
 void DnsUpstream::stop() noexcept {
@@ -112,35 +122,6 @@ class DnsUpstreamGroup::Operation final
     : public std::enable_shared_from_this<DnsUpstreamGroup::Operation> {
   public:
     using MemberTerminal = async::BridgeHandler<DnsExchangeResult>;
-    struct MemberReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<Operation> operation;
-        std::size_t member_index;
-        void set_value(DnsExchangeResult result) noexcept {
-            auto self = std::move(operation);
-            self->member_finished(member_index, std::move(result));
-        }
-        void set_error(std::exception_ptr error) noexcept {
-            auto self = std::move(operation);
-            try {
-                std::rethrow_exception(std::move(error));
-            } catch (const core::Error &failure) {
-                self->member_finished(member_index, core::fail(failure));
-                return;
-            } catch (...) {
-            }
-            self->member_finished(member_index,
-                                  core::fail(core::Error{core::ErrorCode::transport_io,
-                                                         "DNS group member exchange failed"}));
-        }
-        void set_stopped() noexcept {
-            auto self = std::move(operation);
-            self->member_finished(member_index,
-                                  core::fail(core::Error{core::ErrorCode::cancelled,
-                                                         "DNS group member exchange cancelled"}));
-        }
-    };
-    using MemberDrive = async::HeldOperation<io::AnySender<DnsExchangeResult>, MemberReceiver>;
     Operation(DnsUpstreamGroup &owner, DnsPacket query,
               std::chrono::steady_clock::time_point deadline, MemberTerminal handler)
         : owner_(owner), query_(std::move(query)), deadline_(deadline),
@@ -153,71 +134,146 @@ class DnsUpstreamGroup::Operation final
             return;
         }
         attempted_.assign(owner_.members_.size(), false);
-        start_member(owner_.next_start_index());
+        // Sequential member retry as one task: co_await each member
+        // sender in turn, falling through to the next member on failure
+        // or retryable response. Stop aborts the in-flight await via the
+        // scope; the task always ends with a value and finish() drops
+        // late terminals on the completed_ guard.
+        member_scope_.spawn(run(shared_from_this(), owner_.next_start_index()));
     }
 
     void cancel() {
         if (completed_) {
             return;
         }
-        // Destroying the drive aborts exactly the in-flight member
-        // exchange; its late terminal drops on the completed_ guard.
-        // finish() below marks completed, leaves the set, and delivers.
-        drive_.reset();
+        // Requesting stop aborts the in-flight member await; its late
+        // terminal drops on the completed_ guard. finish() below marks
+        // completed, leaves the set, and delivers.
+        try {
+            member_scope_.request_stop();
+        } catch (...) {
+        }
         current_member_.reset();
         finish(
             core::fail({core::ErrorCode::cancelled, "DNS upstream group exchange was cancelled"}));
     }
 
   private:
-    void start_member(std::size_t index) {
-        if (completed_) {
-            return;
-        }
-        if (std::chrono::steady_clock::now() >= deadline_) {
-            finish(core::fail({core::ErrorCode::timeout, "DNS upstream group timed out"}));
-            return;
-        }
-
-        const auto selected = owner_.select_member(index, attempted_);
-        if (!selected) {
-            if (last_error_) {
-                finish(core::fail(*last_error_));
-            } else {
-                finish(core::fail({core::ErrorCode::configuration,
-                                   "DNS upstream group has no available members"}));
+    // Sequential retry loop as a named task (no inline-capture coroutine):
+    // co_await each selected member sender, record health, and continue to
+    // the next member while the deadline holds. Every path funnels through
+    // member_finished()/finish(), so the task always ends with a value.
+    static exec::task<void> run(std::shared_ptr<Operation> self, std::size_t start_index) {
+        auto index = start_index;
+        while (!self->completed_) {
+            if (std::chrono::steady_clock::now() >= self->deadline_) {
+                self->member_finished(
+                    self->current_index_,
+                    core::fail({core::ErrorCode::timeout, "DNS upstream group timed out"}));
+                if (self->completed_) {
+                    co_return;
+                }
+                // member_finished with no selection funnels to finish.
+                co_return;
             }
-            return;
+            const auto selected = self->owner_.select_member(index, self->attempted_);
+            if (!selected) {
+                if (self->last_error_) {
+                    self->finish(core::fail(*self->last_error_));
+                } else {
+                    self->finish(core::fail({core::ErrorCode::configuration,
+                                             "DNS upstream group has no available members"}));
+                }
+                co_return;
+            }
+            self->current_index_ = *selected;
+            self->attempted_[self->current_index_] = true;
+            self->current_member_ = self->owner_.members_[self->current_index_];
+            const auto now = std::chrono::steady_clock::now();
+            const auto remaining = self->deadline_ - now;
+            const auto remaining_members =
+                std::count(self->attempted_.begin(), self->attempted_.end(), false);
+            auto member_deadline = self->deadline_;
+            const auto remaining_attempts = remaining_members + 1;
+            if (remaining_attempts > 1 && remaining > std::chrono::steady_clock::duration::zero()) {
+                member_deadline = now + remaining / remaining_attempts;
+            }
+            DnsExchangeResult result = core::fail(
+                core::Error{core::ErrorCode::cancelled, "DNS group member exchange cancelled"});
+            try {
+                // Stop from member_scope_ maps to a member failure inline:
+                // request_stop unwinds the await as stopped, and the loop
+                // must record it and move on instead of dying silently.
+                auto sender = self->current_member_->exchange(self->query_, member_deadline) |
+                              stdexec::stopped_as_optional();
+                auto outcome = co_await std::move(sender);
+                if (outcome) {
+                    result = std::move(*outcome);
+                }
+            } catch (const core::Error &failure) {
+                result = core::fail(failure);
+            } catch (...) {
+                try {
+                    std::rethrow_exception(std::current_exception());
+                } catch (const core::Error &failure) {
+                    result = core::fail(failure);
+                } catch (...) {
+                    result = core::fail(core::Error{core::ErrorCode::transport_io,
+                                                    "DNS group member exchange failed"});
+                }
+            }
+            if (self->completed_) {
+                co_return;
+            }
+            if (!result && result.error().code == core::ErrorCode::cancelled) {
+                // Stop unwound the member await: the outer cancel already
+                // delivered, so bail instead of retrying siblings.
+                co_return;
+            }
+            const auto member_index = self->current_index_;
+            if (result) {
+                if (!should_retry_response(result.value())) {
+                    self->owner_.record_success(member_index);
+                    self->finish(std::move(result));
+                    co_return;
+                }
+                self->last_error_ = core::Error{core::ErrorCode::resolution,
+                                                "DNS upstream returned a retryable response"};
+                self->owner_.record_failure(member_index, *self->last_error_);
+                const auto next = (member_index + 1) % self->owner_.members_.size();
+                if (std::chrono::steady_clock::now() < self->deadline_ &&
+                    std::any_of(self->attempted_.begin(), self->attempted_.end(),
+                                [](bool attempted) { return !attempted; })) {
+                    index = next;
+                    continue;
+                }
+                self->finish(std::move(result));
+                co_return;
+            }
+            self->last_error_ = result.error();
+            if (result.error().code != core::ErrorCode::cancelled) {
+                self->owner_.record_failure(member_index, result.error());
+            }
+            // Cancelled member results still advance: stop owns teardown
+            // via completed_, and the loop bails at its head.
+            if (self->completed_) {
+                co_return;
+            }
+            const auto next = (member_index + 1) % self->owner_.members_.size();
+            if (std::chrono::steady_clock::now() < self->deadline_) {
+                index = next;
+                continue;
+            }
+            self->finish(std::move(result));
+            co_return;
         }
-
-        current_index_ = *selected;
-        attempted_[current_index_] = true;
-        current_member_ = owner_.members_[current_index_];
-        current_exchange_started_ = false;
-        const auto now = std::chrono::steady_clock::now();
-        const auto remaining = deadline_ - now;
-        const auto remaining_members = std::count(attempted_.begin(), attempted_.end(), false);
-        auto member_deadline = deadline_;
-        const auto remaining_attempts = remaining_members + 1;
-        if (remaining_attempts > 1 && remaining > std::chrono::steady_clock::duration::zero()) {
-            member_deadline = now + remaining / remaining_attempts;
-        }
-        auto self = shared_from_this();
-        // NOTE: name the sender first; argument order is unspecified.
-        auto sender = current_member_->exchange(query_, member_deadline);
-        drive_ = async::hold_operation(std::move(sender), MemberReceiver{self, current_index_});
-        drive_->start();
-        current_exchange_started_ = true;
-        if (completed_) {
-            drive_.reset();
-        }
+        co_return;
     }
 
     void member_finished(std::size_t index, core::Result<DnsPacket> result) {
         if (completed_ || index != current_index_) {
             return;
         }
-        current_exchange_started_ = false;
         if (result) {
             if (!should_retry_response(result.value())) {
                 owner_.record_success(index);
@@ -227,13 +283,6 @@ class DnsUpstreamGroup::Operation final
             last_error_ = core::Error{core::ErrorCode::resolution,
                                       "DNS upstream returned a retryable response"};
             owner_.record_failure(index, *last_error_);
-            const auto next = (index + 1) % owner_.members_.size();
-            if (std::chrono::steady_clock::now() < deadline_ &&
-                std::any_of(attempted_.begin(), attempted_.end(),
-                            [](bool attempted) { return !attempted; })) {
-                start_member(next);
-                return;
-            }
             finish(std::move(result));
             return;
         }
@@ -241,12 +290,12 @@ class DnsUpstreamGroup::Operation final
         if (result.error().code != core::ErrorCode::cancelled) {
             owner_.record_failure(index, result.error());
         }
-        const auto next = (index + 1) % owner_.members_.size();
-        if (std::chrono::steady_clock::now() < deadline_) {
-            start_member(next);
-            return;
+        if (last_error_) {
+            finish(core::fail(*last_error_));
+        } else {
+            finish(core::fail(
+                {core::ErrorCode::configuration, "DNS upstream group has no available members"}));
         }
-        finish(std::move(result));
     }
 
     void finish(core::Result<DnsPacket> result) {
@@ -254,9 +303,8 @@ class DnsUpstreamGroup::Operation final
             return;
         }
         completed_ = true;
-        // Drop the member drive first so no late terminal can reenter,
-        // then leave the owner set and deliver.
-        drive_.reset();
+        // The member task aborts through member_scope_ stop; late finish
+        // drops on completed_. Leave the owner set, then deliver.
         current_member_.reset();
         auto handler = std::move(handler_);
         owner_.forget(this);
@@ -270,9 +318,8 @@ class DnsUpstreamGroup::Operation final
     std::chrono::steady_clock::time_point deadline_;
     MemberTerminal handler_;
     std::shared_ptr<DnsUpstream> current_member_;
-    std::shared_ptr<MemberDrive> drive_;
+    exec::async_scope member_scope_;
     std::size_t current_index_ = 0;
-    bool current_exchange_started_ = false;
     bool completed_ = false;
     std::vector<bool> attempted_;
     std::optional<core::Error> last_error_;
@@ -385,11 +432,17 @@ void DnsUpstreamGroup::record_success(std::size_t member_index) noexcept {
 io::AnySender<DnsExchangeResult>
 DnsUpstreamGroup::exchange(DnsPacket query, std::chrono::steady_clock::time_point deadline) {
     auto self = shared_from_this();
-    return async::bridge_sender<DnsExchangeResult>(
+    using Signatures = async::BridgeSignatures<DnsExchangeResult>;
+    return async::callback_sender<Signatures>(
         [self, query = std::move(query),
-         deadline](async::BridgeHandler<DnsExchangeResult> done) mutable {
-            auto operation =
-                std::make_shared<Operation>(*self, std::move(query), deadline, std::move(done));
+         deadline](auto terminal) mutable -> async::CallbackAbortFn {
+            auto done = std::make_shared<async::BridgeHandler<DnsExchangeResult>>(
+                [terminal = std::move(terminal)](DnsExchangeResult result) mutable {
+                    terminal(std::move(result));
+                });
+            auto operation = std::make_shared<Operation>(
+                *self, std::move(query), deadline,
+                [done](DnsExchangeResult result) mutable { (*done)(std::move(result)); });
             self->operations_.insert(operation);
             if (self->stopped_) {
                 operation->cancel();
@@ -400,7 +453,8 @@ DnsUpstreamGroup::exchange(DnsPacket query, std::chrono::steady_clock::time_poin
                 self->operations_.erase(operation);
                 operation->cancel();
             }};
-        });
+        },
+        async::BridgeTranslate<DnsExchangeResult>{});
 }
 
 void DnsUpstreamGroup::forget(Operation *operation) noexcept {

@@ -1,7 +1,7 @@
 #include <clash_native/outbound/shadowsocks_outbound.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/core/base64.hpp>
 #include <clash_native/dns/ech_resolver.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
@@ -99,46 +99,6 @@ std::vector<std::uint8_t> append_tcp_record(std::string_view method,
     return result;
 }
 
-// Bridges one carrier pull/push back into a legacy (error, size) handler.
-struct CarrierReadBridge {
-    using receiver_concept = stdexec::receiver_tag;
-    StreamReadHandler handler;
-    void set_value(std::optional<std::size_t> size) && noexcept {
-        auto callback = std::move(handler);
-        if (size) {
-            callback({}, *size);
-        } else {
-            callback(boost::asio::error::eof, 0);
-        }
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto callback = std::move(handler);
-        callback(net::unpack_error(std::move(error)), 0);
-    }
-    void set_stopped() && noexcept {
-        auto callback = std::move(handler);
-        callback(boost::asio::error::operation_aborted, 0);
-    }
-};
-
-struct SocketDatagramBridge {
-    using receiver_concept = stdexec::receiver_tag;
-    std::function<void(const boost::system::error_code &, std::size_t, io::DatagramAddress)>
-        handler;
-    void set_value(io::DatagramPacket packet) && noexcept {
-        auto callback = std::move(handler);
-        callback({}, packet.size, std::move(packet.address));
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto callback = std::move(handler);
-        callback(net::unpack_error(std::move(error)), 0, {});
-    }
-    void set_stopped() && noexcept {
-        auto callback = std::move(handler);
-        callback(boost::asio::error::operation_aborted, 0, {});
-    }
-};
-
 // Resolves ECH configs for the WebSocket plugin TLS layer (Mihomo
 // ech-opts): a static base64 ECHConfigList, or an HTTPS-record lookup
 // with an optional query-server-name override. DNS failure fails closed.
@@ -181,23 +141,6 @@ fetch_ss_plugin_ech_config(std::shared_ptr<dns::ResolverService> resolver,
     co_return core::Result<std::vector<std::uint8_t>>{std::move(ech.value())};
 }
 
-struct CarrierWriteBridge {
-    using receiver_concept = stdexec::receiver_tag;
-    StreamWriteHandler handler;
-    void set_value(std::size_t size) && noexcept {
-        auto callback = std::move(handler);
-        callback({}, size);
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto callback = std::move(handler);
-        callback(net::unpack_error(std::move(error)), 0);
-    }
-    void set_stopped() && noexcept {
-        auto callback = std::move(handler);
-        callback(boost::asio::error::operation_aborted, 0);
-    }
-};
-
 class ShadowsocksStreamHandle final : public io::StreamHandle {
   private:
     using ReadSignatures =
@@ -235,6 +178,28 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
             }
         }
 
+        using WriteTerminal = StreamWriteHandler;
+
+        // Single carrier write as one task: co_await the carrier sender
+        // directly instead of bridging it back into a handler.
+        // NOTE: named function per the coroutine creation rules; never an
+        // immediately-invoked capturing lambda.
+        static exec::task<void> run_carrier_write(std::shared_ptr<State> self,
+                                                  std::shared_ptr<std::vector<std::uint8_t>> wire,
+                                                  std::size_t size, WriteTerminal done) {
+            try {
+                // NOTE: name the sender first; argument order is unspecified.
+                auto sender = self->carrier->async_write(boost::asio::buffer(*wire));
+                co_await std::move(sender);
+            } catch (...) {
+                self->write_in_progress = false;
+                done(net::unpack_error(std::current_exception()), 0);
+                co_return;
+            }
+            self->write_in_progress = false;
+            done({}, size);
+        }
+
         void write(boost::asio::const_buffer buffer, StreamWriteHandler handler) {
             if (write_in_progress) {
                 boost::asio::post(carrier->executor(), [handler = std::move(handler)]() mutable {
@@ -267,25 +232,13 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
             }
 
             write_in_progress = true;
-            auto self = shared_from_this();
             write_handler = std::move(handler);
             auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(encoded));
-            if (obfs_mode == ss::ObfsMode::tls) {
-                ss::async_write_tls_obfs_records(
-                    socket, std::move(*wire), [self, size](core::Status result) mutable {
-                        self->finish_write(result ? boost::system::error_code() : protocol_error(),
-                                           result ? size : 0);
-                    });
-                return;
-            }
-            StreamWriteHandler completion =
-                [self, wire, size](const boost::system::error_code &error, std::size_t) mutable {
-                    self->finish_write(error, error ? 0 : size);
-                };
-            // NOTE: name the sender first; argument order is unspecified.
-            auto sender = carrier->async_write(boost::asio::buffer(*wire));
-            async::start_with_receiver(std::move(sender),
-                                       CarrierWriteBridge{std::move(completion)});
+            auto self = shared_from_this();
+            // Single carrier write as one task co_awaiting the carrier
+            // sender directly; teardown stays guard-driven via abort().
+            WriteTerminal done{std::move(write_handler)};
+            scope_.spawn(run_carrier_write(self, wire, size, std::move(done)));
         }
 
         void read(boost::asio::mutable_buffer buffer, StreamReadHandler handler) {
@@ -547,37 +500,41 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
             finish_read({}, copied);
         }
 
-        void read_exact_carrier(boost::asio::mutable_buffer buffer, ExactReadHandler handler) {
-            auto callback = std::make_shared<ExactReadHandler>(std::move(handler));
-            read_exact_carrier(buffer, std::move(callback));
+        // Exact carrier pull as one task: loop co_awaiting carrier senders
+        // directly instead of re-arming through a bridge receiver.
+        // NOTE: named function per the coroutine creation rules; never an
+        // immediately-invoked capturing lambda.
+        static exec::task<void> run_read_exact_carrier(std::shared_ptr<State> self,
+                                                       boost::asio::mutable_buffer buffer,
+                                                       ExactReadHandler handler) {
+            std::size_t done = 0;
+            while (done < buffer.size()) {
+                auto rest = boost::asio::mutable_buffer(
+                    static_cast<std::uint8_t *>(buffer.data()) + done, buffer.size() - done);
+                std::optional<std::size_t> pulled;
+                try {
+                    // NOTE: name the sender first; argument order is unspecified.
+                    auto sender = self->carrier->async_read_some(rest);
+                    pulled = co_await std::move(sender);
+                } catch (...) {
+                    handler(net::unpack_error(std::current_exception()));
+                    co_return;
+                }
+                if (!pulled) {
+                    handler(boost::asio::error::eof);
+                    co_return;
+                }
+                if (*pulled == 0) {
+                    handler(boost::asio::error::eof);
+                    co_return;
+                }
+                done += *pulled;
+            }
+            handler({});
         }
 
-        void read_exact_carrier(boost::asio::mutable_buffer buffer,
-                                std::shared_ptr<ExactReadHandler> callback) {
-            auto self = shared_from_this();
-            StreamReadHandler completion = [self, buffer, callback = std::move(callback)](
-                                               const boost::system::error_code &error,
-                                               std::size_t size) mutable {
-                auto &handler = *callback;
-                if (error) {
-                    handler(error);
-                    return;
-                }
-                if (size == 0) {
-                    handler(boost::asio::error::eof);
-                    return;
-                }
-                if (size == buffer.size()) {
-                    handler({});
-                    return;
-                }
-                auto remaining = boost::asio::mutable_buffer(
-                    static_cast<std::uint8_t *>(buffer.data()) + size, buffer.size() - size);
-                self->read_exact_carrier(remaining, callback);
-            };
-            // NOTE: name the sender first; argument order is unspecified.
-            auto sender = carrier->async_read_some(buffer);
-            async::start_with_receiver(std::move(sender), CarrierReadBridge{std::move(completion)});
+        void read_exact_carrier(boost::asio::mutable_buffer buffer, ExactReadHandler handler) {
+            scope_.spawn(run_read_exact_carrier(shared_from_this(), buffer, std::move(handler)));
         }
 
         void finish_write(const boost::system::error_code &error, std::size_t size) {
@@ -624,6 +581,8 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
         bool obfs_response_ready = true;
         bool read_in_progress = false;
         bool write_in_progress = false;
+        // Owns the read/write chain tasks, which always end with a value.
+        exec::async_scope scope_;
     };
 
   public:
@@ -731,7 +690,7 @@ class ShadowsocksConnectOperation final
           kcptun_pool_(std::move(kcptun_pool)), websocket_mux_pool_(std::move(websocket_mux_pool)),
           request_(std::move(request)),
           socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.serialized_executor())),
-          timer_(runtime.serialized_executor()), handler_(std::move(handler)) {}
+          handler_(std::move(handler)) {}
 
     void start() {
         const auto validation = validate_config();
@@ -739,26 +698,33 @@ class ShadowsocksConnectOperation final
             finish(core::StreamOpenResult::failed(validation.error()));
             return;
         }
-        timer_.expires_after(kConnectTimeout);
-        timer_.async_wait([self = shared_from_this()](const boost::system::error_code &error) {
-            if (!error) {
-                if (self->resolver_ && self->resolver_request_id_) {
-                    self->resolver_->cancel(*self->resolver_request_id_);
-                    self->resolver_request_id_.reset();
-                }
-                boost::system::error_code ignored;
-                if (self->carrier_) {
-                    self->carrier_->close();
-                } else {
-                    self->socket_->cancel(ignored);
-                }
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::timeout, "timed out opening Shadowsocks TCP stream"}));
-            }
-        });
-        // The scope only owns this chain task; teardown stays
+        // Deadline is a sleep task racing the chain: whichever finishes
+        // first wins via the completed_ guard in finish(); the loser
+        // observes completed_ and drops. No steady_timer.async_wait leaf.
+        auto executor = runtime_.serialized_executor();
+        scope_.spawn(run_deadline(shared_from_this(), executor));
+        // The scope owns the chain and deadline tasks; teardown stays
         // guard-driven, so no stop is ever requested.
         scope_.spawn(run(shared_from_this()));
+    }
+
+    // NOTE: named function per the coroutine creation rules; never an
+    // immediately-invoked capturing lambda.
+    static exec::task<void> run_deadline(std::shared_ptr<ShadowsocksConnectOperation> self,
+                                         boost::asio::any_io_executor executor) {
+        try {
+            co_await async::sleep_after(executor, kConnectTimeout);
+        } catch (...) {
+            co_return;
+        }
+        boost::system::error_code ignored;
+        if (self->carrier_) {
+            self->carrier_->close();
+        } else {
+            self->socket_->cancel(ignored);
+        }
+        self->finish(core::StreamOpenResult::failed(
+            {core::ErrorCode::timeout, "timed out opening Shadowsocks TCP stream"}));
     }
 
     // Straight-line connect chain: resolve, transport survivor
@@ -862,17 +828,19 @@ class ShadowsocksConnectOperation final
             }
             core::Result<std::unique_ptr<io::StreamHandle>> mux_stream;
             try {
-                mux_stream =
-                    co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
-                        [self, endpoints](
-                            async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
-                                done) {
-                            self->websocket_mux_pool_->async_open_stream(
-                                std::move(*endpoints), self->websocket_options(),
-                                [done](core::Result<std::unique_ptr<io::StreamHandle>>
-                                           stream) mutable { done(std::move(stream)); });
-                            return async::CallbackAbortFn{[self] { self->abort(); }};
-                        });
+                using Sigs =
+                    async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>;
+                // NOTE: name the sender first; argument order is unspecified.
+                auto sender = async::callback_sender<Sigs>(
+                    [self, endpoints](auto terminal) mutable -> async::CallbackAbortFn {
+                        self->websocket_mux_pool_->async_open_stream(
+                            std::move(*endpoints), self->websocket_options(), std::move(terminal));
+                        return async::CallbackAbortFn{[self] { self->abort(); }};
+                    },
+                    [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> stream) {
+                        stdexec::set_value(std::move(receiver), std::move(stream));
+                    });
+                mux_stream = co_await std::move(sender);
             } catch (...) {
                 self->finish(core::StreamOpenResult::failed(
                     {core::ErrorCode::transport_io, "WebSocket mux pool open failed", {}}));
@@ -968,17 +936,24 @@ class ShadowsocksConnectOperation final
         core::StreamRequest chained_request{std::move(destination), std::nullopt, trace.value()};
         core::Result<std::unique_ptr<io::StreamHandle>> opened;
         try {
-            opened = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
-                [self, plan = std::move(plan.value()),
-                 chained_request = std::move(chained_request)](
-                    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
-                        done) mutable {
-                    transport::EndpointDialer dialer(self->runtime_.serialized_executor(),
-                                                     std::move(plan));
-                    async::start_with_receiver(dialer.connect_stream(std::move(chained_request)),
-                                               transport::ChainedStreamReceiver{std::move(done)});
-                    return async::CallbackAbortFn{[self] { self->abort(); }};
-                });
+            // Co_await the chained sender directly: StreamOpenResult
+            // unwraps into the transported handle; stop aborts via the
+            // operation abort (socket/carrier close through finish path).
+            auto sender = transport::EndpointDialer(self->runtime_.serialized_executor(),
+                                                    std::move(plan.value()))
+                              .connect_stream(std::move(chained_request));
+            auto stream_result = co_await std::move(sender);
+            if (stream_result.status == core::OpenStatus::opened && stream_result.handle) {
+                opened = core::Result<std::unique_ptr<io::StreamHandle>>{
+                    std::move(stream_result.handle)};
+            } else if (stream_result.error) {
+                opened = core::fail(*stream_result.error);
+            } else {
+                opened = core::fail(
+                    {core::ErrorCode::endpoint_connection, "Shadowsocks chained dial failed", {}});
+            }
+        } catch (const core::Error &failure) {
+            opened = core::fail(failure);
         } catch (...) {
             fail({core::ErrorCode::transport_io, "Shadowsocks chained dial failed", {}});
             co_return;
@@ -1260,22 +1235,24 @@ class ShadowsocksConnectOperation final
         }
         core::Result<std::unique_ptr<io::StreamHandle>> result;
         try {
-            result = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
-                [self, stream = std::move(stream), options = std::move(options)](
-                    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
-                        done) mutable {
+            using Sigs = async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>;
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = async::callback_sender<Sigs>(
+                [self, stream,
+                 options = std::move(options)](auto terminal) mutable -> async::CallbackAbortFn {
                     auto handle = transport::proxy::async_open_shadow_tls_abortable(
-                        std::move(*stream), std::move(options),
-                        [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
-                            done(std::move(opened));
-                        });
+                        std::move(*stream), std::move(options), std::move(terminal));
                     return async::CallbackAbortFn{[self, handle] {
                         self->abort();
                         if (handle) {
                             handle->abort();
                         }
                     }};
+                },
+                [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> opened) {
+                    stdexec::set_value(std::move(receiver), std::move(opened));
                 });
+            result = co_await std::move(sender);
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
                 {core::ErrorCode::transport_io, "Shadow-TLS open failed", {}}));
@@ -1304,22 +1281,24 @@ class ShadowsocksConnectOperation final
         options.certificate_pin = self->config_.plugin_fingerprint;
         core::Result<std::unique_ptr<io::StreamHandle>> result;
         try {
-            result = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
-                [self, stream = std::move(stream), options = std::move(options)](
-                    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
-                        done) mutable {
+            using Sigs = async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>;
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = async::callback_sender<Sigs>(
+                [self, stream,
+                 options = std::move(options)](auto terminal) mutable -> async::CallbackAbortFn {
                     auto handle = transport::proxy::async_open_restls_abortable(
-                        std::move(*stream), std::move(options),
-                        [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
-                            done(std::move(opened));
-                        });
+                        std::move(*stream), std::move(options), std::move(terminal));
                     return async::CallbackAbortFn{[self, handle] {
                         self->abort();
                         if (handle) {
                             handle->abort();
                         }
                     }};
+                },
+                [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> opened) {
+                    stdexec::set_value(std::move(receiver), std::move(opened));
                 });
+            result = co_await std::move(sender);
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
                 {core::ErrorCode::transport_io, "ResTLS open failed", {}}));
@@ -1347,22 +1326,24 @@ class ShadowsocksConnectOperation final
         options.skip_cert_verify = self->config_.plugin_skip_cert_verify;
         core::Result<std::unique_ptr<io::StreamHandle>> result;
         try {
-            result = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
-                [self, stream = std::move(stream), options = std::move(options)](
-                    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
-                        done) mutable {
+            using Sigs = async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>;
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = async::callback_sender<Sigs>(
+                [self, stream,
+                 options = std::move(options)](auto terminal) mutable -> async::CallbackAbortFn {
                     auto handle = transport::proxy::async_open_jls_abortable(
-                        std::move(*stream), std::move(options),
-                        [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
-                            done(std::move(opened));
-                        });
+                        std::move(*stream), std::move(options), std::move(terminal));
                     return async::CallbackAbortFn{[self, handle] {
                         self->abort();
                         if (handle) {
                             handle->abort();
                         }
                     }};
+                },
+                [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> opened) {
+                    stdexec::set_value(std::move(receiver), std::move(opened));
                 });
+            result = co_await std::move(sender);
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
                 {core::ErrorCode::transport_io, "JLS open failed", {}}));
@@ -1395,30 +1376,37 @@ class ShadowsocksConnectOperation final
             std::optional<core::StreamOpenResult> opened;
             try {
                 if (self->carrier_) {
-                    opened = co_await async::bridge_sender<core::StreamOpenResult>(
-                        [self, destination = std::move(address.value())](
-                            async::BridgeHandler<core::StreamOpenResult> done) mutable {
+                    using Sigs = async::BridgeSignatures<core::StreamOpenResult>;
+                    // NOTE: name the sender first; argument order is unspecified.
+                    auto sender = async::callback_sender<Sigs>(
+                        [self, dest = std::move(address.value())](
+                            auto terminal) mutable -> async::CallbackAbortFn {
                             ss::async_open_shadowsocks_2022_stream(
                                 self->runtime_, self->carrier_, self->config_.method,
-                                self->config_.password, std::move(destination),
-                                [done](core::StreamOpenResult result) mutable {
-                                    done(std::move(result));
-                                });
+                                self->config_.password, std::move(dest), std::move(terminal));
                             return async::CallbackAbortFn{[self] { self->abort(); }};
+                        },
+                        [](auto receiver, core::StreamOpenResult result) {
+                            stdexec::set_value(std::move(receiver), std::move(result));
                         });
+                    opened = co_await std::move(sender);
                 } else {
-                    opened = co_await async::bridge_sender<core::StreamOpenResult>(
-                        [self, destination = std::move(address.value())](
-                            async::BridgeHandler<core::StreamOpenResult> done) mutable {
+                    using Sigs = async::BridgeSignatures<core::StreamOpenResult>;
+                    auto obfs = self->obfs_options();
+                    // NOTE: name the sender first; argument order is unspecified.
+                    auto sender = async::callback_sender<Sigs>(
+                        [self, dest = std::move(address.value()),
+                         obfs = std::move(obfs)](auto terminal) mutable -> async::CallbackAbortFn {
                             ss::async_open_shadowsocks_2022_stream(
                                 self->runtime_, self->socket_, self->config_.method,
-                                self->config_.password, std::move(destination),
-                                self->obfs_options(),
-                                [done](core::StreamOpenResult result) mutable {
-                                    done(std::move(result));
-                                });
+                                self->config_.password, std::move(dest), std::move(obfs),
+                                std::move(terminal));
                             return async::CallbackAbortFn{[self] { self->abort(); }};
+                        },
+                        [](auto receiver, core::StreamOpenResult result) {
+                            stdexec::set_value(std::move(receiver), std::move(result));
                         });
+                    opened = co_await std::move(sender);
                 }
             } catch (...) {
                 self->finish(core::StreamOpenResult::failed(
@@ -1463,33 +1451,45 @@ class ShadowsocksConnectOperation final
             core::Status obfs_result;
             try {
                 if (obfs->mode == ss::ObfsMode::http) {
-                    obfs_result = co_await async::bridge_sender<core::Status>(
-                        [self, wire](async::BridgeHandler<core::Status> done) mutable {
+                    using Sigs = async::BridgeSignatures<core::Status>;
+                    // NOTE: name the sender first; argument order is unspecified.
+                    auto sender = async::callback_sender<Sigs>(
+                        [self, wire](auto terminal) mutable -> async::CallbackAbortFn {
                             const auto options = self->obfs_options();
                             auto handle = ss::async_write_http_obfs_request_abortable(
                                 self->socket_, std::move(*wire), {options->host, options->port},
-                                [done](core::Status result) mutable { done(std::move(result)); });
+                                std::move(terminal));
                             return async::CallbackAbortFn{[self, handle] {
                                 self->abort();
                                 if (handle) {
                                     handle->abort();
                                 }
                             }};
+                        },
+                        [](auto receiver, core::Status result) {
+                            stdexec::set_value(std::move(receiver), std::move(result));
                         });
+                    obfs_result = co_await std::move(sender);
                 } else {
-                    obfs_result = co_await async::bridge_sender<core::Status>(
-                        [self, wire](async::BridgeHandler<core::Status> done) mutable {
+                    using Sigs = async::BridgeSignatures<core::Status>;
+                    // NOTE: name the sender first; argument order is unspecified.
+                    auto sender = async::callback_sender<Sigs>(
+                        [self, wire](auto terminal) mutable -> async::CallbackAbortFn {
                             const auto options = self->obfs_options();
                             auto handle = ss::async_write_tls_obfs_request_abortable(
                                 self->socket_, std::move(*wire), options->host,
-                                [done](core::Status result) mutable { done(std::move(result)); });
+                                std::move(terminal));
                             return async::CallbackAbortFn{[self, handle] {
                                 self->abort();
                                 if (handle) {
                                     handle->abort();
                                 }
                             }};
+                        },
+                        [](auto receiver, core::Status result) {
+                            stdexec::set_value(std::move(receiver), std::move(result));
                         });
+                    obfs_result = co_await std::move(sender);
                 }
             } catch (...) {
                 self->finish(core::StreamOpenResult::failed(
@@ -1557,17 +1557,23 @@ class ShadowsocksConnectOperation final
             std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         core::Result<std::unique_ptr<io::StreamHandle>> plugin;
         try {
-            plugin = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
-                [self, stream = std::move(stream)](
-                    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
-                        done) mutable {
-                    ss::async_open_websocket_plugin(
-                        std::move(*stream), self->websocket_options(),
-                        [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
-                            done(std::move(opened));
-                        });
-                    return async::CallbackAbortFn{[self] { self->abort(); }};
+            using Sigs = async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>;
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = async::callback_sender<Sigs>(
+                [self, stream](auto terminal) mutable -> async::CallbackAbortFn {
+                    auto handle = ss::async_open_websocket_plugin(
+                        std::move(*stream), self->websocket_options(), std::move(terminal));
+                    return async::CallbackAbortFn{[self, handle] {
+                        self->abort();
+                        if (handle) {
+                            handle->cancel();
+                        }
+                    }};
+                },
+                [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> opened) {
+                    stdexec::set_value(std::move(receiver), std::move(opened));
                 });
+            plugin = co_await std::move(sender);
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
                 {core::ErrorCode::transport_io, "WebSocket plugin open failed", {}}));
@@ -1609,17 +1615,23 @@ class ShadowsocksConnectOperation final
             std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         core::Result<std::unique_ptr<io::StreamHandle>> plugin;
         try {
-            plugin = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
-                [self, stream = std::move(stream)](
-                    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
-                        done) mutable {
-                    ss::async_open_websocket_plugin(
-                        std::move(*stream), self->websocket_options(),
-                        [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
-                            done(std::move(opened));
-                        });
-                    return async::CallbackAbortFn{[self] { self->abort(); }};
+            using Sigs = async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>;
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = async::callback_sender<Sigs>(
+                [self, stream](auto terminal) mutable -> async::CallbackAbortFn {
+                    auto handle = ss::async_open_websocket_plugin(
+                        std::move(*stream), self->websocket_options(), std::move(terminal));
+                    return async::CallbackAbortFn{[self, handle] {
+                        self->abort();
+                        if (handle) {
+                            handle->cancel();
+                        }
+                    }};
+                },
+                [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> opened) {
+                    stdexec::set_value(std::move(receiver), std::move(opened));
                 });
+            plugin = co_await std::move(sender);
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
                 {core::ErrorCode::transport_io, "WebSocket plugin open failed", {}}));
@@ -1635,15 +1647,20 @@ class ShadowsocksConnectOperation final
         self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(plugin.value()));
         core::StreamOpenResult opened;
         try {
-            opened = co_await async::bridge_sender<core::StreamOpenResult>(
+            using Sigs = async::BridgeSignatures<core::StreamOpenResult>;
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = async::callback_sender<Sigs>(
                 [self, destination = std::move(destination)](
-                    async::BridgeHandler<core::StreamOpenResult> done) mutable {
+                    auto terminal) mutable -> async::CallbackAbortFn {
                     ss::async_open_shadowsocks_2022_stream(
                         self->runtime_, self->carrier_, self->config_.method,
-                        self->config_.password, std::move(destination),
-                        [done](core::StreamOpenResult result) mutable { done(std::move(result)); });
+                        self->config_.password, std::move(destination), std::move(terminal));
                     return async::CallbackAbortFn{[self] { self->abort(); }};
+                },
+                [](auto receiver, core::StreamOpenResult result) {
+                    stdexec::set_value(std::move(receiver), std::move(result));
                 });
+            opened = co_await std::move(sender);
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
                 {core::ErrorCode::transport_io, "Shadowsocks 2022 open failed", {}}));
@@ -1691,35 +1708,45 @@ class ShadowsocksConnectOperation final
             core::Status obfs_result;
             try {
                 if (obfs->mode == ss::ObfsMode::http) {
-                    obfs_result = co_await async::bridge_sender<core::Status>(
-                        [self, wire,
-                         write_cipher](async::BridgeHandler<core::Status> done) mutable {
+                    using Sigs = async::BridgeSignatures<core::Status>;
+                    // NOTE: name the sender first; argument order is unspecified.
+                    auto sender = async::callback_sender<Sigs>(
+                        [self, wire](auto terminal) mutable -> async::CallbackAbortFn {
                             const auto options = self->obfs_options();
                             auto handle = ss::async_write_http_obfs_request_abortable(
                                 self->socket_, std::move(*wire), {options->host, options->port},
-                                [done](core::Status result) mutable { done(std::move(result)); });
+                                std::move(terminal));
                             return async::CallbackAbortFn{[self, handle] {
                                 self->abort();
                                 if (handle) {
                                     handle->abort();
                                 }
                             }};
+                        },
+                        [](auto receiver, core::Status result) {
+                            stdexec::set_value(std::move(receiver), std::move(result));
                         });
+                    obfs_result = co_await std::move(sender);
                 } else {
-                    obfs_result = co_await async::bridge_sender<core::Status>(
-                        [self, wire,
-                         write_cipher](async::BridgeHandler<core::Status> done) mutable {
+                    using Sigs = async::BridgeSignatures<core::Status>;
+                    // NOTE: name the sender first; argument order is unspecified.
+                    auto sender = async::callback_sender<Sigs>(
+                        [self, wire](auto terminal) mutable -> async::CallbackAbortFn {
                             const auto options = self->obfs_options();
                             auto handle = ss::async_write_tls_obfs_request_abortable(
                                 self->socket_, std::move(*wire), options->host,
-                                [done](core::Status result) mutable { done(std::move(result)); });
+                                std::move(terminal));
                             return async::CallbackAbortFn{[self, handle] {
                                 self->abort();
                                 if (handle) {
                                     handle->abort();
                                 }
                             }};
+                        },
+                        [](auto receiver, core::Status result) {
+                            stdexec::set_value(std::move(receiver), std::move(result));
                         });
+                    obfs_result = co_await std::move(sender);
                 }
             } catch (...) {
                 self->finish(core::StreamOpenResult::failed(
@@ -1799,17 +1826,23 @@ class ShadowsocksConnectOperation final
             std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         core::Result<std::unique_ptr<io::StreamHandle>> plugin;
         try {
-            plugin = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
-                [self, stream = std::move(stream),
-                 cipher](async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
-                             done) mutable {
-                    ss::async_open_websocket_plugin(
-                        std::move(*stream), self->websocket_options(),
-                        [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
-                            done(std::move(opened));
-                        });
-                    return async::CallbackAbortFn{[self] { self->abort(); }};
+            using Sigs = async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>;
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = async::callback_sender<Sigs>(
+                [self, stream](auto terminal) mutable -> async::CallbackAbortFn {
+                    auto handle = ss::async_open_websocket_plugin(
+                        std::move(*stream), self->websocket_options(), std::move(terminal));
+                    return async::CallbackAbortFn{[self, handle] {
+                        self->abort();
+                        if (handle) {
+                            handle->cancel();
+                        }
+                    }};
+                },
+                [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> opened) {
+                    stdexec::set_value(std::move(receiver), std::move(opened));
                 });
+            plugin = co_await std::move(sender);
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
                 {core::ErrorCode::transport_io, "WebSocket plugin open failed", {}}));
@@ -1849,11 +1882,11 @@ class ShadowsocksConnectOperation final
         self->finish(core::StreamOpenResult::opened(std::move(stream_handle.value())));
     }
 
-    void cancel_timer() noexcept { timer_.cancel(); }
-
   public:
     // Abort for sender-driven cancellation: posted to the strand so it stays
-    // ordered with finish(). The bridge drops the late terminal.
+    // ordered with finish(). The bridge drops the late terminal. The
+    // deadline task observes completed_ and drops; its sleep sender is
+    // aborted when the scope drains (callback_sender aborter cancels it).
     void abort() noexcept {
         auto self = shared_from_this();
         try {
@@ -1862,11 +1895,6 @@ class ShadowsocksConnectOperation final
                     return;
                 }
                 boost::system::error_code ignored;
-                self->cancel_timer();
-                if (self->resolver_ && self->resolver_request_id_) {
-                    self->resolver_->cancel(*self->resolver_request_id_);
-                    self->resolver_request_id_.reset();
-                }
                 self->socket_->close(ignored);
                 if (self->carrier_) {
                     self->carrier_->close();
@@ -1882,11 +1910,6 @@ class ShadowsocksConnectOperation final
             return;
         }
         completed_ = true;
-        cancel_timer();
-        if (resolver_ && resolver_request_id_) {
-            resolver_->cancel(*resolver_request_id_);
-            resolver_request_id_.reset();
-        }
         if (!result.succeeded()) {
             boost::system::error_code ignored;
             socket_->close(ignored);
@@ -1913,10 +1936,8 @@ class ShadowsocksConnectOperation final
     // ECH config bytes resolved once per connect for the WebSocket plugin
     // TLS layer; injected into every plugin open via websocket_options().
     std::optional<std::vector<std::uint8_t>> plugin_ech_config_;
-    boost::asio::steady_timer timer_;
     core::StreamOpenHandler handler_;
     std::vector<std::uint8_t> write_nonce_;
-    std::optional<dns::ResolverService::RequestId> resolver_request_id_;
     bool completed_ = false;
     exec::async_scope scope_;
 };
@@ -1927,6 +1948,29 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
         using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t,
                                                io::DatagramAddress)>;
         using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+        using ReadTerminal = ReadHandler;
+        using WriteTerminal = WriteHandler;
+
+        // Single datagram send as one task co_awaiting the transport
+        // sender directly; teardown stays guard-driven via abort.
+        // NOTE: named function per the coroutine creation rules; never an
+        // immediately-invoked capturing lambda.
+        static exec::task<void> run_send(std::shared_ptr<State> self,
+                                         std::shared_ptr<std::vector<std::uint8_t>> packet,
+                                         std::size_t plaintext_size, WriteTerminal done) {
+            try {
+                // NOTE: name the sender first; argument order is unspecified.
+                auto sender = self->transport_->async_send_to(
+                    boost::asio::buffer(*packet), io::DatagramAddress::from_endpoint(self->server));
+                co_await std::move(sender);
+            } catch (...) {
+                self->send_in_progress = false;
+                done(net::unpack_error(std::current_exception()), 0);
+                co_return;
+            }
+            self->send_in_progress = false;
+            done({}, plaintext_size);
+        }
 
         State(std::shared_ptr<io::DatagramHandle> link, boost::asio::ip::udp::endpoint server,
               std::string method, std::string password)
@@ -1972,16 +2016,8 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
                 auto self = shared_from_this();
                 self->send_in_progress = true;
                 self->send_handler = std::move(handler);
-                WriteHandler completion = [self, packet,
-                                           payload_size](const boost::system::error_code &error,
-                                                         std::size_t) mutable {
-                    self->finish_send(error, error ? 0 : payload_size);
-                };
-                // NOTE: name the sender first; argument order is unspecified.
-                auto sender = transport_->async_send_to(boost::asio::buffer(*packet),
-                                                        io::DatagramAddress::from_endpoint(server));
-                async::start_with_receiver(std::move(sender),
-                                           CarrierWriteBridge{std::move(completion)});
+                WriteTerminal done{std::move(self->send_handler)};
+                scope_.spawn(run_send(self, packet, payload_size, std::move(done)));
                 return;
             }
             std::vector<std::uint8_t> plaintext = std::move(address.value());
@@ -1997,16 +2033,8 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
             auto self = shared_from_this();
             self->send_in_progress = true;
             self->send_handler = std::move(handler);
-            WriteHandler completion = [self, wire,
-                                       payload_size](const boost::system::error_code &error,
-                                                     std::size_t) mutable {
-                self->finish_send(error, error ? 0 : payload_size);
-            };
-            // NOTE: name the sender first; argument order is unspecified.
-            auto sender = transport_->async_send_to(boost::asio::buffer(*wire),
-                                                    io::DatagramAddress::from_endpoint(server));
-            async::start_with_receiver(std::move(sender),
-                                       CarrierWriteBridge{std::move(completion)});
+            WriteTerminal done{std::move(self->send_handler)};
+            scope_.spawn(run_send(self, wire, payload_size, std::move(done)));
         }
 
         void receive(boost::asio::mutable_buffer buffer, ReadHandler handler) {
@@ -2022,34 +2050,41 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
             receive_next();
         }
 
-        void receive_next() {
-            auto self = shared_from_this();
-            ReadHandler completion = [self](const boost::system::error_code &error,
-                                            std::size_t size, io::DatagramAddress sender) {
-                if (!self->receive_handler) {
-                    // Late lower completion after cancel_receive retired the op.
+        // Single-pull receive loop as one task: keep pulling from the
+        // transport (dropping off-server packets) until a decodable
+        // datagram lands in the caller's buffer. Co_awaits the transport
+        // sender directly instead of bridging back into a handler.
+        // NOTE: named function per the coroutine creation rules; never an
+        // immediately-invoked capturing lambda.
+        static exec::task<void> run_receive(std::shared_ptr<State> self, ReadTerminal done) {
+            for (;;) {
+                io::DatagramPacket raw;
+                try {
+                    // NOTE: name the sender first; argument order is unspecified.
+                    auto receiver = self->transport_->async_receive_from(
+                        boost::asio::buffer(self->receive_buffer));
+                    raw = co_await std::move(receiver);
+                } catch (...) {
                     self->receive_in_progress = false;
-                    return;
-                }
-                if (error) {
-                    self->finish_receive(error, 0, {});
-                    return;
+                    done(net::unpack_error(std::current_exception()), 0, {});
+                    co_return;
                 }
                 // Chained relays report the ultimate sender rather than the
                 // Shadowsocks server; the chain is point-to-point and the
                 // AEAD layers still authenticate every packet.
                 if (self->filter_server_endpoint &&
-                    (!sender.is_address() || sender.address() != self->server.address() ||
-                     sender.port() != self->server.port())) {
-                    self->receive_next();
-                    return;
+                    (!raw.address.is_address() || raw.address.address() != self->server.address() ||
+                     raw.address.port() != self->server.port())) {
+                    continue;
                 }
-                self->decode_response(size);
-            };
-            // NOTE: name the sender first; argument order is unspecified.
-            auto sender = transport_->async_receive_from(boost::asio::buffer(receive_buffer));
-            async::start_with_receiver(std::move(sender),
-                                       SocketDatagramBridge{std::move(completion)});
+                self->decode_response(raw.size);
+                co_return;
+            }
+        }
+
+        void receive_next() {
+            ReadTerminal done{std::move(receive_handler)};
+            scope_.spawn(run_receive(shared_from_this(), std::move(done)));
         }
 
         void decode_response(std::size_t size) {
@@ -2207,6 +2242,8 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
         WriteHandler send_handler;
         bool receive_in_progress = false;
         bool send_in_progress = false;
+        // Owns the send/receive chain tasks, which always end with a value.
+        exec::async_scope scope_;
     };
 
   public:
@@ -2461,134 +2498,237 @@ ShadowsocksOutbound::connect_stream(core::StreamRequest request) {
         });
 }
 
-// Completes a chained native-UDP open by layering the cipher session on
-// the chain's DatagramHandle.
-struct ChainedDatagramOpen {
-    using receiver_concept = stdexec::receiver_tag;
-    async::BridgeHandler<core::DatagramOpenResult> handler;
-    boost::asio::ip::udp::endpoint server;
-    ShadowsocksOutboundConfig config;
-    void set_value(core::DatagramOpenResult result) && noexcept {
-        auto done = std::move(handler);
-        if (result.status != core::OpenStatus::opened || !result.handle) {
-            if (result.error) {
-                done(core::DatagramOpenResult::failed(result.error.value()));
-                return;
-            }
-            done(core::DatagramOpenResult::failed(
-                {core::ErrorCode::endpoint_connection, "chained datagram open failed", {}}));
-            return;
-        }
-        std::shared_ptr<io::DatagramHandle> link{std::move(result.handle)};
-        auto state = std::make_shared<ShadowsocksDatagramHandle::State>(
-            std::move(link), server, config.method, config.password);
-        state->filter_server_endpoint = false;
-        done(core::DatagramOpenResult::opened(
-            std::make_unique<ShadowsocksDatagramHandle>(std::move(state)),
-            core::DatagramSemantics::multi_destination));
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto done = std::move(handler);
-        try {
-            std::rethrow_exception(std::move(error));
-        } catch (const core::Error &failure) {
-            done(core::DatagramOpenResult::failed(failure));
-        } catch (...) {
-            done(core::DatagramOpenResult::failed(
-                {core::ErrorCode::endpoint_connection, "chained datagram open failed", {}}));
-        }
-    }
-    void set_stopped() && noexcept {
-        auto done = std::move(handler);
-        done(core::DatagramOpenResult::failed(
-            {core::ErrorCode::cancelled, "chained datagram open was cancelled", {}}));
-    }
-};
-
-// Opens native UDP through the dialer_proxy chain: the chain delivers a
-// DatagramHandle relaying the server, wrapped in the usual cipher session.
+// Chained native-UDP open as one task: co_await the chained datagram
+// sender directly and layer the cipher session on the chain's handle.
 // Stream-kind (legacy) ciphers stay socket-bound and cannot chain.
-void open_chained_datagram_dial(runtime::AsioRuntime &runtime, transport::EndpointDialPlan plan,
-                                ShadowsocksOutboundConfig config,
-                                std::shared_ptr<const core::EndpointDialTrace> trace,
-                                boost::asio::ip::udp::endpoint server,
-                                async::BridgeHandler<core::DatagramOpenResult> handler) {
+// NOTE: named function per the coroutine creation rules; never an
+// immediately-invoked capturing lambda.
+exec::task<core::DatagramOpenResult>
+open_chained_datagram_task(runtime::AsioRuntime &runtime, transport::EndpointDialPlan plan,
+                           ShadowsocksOutboundConfig config,
+                           std::shared_ptr<const core::EndpointDialTrace> trace,
+                           boost::asio::ip::udp::endpoint server) {
     boost::system::error_code ignored;
     const auto numeric = boost::asio::ip::make_address(config.server_host, ignored);
     core::Destination destination =
         ignored ? core::Destination::domain(config.server_host, config.server_port)
                 : core::Destination::address(numeric, config.server_port);
     core::DatagramRequest chained_request{std::move(destination), std::move(trace)};
-    transport::EndpointDialer dialer(runtime.serialized_executor(), std::move(plan));
-    auto opener = dialer.open_datagram(std::move(chained_request));
-    async::start_with_receiver(std::move(opener),
-                               ChainedDatagramOpen{std::move(handler), server, std::move(config)});
+    core::DatagramOpenResult result;
+    try {
+        transport::EndpointDialer dialer(runtime.serialized_executor(), std::move(plan));
+        // NOTE: name the sender first; argument order is unspecified.
+        auto sender = dialer.open_datagram(std::move(chained_request));
+        result = co_await std::move(sender);
+    } catch (const core::Error &failure) {
+        co_return core::DatagramOpenResult::failed(failure);
+    } catch (...) {
+        co_return core::DatagramOpenResult::failed(
+            {core::ErrorCode::endpoint_connection, "chained datagram open failed", {}});
+    }
+    if (result.status != core::OpenStatus::opened || !result.handle) {
+        if (result.error) {
+            co_return core::DatagramOpenResult::failed(result.error.value());
+        }
+        co_return core::DatagramOpenResult::failed(
+            {core::ErrorCode::endpoint_connection, "chained datagram open failed", {}});
+    }
+    std::shared_ptr<io::DatagramHandle> link{std::move(result.handle)};
+    auto state = std::make_shared<ShadowsocksDatagramHandle::State>(std::move(link), server,
+                                                                    config.method, config.password);
+    state->filter_server_endpoint = false;
+    co_return core::DatagramOpenResult::opened(
+        std::make_unique<ShadowsocksDatagramHandle>(std::move(state)),
+        core::DatagramSemantics::multi_destination);
 }
 
-void open_chained_datagram(runtime::AsioRuntime &runtime,
-                           std::shared_ptr<dns::ResolverService> resolver,
-                           OutboundRegistry::Snapshot registry, ShadowsocksOutboundConfig config,
-                           core::DatagramRequest request,
-                           async::BridgeHandler<core::DatagramOpenResult> handler) {
-    auto fail = [handler](core::Error error) mutable {
-        handler(core::DatagramOpenResult::failed(std::move(error)));
-    };
+// Opens native UDP through the dialer_proxy chain: the chain delivers a
+// DatagramHandle relaying the server, wrapped in the usual cipher session.
+// Stream-kind (legacy) ciphers stay socket-bound and cannot chain.
+exec::task<core::DatagramOpenResult>
+open_chained_datagram(runtime::AsioRuntime &runtime, std::shared_ptr<dns::ResolverService> resolver,
+                      OutboundRegistry::Snapshot registry, ShadowsocksOutboundConfig config,
+                      core::DatagramRequest request) {
     if (!registry) {
-        fail({core::ErrorCode::configuration,
-              "Shadowsocks dialer-proxy requires a chain registry",
-              {}});
-        return;
+        co_return core::DatagramOpenResult::failed(
+            {core::ErrorCode::configuration,
+             "Shadowsocks dialer-proxy requires a chain registry",
+             {}});
     }
     const auto trace = transport::extend_endpoint_trace(request.dial_trace, config.id);
     if (!trace) {
-        fail(trace.error());
-        return;
+        co_return core::DatagramOpenResult::failed(trace.error());
     }
     const transport::EndpointDialRequirements requirements{false, true};
     const auto plan =
         transport::EndpointDialPlan::from_registry(registry, config.dialer_proxy, requirements);
     if (!plan) {
-        fail(plan.error());
-        return;
+        co_return core::DatagramOpenResult::failed(plan.error());
     }
     const auto method = transport::proxy::cipher_method(config.method);
     if (!method) {
-        fail(method.error());
-        return;
+        co_return core::DatagramOpenResult::failed(method.error());
     }
     if (method.value().kind == transport::proxy::CipherKind::stream) {
-        fail({core::ErrorCode::unsupported,
-              "Shadowsocks dialer-proxy cannot chain legacy stream-cipher UDP",
-              {}});
-        return;
+        co_return core::DatagramOpenResult::failed(
+            {core::ErrorCode::unsupported,
+             "Shadowsocks dialer-proxy cannot chain legacy stream-cipher UDP",
+             {}});
     }
     // The server endpoint feeds the sender filter; routing itself stays
     // with the chain. Numeric literals skip the resolver outright.
     boost::system::error_code numeric_error;
     const auto numeric_host = boost::asio::ip::make_address(config.server_host, numeric_error);
     if (!numeric_error) {
-        open_chained_datagram_dial(
+        co_return co_await open_chained_datagram_task(
             runtime, std::move(plan.value()), std::move(config), trace.value(),
-            boost::asio::ip::udp::endpoint(numeric_host, config.server_port), std::move(handler));
-        return;
+            boost::asio::ip::udp::endpoint(numeric_host, config.server_port));
     }
-    detail::resolve_host(
-        runtime, resolver, config.server_host,
-        [&runtime, plan = std::move(plan.value()), config = std::move(config),
-         trace = trace.value(),
-         handler = std::move(handler)](core::Result<detail::AddressList> result) mutable {
-            if (!result || result.value().empty()) {
-                handler(core::DatagramOpenResult::failed(
-                    result ? core::Error{core::ErrorCode::resolution,
-                                         "Shadowsocks server hostname resolved to no addresses"}
-                           : result.error()));
-                return;
-            }
-            open_chained_datagram_dial(
-                runtime, std::move(plan), std::move(config), std::move(trace),
-                boost::asio::ip::udp::endpoint(result.value().front(), config.server_port),
-                std::move(handler));
-        });
+    core::Result<detail::AddressList> resolved;
+    try {
+        resolved =
+            co_await detail::resolve_host_sender(runtime, std::move(resolver), config.server_host);
+    } catch (...) {
+        co_return core::DatagramOpenResult::failed(
+            {core::ErrorCode::resolution, "failed to resolve Shadowsocks server", {}});
+    }
+    if (!resolved || resolved.value().empty()) {
+        co_return core::DatagramOpenResult::failed(
+            resolved ? core::Error{core::ErrorCode::resolution,
+                                   "Shadowsocks server hostname resolved to no addresses"}
+                     : resolved.error());
+    }
+    co_return co_await open_chained_datagram_task(
+        runtime, std::move(plan.value()), std::move(config), std::move(trace.value()),
+        boost::asio::ip::udp::endpoint(resolved.value().front(), config.server_port));
+}
+
+// Drives one datagram open task to a bridge terminal: every terminal
+// funnels through done, so the spawned task always ends with a value.
+// NOTE: named function per the coroutine creation rules; never an
+// immediately-invoked capturing lambda.
+exec::task<void> run_datagram_task(exec::task<core::DatagramOpenResult> task,
+                                   async::BridgeHandler<core::DatagramOpenResult> done) {
+    try {
+        done(co_await std::move(task));
+    } catch (const core::Error &failure) {
+        done(core::DatagramOpenResult::failed(failure));
+    } catch (...) {
+        done(core::DatagramOpenResult::failed(
+            {core::ErrorCode::transport_io, "Shadowsocks datagram open failed", {}}));
+    }
+}
+
+// UDP-over-TCP (or kcptun) datagram open as one task: co_await the
+// connect-operation bridge for the TCP carrier, then wrap it in the UoT
+// datagram handle. Stop aborts via the operation abort.
+// NOTE: named function per the coroutine creation rules; never an
+// immediately-invoked capturing lambda.
+exec::task<core::DatagramOpenResult> open_uot_datagram_task(
+    runtime::AsioRuntime &runtime, std::shared_ptr<dns::ResolverService> resolver,
+    OutboundRegistry::Snapshot chain_registry, std::shared_ptr<ss::KcptunClientPool> kcptun_pool,
+    std::shared_ptr<ss::WebSocketPluginMuxPool> websocket_mux_pool,
+    ShadowsocksOutboundConfig config, core::DatagramRequest request) {
+    const auto version = config.udp_over_tcp_version;
+    const auto magic = version == 2 ? kUdpOverTcpV2MagicAddress : kUdpOverTcpMagicAddress;
+    core::StreamRequest stream_request{core::Destination::domain(std::string(magic), 0),
+                                       std::nullopt, request.dial_trace};
+    core::StreamOpenResult stream_result;
+    try {
+        using Sigs = async::BridgeSignatures<core::StreamOpenResult>;
+        // NOTE: name the sender first; argument order is unspecified.
+        auto sender = async::callback_sender<Sigs>(
+            [&runtime, resolver, chain_registry, kcptun_pool, websocket_mux_pool, config,
+             stream_request =
+                 std::move(stream_request)](auto terminal) mutable -> async::CallbackAbortFn {
+                auto operation = std::make_shared<ShadowsocksConnectOperation>(
+                    runtime, std::move(resolver), std::move(chain_registry), std::move(kcptun_pool),
+                    std::move(websocket_mux_pool), std::move(config), std::move(stream_request),
+                    std::move(terminal));
+                operation->start();
+                return async::CallbackAbortFn{[operation] { operation->abort(); }};
+            },
+            [](auto receiver, core::StreamOpenResult result) {
+                stdexec::set_value(std::move(receiver), std::move(result));
+            });
+        stream_result = co_await std::move(sender);
+    } catch (...) {
+        co_return core::DatagramOpenResult::failed(
+            {core::ErrorCode::transport_io, "failed to open Shadowsocks UoT stream", {}});
+    }
+    if (!stream_result.succeeded()) {
+        co_return core::DatagramOpenResult::failed(stream_result.error.value_or(
+            core::Error{core::ErrorCode::transport_io, "failed to open Shadowsocks UoT stream"}));
+    }
+    const auto request_destination = version == 2 ? request.initial_destination : std::nullopt;
+    auto datagram = ss::make_udp_over_tcp_datagram_handle(
+        std::move(stream_result.handle),
+        {version == 2 ? ss::UdpOverTcpVersion::version2 : ss::UdpOverTcpVersion::legacy,
+         request_destination});
+    if (!datagram) {
+        co_return core::DatagramOpenResult::failed(datagram.error());
+    }
+    co_return core::DatagramOpenResult::opened(std::move(datagram.value()),
+                                               core::DatagramSemantics::multi_destination);
+}
+
+// Native UDP datagram open as one task: co_await the resolve sender,
+// then build the cipher session synchronously on a bound socket.
+// NOTE: named function per the coroutine creation rules; never an
+// immediately-invoked capturing lambda.
+exec::task<core::DatagramOpenResult>
+open_native_datagram_task(runtime::AsioRuntime &runtime,
+                          std::shared_ptr<dns::ResolverService> resolver,
+                          ShadowsocksOutboundConfig config) {
+    core::Result<detail::AddressList> resolved;
+    try {
+        resolved =
+            co_await detail::resolve_host_sender(runtime, std::move(resolver), config.server_host);
+    } catch (...) {
+        co_return core::DatagramOpenResult::failed(
+            {core::ErrorCode::resolution, "failed to resolve Shadowsocks server", {}});
+    }
+    if (!resolved || resolved.value().empty()) {
+        co_return core::DatagramOpenResult::failed(
+            resolved ? core::Error{core::ErrorCode::resolution,
+                                   "Shadowsocks server hostname resolved to no addresses"}
+                     : resolved.error());
+    }
+    const auto server =
+        boost::asio::ip::udp::endpoint(resolved.value().front(), config.server_port);
+    auto socket = std::make_shared<net::UdpStream>(runtime.serialized_executor());
+    boost::system::error_code error;
+    socket->open(server.protocol(), error);
+    if (!error) {
+        socket->bind({server.address().is_v4()
+                          ? boost::asio::ip::address(boost::asio::ip::address_v4::any())
+                          : boost::asio::ip::address(boost::asio::ip::address_v6::any()),
+                      0},
+                     error);
+    }
+    if (error) {
+        co_return core::DatagramOpenResult::failed({core::ErrorCode::transport_io,
+                                                    "failed to open Shadowsocks UDP socket",
+                                                    detail::to_std_error(error)});
+    }
+    const auto method = transport::proxy::cipher_method(config.method);
+    if (!method) {
+        co_return core::DatagramOpenResult::failed(method.error());
+    }
+    if (method.value().kind == transport::proxy::CipherKind::stream) {
+        auto handle = detail::make_legacy_shadowsocks_datagram_handle(
+            std::move(socket), server, config.method, config.password);
+        if (!handle) {
+            co_return core::DatagramOpenResult::failed(handle.error());
+        }
+        co_return core::DatagramOpenResult::opened(std::move(handle.value()),
+                                                   core::DatagramSemantics::multi_destination);
+    }
+    auto state = std::make_shared<ShadowsocksDatagramHandle::State>(std::move(socket), server,
+                                                                    config.method, config.password);
+    co_return core::DatagramOpenResult::opened(
+        std::make_unique<ShadowsocksDatagramHandle>(std::move(state)),
+        core::DatagramSemantics::multi_destination);
 }
 
 io::AnySender<core::DatagramOpenResult>
@@ -2601,11 +2741,10 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
     if (const auto validation = validate(); !validation) {
         return ResultSender{stdexec::just(core::DatagramOpenResult::failed(validation.error()))};
     }
-    // The dial internals below still run on callbacks (resolve_host,
-    // connect operation); the bridge turns the single terminal delivery
-    // into a sender. Final core:: handles adapt at the edge; delete with
-    // the datagram-handle plane. Only values are captured: the outbound
-    // itself may die before the open completes.
+    // Each datagram branch runs as one task (chained / UoT / native);
+    // the bridge only adapts the task result into a sender with a real
+    // aborter. Only values are captured: the outbound itself may die
+    // before the open completes.
     // Native UDP through the dialer_proxy chain (UDP-over-TCP rides the
     // chained TCP carrier via the branch below).
     if (!config_.dialer_proxy.empty() && !config_.udp_over_tcp && config_.plugin != "kcptun") {
@@ -2614,116 +2753,48 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
         auto chain_registry = chain_registry_;
         auto config = config_;
         auto chained_request = request;
+        struct Shared {
+            exec::async_scope scope;
+        };
+        auto shared = std::make_shared<Shared>();
         return async::bridge_sender<core::DatagramOpenResult>(
-            [&runtime, resolver = std::move(resolver), chain_registry = std::move(chain_registry),
-             config = std::move(config), request = std::move(chained_request)](
+            [&runtime, shared, resolver = std::move(resolver),
+             chain_registry = std::move(chain_registry), config = std::move(config),
+             request = std::move(chained_request)](
                 async::BridgeHandler<core::DatagramOpenResult> terminal) mutable {
-                open_chained_datagram(runtime, std::move(resolver), std::move(chain_registry),
-                                      std::move(config), std::move(request), std::move(terminal));
-                return async::CallbackAbortFn{};
+                shared->scope.spawn(run_datagram_task(
+                    open_chained_datagram(runtime, std::move(resolver), std::move(chain_registry),
+                                          std::move(config), std::move(request)),
+                    std::move(terminal)));
+                return async::CallbackAbortFn{[shared] { shared->scope.request_stop(); }};
             });
     }
-    return async::bridge_sender<
-        core::DatagramOpenResult>([runtime = &runtime_, resolver = resolver_,
-                                   chain_registry = chain_registry_, kcptun_pool = kcptun_pool_,
-                                   websocket_mux_pool = websocket_mux_pool_, config = config_,
-                                   request = std::move(request)](
-                                      async::BridgeHandler<core::DatagramOpenResult>
-                                          terminal) mutable {
-        auto handler = std::move(terminal);
-        if (config.udp_over_tcp || config.plugin == "kcptun") {
-            const auto version = config.udp_over_tcp_version;
-            const auto magic = version == 2 ? kUdpOverTcpV2MagicAddress : kUdpOverTcpMagicAddress;
-            core::StreamRequest stream_request{core::Destination::domain(std::string(magic), 0),
-                                               std::nullopt, request.dial_trace};
-            auto operation = std::make_shared<ShadowsocksConnectOperation>(
-                *runtime, resolver, chain_registry, kcptun_pool, websocket_mux_pool, config,
-                std::move(stream_request),
-                [handler = std::move(handler), initial_destination = request.initial_destination,
-                 version,
-                 executor = runtime->serialized_executor()](core::StreamOpenResult result) mutable {
-                    boost::asio::post(executor, [handler = std::move(handler), initial_destination,
-                                                 version, result = std::move(result)]() mutable {
-                        if (!result.succeeded()) {
-                            handler(core::DatagramOpenResult::failed(result.error.value_or(
-                                core::Error{core::ErrorCode::transport_io,
-                                            "failed to open Shadowsocks UoT stream"})));
-                            return;
-                        }
-                        const auto request_destination =
-                            version == 2 ? initial_destination : std::nullopt;
-                        auto datagram = ss::make_udp_over_tcp_datagram_handle(
-                            std::move(result.handle),
-                            {version == 2 ? ss::UdpOverTcpVersion::version2
-                                          : ss::UdpOverTcpVersion::legacy,
-                             request_destination});
-                        if (!datagram) {
-                            handler(core::DatagramOpenResult::failed(datagram.error()));
-                            return;
-                        }
-                        handler(core::DatagramOpenResult::opened(
-                            std::move(datagram.value()),
-                            core::DatagramSemantics::multi_destination));
-                    });
-                });
-            operation->start();
-            return async::CallbackAbortFn{};
-        }
-
-        detail::resolve_host(
-            *runtime, resolver, config.server_host,
-            [runtime, config, resolver,
-             handler = std::move(handler)](core::Result<detail::AddressList> result) mutable {
-                if (!result || result.value().empty()) {
-                    handler(core::DatagramOpenResult::failed(
-                        result ? core::Error{core::ErrorCode::resolution,
-                                             "Shadowsocks server hostname resolved to no addresses"}
-                               : result.error()));
-                    return;
-                }
-                const auto server =
-                    boost::asio::ip::udp::endpoint(result.value().front(), config.server_port);
-                auto socket = std::make_shared<net::UdpStream>(runtime->serialized_executor());
-                boost::system::error_code error;
-                socket->open(server.protocol(), error);
-                if (!error) {
-                    socket->bind(
-                        {server.address().is_v4()
-                             ? boost::asio::ip::address(boost::asio::ip::address_v4::any())
-                             : boost::asio::ip::address(boost::asio::ip::address_v6::any()),
-                         0},
-                        error);
-                }
-                if (error) {
-                    handler(core::DatagramOpenResult::failed(
-                        {core::ErrorCode::transport_io, "failed to open Shadowsocks UDP socket",
-                         detail::to_std_error(error)}));
-                    return;
-                }
-                const auto method = transport::proxy::cipher_method(config.method);
-                if (!method) {
-                    handler(core::DatagramOpenResult::failed(method.error()));
-                    return;
-                }
-                if (method.value().kind == transport::proxy::CipherKind::stream) {
-                    auto handle = detail::make_legacy_shadowsocks_datagram_handle(
-                        std::move(socket), server, config.method, config.password);
-                    if (!handle) {
-                        handler(core::DatagramOpenResult::failed(handle.error()));
-                        return;
-                    }
-                    handler(core::DatagramOpenResult::opened(
-                        std::move(handle.value()), core::DatagramSemantics::multi_destination));
-                    return;
-                }
-                auto state = std::make_shared<ShadowsocksDatagramHandle::State>(
-                    std::move(socket), server, config.method, config.password);
-                handler(core::DatagramOpenResult::opened(
-                    std::make_unique<ShadowsocksDatagramHandle>(std::move(state)),
-                    core::DatagramSemantics::multi_destination));
-            });
-        return async::CallbackAbortFn{};
-    });
+    auto &runtime = runtime_;
+    auto resolver = resolver_;
+    auto chain_registry = chain_registry_;
+    auto kcptun_pool = kcptun_pool_;
+    auto websocket_mux_pool = websocket_mux_pool_;
+    auto config = config_;
+    struct Shared {
+        exec::async_scope scope;
+    };
+    auto shared = std::make_shared<Shared>();
+    return async::bridge_sender<core::DatagramOpenResult>(
+        [&runtime, shared, resolver = std::move(resolver),
+         chain_registry = std::move(chain_registry), kcptun_pool = std::move(kcptun_pool),
+         websocket_mux_pool = std::move(websocket_mux_pool), config = std::move(config),
+         request =
+             std::move(request)](async::BridgeHandler<core::DatagramOpenResult> terminal) mutable {
+            exec::task<core::DatagramOpenResult> task =
+                (config.udp_over_tcp || config.plugin == "kcptun")
+                    ? open_uot_datagram_task(runtime, std::move(resolver),
+                                             std::move(chain_registry), std::move(kcptun_pool),
+                                             std::move(websocket_mux_pool), std::move(config),
+                                             std::move(request))
+                    : open_native_datagram_task(runtime, std::move(resolver), std::move(config));
+            shared->scope.spawn(run_datagram_task(std::move(task), std::move(terminal)));
+            return async::CallbackAbortFn{[shared] { shared->scope.request_stop(); }};
+        });
 }
 
 } // namespace clash_native::outbound

@@ -4,17 +4,18 @@
 #include "proxy_address.hpp"
 
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/shadowsocks/legacy_packet.hpp>
 
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
+
 #include <stdexec/execution.hpp>
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/dispatch.hpp>
-#include <boost/asio/post.hpp>
 
 #include <algorithm>
 #include <array>
@@ -22,8 +23,6 @@
 #include <exception>
 #include <functional>
 #include <memory>
-#include <optional>
-#include <span>
 #include <utility>
 #include <vector>
 
@@ -31,291 +30,62 @@ namespace clash_native::outbound::detail {
 
 namespace {
 
-// Bridges one socket push/pull back into a legacy (error, size[, source])
-// handler.
-struct SocketWriteBridge {
-    using receiver_concept = stdexec::receiver_tag;
-    std::function<void(const boost::system::error_code &, std::size_t)> handler;
-    void set_value(std::size_t size) && noexcept {
-        auto callback = std::move(handler);
-        callback({}, size);
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto callback = std::move(handler);
-        callback(net::unpack_error(std::move(error)), 0);
-    }
-    void set_stopped() && noexcept {
-        auto callback = std::move(handler);
-        callback(boost::asio::error::operation_aborted, 0);
-    }
-};
-
-struct SocketReadBridge {
-    using receiver_concept = stdexec::receiver_tag;
-    std::function<void(const boost::system::error_code &, std::size_t, io::DatagramAddress)>
-        handler;
-    void set_value(io::DatagramPacket packet) && noexcept {
-        auto callback = std::move(handler);
-        callback({}, packet.size, std::move(packet.address));
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto callback = std::move(handler);
-        callback(net::unpack_error(std::move(error)), 0, {});
-    }
-    void set_stopped() && noexcept {
-        auto callback = std::move(handler);
-        callback(boost::asio::error::operation_aborted, 0, {});
-    }
-};
-
 constexpr std::size_t kMaxUdpWireSize = 65507;
 constexpr std::size_t kMaxEncryptedUdpDatagramSize = 1500;
 constexpr std::size_t kMaxProxyAddressSize = 1 + 1 + 255 + 2;
 
-boost::system::error_code protocol_error() {
-    return boost::system::errc::make_error_code(boost::system::errc::protocol_error);
-}
+using SendTerminal = std::function<void(const boost::system::error_code &, std::size_t)>;
+using ReceiveTerminal =
+    std::function<void(const boost::system::error_code &, std::size_t, io::DatagramAddress)>;
 
 class LegacyDatagramState final : public std::enable_shared_from_this<LegacyDatagramState> {
   public:
-    using ReadHandler =
-        std::function<void(const boost::system::error_code &, std::size_t, io::DatagramAddress)>;
-    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
-
     LegacyDatagramState(std::shared_ptr<net::UdpStream> socket,
                         boost::asio::ip::udp::endpoint server, std::string method,
                         std::string password)
         : socket_(std::move(socket)), server_(std::move(server)), method_(std::move(method)),
           password_(std::move(password)) {}
 
-    void send(boost::asio::const_buffer buffer, io::DatagramAddress destination,
-              WriteHandler handler) {
+    io::AnySender<std::size_t> async_send(boost::asio::const_buffer buffer,
+                                          io::DatagramAddress destination) {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
         if (send_in_progress_) {
-            boost::asio::post(socket_->executor(), [handler = std::move(handler)]() mutable {
-                handler(boost::asio::error::already_started, 0);
-            });
-            return;
+            return io::AnySender<std::size_t>{stdexec::just_error(std::make_exception_ptr(
+                core::Error{core::ErrorCode::transport_io, "legacy datagram send in progress"}))};
         }
         auto address = encode_proxy_address(
             outbound::detail::to_core_destination(destination.to_destination()));
         if (!address) {
-            boost::asio::post(socket_->executor(), [handler = std::move(handler)]() mutable {
-                handler(protocol_error(), 0);
-            });
-            return;
+            return io::AnySender<std::size_t>{
+                stdexec::just_error(std::make_exception_ptr(address.error()))};
         }
         std::vector<std::uint8_t> plaintext = std::move(address.value());
         const auto *payload = static_cast<const std::uint8_t *>(buffer.data());
         plaintext.insert(plaintext.end(), payload, payload + buffer.size());
         auto wire = transport::shadowsocks::encrypt_legacy_datagram(method_, password_, plaintext);
         if (!wire || wire.value().size() > kMaxEncryptedUdpDatagramSize) {
-            boost::asio::post(socket_->executor(), [handler = std::move(handler)]() mutable {
-                handler(wire_error(), 0);
-            });
-            return;
+            const auto failure = wire ? core::Error{core::ErrorCode::transport_io,
+                                                    "legacy datagram exceeds encrypted size limit"}
+                                      : wire.error();
+            return io::AnySender<std::size_t>{
+                stdexec::just_error(std::make_exception_ptr(failure))};
         }
+        auto self = shared_from_this();
         auto packet = std::make_shared<std::vector<std::uint8_t>>(std::move(wire.value()));
-        auto self = shared_from_this();
-        self->send_in_progress_ = true;
-        self->send_handler_ = std::move(handler);
-        WriteHandler completion = [self, packet, size = buffer.size()](
-                                      const boost::system::error_code &error, std::size_t) mutable {
-            self->finish_send(error, error ? 0 : size);
-        };
-        // NOTE: name the sender first; argument order is unspecified.
-        auto sender = socket_->async_send_to(boost::asio::buffer(*packet),
-                                             io::DatagramAddress::from_endpoint(server_));
-        async::start_with_receiver(std::move(sender), SocketWriteBridge{std::move(completion)});
-    }
-
-    void receive(boost::asio::mutable_buffer buffer, ReadHandler handler) {
-        if (receive_in_progress_) {
-            boost::asio::post(socket_->executor(), [handler = std::move(handler)]() mutable {
-                handler(boost::asio::error::already_started, 0, {});
-            });
-            return;
-        }
-        receive_in_progress_ = true;
-        output_buffer_ = buffer;
-        receive_handler_ = std::move(handler);
-        receive_next();
-    }
-
-    // Retires a parked receive without closing the transport. Dispatched
-    // to the socket executor because the parked state is strand-private.
-    // The lower receive (if any) stays in flight; its late completion
-    // finds no parked handler and is dropped.
-    void cancel_receive() noexcept {
-        try {
-            auto self = shared_from_this();
-            boost::asio::dispatch(socket_->executor(), [self] {
-                auto handler = std::move(self->receive_handler_);
-                if (!handler) {
-                    return;
-                }
-                self->output_buffer_ = {};
-                self->receive_in_progress_ = false;
-                boost::asio::post(self->socket_->executor(),
-                                  [handler = std::move(handler)]() mutable {
-                                      handler(boost::asio::error::operation_aborted, 0, {});
-                                  });
-            });
-        } catch (...) {
-            // Aborter contract: never throw; the late lower completion or
-            // close() retires the parked handler instead.
-        }
-    }
-
-    // Retires a parked send without closing the transport. Dispatched
-    // to the socket executor because the parked state is strand-private.
-    // The lower send (if any) stays in flight; its late completion
-    // finds no parked handler and is dropped.
-    void cancel_send() noexcept {
-        try {
-            auto self = shared_from_this();
-            boost::asio::dispatch(socket_->executor(), [self] {
-                auto handler = std::move(self->send_handler_);
-                if (!handler) {
-                    return;
-                }
-                self->send_in_progress_ = false;
-                boost::asio::post(self->socket_->executor(),
-                                  [handler = std::move(handler)]() mutable {
-                                      handler(boost::asio::error::operation_aborted, 0);
-                                  });
-            });
-        } catch (...) {
-            // Aborter contract: never throw; the late lower completion or
-            // close() retires the parked handler instead.
-        }
-    }
-
-    void finish_send(const boost::system::error_code &error, std::size_t size) {
-        send_in_progress_ = false;
-        auto handler = std::move(send_handler_);
-        if (!handler) {
-            // Late lower completion after cancel_send retired the op.
-            return;
-        }
-        handler(error, size);
-    }
-
-    void close() noexcept { socket_->close(); }
-
-    boost::asio::any_io_executor executor() noexcept { return socket_->executor(); }
-
-    std::size_t max_datagram_size() const noexcept {
-        return std::min<std::size_t>(
-            transport::shadowsocks::legacy_datagram_payload_limit(
-                method_, kMaxEncryptedUdpDatagramSize, kMaxProxyAddressSize),
-            kMaxUdpWireSize);
-    }
-
-  private:
-    static boost::system::error_code wire_error() {
-        return boost::system::errc::make_error_code(boost::system::errc::message_size);
-    }
-
-    void receive_next() {
-        auto self = shared_from_this();
-        ReadHandler completion = [self](const boost::system::error_code &error, std::size_t size,
-                                        io::DatagramAddress sender) {
-            if (!self->receive_handler_) {
-                // Late lower completion after cancel_receive retired the op.
-                self->receive_in_progress_ = false;
-                return;
-            }
-            if (error) {
-                self->finish_receive(error, 0, {});
-                return;
-            }
-            if (!sender.is_address() || sender.address() != self->server_.address() ||
-                sender.port() != self->server_.port()) {
-                self->receive_next();
-                return;
-            }
-            self->decode_response(size);
-        };
-        // NOTE: name the sender first; argument order is unspecified.
-        auto sender = socket_->async_receive_from(boost::asio::buffer(receive_buffer_));
-        async::start_with_receiver(std::move(sender), SocketReadBridge{std::move(completion)});
-    }
-
-    void decode_response(std::size_t size) {
-        auto plaintext = transport::shadowsocks::decrypt_legacy_datagram(
-            method_, password_, std::span<const std::uint8_t>(receive_buffer_.data(), size));
-        if (!plaintext) {
-            finish_receive(protocol_error(), 0, {});
-            return;
-        }
-        auto address = decode_proxy_address(plaintext.value());
-        if (!address || address.value().size > plaintext.value().size()) {
-            finish_receive(protocol_error(), 0, {});
-            return;
-        }
-        const auto payload_offset = address.value().size;
-        const auto payload_size = plaintext.value().size() - payload_offset;
-        if (address.value().destination.is_address()) {
-            complete_payload(plaintext.value(), payload_offset, payload_size,
-                             io::DatagramAddress::address(address.value().destination.address(),
-                                                          address.value().destination.port()));
-            return;
-        }
-        complete_payload(plaintext.value(), payload_offset, payload_size,
-                         io::DatagramAddress::domain(address.value().destination.domain(),
-                                                     address.value().destination.port()));
-    }
-
-    void complete_payload(const std::vector<std::uint8_t> &plaintext, std::size_t offset,
-                          std::size_t size, io::DatagramAddress sender) {
-        if (size > output_buffer_.size()) {
-            finish_receive(boost::asio::error::message_size, 0, {});
-            return;
-        }
-        if (size != 0) {
-            std::memcpy(output_buffer_.data(), plaintext.data() + offset, size);
-        }
-        finish_receive({}, size, std::move(sender));
-    }
-
-    void finish_receive(const boost::system::error_code &error, std::size_t size,
-                        io::DatagramAddress sender) {
-        receive_in_progress_ = false;
-        auto handler = std::move(receive_handler_);
-        output_buffer_ = {};
-        if (!handler) {
-            // Late lower completion after cancel_receive retired the op.
-            return;
-        }
-        handler(error, size, std::move(sender));
-    }
-
-    std::shared_ptr<net::UdpStream> socket_;
-    boost::asio::ip::udp::endpoint server_;
-    std::string method_;
-    std::string password_;
-    std::array<std::uint8_t, kMaxUdpWireSize> receive_buffer_{};
-    boost::asio::mutable_buffer output_buffer_;
-    ReadHandler receive_handler_;
-    WriteHandler send_handler_;
-    bool receive_in_progress_ = false;
-    bool send_in_progress_ = false;
-};
-
-class LegacyDatagramHandle final : public io::DatagramHandle {
-  public:
-    explicit LegacyDatagramHandle(std::shared_ptr<LegacyDatagramState> state)
-        : state_(std::move(state)) {}
-
-    io::AnySender<std::size_t> async_send_to(boost::asio::const_buffer buffer,
-                                             io::DatagramAddress destination) override {
-        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
-                                                          stdexec::set_error_t(std::exception_ptr),
-                                                          stdexec::set_stopped_t()>;
+        const auto plaintext_size = buffer.size();
+        send_in_progress_ = true;
         return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
-            [state = state_, buffer, destination](auto terminal) mutable {
-                state->send(buffer, std::move(destination), std::move(terminal));
-                return async::CallbackAbortFn{[state] { state->cancel_send(); }};
+            [self, packet, plaintext_size](auto terminal) mutable -> async::CallbackAbortFn {
+                // Single send chain as one task co_awaiting the socket sender;
+                // teardown stays guard-driven, so no stop is ever requested.
+                // The terminal drops late completions once stop/destroy claims
+                // the callback_sender settlement.
+                SendTerminal done{std::move(terminal)};
+                self->scope_.spawn(
+                    run_send(self, std::move(packet), plaintext_size, std::move(done)));
+                return async::CallbackAbortFn{[self] { self->abort(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 if (!error) {
@@ -332,19 +102,25 @@ class LegacyDatagramHandle final : public io::DatagramHandle {
             })};
     }
 
-    io::AnySender<io::DatagramPacket>
-    async_receive_from(boost::asio::mutable_buffer buffer) override {
+    io::AnySender<io::DatagramPacket> async_receive(boost::asio::mutable_buffer buffer) {
         using Signatures = stdexec::completion_signatures<stdexec::set_value_t(io::DatagramPacket),
                                                           stdexec::set_error_t(std::exception_ptr),
                                                           stdexec::set_stopped_t()>;
+        if (receive_in_progress_) {
+            return io::AnySender<io::DatagramPacket>{
+                stdexec::just_error(std::make_exception_ptr(core::Error{
+                    core::ErrorCode::transport_io, "legacy datagram receive in progress"}))};
+        }
+        auto self = shared_from_this();
+        receive_in_progress_ = true;
         return io::AnySender<io::DatagramPacket>{async::callback_sender<Signatures>(
-            [state = state_, buffer](auto terminal) mutable {
-                state->receive(buffer, [terminal = std::move(terminal)](
-                                           const boost::system::error_code &error, std::size_t size,
-                                           io::DatagramAddress source) mutable {
-                    terminal(error, size, std::move(source));
-                });
-                return async::CallbackAbortFn{[state] { state->cancel_receive(); }};
+            [self, buffer](auto terminal) mutable -> async::CallbackAbortFn {
+                // Single-pull receive loop as one task: keep pulling from the
+                // socket (dropping off-server packets) until a decodable
+                // datagram lands in the caller's buffer.
+                ReceiveTerminal done{std::move(terminal)};
+                self->scope_.spawn(run_receive(self, buffer, std::move(done)));
+                return async::CallbackAbortFn{[self] { self->abort(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size,
                io::DatagramAddress source) {
@@ -362,6 +138,149 @@ class LegacyDatagramHandle final : public io::DatagramHandle {
                     std::make_exception_ptr(core::Error{core::ErrorCode::transport_io,
                                                         "legacy datagram receive failed", error}));
             })};
+    }
+
+    // Abort for sender-driven cancellation: dispatched to the socket executor
+    // because the parked flags are strand-private. Retires the parked op
+    // without closing the transport; the in-flight socket op (if any)
+    // completes aborted and the task drops its terminal at the retired guard
+    // or the claimed callback_sender settlement.
+    void abort() noexcept {
+        try {
+            auto self = shared_from_this();
+            auto executor = socket_->executor();
+            boost::asio::dispatch(std::move(executor), [self] {
+                self->send_in_progress_ = false;
+                self->receive_in_progress_ = false;
+                self->socket_->cancel();
+            });
+        } catch (...) {
+            // Aborter contract: never throw; the late task completion retires
+            // against the guards instead.
+        }
+    }
+
+    void close() noexcept { socket_->close(); }
+
+    boost::asio::any_io_executor executor() noexcept { return socket_->executor(); }
+
+    std::size_t max_datagram_size() const noexcept {
+        return std::min<std::size_t>(
+            transport::shadowsocks::legacy_datagram_payload_limit(
+                method_, kMaxEncryptedUdpDatagramSize, kMaxProxyAddressSize),
+            kMaxUdpWireSize);
+    }
+
+  private:
+    static exec::task<void> run_send(std::shared_ptr<LegacyDatagramState> self,
+                                     std::shared_ptr<std::vector<std::uint8_t>> packet,
+                                     std::size_t plaintext_size, SendTerminal done) {
+        try {
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = self->socket_->async_send_to(
+                boost::asio::buffer(*packet), io::DatagramAddress::from_endpoint(self->server_));
+            co_await std::move(sender);
+        } catch (...) {
+            // Stopped (via abort's socket cancel) included: the guard is
+            // already retired, the terminal drops at the settlement, and the
+            // task still ends with a value for the scope.
+            self->send_in_progress_ = false;
+            done(net::unpack_error(std::current_exception()), 0);
+            co_return;
+        }
+        self->send_in_progress_ = false;
+        done({}, plaintext_size);
+    }
+
+    static exec::task<void> run_receive(std::shared_ptr<LegacyDatagramState> self,
+                                        boost::asio::mutable_buffer output, ReceiveTerminal done) {
+        for (;;) {
+            std::size_t size = 0;
+            io::DatagramAddress sender;
+            try {
+                // NOTE: name the sender first; argument order is unspecified.
+                auto receiver =
+                    self->socket_->async_receive_from(boost::asio::buffer(self->receive_buffer_));
+                auto raw = co_await std::move(receiver);
+                size = raw.size;
+                sender = std::move(raw.address);
+            } catch (...) {
+                self->receive_in_progress_ = false;
+                done(net::unpack_error(std::current_exception()), 0, {});
+                co_return;
+            }
+            if (!sender.is_address() || sender.address() != self->server_.address() ||
+                sender.port() != self->server_.port()) {
+                continue;
+            }
+            try {
+                auto packet = self->decode_response(size, output);
+                self->receive_in_progress_ = false;
+                done({}, packet.size, std::move(packet.address));
+            } catch (...) {
+                self->receive_in_progress_ = false;
+                done(net::unpack_error(std::current_exception()), 0, {});
+            }
+            co_return;
+        }
+    }
+
+    io::DatagramPacket decode_response(std::size_t size, boost::asio::mutable_buffer output) {
+        auto plaintext = transport::shadowsocks::decrypt_legacy_datagram(
+            method_, password_, std::span<const std::uint8_t>(receive_buffer_.data(), size));
+        if (!plaintext) {
+            throw plaintext.error();
+        }
+        auto address = decode_proxy_address(plaintext.value());
+        if (!address || address.value().size > plaintext.value().size()) {
+            throw core::Error{core::ErrorCode::transport_io, "legacy datagram framing failed"};
+        }
+        const auto payload_offset = address.value().size;
+        const auto payload_size = plaintext.value().size() - payload_offset;
+        if (payload_size > output.size()) {
+            throw core::Error{
+                core::ErrorCode::transport_io, "legacy datagram truncated",
+                std::error_code(boost::asio::error::message_size, std::system_category())};
+        }
+        if (payload_size != 0) {
+            std::memcpy(output.data(), plaintext.value().data() + payload_offset, payload_size);
+        }
+        if (address.value().destination.is_address()) {
+            return io::DatagramPacket{
+                payload_size, io::DatagramAddress::address(address.value().destination.address(),
+                                                           address.value().destination.port())};
+        }
+        return io::DatagramPacket{payload_size,
+                                  io::DatagramAddress::domain(address.value().destination.domain(),
+                                                              address.value().destination.port())};
+    }
+
+    std::shared_ptr<net::UdpStream> socket_;
+    boost::asio::ip::udp::endpoint server_;
+    std::string method_;
+    std::string password_;
+    std::array<std::uint8_t, kMaxUdpWireSize> receive_buffer_{};
+    // Owns the single send/receive chain tasks, which always end with a value.
+    exec::async_scope scope_;
+    // Single-outstanding guards so concurrent callers fail fast instead of
+    // interleaving on the shared codec buffer.
+    bool receive_in_progress_ = false;
+    bool send_in_progress_ = false;
+};
+
+class LegacyDatagramHandle final : public io::DatagramHandle {
+  public:
+    explicit LegacyDatagramHandle(std::shared_ptr<LegacyDatagramState> state)
+        : state_(std::move(state)) {}
+
+    io::AnySender<std::size_t> async_send_to(boost::asio::const_buffer buffer,
+                                             io::DatagramAddress destination) override {
+        return state_->async_send(buffer, std::move(destination));
+    }
+
+    io::AnySender<io::DatagramPacket>
+    async_receive_from(boost::asio::mutable_buffer buffer) override {
+        return state_->async_receive(buffer);
     }
 
     boost::asio::any_io_executor executor() noexcept override { return state_->executor(); }

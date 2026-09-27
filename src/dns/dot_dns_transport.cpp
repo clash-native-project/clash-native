@@ -1,15 +1,11 @@
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/io/sender.hpp>
-#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include <boost/asio/buffer.hpp>
-#include <boost/asio/post.hpp>
-#include <boost/asio/read.hpp>
-#include <boost/asio/write.hpp>
 
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
@@ -19,9 +15,7 @@
 #include <chrono>
 #include <deque>
 #include <memory>
-#include <optional>
 #include <string>
-#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -30,11 +24,6 @@
 namespace clash_native::dns {
 
 namespace {
-
-core::Error io_error(std::string context, const boost::system::error_code &error) {
-    return {core::ErrorCode::transport_io, std::move(context),
-            std::error_code(error.value(), std::system_category())};
-}
 
 core::Error timeout_error() { return {core::ErrorCode::timeout, "DoT DNS query timed out"}; }
 
@@ -75,6 +64,8 @@ class DotDnsTransport final : public DnsTransport,
     std::unordered_map<DnsExchangeId, std::shared_ptr<Operation>> operations_;
     std::shared_ptr<Session> session_;
     std::unordered_set<std::uint16_t> active_query_ids_;
+    // Owns per-exchange run() tasks, which always end with a value.
+    exec::async_scope run_scope_;
     DnsExchangeId next_exchange_id_ = 1;
     std::uint16_t next_query_id_ = 1;
     bool stopped_ = false;
@@ -92,41 +83,56 @@ class DotDnsTransport::Session final
         : runtime_(runtime), endpoint_(endpoint), server_name_(std::move(server_name)),
           verify_peer_(verify_peer), dialer_(std::move(dialer)) {}
 
-    void exchange(std::uint16_t query_id, std::vector<std::uint8_t> query,
-                  std::chrono::steady_clock::time_point deadline, Handler handler) {
-        if (stopped_ || retired_) {
-            complete_immediately(std::move(handler), cancelled_error());
-            return;
-        }
-        if (query.empty() || query.size() > 0xffff) {
-            complete_immediately(std::move(handler), {core::ErrorCode::protocol_framing,
-                                                      "DoT DNS query length is invalid"});
-            return;
-        }
-        if (pending_.contains(query_id)) {
-            complete_immediately(std::move(handler),
-                                 {core::ErrorCode::protocol_framing,
-                                  "DoT DNS transaction ID is already in use on the session"});
-            return;
-        }
-
-        auto pending = std::make_shared<Pending>(runtime_.serialized_executor());
-        pending->frame.reserve(2 + query.size());
-        pending->frame.push_back(static_cast<std::uint8_t>(query.size() >> 8));
-        pending->frame.push_back(static_cast<std::uint8_t>(query.size() & 0xff));
-        pending->frame.insert(pending->frame.end(), query.begin(), query.end());
-        pending->handler = std::move(handler);
-        pending->timer.expires_at(deadline);
+    io::AnySender<core::Result<std::vector<std::uint8_t>>>
+    exchange(std::uint16_t query_id, std::vector<std::uint8_t> query,
+             std::chrono::steady_clock::time_point deadline) {
         auto self = shared_from_this();
-        pending->timer.async_wait([self, query_id](const boost::system::error_code &error) {
-            if (!error) {
-                self->fail_request(query_id, timeout_error());
-            }
-        });
-        pending_.emplace(query_id, pending);
-        write_queue_.push_back(query_id);
-        connect_if_needed();
-        flush_writes();
+        // Shared: the bridge starter is a std::function and must be
+        // copyable; a second start after the moves fails fast instead of
+        // hanging.
+        auto state = std::make_shared<
+            std::tuple<std::vector<std::uint8_t>, std::chrono::steady_clock::time_point, bool>>(
+            std::move(query), deadline, true);
+        return async::bridge_sender<core::Result<std::vector<std::uint8_t>>>(
+            [self, query_id, state](Session::Handler terminal) mutable {
+                if (!std::get<2>(*state)) {
+                    terminal(core::fail(cancelled_error()));
+                    return async::CallbackAbortFn{};
+                }
+                std::get<2>(*state) = false;
+                auto query = std::move(std::get<0>(*state));
+                const auto deadline = std::get<1>(*state);
+                if (self->stopped_ || self->retired_) {
+                    terminal(core::fail(cancelled_error()));
+                    return async::CallbackAbortFn{};
+                }
+                if (query.empty() || query.size() > 0xffff) {
+                    terminal(core::fail(
+                        {core::ErrorCode::protocol_framing, "DoT DNS query length is invalid"}));
+                    return async::CallbackAbortFn{};
+                }
+                if (self->pending_.contains(query_id)) {
+                    terminal(core::fail({core::ErrorCode::protocol_framing,
+                                         "DoT DNS transaction ID is already in use"}));
+                    return async::CallbackAbortFn{};
+                }
+                auto pending = std::make_shared<Pending>();
+                pending->frame.reserve(2 + query.size());
+                pending->frame.push_back(static_cast<std::uint8_t>(query.size() >> 8));
+                pending->frame.push_back(static_cast<std::uint8_t>(query.size() & 0xff));
+                pending->frame.insert(pending->frame.end(), query.begin(), query.end());
+                pending->handler = std::move(terminal);
+                self->pending_.emplace(query_id, pending);
+                self->write_queue_.push_back(query_id);
+                self->connect_if_needed();
+                self->ensure_write_loop();
+                // Per-request deadline task: fires once at the deadline;
+                // the map lookup drops it when the response already won.
+                // Bounded by the deadline, so no stop is ever requested.
+                self->scope_.spawn(run_deadline(self, query_id, deadline));
+                return async::CallbackAbortFn{
+                    [self, query_id] { self->fail_request(query_id, cancelled_error()); }};
+            });
     }
 
     void cancel(std::uint16_t query_id) noexcept { fail_request(query_id, cancelled_error()); }
@@ -143,25 +149,26 @@ class DotDnsTransport::Session final
 
     bool retired() const noexcept { return retired_; }
 
-  private:
     struct Pending {
-        explicit Pending(boost::asio::any_io_executor executor) : timer(std::move(executor)) {}
-
         std::vector<std::uint8_t> frame;
         Handler handler;
-        boost::asio::steady_timer timer;
     };
 
     using PendingPtr = std::shared_ptr<Pending>;
-    using ReadCompletion = std::function<void(const boost::system::error_code &)>;
 
-    void complete_immediately(Handler handler, core::Error error) {
-        runtime_.scheduler().post(
-            [handler = std::move(handler), error = std::move(error)]() mutable {
-                if (handler) {
-                    handler(core::fail(std::move(error)));
-                }
-            });
+    // Per-request deadline task: fires once at the deadline; the map
+    // lookup drops it when the response already won. Bounded by the
+    // deadline, so no stop is ever requested.
+    static exec::task<void> run_deadline(std::shared_ptr<Session> self, std::uint16_t query_id,
+                                         std::chrono::steady_clock::time_point deadline) {
+        try {
+            co_await async::sleep_until(self->runtime_.serialized_executor(), deadline);
+        } catch (...) {
+        }
+        if (!self->stopped_) {
+            self->fail_request(query_id, timeout_error());
+        }
+        co_return;
     }
 
     // Straight-line connect chain: dial, TLS handshake, then frame pumps.
@@ -212,8 +219,10 @@ class DotDnsTransport::Session final
             self->tls_stream_ = std::move(tls.stream);
             self->connecting_ = false;
             self->connected_ = true;
-            self->read_frame(generation);
-            self->flush_writes(generation);
+            // The scope only owns chain tasks (merge-shaped usage); teardown
+            // stays guard-driven, so no stop is ever requested.
+            self->scope_.spawn(run_read_loop(self, generation));
+            self->ensure_write_loop(generation);
         } catch (...) {
             if (generation == self->connection_generation_ && !self->stopped_) {
                 self->connection_failed(
@@ -237,7 +246,7 @@ class DotDnsTransport::Session final
         scope_.spawn(run_connect(self, generation));
     }
 
-    void flush_writes(std::uint64_t generation = 0) {
+    void ensure_write_loop(std::uint64_t generation = 0) {
         if (generation == 0) {
             generation = connection_generation_;
         }
@@ -245,111 +254,155 @@ class DotDnsTransport::Session final
             write_in_progress_) {
             return;
         }
-        while (!write_queue_.empty() && !pending_.contains(write_queue_.front())) {
-            write_queue_.pop_front();
-        }
-        if (write_queue_.empty()) {
-            return;
-        }
-
-        const auto query_id = write_queue_.front();
-        const auto pending = pending_.at(query_id);
         write_in_progress_ = true;
-        auto self = shared_from_this();
-        net::start_write_for_handler(
-            tls_stream_->async_write(boost::asio::buffer(pending->frame)),
-            [self, pending, query_id, generation](const boost::system::error_code &error,
-                                                  std::size_t) {
-                if (generation != self->connection_generation_ || self->stopped_) {
-                    return;
+        scope_.spawn(run_write_loop(shared_from_this(), generation));
+    }
+
+    // Sequential write pump: drains the queue frame by frame with co_await
+    // on the io:: write sender. Ends with a value on every path: normal
+    // drain, stale generation, or connection failure.
+    static exec::task<void> run_write_loop(std::shared_ptr<Session> self,
+                                           std::uint64_t generation) {
+        try {
+            while (!self->stopped_ && !self->retired_ &&
+                   generation == self->connection_generation_ && self->connected_) {
+                while (!self->write_queue_.empty() &&
+                       !self->pending_.contains(self->write_queue_.front())) {
+                    self->write_queue_.pop_front();
                 }
-                self->write_in_progress_ = false;
-                if (error) {
-                    self->connection_failed(io_error("failed to send DoT DNS query", error),
-                                            generation);
-                    return;
+                if (self->write_queue_.empty()) {
+                    break;
+                }
+                const auto query_id = self->write_queue_.front();
+                const auto found = self->pending_.find(query_id);
+                if (found == self->pending_.end()) {
+                    self->write_queue_.pop_front();
+                    continue;
+                }
+                auto frame = found->second->frame;
+                try {
+                    co_await self->tls_stream_->async_write(boost::asio::buffer(frame));
+                } catch (const core::Error &failure) {
+                    self->write_in_progress_ = false;
+                    self->connection_failed(
+                        core::Error{core::ErrorCode::transport_io,
+                                    std::string("failed to send DoT DNS query: ") +
+                                        failure.context},
+                        generation);
+                    co_return;
+                } catch (...) {
+                    self->write_in_progress_ = false;
+                    self->connection_failed(
+                        {core::ErrorCode::transport_io, "failed to send DoT DNS query"},
+                        generation);
+                    co_return;
                 }
                 if (!self->write_queue_.empty() && self->write_queue_.front() == query_id) {
                     self->write_queue_.pop_front();
                 }
-                self->flush_writes(generation);
-            });
+            }
+        } catch (...) {
+        }
+        self->write_in_progress_ = false;
+        if (!self->stopped_ && !self->retired_ && generation == self->connection_generation_ &&
+            self->connected_) {
+            self->ensure_write_loop(generation);
+        }
+        co_return;
     }
 
-    void read_frame(std::uint64_t generation) {
-        if (stopped_ || retired_ || generation != connection_generation_ || !connected_ ||
-            read_in_progress_) {
-            return;
-        }
-        read_in_progress_ = true;
-        auto length = std::make_shared<std::vector<std::uint8_t>>(2);
-        auto self = shared_from_this();
-        read_exact(
-            length, 0, generation,
-            [self, length, generation](const boost::system::error_code &error) {
-                self->read_in_progress_ = false;
-                if (generation != self->connection_generation_ || self->stopped_) {
-                    return;
+    // Sequential read pump: length prefix then body with co_await on the
+    // io:: read sender, dispatching complete frames in order. Ends with a
+    // value on every path; the connection failure path retires the session.
+    static exec::task<void> run_read_loop(std::shared_ptr<Session> self, std::uint64_t generation) {
+        try {
+            while (!self->stopped_ && !self->retired_ &&
+                   generation == self->connection_generation_ && self->connected_) {
+                std::array<std::uint8_t, 2> length{};
+                try {
+                    co_await read_exact_task(self, generation, length);
+                } catch (const core::Error &failure) {
+                    self->connection_failed(
+                        core::Error{core::ErrorCode::transport_io,
+                                    std::string("failed to receive DoT DNS length: ") +
+                                        failure.context},
+                        generation);
+                    co_return;
+                } catch (...) {
+                    self->connection_failed(
+                        {core::ErrorCode::transport_io, "failed to receive DoT DNS length"},
+                        generation);
+                    co_return;
                 }
-                if (error) {
-                    self->connection_failed(io_error("failed to receive DoT DNS length", error),
-                                            generation);
-                    return;
-                }
-                const auto size = static_cast<std::size_t>((*length)[0] << 8 | (*length)[1]);
+                const auto size = static_cast<std::size_t>(length[0] << 8 | length[1]);
                 if (size == 0 || size > 0xffff) {
                     self->connection_failed(
                         {core::ErrorCode::protocol_framing, "DoT DNS response length is invalid"},
                         generation);
-                    return;
+                    co_return;
                 }
-                auto body = std::make_shared<std::vector<std::uint8_t>>(size);
-                self->read_exact(
-                    body, 0, generation,
-                    [self, body, generation](const boost::system::error_code &error) {
-                        if (generation != self->connection_generation_ || self->stopped_) {
-                            return;
-                        }
-                        if (error) {
-                            self->connection_failed(
-                                io_error("failed to receive DoT DNS response", error), generation);
-                            return;
-                        }
-                        self->dispatch_response(std::move(*body), generation);
-                    });
-            });
+                std::vector<std::uint8_t> body(size);
+                try {
+                    co_await read_exact_task(self, generation, body);
+                } catch (const core::Error &failure) {
+                    self->connection_failed(
+                        core::Error{core::ErrorCode::transport_io,
+                                    std::string("failed to receive DoT DNS response: ") +
+                                        failure.context},
+                        generation);
+                    co_return;
+                } catch (...) {
+                    self->connection_failed(
+                        {core::ErrorCode::transport_io, "failed to receive DoT DNS response"},
+                        generation);
+                    co_return;
+                }
+                self->dispatch_response(std::move(body), generation);
+            }
+        } catch (...) {
+            if (generation == self->connection_generation_ && !self->stopped_) {
+                self->connection_failed(
+                    core::Error{core::ErrorCode::transport_io, "DoT read loop failed"}, generation);
+            }
+        }
+        co_return;
     }
 
-    void read_exact(std::shared_ptr<std::vector<std::uint8_t>> buffer, std::size_t offset,
-                    std::uint64_t generation, ReadCompletion handler) {
-        if (stopped_ || retired_ || generation != connection_generation_ || !connected_ ||
-            offset >= buffer->size()) {
-            return;
+    // Reads exactly buffer.size() bytes with co_await on async_read_some,
+    // throwing core::Error on EOF or wire failure. Array/vector overloads
+    // share one path for the prefix and the body.
+    template <typename Buffer>
+    static exec::task<void> read_exact_task(std::shared_ptr<Session> self, std::uint64_t generation,
+                                            Buffer &buffer) {
+        std::size_t offset = 0;
+        const auto total = std::size(buffer);
+        auto *data = std::data(buffer);
+        while (offset < total) {
+            if (self->stopped_ || self->retired_ || generation != self->connection_generation_ ||
+                !self->connected_) {
+                throw core::Error{core::ErrorCode::cancelled, "DoT session is not connected"};
+            }
+            std::optional<std::size_t> count;
+            try {
+                count = co_await self->tls_stream_->async_read_some(
+                    boost::asio::buffer(data + offset, total - offset));
+            } catch (const core::Error &failure) {
+                throw failure;
+            } catch (...) {
+                throw core::Error{core::ErrorCode::transport_io,
+                                  "failed to receive DoT DNS response"};
+            }
+            if (!count) {
+                throw core::Error{core::ErrorCode::transport_io,
+                                  "DoT upstream closed the connection"};
+            }
+            if (*count == 0) {
+                throw core::Error{core::ErrorCode::transport_io,
+                                  "failed to receive DoT DNS response"};
+            }
+            offset += *count;
         }
-        auto self = shared_from_this();
-        net::start_read_for_handler(
-            tls_stream_->async_read_some(
-                boost::asio::buffer(buffer->data() + offset, buffer->size() - offset)),
-            [self, buffer, offset, generation, handler = std::move(handler)](
-                const boost::system::error_code &error, std::size_t size) mutable {
-                if (generation != self->connection_generation_ || self->stopped_) {
-                    return;
-                }
-                if (error) {
-                    handler(error);
-                    return;
-                }
-                if (size == 0) {
-                    handler(boost::asio::error::eof);
-                    return;
-                }
-                const auto next_offset = offset + size;
-                if (next_offset >= buffer->size()) {
-                    handler({});
-                    return;
-                }
-                self->read_exact(buffer, next_offset, generation, std::move(handler));
-            });
+        co_return;
     }
 
     void dispatch_response(std::vector<std::uint8_t> response, std::uint64_t generation) {
@@ -364,13 +417,12 @@ class DotDnsTransport::Session final
         if (const auto found = pending_.find(query_id); found != pending_.end()) {
             auto pending = std::move(found->second);
             pending_.erase(found);
-            pending->timer.cancel();
             handler = std::move(pending->handler);
         }
         if (handler) {
             handler(std::move(response));
         }
-        read_frame(generation);
+        (void)generation;
     }
 
     void fail_request(std::uint16_t query_id, core::Error error) {
@@ -382,7 +434,6 @@ class DotDnsTransport::Session final
         pending_.erase(found);
         write_queue_.erase(std::remove(write_queue_.begin(), write_queue_.end(), query_id),
                            write_queue_.end());
-        pending->timer.cancel();
         if (pending_.empty() && connecting_) {
             retired_ = true;
             close_connection();
@@ -397,7 +448,7 @@ class DotDnsTransport::Session final
         std::vector<Handler> handlers;
         handlers.reserve(pending_.size());
         for (auto &[query_id, pending] : pending_) {
-            pending->timer.cancel();
+            (void)query_id;
             if (pending->handler) {
                 handlers.push_back(std::move(pending->handler));
             }
@@ -423,7 +474,6 @@ class DotDnsTransport::Session final
         connecting_ = false;
         connected_ = false;
         write_in_progress_ = false;
-        read_in_progress_ = false;
         boost::system::error_code ignored;
         if (tls_stream_) {
             tls_stream_->close();
@@ -445,7 +495,6 @@ class DotDnsTransport::Session final
     bool connecting_ = false;
     bool connected_ = false;
     bool write_in_progress_ = false;
-    bool read_in_progress_ = false;
     bool retired_ = false;
     bool stopped_ = false;
 };
@@ -458,37 +507,75 @@ class DotDnsTransport::Operation final
         : owner_(owner), exchange_id_(exchange_id), request_(std::move(request)),
           handler_(std::move(handler)) {}
 
-    void start() {
-        if (std::chrono::steady_clock::now() >= request_.deadline) {
-            finish(core::fail(timeout_error()));
-            return;
+    void start() { owner_.run_scope_.spawn(run(shared_from_this())); }
+
+    // One multiplexed exchange: build the query, co_await the session
+    // sender (deadline enforced inside), validate, and finish exactly
+    // once. Always ends with a value; finish() drops late terminals.
+    static exec::task<void> run(std::shared_ptr<Operation> self) {
+        try {
+            if (std::chrono::steady_clock::now() >= self->request_.deadline) {
+                self->finish(core::fail(timeout_error()));
+                co_return;
+            }
+            const auto query_id = self->owner_.next_query_id();
+            if (!query_id) {
+                self->finish(core::fail({core::ErrorCode::configuration,
+                                         "DoT transport has no available transaction IDs"}));
+                co_return;
+            }
+            self->query_id_ = *query_id;
+            self->owner_.active_query_ids_.insert(self->query_id_);
+            const auto encoded = DnsMessageCodec::rewrite_id(self->request_.query, self->query_id_);
+            if (!encoded) {
+                self->finish(core::fail(encoded.error()));
+                co_return;
+            }
+            auto session = self->owner_.session();
+            if (!session) {
+                self->finish(core::fail(
+                    {core::ErrorCode::configuration, "DoT transport session is not available"}));
+                co_return;
+            }
+            self->session_ = session;
+            self->exchange_started_ = true;
+            core::Result<std::vector<std::uint8_t>> wire_result = core::fail(cancelled_error());
+            try {
+                wire_result = co_await session->exchange(self->query_id_, encoded.value(),
+                                                         self->request_.deadline);
+            } catch (const core::Error &failure) {
+                self->finish(core::fail(failure));
+                co_return;
+            } catch (...) {
+                self->finish(
+                    core::fail(core::Error{core::ErrorCode::transport_io, "DoT exchange failed"}));
+                co_return;
+            }
+            self->exchange_started_ = false;
+            if (self->completed_) {
+                co_return;
+            }
+            if (!wire_result) {
+                self->finish(core::fail(wire_result.error()));
+                co_return;
+            }
+            const auto response =
+                DnsMessageCodec::decode_packet(wire_result.value(), self->query_id_);
+            if (!response) {
+                self->finish(core::fail(response.error()));
+                co_return;
+            }
+            if (!self->matches_question(response.value())) {
+                self->finish(core::fail({core::ErrorCode::protocol_framing,
+                                         "DoT DNS response question does not match the query"}));
+                co_return;
+            }
+            self->finish(response);
+        } catch (...) {
+            self->finish(
+                core::fail(core::Error{core::ErrorCode::transport_io, "DoT exchange failed"}));
         }
-        const auto query_id = owner_.next_query_id();
-        if (!query_id) {
-            finish(core::fail({core::ErrorCode::configuration,
-                               "DoT transport has no available transaction IDs"}));
-            return;
-        }
-        query_id_ = *query_id;
-        owner_.active_query_ids_.insert(query_id_);
-        const auto encoded = DnsMessageCodec::rewrite_id(request_.query, query_id_);
-        if (!encoded) {
-            finish(core::fail(encoded.error()));
-            return;
-        }
-        query_wire_ = encoded.value();
-        session_ = owner_.session();
-        if (!session_) {
-            finish(core::fail(
-                {core::ErrorCode::configuration, "DoT transport session is not available"}));
-            return;
-        }
-        auto self = shared_from_this();
-        session_->exchange(query_id_, query_wire_, request_.deadline,
-                           [self](core::Result<std::vector<std::uint8_t>> result) {
-                               self->session_finished(std::move(result));
-                           });
-        exchange_started_ = true;
+        co_return;
     }
 
     void cancel() {
@@ -504,28 +591,6 @@ class DotDnsTransport::Operation final
     std::uint16_t query_id() const noexcept { return query_id_; }
 
   private:
-    void session_finished(core::Result<std::vector<std::uint8_t>> result) {
-        exchange_started_ = false;
-        if (completed_) {
-            return;
-        }
-        if (!result) {
-            finish(core::fail(result.error()));
-            return;
-        }
-        const auto response = DnsMessageCodec::decode_packet(result.value(), query_id_);
-        if (!response) {
-            finish(core::fail(response.error()));
-            return;
-        }
-        if (!matches_question(response.value())) {
-            finish(core::fail({core::ErrorCode::protocol_framing,
-                               "DoT DNS response question does not match the query"}));
-            return;
-        }
-        finish(response);
-    }
-
     bool matches_question(const DnsPacket &response) const {
         if (!response.response() || response.questions.size() != request_.query.questions.size()) {
             return false;
@@ -560,7 +625,6 @@ class DotDnsTransport::Operation final
     DnsExchangeRequest request_;
     OpenHandler handler_;
     std::shared_ptr<Session> session_;
-    std::vector<std::uint8_t> query_wire_;
     std::uint16_t query_id_ = 0;
     bool exchange_started_ = false;
     bool completed_ = false;

@@ -60,16 +60,19 @@ class ProxyStream : public io::StreamHandle {
     using Socket = boost::asio::ip::tcp::socket;
     using TlsSocket = boost::asio::ssl::stream<Socket>;
     using Stream = std::variant<std::unique_ptr<Socket>, std::unique_ptr<TlsSocket>>;
-    using ReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
-    using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
+    // Server-side TLS handshake as a task: no-op when TLS is disabled,
+    // throws system_error on failure or stop. Aborter cancels the socket.
+    exec::task<void> async_server_handshake();
 
     ProxyStream(Socket socket, std::shared_ptr<boost::asio::ssl::context> tls_context);
 
-    void async_server_handshake(std::function<void(const boost::system::error_code &)> handler);
+    using HandshakeSignatures =
+        stdexec::completion_signatures<stdexec::set_value_t(boost::system::error_code),
+                                       stdexec::set_error_t(std::exception_ptr),
+                                       stdexec::set_stopped_t()>;
     bool tls_enabled() const noexcept;
-    // Handler-style reads/writes stay for the Asio composed operations
-    // and Beast parsers that drive the proxy handshakes structurally.
-    void async_read_some(boost::asio::mutable_buffer buffer, ReadHandler handler);
+    // StreamHandleAdapter drives Beast parsers and composed Asio ops
+    // structurally through this generic initiation.
     template <typename Handler>
     void async_read_some(boost::asio::mutable_buffer buffer, Handler &&handler) {
         std::visit(
@@ -78,7 +81,6 @@ class ProxyStream : public io::StreamHandle {
             },
             stream_);
     }
-    void async_write(boost::asio::const_buffer buffer, WriteHandler handler);
     io::AnySender<std::optional<std::size_t>>
     async_read_some(boost::asio::mutable_buffer buffer) override;
     io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override;
@@ -138,7 +140,8 @@ class ProxyRequestBodyStream final : public io::ExchangeBodyStream,
     void cancel_read() noexcept;
 
   private:
-    void read_some(boost::asio::mutable_buffer buffer, ReadHandler handler);
+    static void run_read_some(std::shared_ptr<ProxyRequestBodyStream> self,
+                              boost::asio::mutable_buffer buffer, ReadHandler handler);
     void retry_read(boost::asio::mutable_buffer buffer, ReadHandler handler);
     void post_read(ReadHandler handler, boost::system::error_code error, std::size_t size);
 
@@ -189,14 +192,12 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
         http,
     };
 
-    void reset_handshake_timer();
-    void cancel_handshake_timer() noexcept;
-    void read_protocol_byte();
+    static exec::task<void> run_handshake(std::shared_ptr<ProxySession> self);
     static exec::task<void> run_socks4_request(std::shared_ptr<ProxySession> self);
     static exec::task<void> run_socks4_reply(std::shared_ptr<ProxySession> self,
                                              std::uint8_t status, bool start_relay);
-    void read_socks4_user_id();
-    void read_socks4_domain();
+    static exec::task<std::vector<std::uint8_t>>
+    read_socks4_cstring(std::shared_ptr<ProxySession> self);
     void open_socks4_target();
     void open_target(core::Destination destination);
     static exec::task<void>
@@ -215,50 +216,79 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
     void open_socks_target();
     void open_socks_udp_association();
     void send_socks_udp_associate_reply(const boost::asio::ip::udp::endpoint &endpoint);
-    void read_udp_control();
-    void read_socks_udp_packet();
+    static exec::task<void> run_socks_udp_associate_reply(std::shared_ptr<ProxySession> self,
+                                                          boost::asio::ip::udp::endpoint endpoint);
+    static exec::task<void> run_udp_control(std::shared_ptr<ProxySession> self);
+    static exec::task<void> run_socks_udp_ingress(std::shared_ptr<ProxySession> self);
     static exec::task<void> run_udp_route(std::shared_ptr<ProxySession> self,
                                           runtime::RuntimeSnapshotPtr snapshot,
                                           core::ConnectionMetadata metadata, std::string key);
     bool accept_udp_sender(const boost::asio::ip::udp::endpoint &sender);
     void process_socks_udp_packet(std::size_t size);
-    void send_udp_payload(const std::shared_ptr<UdpPath> &path,
-                          std::shared_ptr<std::vector<std::uint8_t>> payload);
-    // Single-pull response loop, re-armed per completion; no task needed.
-    void receive_udp_response(const std::shared_ptr<UdpPath> &path);
-    void send_socks_udp_response(io::DatagramAddress source, std::span<const std::uint8_t> payload);
+    static exec::task<void> run_udp_send(std::shared_ptr<ProxySession> self,
+                                         std::shared_ptr<UdpPath> path,
+                                         std::shared_ptr<std::vector<std::uint8_t>> payload);
+    static exec::task<void> run_udp_response_loop(std::shared_ptr<ProxySession> self,
+                                                  std::shared_ptr<UdpPath> path);
+    static std::shared_ptr<std::vector<std::uint8_t>>
+    build_socks_udp_response(io::DatagramAddress source, std::span<const std::uint8_t> payload);
+    static exec::task<void> run_udp_client_send(std::shared_ptr<ProxySession> self,
+                                                std::shared_ptr<std::vector<std::uint8_t>> packet);
     void send_socks4_reply(std::uint8_t status, bool start_relay);
     void send_socks_reply(std::uint8_t reply, bool start_relay);
+    void send_udp_payload(const std::shared_ptr<UdpPath> &path,
+                          std::shared_ptr<std::vector<std::uint8_t>> payload);
+    void receive_udp_response(const std::shared_ptr<UdpPath> &path);
+    void send_socks_udp_response(io::DatagramAddress source, std::span<const std::uint8_t> payload);
+    static exec::task<void> run_socks_reply(std::shared_ptr<ProxySession> self, std::uint8_t reply,
+                                            bool start_relay);
 
     void read_http_headers();
+    static exec::task<void> run_http_headers(std::shared_ptr<ProxySession> self);
+    void handle_http_headers(boost::beast::http::request<boost::beast::http::buffer_body> &request);
     HttpAuthenticationResult authenticate_http_request(
         const boost::beast::http::request<boost::beast::http::buffer_body> &request) const;
     bool http_request_keep_alive(
         const boost::beast::http::request<boost::beast::http::buffer_body> &request) const;
     void send_http_auth_response(bool missing, bool keep_alive);
+    static exec::task<void> run_http_auth_response(std::shared_ptr<ProxySession> self, bool missing,
+                                                   bool keep_alive);
     void begin_http_forward();
     void open_http_forward_target(core::Destination destination);
     void start_http_upgrade_exchange();
     void start_http_forward_exchange();
-    void handle_http_upgrade_response(core::Result<io::StreamUpgradeResponse> result);
-    void handle_http_forward_response(core::Result<io::StreamingExchangeResponse> result);
+    static exec::task<void> run_http_upgrade_exchange(std::shared_ptr<ProxySession> self);
+    static exec::task<void> run_http_forward_exchange(std::shared_ptr<ProxySession> self);
+    static exec::task<void>
+    run_http_upgrade_response(std::shared_ptr<ProxySession> self,
+                              core::Result<io::StreamUpgradeResponse> result);
+    static exec::task<void>
+    run_http_forward_response(std::shared_ptr<ProxySession> self,
+                              core::Result<io::StreamingExchangeResponse> result);
     bool http_forward_request_method_is(std::string_view method) const noexcept;
     std::string build_http_upgrade_response_headers(const io::ExchangeResponse &response) const;
     std::string build_http_forward_response_headers(const io::ExchangeResponse &response,
                                                     bool has_body);
-    void read_http_forward_response_body();
-    void on_http_forward_response_read(const boost::system::error_code &error, std::size_t size);
-    void write_http_forward_response_trailers();
+    static exec::task<void> run_http_forward_body(std::shared_ptr<ProxySession> self);
+    static exec::task<void> write_http_forward_trailers(std::shared_ptr<ProxySession> self);
     void reset_http_forward_exchange();
     void finish_http_forward();
     void send_http_forward_response(int status, std::string_view reason,
                                     std::string_view extra_headers = {}, bool keep_alive = false);
+    static exec::task<void> run_http_forward_response_send(std::shared_ptr<ProxySession> self,
+                                                           int status, std::string reason,
+                                                           std::string extra_headers,
+                                                           bool keep_alive);
     void send_http_response(int status, std::string_view reason, bool start_relay);
+    static exec::task<void> run_http_response(std::shared_ptr<ProxySession> self, int status,
+                                              std::string reason, bool start_relay);
+    static exec::task<void> run_client_write_then_open(std::shared_ptr<ProxySession> self,
+                                                       std::string payload,
+                                                       core::Destination destination);
 
     ProxyServer &owner_;
     ProxyStream client_;
-    boost::asio::steady_timer handshake_timer_;
-    // Owns handshake chain tasks; teardown stays guard-driven, so no
+    // Owns handshake/route chain tasks; teardown stays guard-driven, so no
     // stop is ever requested.
     exec::async_scope scope_;
     std::unique_ptr<io::StreamHandle> remote_;

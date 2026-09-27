@@ -2769,3 +2769,42 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validation: Release build clean, 315/315 CTest pass (the known
   `UsesTheConfiguredDialerForPlainTcp` failure from earlier runs did not
   reproduce in this run); `format-check` and `git diff --check` pass.
+
+### 2026-09-28 - Full coroutine migration: timers, receivers, bridges to tasks
+
+- New `async::sleep_after/sleep_until/with_timeout` (`async/timer.hpp`,
+  covered by `TimerFixture`): steady_timer as a sender with a real aborter
+  (timer cancel); expiry is value, stop is stopped, other failures are
+  errors. `with_timeout` races bridge-style work against a sleep as a
+  coroutine; the timeout is an in-band factory value (move-only Results
+  cross as `shared_ptr`, matching `when_any` variant storage).
+- DNS: `dns_transport` Operation/TcpSession, bootstrap resolver/system/
+  bootstrap-transport, DoT/DoH1/DoH2/DoH3/DoQ, server UDP/TCP loops, query
+  service per-key drive, upstream drive + group retry, address CNAME chain,
+  ECH chain, QUIC open/deadline/idle all run as `exec::task` co_awaiting
+  senders. Registry edges (`query_sender`, group/upstream/QUIC exchange)
+  keep thin `callback_sender` leaves; `open_exchange/cancel_exchange`
+  signatures kept. Stop maps to in-band cancelled via
+  `stopped_as_optional` at every scope-driven await (tasks must deliver
+  their own terminal; request_stop unwinds as stopped, nobody else will).
+- Outbound: connect timers to deadline tasks, `resolve_host` callback entry
+  deleted (all sites on `resolve_host_sender`), bridge-wrapped Operations to
+  task-driven states, SS/Trojan overlay/datagram/chain opens to
+  `co_await` chains, legacy datagram bridges to direct sender tasks.
+- Proxy: accept/handshake timers to task races, session TCP分流/write
+  chains and UDP 9-group Receivers to per-path loop tasks, TcpRelay idle to
+  `when_any` watchdog, signals to an awaitable task. `ProxyStream`
+  read/write to `use_sender`; TLS/Beast void-signature leaves stay thin
+  `callback_sender` driven from tasks.
+- Transport: carrier/datagram/stream Bridge pairs (SS2022/UoT/packet-conn/
+  ss-stream/legacy/kcptun/mux/ws/grpc) to `start_read/write_for_handler`
+  thin leaves or direct task awaits; HTTP pending/ping timers to deadline
+  tasks; TLS/WS/QUIC/KCP handshakes and pumps to tasks; nghttp2/ngtcp2/
+  ikcp/Botan/Beast engine callbacks thinned to data movement only.
+- Validation: Release build clean, core zero errors, `format-check` +
+  `git diff --check` pass. CTest 319/321: the 3 cancel-path regressions
+  are fixed; remaining 2 failures are pre-existing/environmental --
+  `UsesTheConfiguredDialerForPlainTcp` SEGVs on the clean tree too (log
+  2026-09-27 stash check), `TracksLifecycle` passes standalone (exit 0)
+  and only fails under ctest teardown ordering (same park note as 2026-09-27
+  accept_tcp entry).

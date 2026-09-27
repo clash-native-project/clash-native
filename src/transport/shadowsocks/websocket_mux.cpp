@@ -2,7 +2,6 @@
 
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/oneshot.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/core/result.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
@@ -783,44 +782,25 @@ void WebSocketMuxSession::pump_write() {
     writes_.pop_front();
     auto self = shared_from_this();
     auto frame = pending.bytes;
-    struct WriteReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<WebSocketMuxSession> self;
-        QueuedFrame pending;
-        void set_value(std::size_t) && noexcept {
-            self->writing_ = false;
-            if (pending.completed) {
-                pending.completed({});
-            }
-            self->pump_write();
-        }
-        void set_error(std::exception_ptr error) && noexcept {
-            self->writing_ = false;
-            boost::system::error_code code = boost::asio::error::fault;
-            try {
-                std::rethrow_exception(std::move(error));
-            } catch (const core::Error &failure) {
-                if (failure.cause) {
-                    code = {failure.cause.value(), boost::system::system_category()};
-                }
-            } catch (...) {
-            }
-            if (pending.completed) {
-                pending.completed(code);
-            }
-            self->fail(code);
-        }
-        void set_stopped() && noexcept {
-            self->writing_ = false;
-            if (pending.completed) {
-                pending.completed(boost::asio::error::operation_aborted);
-            }
-            self->fail(boost::asio::error::operation_aborted);
-        }
-    };
+    auto completed = std::move(pending.completed);
     // NOTE: name the sender first; argument order is unspecified.
     auto sender = carrier_->async_write(boost::asio::buffer(*frame));
-    async::start_with_receiver(std::move(sender), WriteReceiver{self, std::move(pending)});
+    net::start_write_for_handler(std::move(sender),
+                                 [self, frame = std::move(frame), completed = std::move(completed)](
+                                     const boost::system::error_code &error, std::size_t) mutable {
+                                     self->writing_ = false;
+                                     if (error) {
+                                         if (completed) {
+                                             completed(error);
+                                         }
+                                         self->fail(error);
+                                         return;
+                                     }
+                                     if (completed) {
+                                         completed(boost::system::error_code{});
+                                     }
+                                     self->pump_write();
+                                 });
 }
 
 void WebSocketMuxSession::read_more() {
@@ -828,44 +808,27 @@ void WebSocketMuxSession::read_more() {
         return;
     }
     reading_ = true;
-    struct ReadReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<WebSocketMuxSession> self;
-        void set_value(std::optional<std::size_t> size) && noexcept {
-            self->reading_ = false;
-            if (!size || *size == 0) {
-                self->fail(boost::asio::error::eof);
-                return;
-            }
-            self->input_.insert(self->input_.end(), self->read_buffer_.begin(),
-                                self->read_buffer_.begin() + static_cast<std::ptrdiff_t>(*size));
-            self->parse_frames();
-            if (!self->closed_) {
-                self->read_more();
-            }
-        }
-        void set_error(std::exception_ptr error) && noexcept {
-            self->reading_ = false;
-            boost::system::error_code code = boost::asio::error::fault;
-            try {
-                std::rethrow_exception(std::move(error));
-            } catch (const core::Error &failure) {
-                if (failure.cause) {
-                    code = {failure.cause.value(), boost::system::system_category()};
-                }
-            } catch (...) {
-            }
-            self->fail(code);
-        }
-        void set_stopped() && noexcept {
-            self->reading_ = false;
-            self->fail(boost::asio::error::operation_aborted);
-        }
-    };
     auto self = shared_from_this();
     // NOTE: name the sender first; argument order is unspecified.
     auto sender = carrier_->async_read_some(boost::asio::buffer(read_buffer_));
-    async::start_with_receiver(std::move(sender), ReadReceiver{self});
+    net::start_read_for_handler(std::move(sender), [self](const boost::system::error_code &error,
+                                                          std::size_t size) mutable {
+        self->reading_ = false;
+        if (error) {
+            self->fail(error);
+            return;
+        }
+        if (size == 0) {
+            self->fail(boost::asio::error::eof);
+            return;
+        }
+        self->input_.insert(self->input_.end(), self->read_buffer_.begin(),
+                            self->read_buffer_.begin() + static_cast<std::ptrdiff_t>(size));
+        self->parse_frames();
+        if (!self->closed_) {
+            self->read_more();
+        }
+    });
 }
 
 void WebSocketMuxSession::parse_frames() {

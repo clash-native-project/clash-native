@@ -7,6 +7,9 @@
 
 #include <boost/asio/any_io_executor.hpp>
 
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
+
 #include <chrono>
 #include <cstddef>
 #include <functional>
@@ -68,8 +71,12 @@ class GrpcClientCall final : public std::enable_shared_from_this<GrpcClientCall>
                    std::shared_ptr<io::ExchangeSession> session, GrpcCallOptions options,
                    OpenHandler open_handler);
     void start();
+    static exec::task<void> run_open(std::shared_ptr<GrpcClientCall> self,
+                                     io::StreamingExchangeRequest request,
+                                     std::chrono::steady_clock::time_point deadline);
     void on_response(core::Result<io::StreamingExchangeResponse> result);
     void read_response();
+    static exec::task<void> run_body_read(std::shared_ptr<GrpcClientCall> self);
     void on_response_read(const boost::system::error_code &error, std::size_t size);
     void deliver_or_read();
     core::Status finish_response();
@@ -89,6 +96,7 @@ class GrpcClientCall final : public std::enable_shared_from_this<GrpcClientCall>
     std::vector<std::uint8_t> read_buffer_;
     ReadMessageHandler pending_read_;
     std::optional<core::Error> read_error_;
+    exec::async_scope scope_;
     bool opened_ = false;
     bool reading_body_ = false;
     bool body_eof_ = false;

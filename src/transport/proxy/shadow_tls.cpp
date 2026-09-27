@@ -2,6 +2,7 @@
 #include <clash_native/transport/proxy/shadow_tls_v3.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/timer.hpp>
 
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/proxy/crypto.hpp>
@@ -582,30 +583,15 @@ class ShadowTlsOpenOperation final : public std::enable_shared_from_this<ShadowT
             std::make_shared<ShadowTlsV2Stream>(std::move(established.stream), std::move(hash));
         self->delayed_stream_ =
             std::make_unique<SharedStreamAdapter<ShadowTlsV2Stream>>(std::move(framed));
-        using DelaySigs = stdexec::completion_signatures<stdexec::set_value_t(bool),
-                                                         stdexec::set_error_t(std::exception_ptr),
-                                                         stdexec::set_stopped_t()>;
         try {
-            co_await async::callback_sender<DelaySigs>(
-                [self](auto terminal) mutable -> async::CallbackAbortFn {
-                    self->delay_timer_.expires_after(std::chrono::milliseconds(20));
-                    self->delay_timer_.async_wait(std::move(terminal));
-                    return async::CallbackAbortFn{[self] { (void)self->delay_timer_.cancel(); }};
-                },
-                [](auto receiver, const boost::system::error_code &error) {
-                    if (error) {
-                        stdexec::set_error(
-                            std::move(receiver),
-                            std::make_exception_ptr(
-                                io_error("Shadow-TLS v2 post-handshake delay failed", error)));
-                        return;
-                    }
-                    stdexec::set_value(std::move(receiver), true);
-                });
-        } catch (const core::Error &failure) {
-            self->finish(core::fail(failure));
-            co_return;
+            co_await async::sleep_after(self->delay_timer_.get_executor(),
+                                        std::chrono::milliseconds(20));
         } catch (...) {
+            // Abort path already finished through abort(); a timer failure
+            // surfaces as a handshake failure instead.
+            if (self->completed_) {
+                co_return;
+            }
             self->finish(core::fail(protocol_error("Shadow-TLS v2 post-handshake delay failed")));
             co_return;
         }

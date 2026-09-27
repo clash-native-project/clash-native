@@ -1,8 +1,12 @@
 #include <clash_native/transport/proxy/jls_client.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/proxy/jls.hpp>
+
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include <botan/auto_rng.h>
 #include <botan/credentials_manager.h>
@@ -16,7 +20,6 @@
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
 
 #include <algorithm>
 #include <array>
@@ -663,8 +666,7 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
   public:
     JlsOpenOperation(std::unique_ptr<io::StreamHandle> stream, JlsClientOptions options,
                      JlsOpenHandler handler)
-        : stream_(std::move(stream)), options_(std::move(options)), handler_(std::move(handler)),
-          timer_(stream_->executor()) {}
+        : stream_(std::move(stream)), options_(std::move(options)), handler_(std::move(handler)) {}
 
     void start() {
         if (!stream_ || options_.server_name.empty() || options_.username.empty() ||
@@ -673,13 +675,7 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
                                         "JLS server name, username, and password are required")));
             return;
         }
-        timer_.expires_after(kHandshakeTimeout);
-        timer_.async_wait([self = shared_from_this()](const boost::system::error_code &error) {
-            if (!error && !self->completed_) {
-                self->finish(
-                    core::fail(jls_error(core::ErrorCode::timeout, "JLS TLS handshake timed out")));
-            }
-        });
+        // Timeout races each read inside run_open via with_timeout; no timer leaf here.
         try {
             rng_ = std::make_shared<Botan::AutoSeeded_RNG>();
             callbacks_ = std::make_shared<JlsCallbacks>(
@@ -702,8 +698,7 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
             tls_client_ = std::make_unique<Botan::TLS::Client>(
                 callbacks_, session_manager_, credentials_, policy_, rng_, info,
                 Botan::TLS::Protocol_Version::TLS_V13, alpn);
-            read_tls_records();
-            start_tls_write();
+            scope_.spawn(run_open(shared_from_this()));
         } catch (const std::exception &exception) {
             finish(core::fail(jls_exception("failed to initialize JLS TLS client", exception)));
         } catch (...) {
@@ -712,97 +707,114 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
         }
     }
 
+    void request_scope_stop() noexcept {
+        try {
+            scope_.request_stop();
+        } catch (...) {
+        }
+    }
+
     void abort() noexcept {
         auto self = shared_from_this();
         try {
-            // timer_ shares the stream executor but outlives the stream
-            // move in maybe_open().
-            boost::asio::post(timer_.get_executor(), [self] {
+            auto executor =
+                self->stream_ ? self->stream_->executor() : boost::asio::any_io_executor{};
+            if (!executor) {
                 self->finish(core::fail(
                     jls_error(core::ErrorCode::cancelled, "JLS TLS handshake was cancelled")));
+                self->request_scope_stop();
+                return;
+            }
+            boost::asio::post(executor, [self] {
+                self->finish(core::fail(
+                    jls_error(core::ErrorCode::cancelled, "JLS TLS handshake was cancelled")));
+                self->request_scope_stop();
             });
         } catch (...) {
         }
     }
 
   private:
+    static exec::task<void> run_open(std::shared_ptr<JlsOpenOperation> self) {
+        if (auto error = co_await run_flush_writes(self); error) {
+            self->finish(core::fail(std::move(*error)));
+            co_return;
+        }
+        using ReadResult = core::Result<std::size_t>;
+        while (!self->completed_ && !self->handshake_complete_) {
+            auto executor = self->stream_->executor();
+            auto read = self->stream_->async_read_some(boost::asio::buffer(self->read_temp_)) |
+                        stdexec::then([](std::optional<std::size_t> count) -> ReadResult {
+                            if (!count || *count == 0) {
+                                return core::fail(jls_error(core::ErrorCode::transport_io,
+                                                            "JLS TLS handshake reached EOF"));
+                            }
+                            return ReadResult{*count};
+                        });
+            auto timed = co_await async::with_timeout<ReadResult>(
+                executor, kHandshakeTimeout, std::move(read), []() -> ReadResult {
+                    return core::fail(
+                        jls_error(core::ErrorCode::timeout, "JLS TLS handshake timed out"));
+                });
+            if (self->completed_) {
+                co_return;
+            }
+            if (!timed) {
+                self->finish(core::fail(timed.error()));
+                co_return;
+            }
+            try {
+                self->tls_client_->received_data(
+                    std::span<const std::uint8_t>(self->read_temp_.data(), timed.value()));
+            } catch (const std::exception &exception) {
+                self->finish(core::fail(jls_exception("JLS TLS handshake failed", exception)));
+                co_return;
+            } catch (...) {
+                self->finish(core::fail(
+                    jls_error(core::ErrorCode::carrier_handshake, "JLS TLS handshake failed")));
+                co_return;
+            }
+            if (self->tls_client_->is_handshake_complete()) {
+                self->handshake_complete_ = true;
+            }
+            if (auto error = co_await run_flush_writes(self); error) {
+                self->finish(core::fail(std::move(*error)));
+                co_return;
+            }
+            self->maybe_open();
+        }
+    }
+
+    static exec::task<std::optional<core::Error>>
+    run_flush_writes(std::shared_ptr<JlsOpenOperation> self) {
+        while (!self->completed_ && !self->tls_write_queue_.empty()) {
+            auto chunk = std::move(self->tls_write_queue_.front());
+            self->tls_write_queue_.erase(self->tls_write_queue_.begin());
+            try {
+                co_await self->stream_->async_write(boost::asio::buffer(chunk));
+            } catch (const core::Error &failure) {
+                co_return std::optional<core::Error>{failure};
+            } catch (...) {
+                co_return std::optional<core::Error>{
+                    jls_error(core::ErrorCode::transport_io, "failed to write JLS TLS record")};
+            }
+        }
+        co_return std::optional<core::Error>{};
+    }
+
     void emit_tls(std::span<const std::uint8_t> data) {
         if (completed_) {
             return;
         }
         tls_write_queue_.emplace_back(data.begin(), data.end());
-        start_tls_write();
         maybe_open();
     }
-
     void record_received(std::span<const std::uint8_t> data) {
         pending_plain_.insert(pending_plain_.end(), data.begin(), data.end());
     }
 
-    void start_tls_write() {
-        if (completed_ || tls_write_in_progress_ || tls_write_queue_.empty()) {
-            return;
-        }
-        tls_write_in_progress_ = true;
-        tls_write_current_ = std::move(tls_write_queue_.front());
-        tls_write_queue_.erase(tls_write_queue_.begin());
-        auto self = shared_from_this();
-        net::start_write_for_handler(
-            stream_->async_write(boost::asio::buffer(tls_write_current_)),
-            [self](const boost::system::error_code &error, std::size_t) {
-                self->tls_write_in_progress_ = false;
-                self->tls_write_current_.clear();
-                if (error) {
-                    self->finish(core::fail(jls_io_error("failed to write JLS TLS record", error)));
-                    return;
-                }
-                self->start_tls_write();
-                self->maybe_open();
-            });
-    }
-
-    void read_tls_records() {
-        if (completed_ || read_in_progress_ || handshake_complete_) {
-            return;
-        }
-        read_in_progress_ = true;
-        auto self = shared_from_this();
-        net::start_read_for_handler(
-            stream_->async_read_some(boost::asio::buffer(read_temp_)),
-            [self](const boost::system::error_code &error, std::size_t size) {
-                self->read_in_progress_ = false;
-                if (error) {
-                    self->finish(core::fail(jls_io_error("failed to read JLS TLS record", error)));
-                    return;
-                }
-                if (size == 0) {
-                    self->finish(core::fail(
-                        jls_error(core::ErrorCode::transport_io, "JLS TLS handshake reached EOF")));
-                    return;
-                }
-                try {
-                    self->tls_client_->received_data(
-                        std::span<const std::uint8_t>(self->read_temp_.data(), size));
-                } catch (const std::exception &exception) {
-                    self->finish(core::fail(jls_exception("JLS TLS handshake failed", exception)));
-                    return;
-                } catch (...) {
-                    self->finish(core::fail(
-                        jls_error(core::ErrorCode::carrier_handshake, "JLS TLS handshake failed")));
-                    return;
-                }
-                if (self->tls_client_->is_handshake_complete()) {
-                    self->handshake_complete_ = true;
-                    self->maybe_open();
-                    return;
-                }
-                self->read_tls_records();
-            });
-    }
-
     void maybe_open() {
-        if (completed_ || !handshake_complete_ || tls_write_in_progress_ ||
-            !tls_write_queue_.empty()) {
+        if (completed_ || !handshake_complete_ || !tls_write_queue_.empty()) {
             return;
         }
         if (!callbacks_->authenticated()) {
@@ -810,7 +822,6 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
                                         "JLS TLS handshake did not authenticate the peer")));
             return;
         }
-        (void)timer_.cancel();
         completed_ = true;
         auto lower = std::move(stream_);
         auto tls_client = std::move(tls_client_);
@@ -829,7 +840,6 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
             return;
         }
         completed_ = true;
-        (void)timer_.cancel();
         if (!result && stream_) {
             stream_->close();
             stream_.reset();
@@ -840,10 +850,10 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
         }
     }
 
+  private:
     std::unique_ptr<io::StreamHandle> stream_;
     JlsClientOptions options_;
     JlsOpenHandler handler_;
-    boost::asio::steady_timer timer_;
     std::shared_ptr<Botan::RandomNumberGenerator> rng_;
     std::shared_ptr<JlsCallbacks> callbacks_;
     std::shared_ptr<JlsPolicy> policy_;
@@ -853,11 +863,9 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
     std::vector<std::uint8_t> pending_plain_;
     std::vector<std::uint8_t> read_temp_ = std::vector<std::uint8_t>(kTlsRecordBufferSize);
     std::vector<std::vector<std::uint8_t>> tls_write_queue_;
-    std::vector<std::uint8_t> tls_write_current_;
-    bool tls_write_in_progress_ = false;
-    bool read_in_progress_ = false;
     bool handshake_complete_ = false;
     bool completed_ = false;
+    exec::async_scope scope_;
 };
 
 } // namespace
@@ -887,7 +895,10 @@ std::shared_ptr<JlsOpenAborter> async_open_jls_abortable(std::unique_ptr<io::Str
     struct Handle final : public JlsOpenAborter {
         explicit Handle(std::shared_ptr<JlsOpenOperation> operation)
             : operation_(std::move(operation)) {}
-        void abort() noexcept override { operation_->abort(); }
+        void abort() noexcept override {
+            operation_->abort();
+            operation_->request_scope_stop();
+        }
         std::shared_ptr<JlsOpenOperation> operation_;
     };
     auto operation = std::make_shared<JlsOpenOperation>(std::move(stream), std::move(options),

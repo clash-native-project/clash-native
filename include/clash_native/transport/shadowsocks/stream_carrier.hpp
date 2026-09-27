@@ -1,13 +1,11 @@
 #pragma once
 
-#include <clash_native/async/callback_sender.hpp>
-#include <clash_native/core/outbound.hpp>
+#include <clash_native/core/error.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/io/stream_handle.hpp>
-#include <clash_native/net/stream_handle_adapter.hpp>
 
-#include <boost/asio/bind_cancellation_slot.hpp>
-#include <boost/asio/cancellation_signal.hpp>
+#include <exec/asio/use_sender.hpp>
+
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/write.hpp>
 
@@ -17,7 +15,6 @@
 #include <memory>
 #include <optional>
 #include <utility>
-
 namespace clash_native::transport::shadowsocks {
 
 // A Shadowsocks byte carrier that can be backed by a raw TCP socket or by a
@@ -40,24 +37,25 @@ class StreamCarrier final : public std::enable_shared_from_this<StreamCarrier> {
         if (stream_) {
             return stream_->async_read_some(buffer);
         }
-        using Signatures =
-            stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
-                                           stdexec::set_error_t(std::exception_ptr),
-                                           stdexec::set_stopped_t()>;
+        // use_sender drives the socket initiation directly; the stop token
+        // wires to Asio cancellation and system_errors translate below.
         auto socket = socket_;
-        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
-            [socket, buffer](auto terminal) mutable -> async::CallbackAbortFn {
-                auto handler = [terminal = std::move(terminal)](
-                                   const boost::system::error_code &error,
-                                   std::size_t size) mutable { terminal(error, size); };
-                auto sig = std::make_shared<boost::asio::cancellation_signal>();
-                socket->async_read_some(
-                    buffer, boost::asio::bind_cancellation_slot(sig->slot(), std::move(handler)));
-                return async::CallbackAbortFn{
-                    [sig] { sig->emit(boost::asio::cancellation_type::terminal); }};
-            },
-            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
-                net::translate_read(std::move(receiver), error, size, "carrier read");
+        return io::AnySender<std::optional<std::size_t>>{
+            socket->async_read_some(buffer, exec::asio::use_sender) |
+            stdexec::then([](std::size_t count) { return std::optional<std::size_t>(count); }) |
+            stdexec::let_error([](std::exception_ptr error) -> decltype(stdexec::just(
+                                                                std::optional<std::size_t>())) {
+                try {
+                    std::rethrow_exception(error);
+                } catch (const boost::system::system_error &failure) {
+                    if (failure.code() == boost::asio::error::eof) {
+                        return stdexec::just(std::optional<std::size_t>());
+                    }
+                    std::rethrow_exception(std::make_exception_ptr(core::Error{
+                        core::ErrorCode::transport_io, "carrier read",
+                        std::error_code(failure.code().value(), std::system_category())}));
+                }
+                std::rethrow_exception(error);
             })};
     }
 
@@ -65,25 +63,21 @@ class StreamCarrier final : public std::enable_shared_from_this<StreamCarrier> {
         if (stream_) {
             return stream_->async_write(buffer);
         }
-        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
-                                                          stdexec::set_error_t(std::exception_ptr),
-                                                          stdexec::set_stopped_t()>;
         auto socket = socket_;
-        return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
-            [socket, buffer](auto terminal) mutable -> async::CallbackAbortFn {
-                auto handler = [terminal = std::move(terminal)](
-                                   const boost::system::error_code &error,
-                                   std::size_t size) mutable { terminal(error, size); };
-                auto sig = std::make_shared<boost::asio::cancellation_signal>();
-                boost::asio::async_write(
-                    *socket, buffer,
-                    boost::asio::bind_cancellation_slot(sig->slot(), std::move(handler)));
-                return async::CallbackAbortFn{
-                    [sig] { sig->emit(boost::asio::cancellation_type::terminal); }};
-            },
-            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
-                net::translate_write(std::move(receiver), error, size, "carrier write");
-            })};
+        return io::AnySender<std::size_t>{
+            boost::asio::async_write(*socket, buffer, exec::asio::use_sender) |
+            stdexec::then([](std::size_t count) { return count; }) |
+            stdexec::let_error(
+                [](std::exception_ptr error) -> decltype(stdexec::just(std::size_t(0))) {
+                    try {
+                        std::rethrow_exception(error);
+                    } catch (const boost::system::system_error &failure) {
+                        std::rethrow_exception(std::make_exception_ptr(core::Error{
+                            core::ErrorCode::transport_io, "carrier write",
+                            std::error_code(failure.code().value(), std::system_category())}));
+                    }
+                    std::rethrow_exception(error);
+                })};
     }
 
     boost::asio::any_io_executor executor() noexcept {

@@ -1,6 +1,7 @@
 #include <clash_native/transport/shadowsocks/websocket_plugin.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 
@@ -10,6 +11,9 @@
 
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
+#include <exec/when_any.hpp>
+
+#include <stdexec/execution.hpp>
 
 #include <memory>
 #include <string>
@@ -301,6 +305,67 @@ class WebSocketPluginMuxOperation final
 
 } // namespace
 
+// Opens one mux logical stream as a task: the session open races a 15s
+// sleep via with_timeout so a stalled peer cannot park the queued handler.
+// Timeout surfaces as an in-band Result; outer stop cancels both branches.
+// A named function (not an immediately-invoked capturing lambda) builds the
+// task; see docs/async-pitfalls.md.
+class MuxSessionStreamOpen final : public std::enable_shared_from_this<MuxSessionStreamOpen> {
+  public:
+    using StreamHandler = WebSocketPluginMuxPool::StreamHandler;
+    using StreamResult = core::Result<std::unique_ptr<io::StreamHandle>>;
+
+    MuxSessionStreamOpen(boost::asio::any_io_executor executor,
+                         std::shared_ptr<io::MultiplexedSession> session, StreamHandler handler)
+        : executor_(std::move(executor)), session_(std::move(session)),
+          handler_(std::move(handler)) {}
+
+    void start() {
+        auto self = shared_from_this();
+        boost::asio::post(executor_, [self] { self->scope_.spawn(run_open(self)); });
+    }
+
+  private:
+    static exec::task<void> run_open(std::shared_ptr<MuxSessionStreamOpen> self) {
+        constexpr auto kOpenTimeout = std::chrono::seconds(15);
+        const auto deadline = std::chrono::steady_clock::now() + kOpenTimeout;
+        auto work = self->session_->open_stream({}, deadline) |
+                    stdexec::then([](std::unique_ptr<io::StreamHandle> stream) -> StreamResult {
+                        return StreamResult(std::move(stream));
+                    }) |
+                    stdexec::let_error([](std::exception_ptr error) {
+                        try {
+                            std::rethrow_exception(std::move(error));
+                        } catch (const core::Error &failure) {
+                            return stdexec::just(StreamResult(core::fail(failure)));
+                        } catch (...) {
+                            return stdexec::just(StreamResult(core::fail(core::Error{
+                                core::ErrorCode::transport_io, "mux open failed", {}})));
+                        }
+                    });
+        StreamResult result = StreamResult(
+            core::fail(core::Error{core::ErrorCode::cancelled, "mux open stopped", {}}));
+        try {
+            result = co_await async::with_timeout<StreamResult>(
+                self->executor_, kOpenTimeout, std::move(work), [] {
+                    return StreamResult(core::fail(
+                        core::Error{core::ErrorCode::timeout, "mux open timed out", {}}));
+                });
+        } catch (...) {
+            result = StreamResult(
+                core::fail(core::Error{core::ErrorCode::cancelled, "mux open stopped", {}}));
+        }
+        if (self->handler_) {
+            self->handler_(std::move(result));
+        }
+    }
+
+    boost::asio::any_io_executor executor_;
+    std::shared_ptr<io::MultiplexedSession> session_;
+    StreamHandler handler_;
+    exec::async_scope scope_;
+};
+
 std::shared_ptr<clash_native::transport::WebSocketClientHandshake>
 async_open_websocket_plugin(std::unique_ptr<io::StreamHandle> stream,
                             WebSocketPluginOptions options, WebSocketPluginHandler handler) {
@@ -359,34 +424,9 @@ void WebSocketPluginMuxPool::async_open_stream(
             self->session_.reset();
         }
         if (self->session_) {
-            struct OpenReceiver {
-                using receiver_concept = stdexec::receiver_tag;
-                StreamHandler handler;
-                void set_value(std::unique_ptr<io::StreamHandle> stream) && noexcept {
-                    auto callback = std::move(handler);
-                    callback(std::move(stream));
-                }
-                void set_error(std::exception_ptr error) && noexcept {
-                    auto callback = std::move(handler);
-                    try {
-                        std::rethrow_exception(std::move(error));
-                    } catch (const core::Error &failure) {
-                        callback(core::fail(failure));
-                    } catch (...) {
-                        callback(core::fail(
-                            core::Error{core::ErrorCode::transport_io, "mux open failed", {}}));
-                    }
-                }
-                void set_stopped() && noexcept {
-                    auto callback = std::move(handler);
-                    callback(core::fail(
-                        core::Error{core::ErrorCode::cancelled, "mux open stopped", {}}));
-                }
-            };
-            // NOTE: name the sender first; argument order is unspecified.
-            auto sender = self->session_->open_stream({}, std::chrono::steady_clock::now() +
-                                                              std::chrono::seconds(15));
-            async::start_with_receiver(std::move(sender), OpenReceiver{std::move(handler)});
+            std::make_shared<MuxSessionStreamOpen>(self->executor_, self->session_,
+                                                   std::move(handler))
+                ->start();
             return;
         }
         if (endpoints.empty()) {
@@ -455,34 +495,8 @@ void WebSocketPluginMuxPool::drain_pending() {
     auto pending = std::move(pending_);
     pending_.clear();
     for (auto &request : pending) {
-        struct OpenReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            StreamHandler handler;
-            void set_value(std::unique_ptr<io::StreamHandle> stream) && noexcept {
-                auto callback = std::move(handler);
-                callback(std::move(stream));
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                auto callback = std::move(handler);
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    callback(core::fail(failure));
-                } catch (...) {
-                    callback(core::fail(
-                        core::Error{core::ErrorCode::transport_io, "mux open failed", {}}));
-                }
-            }
-            void set_stopped() && noexcept {
-                auto callback = std::move(handler);
-                callback(
-                    core::fail(core::Error{core::ErrorCode::cancelled, "mux open stopped", {}}));
-            }
-        };
-        // NOTE: name the sender first; argument order is unspecified.
-        auto sender =
-            session_->open_stream({}, std::chrono::steady_clock::now() + std::chrono::seconds(15));
-        async::start_with_receiver(std::move(sender), OpenReceiver{std::move(request.handler)});
+        std::make_shared<MuxSessionStreamOpen>(executor_, session_, std::move(request.handler))
+            ->start();
     }
 }
 

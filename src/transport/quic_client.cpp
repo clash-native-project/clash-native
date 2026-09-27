@@ -2,19 +2,21 @@
 
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/oneshot.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
+
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include "transport/builtin_ca_bundle.hpp"
 
 #include <stdexec/execution.hpp>
 
-#include <boost/asio/bind_executor.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
 
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
@@ -94,7 +96,7 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
     Impl(boost::asio::any_io_executor executor, std::unique_ptr<io::DatagramHandle> datagram,
          boost::asio::ip::udp::endpoint remote_endpoint, QuicClientOptions options,
          QuicClientEvents events)
-        : executor_(std::move(executor)), expiry_timer_(executor_), datagram_(std::move(datagram)),
+        : executor_(std::move(executor)), datagram_(std::move(datagram)),
           remote_endpoint_(std::move(remote_endpoint)), options_(std::move(options)),
           events_(std::move(events)) {
         connection_ref_.get_conn = &get_connection;
@@ -112,9 +114,10 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
             fail(*error_);
             return;
         }
-        receive_next();
+        pump_scope_.spawn(run_receive_loop(shared_from_this()));
+        pump_scope_.spawn(run_send_loop(shared_from_this()));
+        pump_scope_.spawn(run_expiry_loop(shared_from_this()));
         write_packets();
-        schedule_expiry();
     }
 
     QuicOpenStreamResult open_stream(bool unidirectional) {
@@ -796,78 +799,68 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         return {core::ErrorCode::protocol_framing, std::move(context), {}};
     }
 
-    void receive_next() {
-        if (retired_ || !datagram_ || receiving_) {
+    // UDP receive loop as a task: each pull is co_awaited directly on the
+    // datagram sender (cancellable on retire/fail); thin ngtcp2 boundary is
+    // process_datagram below (no sender wrapping of the C engine).
+    static exec::task<void> run_receive_loop(std::shared_ptr<Impl> self) {
+        auto buffer = std::make_shared<ReceiveBuffer>();
+        while (!self->retired_) {
+            io::DatagramPacket packet{0, {}};
+            std::exception_ptr failure;
+            try {
+                packet = co_await self->datagram_->async_receive_from(
+                    boost::asio::buffer(buffer->bytes));
+            } catch (...) {
+                failure = std::current_exception();
+            }
+            if (failure) {
+                auto executor = self->executor_;
+                boost::asio::dispatch(std::move(executor), [self, failure] {
+                    self->receiving_ = false;
+                    self->check_teardown();
+                    if (!self->retired_) {
+                        self->handle_receive_error(failure);
+                    }
+                    self->check_teardown();
+                });
+                co_return;
+            }
+            auto executor = self->executor_;
+            boost::asio::dispatch(std::move(executor), [self, buffer, packet = std::move(packet)] {
+                self->receiving_ = false;
+                self->check_teardown();
+                if (self->retired_) {
+                    return;
+                }
+                if (packet.address.is_address() &&
+                    packet.address.address() == self->remote_endpoint_.address() &&
+                    packet.address.port() == self->remote_endpoint_.port() && packet.size != 0) {
+                    self->process_datagram(buffer->bytes.data(), packet.size,
+                                           boost::asio::ip::udp::endpoint(packet.address.address(),
+                                                                          packet.address.port()));
+                }
+                self->check_teardown();
+            });
+        }
+    }
+
+    // Legacy failure mapping kept for the error path: non-abort errors fail
+    // the connection; aborts/stops just drain the pump for teardown join.
+    void handle_receive_error(std::exception_ptr error) {
+        if (retired_) {
             return;
         }
-        receiving_ = true;
-        struct ReceiveReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<Impl> self;
-            std::shared_ptr<ReceiveBuffer> buffer;
-            void set_value(io::DatagramPacket packet) && noexcept {
-                // Hoist before the move below: argument evaluation order
-                // is unspecified, so reading self->executor_ next to
-                // [self = std::move(self)] may observe the moved-from state.
-                auto executor = self->executor_;
-                boost::asio::dispatch(std::move(executor), [self = std::move(self),
-                                                            buffer = std::move(buffer),
-                                                            packet = std::move(packet)] {
-                    self->receiving_ = false;
-                    self->check_teardown();
-                    if (self->retired_) {
-                        return;
-                    }
-                    if (packet.address.is_address() &&
-                        packet.address.address() == self->remote_endpoint_.address() &&
-                        packet.address.port() == self->remote_endpoint_.port() &&
-                        packet.size != 0) {
-                        self->process_datagram(
-                            buffer->bytes.data(), packet.size,
-                            boost::asio::ip::udp::endpoint(packet.address.address(),
-                                                           packet.address.port()));
-                    }
-                    if (!self->retired_) {
-                        self->receive_next();
-                    }
-                    self->check_teardown();
-                });
+        try {
+            std::rethrow_exception(std::move(error));
+        } catch (const boost::system::system_error &failure) {
+            if (failure.code() != boost::asio::error::operation_aborted) {
+                fail(transport_error("failed to receive QUIC datagram", failure.code()));
             }
-            void set_error(std::exception_ptr error) && noexcept {
-                const auto self = std::move(this->self);
-                boost::asio::dispatch(self->executor_, [self, error = std::move(error)] {
-                    self->receiving_ = false;
-                    self->check_teardown();
-                    if (self->retired_) {
-                        return;
-                    }
-                    try {
-                        std::rethrow_exception(std::move(error));
-                    } catch (const boost::system::system_error &failure) {
-                        if (failure.code() != boost::asio::error::operation_aborted) {
-                            self->fail(
-                                transport_error("failed to receive QUIC datagram", failure.code()));
-                        }
-                    } catch (const core::Error &failure) {
-                        self->fail(failure);
-                    } catch (...) {
-                        self->fail(core::Error{
-                            core::ErrorCode::transport_io, "failed to receive QUIC datagram", {}});
-                    }
-                    self->check_teardown();
-                });
-            }
-            void set_stopped() && noexcept {
-                const auto self = std::move(this->self);
-                boost::asio::dispatch(self->executor_, [self] {
-                    self->receiving_ = false;
-                    self->check_teardown();
-                });
-            }
-        };
-        auto buffer = std::make_shared<ReceiveBuffer>();
-        auto sender = datagram_->async_receive_from(boost::asio::buffer(buffer->bytes));
-        async::start_with_receiver(std::move(sender), ReceiveReceiver{shared_from_this(), buffer});
+        } catch (const core::Error &failure) {
+            fail(failure);
+        } catch (...) {
+            fail(core::Error{core::ErrorCode::transport_io, "failed to receive QUIC datagram", {}});
+        }
     }
 
     void process_datagram(const std::uint8_t *data, std::size_t length,
@@ -1106,89 +1099,91 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
     }
 
     void send_next_packet() {
-        if (retired_ || sending_ || outgoing_.empty() || !datagram_) {
-            return;
-        }
-        sending_ = true;
-        auto packet = std::make_shared<std::vector<std::uint8_t>>(std::move(outgoing_.front()));
-        outgoing_.pop_front();
-        struct SendReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<Impl> self;
-            std::shared_ptr<std::vector<std::uint8_t>> packet;
-            void set_value(std::size_t length) && noexcept {
-                // Hoist before the move below: argument evaluation order
-                // is unspecified, so reading self->executor_ next to
-                // [self = std::move(self)] may observe the moved-from state.
-                auto executor = self->executor_;
-                boost::asio::dispatch(std::move(executor), [self = std::move(self),
-                                                            packet = std::move(packet), length] {
-                    self->sending_ = false;
-                    self->check_teardown();
-                    if (self->retired_) {
-                        return;
-                    }
-                    if (length != packet->size()) {
-                        self->fail(core::Error{core::ErrorCode::transport_io,
-                                               "QUIC datagram was only partially sent",
-                                               {}});
-                        return;
-                    }
-                    self->send_next_packet();
-                    if (self->outgoing_.empty()) {
-                        self->request_write();
-                    }
-                    self->check_teardown();
-                });
+        // No-op kick: run_send_loop polls the queue; kept so write_packets
+        // call sites stay untouched.
+    }
+
+    // UDP send loop as a task: each send is co_awaited directly on the
+    // datagram sender (cancellable on retire/fail via datagram cancel).
+    static exec::task<void> run_send_loop(std::shared_ptr<Impl> self) {
+        while (!self->retired_) {
+            if (self->outgoing_.empty() || !self->datagram_) {
+                try {
+                    co_await async::sleep_after(self->executor_, std::chrono::milliseconds(1));
+                } catch (...) {
+                    co_return;
+                }
+                continue;
             }
-            void set_error(std::exception_ptr error) && noexcept {
-                const auto self = std::move(this->self);
-                boost::asio::dispatch(self->executor_, [self, error = std::move(error)] {
-                    self->sending_ = false;
-                    self->check_teardown();
-                    if (self->retired_) {
-                        return;
-                    }
+            auto packet =
+                std::make_shared<std::vector<std::uint8_t>>(std::move(self->outgoing_.front()));
+            self->outgoing_.pop_front();
+            self->sending_ = true;
+            std::size_t length = 0;
+            std::exception_ptr failure;
+            try {
+                length = co_await self->datagram_->async_send_to(
+                    boost::asio::buffer(*packet),
+                    io::DatagramAddress::from_endpoint(self->remote_endpoint_));
+            } catch (...) {
+                failure = std::current_exception();
+            }
+            auto executor = self->executor_;
+            boost::asio::dispatch(std::move(executor), [self, packet, length, failure] {
+                self->sending_ = false;
+                self->check_teardown();
+                if (self->retired_) {
+                    return;
+                }
+                if (failure) {
                     try {
-                        std::rethrow_exception(std::move(error));
-                    } catch (const core::Error &failure) {
-                        self->fail(failure);
+                        std::rethrow_exception(failure);
+                    } catch (const core::Error &named) {
+                        self->fail(named);
                     } catch (...) {
                         self->fail(core::Error{
                             core::ErrorCode::transport_io, "failed to send QUIC datagram", {}});
                     }
                     self->check_teardown();
-                });
-            }
-            void set_stopped() && noexcept {
-                const auto self = std::move(this->self);
-                boost::asio::dispatch(self->executor_, [self] {
-                    self->sending_ = false;
-                    self->check_teardown();
-                });
-            }
-        };
-        auto sender = datagram_->async_send_to(
-            boost::asio::buffer(*packet), io::DatagramAddress::from_endpoint(remote_endpoint_));
-        async::start_with_receiver(std::move(sender),
-                                   SendReceiver{shared_from_this(), std::move(packet)});
+                    return;
+                }
+                if (length != packet->size()) {
+                    self->fail(core::Error{core::ErrorCode::transport_io,
+                                           "QUIC datagram was only partially sent",
+                                           {}});
+                    return;
+                }
+                if (self->outgoing_.empty()) {
+                    self->request_write();
+                }
+                self->check_teardown();
+            });
+        }
     }
 
-    void schedule_expiry() {
-        if (retired_ || connection_ == nullptr) {
-            return;
-        }
-        const auto expiry = ngtcp2_conn_get_expiry2(connection_);
-        if (expiry == std::numeric_limits<ngtcp2_tstamp>::max()) {
-            return;
-        }
-        const auto now = timestamp_now();
-        const auto wait = expiry > now ? expiry - now : 1;
-        expiry_timer_.expires_after(std::chrono::nanoseconds(wait));
-        const auto self = shared_from_this();
-        expiry_timer_.async_wait(
-            boost::asio::bind_executor(executor_, [self](const boost::system::error_code &error) {
-                if (error || self->retired_ || self->connection_ == nullptr) {
+    // ngtcp2 expiry loop: the wait is sleep_after (sender), not a
+    // steady_timer.async_wait leaf; handle_expiry stays a thin C call.
+    static exec::task<void> run_expiry_loop(std::shared_ptr<Impl> self) {
+        while (!self->retired_ && self->connection_ != nullptr) {
+            const auto expiry = ngtcp2_conn_get_expiry2(self->connection_);
+            if (expiry == std::numeric_limits<ngtcp2_tstamp>::max()) {
+                try {
+                    co_await async::sleep_after(self->executor_, std::chrono::milliseconds(10));
+                } catch (...) {
+                    co_return;
+                }
+                continue;
+            }
+            const auto now = timestamp_now();
+            const auto wait = expiry > now ? expiry - now : 1;
+            try {
+                co_await async::sleep_after(self->executor_, std::chrono::nanoseconds(wait));
+            } catch (...) {
+                co_return;
+            }
+            auto executor = self->executor_;
+            boost::asio::dispatch(std::move(executor), [self] {
+                if (self->retired_ || self->connection_ == nullptr) {
                     return;
                 }
                 const auto result = ngtcp2_conn_handle_expiry(self->connection_, timestamp_now());
@@ -1198,8 +1193,13 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
                     return;
                 }
                 self->write_packets();
-                self->schedule_expiry();
-            }));
+            });
+        }
+    }
+
+    void schedule_expiry() {
+        // No-op shim: expiry is driven by run_expiry_loop now. Kept so
+        // process_datagram/write_packets call sites stay untouched.
     }
 
     void fail(core::Error error) {
@@ -1209,7 +1209,6 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         error_ = error;
         retired_ = true;
         ready_ = false;
-        expiry_timer_.cancel();
         for (auto &datagram : datagram_writes_) {
             post_datagram_result(std::move(datagram.handler), boost::asio::error::operation_aborted,
                                  0);
@@ -1221,26 +1220,13 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         multiplexed_streams_.clear();
         active_streams_.clear();
         if (datagram_) {
-            // Cancel and close promptly, but do not release: sender ops
-            // parked on the handle (receive_next/send_next_packet) keep
-            // the Impl alive through their receivers and must still see
-            // a live handle when they complete. The handle dies with the
-            // Impl once they drain.
             datagram_->cancel();
             datagram_->close();
         }
         release_protocol();
-        // Join the pump before reporting: parked sender ops still hold
-        // receivers that dispatch back to this strand, so the failure
-        // notification (and everything downstream of it, up to process
-        // teardown) waits until they have drained. Reporting early lets
-        // the caller stop the runtime while completions are still in
-        // flight, which destroys queued strand work out from under them.
         check_teardown();
     }
 
-    // Fires events_.failed once the pump has drained after fail(). Runs
-    // on the strand; every receiving_/sending_ transition funnels here.
     void check_teardown() {
         if (!retired_ || teardown_notified_ || receiving_ || sending_ || !error_) {
             return;
@@ -1257,7 +1243,6 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         }
         retired_ = true;
         ready_ = false;
-        expiry_timer_.cancel();
         for (auto &datagram : datagram_writes_) {
             post_datagram_result(std::move(datagram.handler), boost::asio::error::operation_aborted,
                                  0);
@@ -1269,8 +1254,6 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
         multiplexed_streams_.clear();
         active_streams_.clear();
         if (datagram_) {
-            // Same lifetime rule as fail(): parked sender ops outlive
-            // this call and complete against the handle.
             datagram_->cancel();
             datagram_->close();
         }
@@ -1295,7 +1278,7 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
     }
 
     boost::asio::any_io_executor executor_;
-    boost::asio::steady_timer expiry_timer_;
+    exec::async_scope pump_scope_;
     std::unique_ptr<io::DatagramHandle> datagram_;
     boost::asio::ip::udp::endpoint remote_endpoint_;
     boost::asio::ip::udp::endpoint local_endpoint_;

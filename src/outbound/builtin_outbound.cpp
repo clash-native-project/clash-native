@@ -1,15 +1,19 @@
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
 
+#include "outbound_utils.hpp"
+
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
 
 #include <exec/asio/use_sender.hpp>
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
+
+#include <stdexec/execution.hpp>
 
 #include <fmt/format.h>
 
@@ -40,35 +44,48 @@ core::Error connection_error(core::ErrorCode code, std::string context,
     return {code, std::move(context), to_std_error(error)};
 }
 
-class DirectConnectOperation final : public std::enable_shared_from_this<DirectConnectOperation> {
+class DirectConnectState final : public std::enable_shared_from_this<DirectConnectState> {
   public:
-    DirectConnectOperation(boost::asio::any_io_executor executor, core::StreamRequest request,
-                           std::shared_ptr<dns::ResolverService> resolver,
-                           core::StreamOpenHandler handler)
-        : request_(std::move(request)), resolver_(std::move(resolver)),
-          socket_(std::move(executor)), connect_timer_(socket_.get_executor()),
-          handler_(std::move(handler)) {}
+    DirectConnectState(runtime::AsioRuntime &runtime, core::StreamRequest request,
+                       std::shared_ptr<dns::ResolverService> resolver,
+                       core::StreamOpenHandler handler)
+        : runtime_(runtime), request_(std::move(request)), resolver_(std::move(resolver)),
+          socket_(runtime.serialized_executor()), handler_(std::move(handler)) {}
 
     void start() {
-        connect_timer_.expires_after(std::chrono::seconds(10));
         auto self = shared_from_this();
-        connect_timer_.async_wait([self](const boost::system::error_code &error) {
-            if (!error) {
-                if (self->resolver_ && self->resolver_request_id_) {
-                    self->resolver_->cancel(*self->resolver_request_id_);
-                }
-                boost::system::error_code ignored;
-                self->socket_.cancel(ignored);
-                self->complete(
-                    core::Error{core::ErrorCode::timeout,
-                                fmt::format("timed out connecting direct target {}",
-                                            destination_text(self->request_.destination))});
-            }
-        });
-        scope_.spawn(run_connect(shared_from_this()));
+        // Deadline task races the open chain; teardown stays guard-driven,
+        // so no stop is ever requested.
+        scope_.spawn(run_open(self));
+        scope_.spawn(run_deadline(self));
     }
 
-    static exec::task<void> run_connect(std::shared_ptr<DirectConnectOperation> self) {
+    // Abort for sender-driven cancellation: idempotent with finish().
+    // Stops the chain tasks (stop propagates into the resolve/connect
+    // awaits) and closes the socket; the late terminal drops at the
+    // completed_ guard or the claimed callback_sender settlement.
+    void abort() noexcept {
+        auto self = shared_from_this();
+        try {
+            boost::asio::post(runtime_.serialized_executor(), [self] {
+                if (self->completed_) {
+                    return;
+                }
+                self->completed_ = true;
+                self->scope_.request_stop();
+                boost::system::error_code ignored;
+                self->socket_.close(ignored);
+            });
+        } catch (...) {
+        }
+    }
+
+  private:
+    // Straight-line open chain: resolve (A/AAAA loop inside the shared
+    // sender, kept as in-band Result), then TCP connect. Every terminal
+    // funnels through finish(), so the spawned task always ends with a
+    // value unless an outer stop ends it early.
+    static exec::task<void> run_open(std::shared_ptr<DirectConnectState> self) {
         if (self->request_.resolved_address) {
             co_await connect_addresses(
                 self, std::vector<boost::asio::ip::address>{*self->request_.resolved_address});
@@ -80,57 +97,37 @@ class DirectConnectOperation final : public std::enable_shared_from_this<DirectC
             co_return;
         }
         if (!self->resolver_) {
-            self->complete(core::Error{core::ErrorCode::configuration,
-                                       "direct outbound requires a configured DNS resolver"});
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::configuration,
+                 "direct outbound requires a configured DNS resolver"}));
             co_return;
         }
-        for (const auto type : {dns::DnsRecordType::a, dns::DnsRecordType::aaaa}) {
-            core::Result<dns::DnsAnswer> answer;
-            try {
-                answer = co_await async::bridge_sender<core::Result<dns::DnsAnswer>>(
-                    [self, type](async::BridgeHandler<core::Result<dns::DnsAnswer>> done) {
-                        self->resolver_request_id_ = self->resolver_->resolve(
-                            {self->request_.destination.domain(), type, 1},
-                            [self, done](core::Result<dns::DnsAnswer> result) mutable {
-                                self->resolver_request_id_.reset();
-                                done(std::move(result));
-                            },
-                            std::nullopt);
-                        return async::CallbackAbortFn{[self] { self->abort(); }};
-                    });
-            } catch (...) {
-                self->complete(
-                    core::Error{core::ErrorCode::resolution,
-                                fmt::format("failed to resolve direct target {}",
-                                            destination_text(self->request_.destination))});
-                co_return;
-            }
-            if (self->completed_) {
-                co_return;
-            }
-            if (answer) {
-                self->resolved_addresses_.insert(self->resolved_addresses_.end(),
-                                                 answer.value().addresses.begin(),
-                                                 answer.value().addresses.end());
-            } else if (!self->first_resolution_error_) {
-                self->first_resolution_error_ = answer.error();
-            }
-        }
-        if (self->resolved_addresses_.empty()) {
-            if (self->first_resolution_error_) {
-                self->complete(*self->first_resolution_error_);
-            } else {
-                self->complete(
-                    core::Error{core::ErrorCode::resolution,
-                                fmt::format("direct target {} has no resolved addresses",
-                                            destination_text(self->request_.destination))});
-            }
+        core::Result<detail::AddressList> resolved;
+        try {
+            resolved = co_await detail::resolve_host_sender(self->runtime_, self->resolver_,
+                                                            self->request_.destination.domain());
+        } catch (...) {
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::resolution,
+                 fmt::format("failed to resolve direct target {}",
+                             destination_text(self->request_.destination))}));
             co_return;
         }
-        co_await connect_addresses(self, self->resolved_addresses_);
+        if (self->completed_) {
+            co_return;
+        }
+        if (!resolved || resolved.value().empty()) {
+            self->finish(core::StreamOpenResult::failed(
+                resolved ? core::Error{core::ErrorCode::resolution,
+                                       fmt::format("direct target {} has no resolved addresses",
+                                                   destination_text(self->request_.destination))}
+                         : resolved.error()));
+            co_return;
+        }
+        co_await connect_addresses(self, std::move(resolved.value()));
     }
 
-    static exec::task<void> connect_addresses(std::shared_ptr<DirectConnectOperation> self,
+    static exec::task<void> connect_addresses(std::shared_ptr<DirectConnectState> self,
                                               std::vector<boost::asio::ip::address> addresses) {
         auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
         endpoints->reserve(addresses.size());
@@ -154,74 +151,59 @@ class DirectConnectOperation final : public std::enable_shared_from_this<DirectC
                     std::rethrow_exception(std::current_exception());
                 }));
         } catch (const core::Error &failure) {
-            self->complete(failure);
+            self->finish(core::StreamOpenResult::failed(failure));
             co_return;
         } catch (...) {
-            self->complete(
+            self->finish(core::StreamOpenResult::failed(
                 connection_error(core::ErrorCode::endpoint_connection,
                                  fmt::format("failed to connect direct target {}",
                                              destination_text(self->request_.destination)),
-                                 boost::asio::error::fault));
+                                 boost::asio::error::fault)));
             co_return;
         }
         if (!self->completed_) {
-            self->complete(std::nullopt);
+            self->finish(core::StreamOpenResult::opened(
+                std::make_unique<net::TcpStream>(std::move(self->socket_))));
         }
     }
 
-    // Abort for sender-driven cancellation: runs on the strand (fully
-    // ordered with complete()), best-effort and idempotent. The bridge drops
-    // the late terminal through its settled flag.
-    void abort() noexcept {
-        auto self = shared_from_this();
+    static exec::task<void> run_deadline(std::shared_ptr<DirectConnectState> self) {
         try {
-            boost::asio::post(socket_.get_executor(), [self]() {
-                if (self->completed_) {
-                    return;
-                }
-                self->connect_timer_.cancel();
-                if (self->resolver_ && self->resolver_request_id_) {
-                    self->resolver_->cancel(*self->resolver_request_id_);
-                    self->resolver_request_id_.reset();
-                }
-                boost::system::error_code ignored;
-                self->socket_.close(ignored);
-            });
+            co_await async::sleep_after(self->runtime_.serialized_executor(),
+                                        std::chrono::seconds(10));
         } catch (...) {
+            co_return;
         }
+        self->finish(core::StreamOpenResult::failed(
+            {core::ErrorCode::timeout, fmt::format("timed out connecting direct target {}",
+                                                   destination_text(self->request_.destination))}));
     }
 
-  private:
-    void complete(std::optional<core::Error> error) {
+    void finish(core::StreamOpenResult result) {
         if (completed_) {
+            if (result.handle) {
+                result.handle->close();
+            }
             return;
         }
         completed_ = true;
-        boost::system::error_code ignored;
-        connect_timer_.cancel();
-        if (error) {
-            if (resolver_ && resolver_request_id_) {
-                resolver_->cancel(*resolver_request_id_);
-                resolver_request_id_.reset();
-            }
+        if (!result.succeeded()) {
+            boost::system::error_code ignored;
             socket_.close(ignored);
-            handler_(core::StreamOpenResult::failed(std::move(*error)));
-            return;
         }
-
-        handler_(
-            core::StreamOpenResult::opened(std::make_unique<net::TcpStream>(std::move(socket_))));
+        auto handler = std::move(handler_);
+        if (handler) {
+            handler(std::move(result));
+        }
     }
 
+    runtime::AsioRuntime &runtime_;
     core::StreamRequest request_;
     std::shared_ptr<dns::ResolverService> resolver_;
-    std::optional<dns::ResolverService::RequestId> resolver_request_id_;
-    std::vector<boost::asio::ip::address> resolved_addresses_;
-    std::optional<core::Error> first_resolution_error_;
     boost::asio::ip::tcp::socket socket_;
-    boost::asio::steady_timer connect_timer_;
     core::StreamOpenHandler handler_;
     bool completed_ = false;
+    // Owns the open/deadline chain tasks, which always end with a value.
     exec::async_scope scope_;
 };
 
@@ -245,16 +227,21 @@ const core::OutboundDescriptor &DirectOutbound::descriptor() const noexcept { re
 core::OutboundCapabilities DirectOutbound::capabilities() const noexcept { return capabilities_; }
 
 io::AnySender<core::StreamOpenResult> DirectOutbound::connect_stream(core::StreamRequest request) {
-    auto executor = runtime_.serialized_executor();
-    auto resolver = resolver_;
-    return async::bridge_sender<core::StreamOpenResult>(
-        [executor, request = std::move(request), resolver = std::move(resolver)](
-            async::BridgeHandler<core::StreamOpenResult> terminal) mutable {
-            auto operation = std::make_shared<DirectConnectOperation>(
-                executor, std::move(request), std::move(resolver), std::move(terminal));
-            operation->start();
-            return async::CallbackAbortFn{[operation] { operation->abort(); }};
-        });
+    using Signatures = stdexec::completion_signatures<stdexec::set_value_t(core::StreamOpenResult),
+                                                      stdexec::set_error_t(std::exception_ptr),
+                                                      stdexec::set_stopped_t()>;
+    return io::AnySender<core::StreamOpenResult>{async::callback_sender<Signatures>(
+        [&runtime = runtime_, resolver = resolver_,
+         request = std::move(request)](auto terminal) mutable -> async::CallbackAbortFn {
+            auto state = std::make_shared<DirectConnectState>(
+                runtime, std::move(request), std::move(resolver),
+                core::StreamOpenHandler{std::move(terminal)});
+            state->start();
+            return async::CallbackAbortFn{[state] { state->abort(); }};
+        },
+        [](stdexec::receiver auto &&receiver, core::StreamOpenResult result) {
+            stdexec::set_value(std::forward<decltype(receiver)>(receiver), std::move(result));
+        })};
 }
 
 io::AnySender<core::DatagramOpenResult>

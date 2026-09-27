@@ -1,5 +1,5 @@
 #include <clash_native/async/oneshot.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/core/result.hpp>
 #include <clash_native/io/exchange_body_stream.hpp>
 #include <clash_native/io/exchange_session.hpp>
@@ -12,8 +12,10 @@
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/write.hpp>
+
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include <nghttp2/nghttp2.h>
 
@@ -115,12 +117,15 @@ using TunnelTerminal = core::Result<io::StreamUpgradeResponse>;
 
 class Http2ClientSession final : public io::ExchangeSession,
                                  public std::enable_shared_from_this<Http2ClientSession> {
+    struct Pending;
+    using PendingPtr = std::shared_ptr<Pending>;
+
   public:
     explicit Http2ClientSession(std::unique_ptr<io::StreamHandle> stream,
                                 Http2SessionOptions options = {})
         : executor_(stream->executor()),
           stream_(std::make_unique<net::StreamHandleAdapter>(std::move(stream))),
-          ping_interval_(options.ping_interval), ping_timer_(executor_) {}
+          ping_interval_(options.ping_interval) {}
 
     ~Http2ClientSession() { close_http2(); }
 
@@ -165,20 +170,31 @@ class Http2ClientSession final : public io::ExchangeSession,
 
     // PING keepalive: every interval without an ack counts a miss; two
     // consecutive misses fail the connection so dead peers cannot hold
-    // multiplexed streams hostage.
+    // multiplexed streams hostage. The wait is a sleep_after task racing
+    // teardown via the ping_generation guard; ping_tick re-arms after each
+    // firing.
     void arm_ping() {
         if (ping_interval_.count() <= 0 || stopped_ || retired_ || !http2_session_) {
             return;
         }
-        const auto self = weak_from_this();
-        ping_timer_.expires_after(ping_interval_);
-        ping_timer_.async_wait([self](const boost::system::error_code &error) {
-            const auto locked = self.lock();
-            if (!locked || error) {
-                return;
-            }
-            locked->ping_tick();
-        });
+        ++ping_generation_;
+        scope_.spawn(run_ping(shared_from_this(), ping_generation_));
+    }
+
+    static exec::task<void> run_ping(std::shared_ptr<Http2ClientSession> self,
+                                     std::uint64_t generation) {
+        auto executor = self->executor_;
+        auto interval = self->ping_interval_;
+        try {
+            co_await async::sleep_after(executor, interval);
+        } catch (...) {
+            co_return;
+        }
+        if (generation != self->ping_generation_) {
+            co_return;
+        }
+        self->ping_tick();
+        co_return;
     }
 
     void ping_tick() {
@@ -207,6 +223,30 @@ class Http2ClientSession final : public io::ExchangeSession,
         ping_misses_ = 0;
     }
 
+    // Per-exchange deadline task: fires once at the deadline; the map
+    // lookup + timer_done guard drop it when the exchange already won.
+    // Bounded by the deadline, so no stop is ever requested.
+    void arm_deadline(ExchangeId exchange_id, PendingPtr pending,
+                      std::chrono::steady_clock::time_point deadline) {
+        pending->deadline = deadline;
+        scope_.spawn(run_deadline(shared_from_this(), exchange_id, pending, deadline));
+    }
+
+    static exec::task<void> run_deadline(std::shared_ptr<Http2ClientSession> self,
+                                         ExchangeId exchange_id, PendingPtr pending,
+                                         std::chrono::steady_clock::time_point deadline) {
+        auto executor = self->executor_;
+        try {
+            co_await async::sleep_until(executor, deadline);
+        } catch (...) {
+            co_return;
+        }
+        if (pending->timer_done) {
+            co_return;
+        }
+        self->fail_pending(exchange_id, timeout_error());
+        co_return;
+    }
     io::AnySender<io::ExchangeResponse>
     exchange(io::ExchangeRequest request, std::chrono::steady_clock::time_point deadline) override {
         auto channel = async::oneshot::channel<BufferedTerminal>();
@@ -229,19 +269,14 @@ class Http2ClientSession final : public io::ExchangeSession,
             return wrap_result(exchange_id, std::move(channel.receiver));
         }
 
-        auto pending = std::make_shared<Pending>(executor_);
+        auto pending = std::make_shared<Pending>();
         pending->request = std::move(request);
         pending->handler = std::move(channel.sender);
-        pending->timer.expires_at(deadline);
-        const auto self = shared_from_this();
-        pending->timer.async_wait([self, exchange_id](const boost::system::error_code &error) {
-            if (!error) {
-                self->fail_pending(exchange_id, timeout_error());
-            }
-        });
+        pending->deadline = deadline;
         pending_.emplace(exchange_id, pending);
         submit_request(exchange_id, pending);
         send_pending();
+        arm_deadline(exchange_id, pending, deadline);
         return wrap_result(exchange_id, std::move(channel.receiver));
     }
 
@@ -273,23 +308,18 @@ class Http2ClientSession final : public io::ExchangeSession,
             return wrap_streaming(exchange_id, std::move(channel.receiver));
         }
 
-        auto pending = std::make_shared<Pending>(executor_);
+        auto pending = std::make_shared<Pending>();
         pending->request = std::move(request.request);
         pending->request_body = std::move(request.body);
         pending->head_deadline_only = request.head_deadline_only;
         pending->request_content_length = content_length;
         pending->streaming_request = true;
         pending->streaming_handler = std::move(channel.sender);
-        pending->timer.expires_at(deadline);
-        const auto self = shared_from_this();
-        pending->timer.async_wait([self, exchange_id](const boost::system::error_code &error) {
-            if (!error) {
-                self->fail_pending(exchange_id, timeout_error());
-            }
-        });
+        pending->deadline = deadline;
         pending_.emplace(exchange_id, pending);
         submit_request(exchange_id, pending);
         send_pending();
+        arm_deadline(exchange_id, pending, deadline);
         return wrap_streaming(exchange_id, std::move(channel.receiver));
     }
 
@@ -342,19 +372,13 @@ class Http2ClientSession final : public io::ExchangeSession,
                 core::fail(protocol_error("HTTP/2 peer did not enable extended CONNECT")));
             return wrap_tunnel(exchange_id, std::move(channel.receiver));
         }
-        auto pending = std::make_shared<Pending>(executor_);
+        auto pending = std::make_shared<Pending>();
         pending->is_tunnel = true;
         pending->tunnel_request = std::move(request);
         pending->tunnel_handler = std::move(channel.sender);
         pending->response.version = 20;
         pending->response.keep_alive = true;
-        pending->timer.expires_at(deadline);
-        const auto self = shared_from_this();
-        pending->timer.async_wait([self, exchange_id](const boost::system::error_code &error) {
-            if (!error) {
-                self->fail_pending(exchange_id, timeout_error());
-            }
-        });
+        pending->deadline = deadline;
         pending_.emplace(exchange_id, pending);
         if (pending->tunnel_request.mode == io::StreamUpgradeMode::upgrade &&
             !peer_connect_protocol_enabled_) {
@@ -363,6 +387,7 @@ class Http2ClientSession final : public io::ExchangeSession,
             submit_tunnel(exchange_id, pending);
         }
         send_pending();
+        arm_deadline(exchange_id, pending, deadline);
         return wrap_tunnel(exchange_id, std::move(channel.receiver));
     }
 
@@ -403,7 +428,7 @@ class Http2ClientSession final : public io::ExchangeSession,
 
   private:
     struct Pending {
-        explicit Pending(boost::asio::any_io_executor executor) : timer(std::move(executor)) {}
+        Pending() = default;
 
         io::ExchangeRequest request;
         io::StreamUpgradeRequest tunnel_request;
@@ -411,7 +436,12 @@ class Http2ClientSession final : public io::ExchangeSession,
         async::oneshot::Sender<BufferedTerminal> handler;
         async::oneshot::Sender<StreamingTerminal> streaming_handler;
         async::oneshot::Sender<TunnelTerminal> tunnel_handler;
-        boost::asio::steady_timer timer;
+        std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::time_point::max();
+        // Set on every terminal path (completion, fail, connection
+        // failure). The deadline task rechecks it after the sleep and drops
+        // instead of firing into a recycled exchange id.
+        bool timer_done = false;
         std::shared_ptr<io::ExchangeBodyStream> request_body;
         std::shared_ptr<io::detail::QueuedExchangeBodyStream> response_body;
         std::optional<std::uint64_t> request_content_length;
@@ -445,8 +475,6 @@ class Http2ClientSession final : public io::ExchangeSession,
         bool tunnel_write_ready = false;
         bool remote_end_stream = false;
     };
-
-    using PendingPtr = std::shared_ptr<Pending>;
 
     static std::optional<core::Error> validate_request(const io::ExchangeRequest &request) {
         if (!is_token(request.method) || !is_token(request.scheme) || request.authority.empty() ||
@@ -684,39 +712,13 @@ class Http2ClientSession final : public io::ExchangeSession,
                     pending->request_body_read_in_progress = false;
                     return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
                 }
-                struct BodyReceiver {
-                    using receiver_concept = stdexec::receiver_tag;
-                    std::weak_ptr<Http2ClientSession> weak;
-                    PendingPtr pending_owner;
-                    std::int32_t stream_id;
-                    void deliver(const boost::system::error_code &error, std::size_t size) {
-                        if (const auto locked = weak.lock()) {
-                            boost::asio::post(
-                                locked->executor_,
-                                [locked, owner = std::move(pending_owner), id = stream_id, error,
-                                 size] { locked->on_request_body_read(id, owner, error, size); });
-                        }
-                    }
-                    void set_value(std::optional<std::size_t> size) && noexcept {
-                        if (size) {
-                            deliver({}, *size);
-                        } else {
-                            deliver(boost::asio::error::eof, 0);
-                        }
-                    }
-                    void set_error(std::exception_ptr error) && noexcept {
-                        deliver(net::unpack_error(std::move(error)), 0);
-                    }
-                    void set_stopped() && noexcept {
-                        deliver(boost::asio::error::operation_aborted, 0);
-                    }
-                };
-                const auto weak = self->weak_from_this();
-                // NOTE: name the sender first; argument order is unspecified.
-                auto body_sender = pending->request_body->async_read_some(
-                    boost::asio::buffer(pending->request_body_buffer));
-                async::start_with_receiver(std::move(body_sender),
-                                           BodyReceiver{weak, pending_owner->second, stream_id});
+                // Thin nghttp2 boundary: the provider callback only moves
+                // bytes already staged; the body read itself is a task that
+                // co_awaits the body sender and posts the terminal back for
+                // on_request_body_read. The read task is owned by the
+                // session scope and guarded by timer_done/completed checks.
+                self->scope_.spawn(run_request_body_read(self->shared_from_this(),
+                                                         pending_owner->second, stream_id));
             }
             return NGHTTP2_ERR_DEFERRED;
         }
@@ -778,6 +780,28 @@ class Http2ClientSession final : public io::ExchangeSession,
             }
         }
         return std::nullopt;
+    }
+
+    static exec::task<void> run_request_body_read(std::shared_ptr<Http2ClientSession> self,
+                                                  PendingPtr pending, std::int32_t stream_id) {
+        boost::system::error_code terminal = {};
+        std::size_t size = 0;
+        try {
+            auto pulled = co_await pending->request_body->async_read_some(
+                boost::asio::buffer(pending->request_body_buffer));
+            if (pulled) {
+                size = *pulled;
+            } else {
+                terminal = boost::asio::error::eof;
+            }
+        } catch (...) {
+            terminal = net::unpack_error(std::current_exception());
+        }
+        auto executor = self->executor_;
+        boost::asio::post(
+            executor, [self = std::move(self), pending = std::move(pending), stream_id, terminal,
+                       size] { self->on_request_body_read(stream_id, pending, terminal, size); });
+        co_return;
     }
 
     void on_request_body_read(std::int32_t stream_id, const PendingPtr &pending,
@@ -1254,7 +1278,7 @@ class Http2ClientSession final : public io::ExchangeSession,
             },
             [] {});
         if (pending->head_deadline_only) {
-            (void)pending->timer.cancel();
+            pending->timer_done = true;
         }
         auto handler = std::move(pending->streaming_handler);
         auto response = std::move(pending->response);
@@ -1285,7 +1309,7 @@ class Http2ClientSession final : public io::ExchangeSession,
         }
         pending->streaming_response_complete = true;
         pending->completed = true;
-        (void)pending->timer.cancel();
+        pending->timer_done = true;
         if (!pending->request_body_complete) {
             if (pending->request_body) {
                 pending->request_body->cancel();
@@ -1304,19 +1328,19 @@ class Http2ClientSession final : public io::ExchangeSession,
     void accept_tunnel(ExchangeId exchange_id, const PendingPtr &pending) {
         pending->completed = true;
         pending->tunnel_established = true;
-        (void)pending->timer.cancel();
+        pending->timer_done = true;
         pending_.erase(exchange_id);
         const auto weak = weak_from_this();
         const auto stream_id = pending->stream_id;
         pending->tunnel_state = std::make_shared<io::detail::HttpTunnelStreamState>(
             executor_,
-            [weak, pending, stream_id](std::vector<std::uint8_t> bytes,
-                                       StreamWriteHandler handler) mutable {
+            [weak, pending, stream_id, executor = executor_](std::vector<std::uint8_t> bytes,
+                                                             StreamWriteHandler handler) mutable {
                 const auto self = weak.lock();
                 if (!self || self->retired_ || pending->tunnel_write_closed ||
                     pending->tunnel_write_handler) {
-                    const auto executor = self ? self->executor_ : pending->timer.get_executor();
-                    boost::asio::post(executor, [handler = std::move(handler)]() mutable {
+                    const auto target = self ? self->executor_ : executor;
+                    boost::asio::post(target, [handler = std::move(handler)]() mutable {
                         if (handler) {
                             handler(boost::asio::error::operation_aborted, 0);
                         }
@@ -1436,7 +1460,7 @@ class Http2ClientSession final : public io::ExchangeSession,
         }
         const auto pending = found->second;
         pending->completed = true;
-        (void)pending->timer.cancel();
+        pending->timer_done = true;
         pending_.erase(found);
         if (pending->response_too_large) {
             if (pending->is_tunnel) {
@@ -1465,7 +1489,7 @@ class Http2ClientSession final : public io::ExchangeSession,
         }
         const auto pending = found->second;
         pending->completed = true;
-        (void)pending->timer.cancel();
+        pending->timer_done = true;
         if (pending->request_body) {
             pending->request_body->cancel();
             pending->request_body.reset();
@@ -1500,7 +1524,7 @@ class Http2ClientSession final : public io::ExchangeSession,
         }
         const auto pending = found->second;
         pending->completed = true;
-        (void)pending->timer.cancel();
+        pending->timer_done = true;
         if (pending->request_body) {
             pending->request_body->cancel();
             pending->request_body.reset();
@@ -1565,7 +1589,7 @@ class Http2ClientSession final : public io::ExchangeSession,
             (void)exchange_id;
             const bool already_completed = pending->completed;
             pending->completed = true;
-            (void)pending->timer.cancel();
+            pending->timer_done = true;
             if (pending->request_body) {
                 pending->request_body->cancel();
                 pending->request_body.reset();
@@ -1609,9 +1633,7 @@ class Http2ClientSession final : public io::ExchangeSession,
     }
 
     void close_http2() noexcept {
-        boost::system::error_code ignored;
-        (void)ignored;
-        (void)ping_timer_.cancel();
+        ++ping_generation_;
         ping_pending_ = false;
         if (http2_session_) {
             nghttp2_session_del(http2_session_);
@@ -1637,7 +1659,8 @@ class Http2ClientSession final : public io::ExchangeSession,
     std::unique_ptr<net::StreamHandleAdapter> stream_;
     nghttp2_session *http2_session_ = nullptr;
     std::chrono::milliseconds ping_interval_{0};
-    boost::asio::steady_timer ping_timer_;
+    std::uint64_t ping_generation_ = 0;
+    exec::async_scope scope_;
     bool ping_pending_ = false;
     unsigned ping_misses_ = 0;
     std::optional<core::Error> initialization_error_;

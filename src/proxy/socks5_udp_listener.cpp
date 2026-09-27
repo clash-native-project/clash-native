@@ -2,7 +2,6 @@
 
 #include "outbound/outbound_utils.hpp"
 #include "outbound/proxy_address.hpp"
-#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
 
@@ -50,7 +49,8 @@ core::Status Socks5UdpListener::start(boost::asio::ip::udp::endpoint endpoint) {
     stopped_ = false;
     spdlog::info("SOCKS5 UDP listener listening on {}:{}", endpoint_->address().to_string(),
                  endpoint_->port());
-    receive();
+    auto self = shared_from_this();
+    scope_.spawn(run_receive(self));
     return {};
 }
 
@@ -82,36 +82,41 @@ std::optional<boost::asio::ip::udp::endpoint> Socks5UdpListener::endpoint() cons
     return endpoint_;
 }
 
-void Socks5UdpListener::receive() {
-    if (stopped_ || !socket_) {
-        return;
-    }
-    struct ReceiveReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<Socks5UdpListener> self;
-        void set_value(io::DatagramPacket packet) && noexcept {
-            if (self->stopped_) {
-                return;
-            }
-            if (packet.address.is_address()) {
-                self->process(packet.size, {packet.address.address(), packet.address.port()});
-            }
-            self->receive();
+exec::task<void> Socks5UdpListener::run_receive(std::shared_ptr<Socks5UdpListener> self) {
+    // Ingress loop: each datagram routes per path inline; teardown aborts
+    // exit quietly while other failures only warn and continue.
+    while (!self->stopped_) {
+        auto socket = self->socket_;
+        if (!socket) {
+            co_return;
         }
-        void set_error(std::exception_ptr error) && noexcept {
+        io::DatagramPacket packet{};
+        try {
+            packet =
+                co_await socket->async_receive_from(boost::asio::buffer(self->receive_buffer_));
+        } catch (const core::Error &failure) {
             if (self->stopped_) {
-                return;
+                co_return;
             }
-            if (net::unpack_error(std::move(error)) != boost::asio::error::operation_aborted) {
+            if (failure.cause !=
+                std::error_code(boost::asio::error::operation_aborted, std::system_category())) {
                 spdlog::warn("SOCKS5 UDP listener receive failed");
             }
-            self->receive();
+            continue;
+        } catch (...) {
+            if (self->stopped_) {
+                co_return;
+            }
+            spdlog::warn("SOCKS5 UDP listener receive failed");
+            continue;
         }
-        void set_stopped() && noexcept { self->receive(); }
-    };
-    auto self = shared_from_this();
-    auto sender = socket_->async_receive_from(boost::asio::buffer(receive_buffer_));
-    async::start_with_receiver(std::move(sender), ReceiveReceiver{self});
+        if (self->stopped_) {
+            co_return;
+        }
+        if (packet.address.is_address()) {
+            self->process(packet.size, {packet.address.address(), packet.address.port()});
+        }
+    }
 }
 
 std::string Socks5UdpListener::path_key(const boost::asio::ip::udp::endpoint &client,
@@ -231,141 +236,145 @@ exec::task<void> Socks5UdpListener::run_route(std::shared_ptr<Socks5UdpListener>
         std::lock_guard lock(self->paths_mutex_);
         self->paths_.emplace(key, path);
     }
-    self->receive_response(path);
+    self->scope_.spawn(run_response_loop(self, path));
     for (auto &queued : payloads) {
-        self->send_payload(path, std::move(queued));
+        self->scope_.spawn(run_send(self, path, std::move(queued)));
+    }
+}
+
+exec::task<void> Socks5UdpListener::run_send(std::shared_ptr<Socks5UdpListener> self,
+                                             std::shared_ptr<Path> path,
+                                             std::shared_ptr<std::vector<std::uint8_t>> payload) {
+    try {
+        co_await path->handle->async_send_to(boost::asio::buffer(*payload),
+                                             io::DatagramAddress::from_endpoint(path->target));
+    } catch (const core::Error &failure) {
+        if (self->stopped_) {
+            co_return;
+        }
+        spdlog::warn("SOCKS5 outbound UDP send failed: {}", failure.context);
+        retire_path(self, path);
+    } catch (...) {
+        if (self->stopped_) {
+            co_return;
+        }
+        spdlog::warn("SOCKS5 outbound UDP send failed");
+        retire_path(self, path);
+    }
+}
+
+exec::task<void> Socks5UdpListener::run_response_loop(std::shared_ptr<Socks5UdpListener> self,
+                                                      std::shared_ptr<Path> path) {
+    // Per-path response loop; teardown aborts exit quietly, other failures
+    // warn and retire the path.
+    while (!self->stopped_) {
+        io::DatagramPacket packet{};
+        try {
+            packet = co_await path->handle->async_receive_from(
+                boost::asio::buffer(path->receive_buffer));
+        } catch (const core::Error &failure) {
+            if (self->stopped_) {
+                co_return;
+            }
+            if (failure.cause ==
+                std::error_code(boost::asio::error::operation_aborted, std::system_category())) {
+                co_return;
+            }
+            spdlog::warn("SOCKS5 outbound UDP receive failed: {}", failure.context);
+            retire_path(self, path);
+            co_return;
+        } catch (...) {
+            if (self->stopped_) {
+                co_return;
+            }
+            spdlog::warn("SOCKS5 outbound UDP receive failed");
+            retire_path(self, path);
+            co_return;
+        }
+        if (self->stopped_) {
+            co_return;
+        }
+        self->scope_.spawn(
+            run_respond(self, path,
+                        build_response_packet(path, packet.address,
+                                              std::span<const std::uint8_t>(
+                                                  path->receive_buffer.data(), packet.size))));
     }
 }
 
 void Socks5UdpListener::send_payload(const std::shared_ptr<Path> &path,
                                      std::shared_ptr<std::vector<std::uint8_t>> payload) {
-    if (stopped_) {
-        return;
-    }
-    struct SendReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<Socks5UdpListener> self;
-        std::shared_ptr<Path> path;
-        // Keeps the payload bytes alive until the send settles.
-        std::shared_ptr<std::vector<std::uint8_t>> payload;
-        void set_value(std::size_t) && noexcept {}
-        void set_error(std::exception_ptr error) && noexcept {
-            if (self->stopped_) {
-                return;
-            }
-            try {
-                std::rethrow_exception(std::move(error));
-            } catch (const core::Error &failure) {
-                spdlog::warn("SOCKS5 outbound UDP send failed: {}", failure.context);
-            } catch (...) {
-                spdlog::warn("SOCKS5 outbound UDP send failed");
-            }
-            std::shared_ptr<Path> retired;
-            {
-                std::lock_guard lock(self->paths_mutex_);
-                const auto found = self->paths_.find(path->key);
-                if (found != self->paths_.end() && found->second == path) {
-                    retired = found->second;
-                    self->paths_.erase(found);
-                }
-            }
-            if (retired) {
-                retired->handle->close();
-            }
-        }
-        void set_stopped() && noexcept {}
-    };
     auto self = shared_from_this();
-    // NOTE: the sender must be named before the receiver moves payload away;
-    // argument evaluation order is unspecified (use-after-move otherwise).
-    auto sender = path->handle->async_send_to(boost::asio::buffer(*payload),
-                                              io::DatagramAddress::from_endpoint(path->target));
-    async::start_with_receiver(std::move(sender), SendReceiver{self, path, std::move(payload)});
+    self->scope_.spawn(run_send(self, path, std::move(payload)));
 }
 
 void Socks5UdpListener::receive_response(const std::shared_ptr<Path> &path) {
-    if (stopped_) {
-        return;
-    }
-    struct ReceiveReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<Socks5UdpListener> self;
-        std::shared_ptr<Path> path;
-        void set_value(io::DatagramPacket packet) && noexcept {
-            if (self->stopped_) {
-                return;
-            }
-            self->send_response(
-                path, packet.address,
-                std::span<const std::uint8_t>(path->receive_buffer.data(), packet.size));
-            self->receive_response(path);
-        }
-        void set_error(std::exception_ptr error) && noexcept {
-            if (self->stopped_) {
-                return;
-            }
-            try {
-                std::rethrow_exception(std::move(error));
-            } catch (const core::Error &failure) {
-                spdlog::warn("SOCKS5 outbound UDP receive failed: {}", failure.context);
-            } catch (...) {
-                spdlog::warn("SOCKS5 outbound UDP receive failed");
-            }
-            std::lock_guard lock(self->paths_mutex_);
-            const auto found = self->paths_.find(path->key);
-            if (found != self->paths_.end() && found->second == path) {
-                self->paths_.erase(found);
-            }
-        }
-        void set_stopped() && noexcept {
-            // Teardown aborted the pull; stop() already retired the maps.
-        }
-    };
     auto self = shared_from_this();
-    // NOTE: name the sender first; argument order is unspecified.
-    auto sender = path->handle->async_receive_from(boost::asio::buffer(path->receive_buffer));
-    async::start_with_receiver(std::move(sender), ReceiveReceiver{self, path});
+    self->scope_.spawn(run_response_loop(self, path));
 }
 
-void Socks5UdpListener::send_response(const std::shared_ptr<Path> &path, io::DatagramAddress source,
-                                      std::span<const std::uint8_t> payload) {
-    if (stopped_ || !socket_) {
-        return;
+void Socks5UdpListener::retire_path(std::shared_ptr<Socks5UdpListener> self,
+                                    const std::shared_ptr<Path> &path) {
+    std::shared_ptr<Path> retired;
+    {
+        std::lock_guard lock(self->paths_mutex_);
+        const auto found = self->paths_.find(path->key);
+        if (found != self->paths_.end() && found->second == path) {
+            retired = found->second;
+            self->paths_.erase(found);
+        }
     }
+    if (retired) {
+        retired->handle->close();
+    }
+}
+
+std::shared_ptr<std::vector<std::uint8_t>>
+Socks5UdpListener::build_response_packet(const std::shared_ptr<Path> &path,
+                                         io::DatagramAddress source,
+                                         std::span<const std::uint8_t> payload) {
     const auto address = outbound::detail::encode_proxy_address(
         outbound::detail::to_core_destination(source.to_destination()));
     if (!address) {
-        return;
+        return {};
     }
     auto packet = std::make_shared<std::vector<std::uint8_t>>();
     packet->reserve(3 + address.value().size() + payload.size());
     packet->insert(packet->end(), {0, 0, 0});
     packet->insert(packet->end(), address.value().begin(), address.value().end());
     packet->insert(packet->end(), payload.begin(), payload.end());
-    struct ResponseReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<Socks5UdpListener> self;
-        std::shared_ptr<std::vector<std::uint8_t>> packet;
-        void set_value(std::size_t) && noexcept {}
-        void set_error(std::exception_ptr error) && noexcept {
-            if (self->stopped_) {
-                return;
-            }
-            try {
-                std::rethrow_exception(std::move(error));
-            } catch (const core::Error &failure) {
-                spdlog::warn("SOCKS5 UDP response send failed: {}", failure.context);
-            } catch (...) {
-                spdlog::warn("SOCKS5 UDP response send failed");
-            }
-        }
-        void set_stopped() && noexcept {}
-    };
+    return packet;
+}
+
+void Socks5UdpListener::send_response(const std::shared_ptr<Path> &path, io::DatagramAddress source,
+                                      std::span<const std::uint8_t> payload) {
+    auto packet = build_response_packet(path, source, payload);
+    if (!packet) {
+        return;
+    }
     auto self = shared_from_this();
-    // NOTE: name the sender first; argument order is unspecified.
-    auto sender = socket_->async_send_to(boost::asio::buffer(*packet),
-                                         io::DatagramAddress::from_endpoint(path->client));
-    async::start_with_receiver(std::move(sender), ResponseReceiver{self, std::move(packet)});
+    self->scope_.spawn(run_respond(self, path, std::move(packet)));
+}
+
+exec::task<void> Socks5UdpListener::run_respond(std::shared_ptr<Socks5UdpListener> self,
+                                                std::shared_ptr<Path> path,
+                                                std::shared_ptr<std::vector<std::uint8_t>> packet) {
+    auto socket = self->socket_;
+    if (self->stopped_ || !socket || !packet) {
+        co_return;
+    }
+    try {
+        co_await socket->async_send_to(boost::asio::buffer(*packet),
+                                       io::DatagramAddress::from_endpoint(path->client));
+    } catch (const core::Error &failure) {
+        if (!self->stopped_) {
+            spdlog::warn("SOCKS5 UDP response send failed: {}", failure.context);
+        }
+    } catch (...) {
+        if (!self->stopped_) {
+            spdlog::warn("SOCKS5 UDP response send failed");
+        }
+    }
 }
 
 } // namespace clash_native::proxy

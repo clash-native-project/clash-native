@@ -1,14 +1,14 @@
 #include <clash_native/transport/websocket_client.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/timer.hpp>
+#include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
 #include <boost/beast/core/flat_buffer.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/system/error_code.hpp>
@@ -56,9 +56,9 @@ class WebSocketStreamAdapter {
     lowest_layer_type &lowest_layer() noexcept { return *this; }
     const lowest_layer_type &lowest_layer() const noexcept { return *this; }
 
-    // Drives the sender-based handle to completion on the heap and translates
-    // the terminal signal back into the Asio handler call. Unqualified
-    // completions: the erased sender invokes the receiver as an lvalue.
+    // Beast engine leaf: the C++ sender result is pressed thin back into
+    // the Asio (error, size) completion via the shared net:: helper; the
+    // io:: handle stays the single task-composable primitive.
     template <typename MutableBufferSequence, typename CompletionToken>
     auto async_read_some(const MutableBufferSequence &buffers, CompletionToken &&token) {
         auto first = boost::asio::buffer_sequence_begin(buffers);
@@ -74,25 +74,8 @@ class WebSocketStreamAdapter {
         return boost::asio::async_initiate<CompletionToken,
                                            void(boost::system::error_code, std::size_t)>(
             [handle = std::move(handle), buffer](auto completion_handler) mutable {
-                using Handler = std::decay_t<decltype(completion_handler)>;
-                struct Receiver {
-                    Handler handler;
-                    void set_value(std::optional<std::size_t> count) noexcept {
-                        if (count) {
-                            std::move(handler)(boost::system::error_code{}, *count);
-                        } else {
-                            std::move(handler)(boost::asio::error::eof, std::size_t{0});
-                        }
-                    }
-                    void set_error(std::exception_ptr error) noexcept {
-                        std::move(handler)(unpack_error(std::move(error)), std::size_t{0});
-                    }
-                    void set_stopped() noexcept {
-                        std::move(handler)(boost::asio::error::operation_aborted, std::size_t{0});
-                    }
-                };
-                async::start_with_receiver(handle->async_read_some(buffer),
-                                           Receiver{std::move(completion_handler)});
+                net::start_read_for_handler(handle->async_read_some(buffer),
+                                            std::move(completion_handler));
             },
             token);
     }
@@ -106,27 +89,19 @@ class WebSocketStreamAdapter {
                                            void(boost::system::error_code, std::size_t)>(
             [handle = std::move(handle),
              bytes = std::move(bytes)](auto completion_handler) mutable {
-                using Handler = std::decay_t<decltype(completion_handler)>;
-                struct Receiver {
-                    Handler handler;
-                    std::shared_ptr<std::vector<std::uint8_t>> lifetime;
-                    void set_value(std::size_t count) noexcept {
-                        std::move(handler)(boost::system::error_code{}, count);
-                    }
-                    void set_error(std::exception_ptr error) noexcept {
-                        std::move(handler)(unpack_error(std::move(error)), std::size_t{0});
-                    }
-                    void set_stopped() noexcept {
-                        std::move(handler)(boost::asio::error::operation_aborted, std::size_t{0});
-                    }
-                };
                 // Split sender creation from the move below: function argument
                 // evaluation order is unspecified, so dereferencing bytes for
                 // the sender while moving it into the receiver in one call
                 // risks use-after-move.
                 auto sender = handle->async_write(boost::asio::buffer(*bytes));
-                async::start_with_receiver(
-                    std::move(sender), Receiver{std::move(completion_handler), std::move(bytes)});
+                auto handler = std::move(completion_handler);
+                auto lifetime = std::move(bytes);
+                net::start_write_for_handler(
+                    std::move(sender),
+                    [handler = std::move(handler), lifetime = std::move(lifetime)](
+                        const boost::system::error_code &error, std::size_t size) mutable {
+                        std::move(handler)(error, size);
+                    });
             },
             token);
     }
@@ -779,15 +754,22 @@ class FastOpenUpgradeStream final : public io::StreamHandle {
         return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
             [shared, buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 auto abortable = shared;
-                ValidationLoop::start(std::move(shared), buffer, std::move(terminal));
-                // Handshake-phase stream is owned solely by State; abort closes it to unblock
-                // the validation loop. Serialized with finish()/close() under the state mutex.
+                {
+                    std::unique_lock<std::mutex> lock(shared->mutex_);
+                    shared->pending_terminal_ = std::move(terminal);
+                    shared->pending_buffer_ = buffer;
+                }
+                // Task cannot be connected via start_with_receiver
+                // (exec::task has no connect()); spawn it on the
+                // State-owned scope and bridge the terminal back through
+                // finish_validation. Abort closes the inner stream to
+                // unblock the task's co_awaited pull.
+                shared->scope_.spawn(run_validation(shared));
                 return async::CallbackAbortFn{[abortable] {
                     try {
                         std::unique_lock<std::mutex> lock(abortable->mutex_);
                         abortable->inner_->close();
                     } catch (...) {
-                        // Aborter contract: never throw.
                     }
                 }};
             },
@@ -845,6 +827,9 @@ class FastOpenUpgradeStream final : public io::StreamHandle {
         bool closed_ = false;
         core::Error failure_ = {core::ErrorCode::cancelled, "fast-open upgrade not validated"};
         std::vector<std::uint8_t> remainder_;
+        std::function<void(core::Result<std::optional<std::size_t>>)> pending_terminal_;
+        boost::asio::mutable_buffer pending_buffer_{};
+        exec::async_scope scope_;
     };
 
     explicit FastOpenUpgradeStream(std::unique_ptr<io::StreamHandle> stream)
@@ -852,155 +837,99 @@ class FastOpenUpgradeStream final : public io::StreamHandle {
         state_->inner_ = std::move(stream);
     }
 
-    // Self-driving 101 validation loop. Calls the terminal exactly once on
-    // every path; a destroyed outer operation drops the late terminal via
-    // the callback sender's settlement flag. The loop is bounded by the
-    // response size guard and by close(), which unblocks the inner read.
-    // NOTE: no shared_from_this anywhere in this loop; ownership flows
-    // explicitly through shared_ptr parameters.
-    struct ValidationLoop : public std::enable_shared_from_this<ValidationLoop> {
-        std::shared_ptr<State> state;
+    // 101 validation as a single task: each inner pull is co_awaited
+    // directly (cancellable via abort/close); the terminal travels via the
+    // State pending slot so no Step/Serve receivers remain.
+    static exec::task<void> run_validation(std::shared_ptr<State> state) {
         boost::asio::mutable_buffer buffer;
-        std::function<void(core::Result<std::optional<std::size_t>>)> terminal;
-        std::string head_;
-        std::array<std::uint8_t, 1024> chunk_{};
-
-        ValidationLoop(std::shared_ptr<State> state, boost::asio::mutable_buffer buffer,
-                       std::function<void(core::Result<std::optional<std::size_t>>)> terminal)
-            : state(std::move(state)), buffer(buffer), terminal(std::move(terminal)) {}
-
-        static void start(std::shared_ptr<State> state, boost::asio::mutable_buffer buffer,
-                          std::function<void(core::Result<std::optional<std::size_t>>)> terminal) {
-            auto loop = std::shared_ptr<ValidationLoop>(
-                new ValidationLoop(std::move(state), std::move(buffer), std::move(terminal)));
-            step(std::move(loop));
+        {
+            std::unique_lock<std::mutex> lock(state->mutex_);
+            buffer = state->pending_buffer_;
         }
-
-        struct StepReceiver {
-            std::shared_ptr<ValidationLoop> owner;
-            void set_value(std::optional<std::size_t> got) noexcept {
-                ValidationLoop::on_read(std::move(owner), std::move(got));
-            }
-            void set_error(std::exception_ptr error) noexcept {
-                ValidationLoop::on_error(std::move(owner), std::move(error));
-            }
-            void set_stopped() noexcept { ValidationLoop::on_stopped(std::move(owner)); }
-        };
-
-        static void step(std::shared_ptr<ValidationLoop> self) {
-            // NOTE: name the sender first; argument evaluation order is
-            // unspecified and moving self into the receiver first would
-            // null it before the sender is built.
-            auto sender = self->state->inner_->async_read_some(boost::asio::buffer(self->chunk_));
-            async::start_with_receiver(std::move(sender), StepReceiver{std::move(self)});
-        }
-
-        static void on_read(std::shared_ptr<ValidationLoop> self, std::optional<std::size_t> got) {
-            if (!got) {
-                finish(std::move(self), core::fail(handshake_error(boost::asio::error::eof)));
-                return;
-            }
-            self->head_.append(reinterpret_cast<const char *>(self->chunk_.data()), *got);
-            if (self->head_.find("\r\n\r\n") == std::string::npos) {
-                if (self->head_.size() > 64 * 1024) {
-                    finish(std::move(self),
-                           core::fail(handshake_error(boost::asio::error::message_size)));
-                    return;
-                }
-                step(std::move(self));
-                return;
-            }
-            const auto status_line = self->head_.substr(0, self->head_.find("\r\n"));
-            const auto lower_head = lower_copy(self->head_);
-            const bool accepted = status_line.size() >= 12 && status_line.substr(9, 3) == "101" &&
-                                  lower_head.find("\nconnection:") != std::string::npos &&
-                                  lower_head.find("upgrade") != std::string::npos &&
-                                  lower_head.find("\nupgrade:") != std::string::npos &&
-                                  lower_head.find("websocket") != std::string::npos;
-            if (!accepted) {
-                finish(std::move(self), core::fail(handshake_error(boost::asio::error::fault)));
-                return;
-            }
-            const auto body_start = self->head_.find("\r\n\r\n") + 4;
-            std::unique_lock<std::mutex> lock(self->state->mutex_);
-            self->state->remainder_.assign(
-                self->head_.begin() + static_cast<std::ptrdiff_t>(body_start), self->head_.end());
-            self->state->validated_ = true;
-            if (!self->state->remainder_.empty()) {
-                const auto count =
-                    std::min<std::size_t>(self->state->remainder_.size(), self->buffer.size());
-                std::memcpy(self->buffer.data(), self->state->remainder_.data(), count);
-                self->state->remainder_.erase(self->state->remainder_.begin(),
-                                              self->state->remainder_.begin() +
-                                                  static_cast<std::ptrdiff_t>(count));
-                lock.unlock();
-                finish(std::move(self), std::optional<std::size_t>{count});
-                return;
-            }
-            lock.unlock();
-            auto sender = self->state->inner_->async_read_some(self->buffer);
-            async::start_with_receiver(std::move(sender), ServeReceiver{std::move(self)});
-        }
-
-        struct ServeReceiver {
-            std::shared_ptr<ValidationLoop> owner;
-            void set_value(std::optional<std::size_t> got) noexcept {
-                ValidationLoop::finish(std::move(owner), std::move(got));
-            }
-            void set_error(std::exception_ptr error) noexcept {
-                ValidationLoop::finish(std::move(owner),
-                                       core::fail(ServeReceiver::map_error(std::move(error))));
-            }
-            void set_stopped() noexcept {
-                ValidationLoop::finish(std::move(owner),
-                                       core::fail(core::Error{core::ErrorCode::cancelled,
-                                                              "fast-open upgrade read cancelled"}));
-            }
-
-            static core::Error map_error(std::exception_ptr error) {
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    return failure;
-                } catch (...) {
-                }
-                return core::Error{core::ErrorCode::carrier_handshake,
-                                   "fast-open upgrade read failed"};
-            }
-        };
-
-        static void on_error(std::shared_ptr<ValidationLoop> self, std::exception_ptr error) {
+        std::string head;
+        std::array<std::uint8_t, 1024> chunk{};
+        while (head.find("\r\n\r\n") == std::string::npos) {
+            std::optional<std::size_t> got;
             try {
-                std::rethrow_exception(std::move(error));
+                got = co_await state->inner_->async_read_some(boost::asio::buffer(chunk));
             } catch (const core::Error &failure) {
-                finish(std::move(self), core::fail(failure));
-                return;
+                finish_validation(state, core::fail(failure));
+                co_return;
             } catch (...) {
+                finish_validation(
+                    state, core::fail(core::Error{core::ErrorCode::carrier_handshake,
+                                                  "fast-open upgrade validation read failed"}));
+                co_return;
             }
-            finish(std::move(self), core::fail(core::Error{core::ErrorCode::carrier_handshake,
-                                                           "fast-open upgrade validation read "
-                                                           "failed"}));
+            if (!got) {
+                finish_validation(state, core::fail(handshake_error(boost::asio::error::eof)));
+                co_return;
+            }
+            head.append(reinterpret_cast<const char *>(chunk.data()), *got);
+            if (head.size() > 64 * 1024) {
+                finish_validation(state,
+                                  core::fail(handshake_error(boost::asio::error::message_size)));
+                co_return;
+            }
         }
-
-        static void on_stopped(std::shared_ptr<ValidationLoop> self) {
-            finish(std::move(self), core::fail(core::Error{core::ErrorCode::cancelled,
-                                                           "fast-open upgrade validation "
-                                                           "cancelled"}));
+        const auto status_line = head.substr(0, head.find("\r\n"));
+        const auto lower_head = lower_copy(head);
+        const bool accepted = status_line.size() >= 12 && status_line.substr(9, 3) == "101" &&
+                              lower_head.find("\nconnection:") != std::string::npos &&
+                              lower_head.find("upgrade") != std::string::npos &&
+                              lower_head.find("\nupgrade:") != std::string::npos &&
+                              lower_head.find("websocket") != std::string::npos;
+        if (!accepted) {
+            finish_validation(state, core::fail(handshake_error(boost::asio::error::fault)));
+            co_return;
         }
+        const auto body_start = head.find("\r\n\r\n") + 4;
+        {
+            std::unique_lock<std::mutex> lock(state->mutex_);
+            state->remainder_.assign(head.begin() + static_cast<std::ptrdiff_t>(body_start),
+                                     head.end());
+            state->validated_ = true;
+            if (!state->remainder_.empty()) {
+                const auto count = std::min<std::size_t>(state->remainder_.size(), buffer.size());
+                std::memcpy(buffer.data(), state->remainder_.data(), count);
+                state->remainder_.erase(state->remainder_.begin(),
+                                        state->remainder_.begin() +
+                                            static_cast<std::ptrdiff_t>(count));
+                lock.unlock();
+                finish_validation(state, std::optional<std::size_t>{count});
+                co_return;
+            }
+        }
+        try {
+            auto got = co_await state->inner_->async_read_some(buffer);
+            finish_validation(state, std::move(got));
+        } catch (const core::Error &failure) {
+            finish_validation(state, core::fail(failure));
+        } catch (...) {
+            finish_validation(state, core::fail(core::Error{core::ErrorCode::carrier_handshake,
+                                                            "fast-open upgrade read failed"}));
+        }
+    }
 
-        static void finish(std::shared_ptr<ValidationLoop> self,
-                           core::Result<std::optional<std::size_t>> result) {
+    static void finish_validation(std::shared_ptr<State> state,
+                                  core::Result<std::optional<std::size_t>> result) {
+        std::function<void(core::Result<std::optional<std::size_t>>)> terminal;
+        {
+            std::unique_lock<std::mutex> lock(state->mutex_);
+            terminal = std::move(state->pending_terminal_);
+            state->pending_terminal_ = nullptr;
             if (!result) {
-                std::unique_lock<std::mutex> lock(self->state->mutex_);
-                if (!self->state->validated_ && !self->state->failed_) {
-                    self->state->failed_ = true;
-                    self->state->failure_ = result.error();
-                    self->state->inner_->close();
+                if (!state->validated_ && !state->failed_) {
+                    state->failed_ = true;
+                    state->failure_ = result.error();
+                    state->inner_->close();
                 }
             }
-            self->terminal(std::move(result));
         }
-    };
+        if (terminal) {
+            terminal(std::move(result));
+        }
+    }
 
     std::shared_ptr<State> state_;
 };
@@ -1012,7 +941,7 @@ class WebSocketClientHandshakeOperation final
                                       WebSocketClientOptions options,
                                       WebSocketClientHandler handler)
         : executor_(stream->executor()), stream_(std::move(stream)), options_(std::move(options)),
-          handler_(std::move(handler)), timer_(executor_) {}
+          handler_(std::move(handler)) {}
 
     void start() {
         const auto self = shared_from_this();
@@ -1121,6 +1050,17 @@ class WebSocketClientHandshakeOperation final
         self->finish(std::unique_ptr<io::StreamHandle>(std::move(self->stream_)));
     }
 
+    static exec::task<void> run_deadline(std::shared_ptr<WebSocketClientHandshakeOperation> self,
+                                         boost::asio::any_io_executor executor,
+                                         std::chrono::steady_clock::time_point deadline) {
+        try {
+            co_await async::sleep_until(executor, deadline);
+        } catch (...) {
+            co_return;
+        }
+        self->finish(core::fail(timeout_error()));
+    }
+
     static exec::task<void> run_open(std::shared_ptr<WebSocketClientHandshakeOperation> self) {
         if (const auto error = validate_options(self->options_)) {
             self->finish(core::fail(*error));
@@ -1131,12 +1071,9 @@ class WebSocketClientHandshakeOperation final
                 self->finish(core::fail(timeout_error()));
                 co_return;
             }
-            self->timer_.expires_at(*self->options_.deadline);
-            self->timer_.async_wait([self](const boost::system::error_code &error) {
-                if (!error) {
-                    self->finish(core::fail(timeout_error()));
-                }
-            });
+            auto deadline = *self->options_.deadline;
+            auto executor = self->executor_;
+            self->scope_.spawn(run_deadline(self, executor, deadline));
         }
         if (self->options_.tls) {
             TlsClientOptions tls_options;
@@ -1309,7 +1246,6 @@ class WebSocketClientHandshakeOperation final
             return;
         }
         completed_ = true;
-        (void)timer_.cancel();
         if (!result) {
             if (websocket_) {
                 websocket_->next_layer().close();
@@ -1333,7 +1269,6 @@ class WebSocketClientHandshakeOperation final
     WebSocketClientOptions options_;
     WebSocketClientHandler handler_;
     std::shared_ptr<BeastWebSocket> websocket_;
-    boost::asio::steady_timer timer_;
     bool completed_ = false;
     exec::async_scope scope_;
 };

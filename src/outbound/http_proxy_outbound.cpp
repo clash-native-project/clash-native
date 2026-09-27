@@ -1,4 +1,5 @@
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/core/base64.hpp>
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
@@ -11,13 +12,13 @@
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/connect.hpp>
-#include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
 
 #include <exec/asio/use_sender.hpp>
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
+
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -97,25 +98,18 @@ class HttpProxyTunnelStream final : public io::StreamHandle {
     std::shared_ptr<io::ExchangeSession> session_;
 };
 
-class HttpProxyConnectOperation final
-    : public std::enable_shared_from_this<HttpProxyConnectOperation> {
+class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProxyConnectState> {
   public:
-    HttpProxyConnectOperation(runtime::AsioRuntime &runtime,
-                              std::shared_ptr<dns::ResolverService> resolver,
-                              HttpProxyOutboundConfig config, core::StreamRequest request,
-                              core::StreamOpenHandler handler)
+    HttpProxyConnectState(runtime::AsioRuntime &runtime,
+                          std::shared_ptr<dns::ResolverService> resolver,
+                          HttpProxyOutboundConfig config, core::StreamRequest request,
+                          core::StreamOpenHandler handler)
         : runtime_(runtime), resolver_(std::move(resolver)), config_(std::move(config)),
           request_(std::move(request)),
           socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.serialized_executor())),
-          timer_(runtime.serialized_executor()), handler_(std::move(handler)) {}
+          handler_(std::move(handler)) {}
 
     void start() {
-        const auto self = shared_from_this();
-        boost::asio::dispatch(runtime_.serialized_executor(), [self] { self->start_on_owner(); });
-    }
-
-  private:
-    void start_on_owner() {
         const auto validation = validate_config(config_);
         if (!validation) {
             finish(core::StreamOpenResult::failed(validation.error()));
@@ -126,27 +120,43 @@ class HttpProxyConnectOperation final
                 {core::ErrorCode::configuration, "HTTP proxy target port must be non-zero"}));
             return;
         }
-
         deadline_ = std::chrono::steady_clock::now() + kConnectTimeout;
-        timer_.expires_at(deadline_);
-        timer_.async_wait([self = shared_from_this()](const boost::system::error_code &error) {
-            if (!error) {
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::timeout, "timed out opening HTTP proxy tunnel"}));
-            }
-        });
-
         auto self = shared_from_this();
-        detail::resolve_host(runtime_, resolver_, config_.server_host,
-                             [self](core::Result<detail::AddressList> result) mutable {
-                                 boost::asio::dispatch(
-                                     self->runtime_.serialized_executor(),
-                                     [self, result = std::move(result)]() mutable {
-                                         self->resolved(std::move(result));
-                                     });
-                             });
+        // Deadline task races the connect chain; teardown stays
+        // guard-driven, so no stop is ever requested.
+        scope_.spawn(run(self));
+        scope_.spawn(run_deadline(self));
     }
 
+    // Abort for sender-driven cancellation: posted to the strand so it stays
+    // ordered with finish(). Marks completion so the chain task bails at its
+    // next guard and stops the scope so stop propagates into the awaits;
+    // the callback_sender settlement drops the late terminal.
+    void abort() noexcept {
+        auto self = shared_from_this();
+        try {
+            // Runtime outlives every operation; socket_ may already be moved
+            // into the stream chain, so never touch it here.
+            boost::asio::post(runtime_.serialized_executor(), [self]() {
+                if (self->completed_) {
+                    return;
+                }
+                self->completed_ = true;
+                self->scope_.request_stop();
+                boost::system::error_code ignored;
+                if (self->socket_) {
+                    self->socket_->cancel(ignored);
+                    self->socket_->close(ignored);
+                }
+                if (self->session_) {
+                    self->session_->stop();
+                }
+            });
+        } catch (...) {
+        }
+    }
+
+  private:
     static core::Status validate_config(const HttpProxyOutboundConfig &config) {
         if (config.id.empty() || config.server_host.empty() || config.server_port == 0) {
             return core::fail({core::ErrorCode::configuration,
@@ -164,12 +174,32 @@ class HttpProxyConnectOperation final
         return {};
     }
 
-    // Straight-line connect chain: TCP connect, optional TLS handshake,
-    // HTTP session, CONNECT tunnel. Every terminal funnels through finish(),
-    // so the spawned task always ends with a value.
-    static exec::task<void>
-    run(std::shared_ptr<HttpProxyConnectOperation> self,
-        std::shared_ptr<std::vector<boost::asio::ip::tcp::endpoint>> endpoints) {
+    // Straight-line connect chain: resolve, TCP connect, optional TLS
+    // handshake, HTTP session, CONNECT tunnel. Every terminal funnels
+    // through finish(), so the spawned task always ends with a value unless
+    // an outer stop ends it early.
+    static exec::task<void> run(std::shared_ptr<HttpProxyConnectState> self) {
+        core::Result<detail::AddressList> resolved;
+        try {
+            resolved = co_await detail::resolve_host_sender(self->runtime_, self->resolver_,
+                                                            self->config_.server_host);
+        } catch (...) {
+            self->finish(core::StreamOpenResult::failed(
+                {core::ErrorCode::resolution, "failed to resolve HTTP proxy server"}));
+            co_return;
+        }
+        if (self->completed_) {
+            co_return;
+        }
+        if (!resolved) {
+            self->finish(core::StreamOpenResult::failed(resolved.error()));
+            co_return;
+        }
+        auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
+        endpoints->reserve(resolved.value().size());
+        for (const auto &address : resolved.value()) {
+            endpoints->emplace_back(address, self->config_.server_port);
+        }
         try {
             try {
                 co_await (
@@ -296,50 +326,16 @@ class HttpProxyConnectOperation final
         co_return;
     }
 
-    void resolved(core::Result<detail::AddressList> result) {
-        if (completed_) {
-            return;
-        }
-        if (!result) {
-            finish(core::StreamOpenResult::failed(result.error()));
-            return;
-        }
-        auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
-        endpoints->reserve(result.value().size());
-        for (const auto &address : result.value()) {
-            endpoints->emplace_back(address, config_.server_port);
-        }
-        // The scope only owns this chain task (merge-shaped usage);
-        // teardown stays guard-driven, so no stop is ever requested.
-        scope_.spawn(run(shared_from_this(), std::move(endpoints)));
-    }
-
-  public:
-    // Abort for sender-driven cancellation: posted to the strand so it stays
-    // ordered with finish(). Marks completion so the chain task bails at its
-    // next guard; the bridge drops the late terminal.
-    void abort() noexcept {
-        auto self = shared_from_this();
+    static exec::task<void> run_deadline(std::shared_ptr<HttpProxyConnectState> self) {
         try {
-            // Runtime outlives every operation; socket_ may already be moved
-            // into the stream chain, so never touch it here.
-            boost::asio::post(runtime_.serialized_executor(), [self]() {
-                if (self->completed_) {
-                    return;
-                }
-                self->completed_ = true;
-                boost::system::error_code ignored;
-                (void)self->timer_.cancel();
-                if (self->socket_) {
-                    self->socket_->cancel(ignored);
-                    self->socket_->close(ignored);
-                }
-            });
+            co_await async::sleep_after(self->runtime_.serialized_executor(), kConnectTimeout);
         } catch (...) {
+            co_return;
         }
+        self->finish(core::StreamOpenResult::failed(
+            {core::ErrorCode::timeout, "timed out opening HTTP proxy tunnel"}));
     }
 
-  private:
     void finish(core::StreamOpenResult result) {
         if (completed_) {
             if (result.handle) {
@@ -348,7 +344,6 @@ class HttpProxyConnectOperation final
             return;
         }
         completed_ = true;
-        (void)timer_.cancel();
         if (!result.succeeded()) {
             boost::system::error_code ignored;
             if (socket_) {
@@ -373,9 +368,8 @@ class HttpProxyConnectOperation final
     core::StreamRequest request_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
     std::shared_ptr<io::ExchangeSession> session_;
-    // Owns the single connect chain task, which always ends with a value.
+    // Owns the connect/deadline chain tasks, which always end with a value.
     exec::async_scope scope_;
-    boost::asio::steady_timer timer_;
     core::StreamOpenHandler handler_;
     std::chrono::steady_clock::time_point deadline_{};
     bool completed_ = false;
@@ -415,19 +409,21 @@ core::OutboundCapabilities HttpProxyOutbound::capabilities() const noexcept {
 
 io::AnySender<core::StreamOpenResult>
 HttpProxyOutbound::connect_stream(core::StreamRequest request) {
-    auto &runtime = runtime_;
-    auto resolver = resolver_;
-    auto config = config_;
-    return async::bridge_sender<core::StreamOpenResult>(
-        [&runtime, resolver = std::move(resolver), config = std::move(config),
-         request =
-             std::move(request)](async::BridgeHandler<core::StreamOpenResult> terminal) mutable {
-            auto operation = std::make_shared<HttpProxyConnectOperation>(
+    using Signatures = stdexec::completion_signatures<stdexec::set_value_t(core::StreamOpenResult),
+                                                      stdexec::set_error_t(std::exception_ptr),
+                                                      stdexec::set_stopped_t()>;
+    return io::AnySender<core::StreamOpenResult>{async::callback_sender<Signatures>(
+        [&runtime = runtime_, resolver = resolver_, config = config_,
+         request = std::move(request)](auto terminal) mutable -> async::CallbackAbortFn {
+            auto state = std::make_shared<HttpProxyConnectState>(
                 runtime, std::move(resolver), std::move(config), std::move(request),
-                std::move(terminal));
-            operation->start();
-            return async::CallbackAbortFn{[operation] { operation->abort(); }};
-        });
+                core::StreamOpenHandler{std::move(terminal)});
+            state->start();
+            return async::CallbackAbortFn{[state] { state->abort(); }};
+        },
+        [](stdexec::receiver auto &&receiver, core::StreamOpenResult result) {
+            stdexec::set_value(std::forward<decltype(receiver)>(receiver), std::move(result));
+        })};
 }
 
 io::AnySender<core::DatagramOpenResult> HttpProxyOutbound::open_datagram(core::DatagramRequest) {

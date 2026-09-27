@@ -1,12 +1,12 @@
 #include "proxy_session.hpp"
 
-#include <clash_native/async/start_with_receiver.hpp>
-
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 
 #include <exec/asio/use_sender.hpp>
 #include <exec/task.hpp>
+
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
 #include <iterator>
@@ -43,21 +43,8 @@ std::optional<std::size_t> null_position(const std::vector<std::uint8_t> &payloa
 
 exec::task<void> ProxySession::run_socks4_request(std::shared_ptr<ProxySession> self) {
     try {
-        co_await (boost::asio::async_read(self->client_,
-                                          boost::asio::buffer(self->socks4_request_.data() + 1,
-                                                              self->socks4_request_.size() - 1),
-                                          exec::asio::use_sender) |
-                  stdexec::then([](std::size_t) {}) |
-                  stdexec::let_error([](std::exception_ptr error) {
-                      try {
-                          std::rethrow_exception(std::move(error));
-                      } catch (const boost::system::system_error &failure) {
-                          return stdexec::just_error(std::make_exception_ptr(core::Error{
-                              core::ErrorCode::transport_io, "SOCKS4 handshake read failed",
-                              std::error_code(failure.code().value(), std::system_category())}));
-                      }
-                      std::rethrow_exception(std::current_exception());
-                  }));
+        co_await read_handshake_exact(self, boost::asio::buffer(self->socks4_request_.data() + 1,
+                                                                self->socks4_request_.size() - 1));
     } catch (...) {
         self->close();
         co_return;
@@ -66,113 +53,82 @@ exec::task<void> ProxySession::run_socks4_request(std::shared_ptr<ProxySession> 
         self->close();
         co_return;
     }
+    // NUL-terminated user-id then (for SOCKS4a) domain via one shared task
+    // helper instead of two re-armed receivers.
+    try {
+        self->socks4_user_id_ = co_await read_socks4_cstring(self);
+    } catch (...) {
+        self->close();
+        co_return;
+    }
+    if (self->socks4_user_id_.size() > kSocks4MaximumStringLength) {
+        self->close();
+        co_return;
+    }
+    if (self->owner_.socks5_users_.empty()) {
+        self->authenticated_user_ =
+            std::string(self->socks4_user_id_.begin(), self->socks4_user_id_.end());
+    } else {
+        const auto user =
+            std::find_if(self->owner_.socks5_users_.begin(), self->owner_.socks5_users_.end(),
+                         [self](const Socks5User &candidate) {
+                             return candidate.password.empty() &&
+                                    candidate.username.size() == self->socks4_user_id_.size() &&
+                                    std::equal(candidate.username.begin(), candidate.username.end(),
+                                               self->socks4_user_id_.begin());
+                         });
+        if (user == self->owner_.socks5_users_.end()) {
+            self->send_socks4_reply(kSocks4IdentdMismatched, false);
+            co_return;
+        }
+        self->authenticated_user_ = user->username;
+    }
+    if (is_socks4a_address(self->socks4_request_)) {
+        try {
+            self->socks4_domain_ = co_await read_socks4_cstring(self);
+        } catch (...) {
+            self->close();
+            co_return;
+        }
+        if (self->socks4_domain_.empty() ||
+            self->socks4_domain_.size() > kSocks4MaximumStringLength) {
+            self->send_socks4_reply(kSocks4Rejected, false);
+            co_return;
+        }
+    }
+    self->open_socks4_target();
+}
+
+exec::task<std::vector<std::uint8_t>>
+ProxySession::read_socks4_cstring(std::shared_ptr<ProxySession> self) {
     self->socks4_payload_.clear();
-    self->read_socks4_user_id();
-}
-
-void ProxySession::read_socks4_user_id() {
-    if (const auto position = null_position(socks4_payload_)) {
-        if (*position > kSocks4MaximumStringLength) {
-            close();
-            return;
+    std::array<std::uint8_t, 1024> chunk{};
+    while (true) {
+        if (const auto position = null_position(self->socks4_payload_)) {
+            std::vector<std::uint8_t> text(self->socks4_payload_.begin(),
+                                           self->socks4_payload_.begin() +
+                                               static_cast<std::ptrdiff_t>(*position));
+            self->socks4_payload_.erase(self->socks4_payload_.begin(),
+                                        self->socks4_payload_.begin() +
+                                            static_cast<std::ptrdiff_t>(*position + 1));
+            co_return text;
         }
-        socks4_user_id_.assign(socks4_payload_.begin(),
-                               socks4_payload_.begin() + static_cast<std::ptrdiff_t>(*position));
-        socks4_payload_.erase(socks4_payload_.begin(),
-                              socks4_payload_.begin() + static_cast<std::ptrdiff_t>(*position + 1));
-
-        if (owner_.socks5_users_.empty()) {
-            authenticated_user_ = std::string(socks4_user_id_.begin(), socks4_user_id_.end());
-        } else {
-            const auto user = std::find_if(
-                owner_.socks5_users_.begin(), owner_.socks5_users_.end(),
-                [this](const Socks5User &candidate) {
-                    return candidate.password.empty() &&
-                           candidate.username.size() == socks4_user_id_.size() &&
-                           std::equal(candidate.username.begin(), candidate.username.end(),
-                                      socks4_user_id_.begin());
-                });
-            if (user == owner_.socks5_users_.end()) {
-                send_socks4_reply(kSocks4IdentdMismatched, false);
-                return;
-            }
-            authenticated_user_ = user->username;
+        if (self->socks4_payload_.size() > kSocks4MaximumStringLength) {
+            throw core::Error{core::ErrorCode::protocol_framing, "SOCKS4 string too long"};
         }
-
-        if (is_socks4a_address(socks4_request_)) {
-            read_socks4_domain();
-        } else {
-            open_socks4_target();
+        std::optional<std::size_t> pulled;
+        try {
+            pulled = co_await self->client_.async_read_some(boost::asio::buffer(chunk));
+        } catch (...) {
+            throw core::Error{core::ErrorCode::transport_io, "SOCKS4 handshake read failed"};
         }
-        return;
+        if (!pulled || *pulled == 0 ||
+            self->socks4_payload_.size() + *pulled > kSocks4MaximumStringLength + 1) {
+            throw core::Error{core::ErrorCode::protocol_framing, "SOCKS4 string too long"};
+        }
+        self->socks4_payload_.insert(self->socks4_payload_.end(), chunk.begin(),
+                                     chunk.begin() + static_cast<std::ptrdiff_t>(*pulled));
     }
-
-    if (socks4_payload_.size() > kSocks4MaximumStringLength) {
-        close();
-        return;
-    }
-    auto self = shared_from_this();
-    auto buffer = std::make_shared<std::array<std::uint8_t, 1024>>();
-    struct UserIdReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<ProxySession> self;
-        std::shared_ptr<std::array<std::uint8_t, 1024>> buffer;
-        void set_value(std::optional<std::size_t> size) && noexcept {
-            if (!size || *size == 0 ||
-                self->socks4_payload_.size() + *size > kSocks4MaximumStringLength + 1) {
-                self->close();
-                return;
-            }
-            self->socks4_payload_.insert(self->socks4_payload_.end(), buffer->begin(),
-                                         buffer->begin() + static_cast<std::ptrdiff_t>(*size));
-            self->read_socks4_user_id();
-        }
-        void set_error(std::exception_ptr) && noexcept { self->close(); }
-        void set_stopped() && noexcept { self->close(); }
-    };
-    auto sender = client_.async_read_some(boost::asio::buffer(*buffer));
-    async::start_with_receiver(std::move(sender), UserIdReceiver{self, buffer});
-}
-
-void ProxySession::read_socks4_domain() {
-    if (const auto position = null_position(socks4_payload_)) {
-        if (*position == 0 || *position > kSocks4MaximumStringLength) {
-            send_socks4_reply(kSocks4Rejected, false);
-            return;
-        }
-        socks4_domain_.assign(socks4_payload_.begin(),
-                              socks4_payload_.begin() + static_cast<std::ptrdiff_t>(*position));
-        socks4_payload_.erase(socks4_payload_.begin(),
-                              socks4_payload_.begin() + static_cast<std::ptrdiff_t>(*position + 1));
-        open_socks4_target();
-        return;
-    }
-
-    if (socks4_payload_.size() > kSocks4MaximumStringLength) {
-        close();
-        return;
-    }
-    auto self = shared_from_this();
-    auto buffer = std::make_shared<std::array<std::uint8_t, 1024>>();
-    struct DomainReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<ProxySession> self;
-        std::shared_ptr<std::array<std::uint8_t, 1024>> buffer;
-        void set_value(std::optional<std::size_t> size) && noexcept {
-            if (!size || *size == 0 ||
-                self->socks4_payload_.size() + *size > kSocks4MaximumStringLength + 1) {
-                self->close();
-                return;
-            }
-            self->socks4_payload_.insert(self->socks4_payload_.end(), buffer->begin(),
-                                         buffer->begin() + static_cast<std::ptrdiff_t>(*size));
-            self->read_socks4_domain();
-        }
-        void set_error(std::exception_ptr) && noexcept { self->close(); }
-        void set_stopped() && noexcept { self->close(); }
-    };
-    auto sender = client_.async_read_some(boost::asio::buffer(*buffer));
-    async::start_with_receiver(std::move(sender), DomainReceiver{self, buffer});
 }
 
 void ProxySession::open_socks4_target() {

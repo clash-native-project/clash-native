@@ -1,13 +1,13 @@
 #pragma once
 
-#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/transport/quic_client.hpp>
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include <boost/asio/ip/udp.hpp>
-#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
 
 #include <atomic>
@@ -77,14 +77,11 @@ class QuicDnsTransport final : public DnsTransport,
 class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Operation> {
   public:
     struct Exchange {
-        Exchange(DnsExchangeId exchange_id, DnsExchangeRequest exchange_request,
-                 boost::asio::any_io_executor executor)
-            : id(exchange_id), request(std::move(exchange_request)),
-              deadline_timer(std::move(executor)) {}
+        Exchange(DnsExchangeId exchange_id, DnsExchangeRequest exchange_request)
+            : id(exchange_id), request(std::move(exchange_request)) {}
 
         DnsExchangeId id;
         DnsExchangeRequest request;
-        boost::asio::steady_timer deadline_timer;
         std::int64_t stream_id = -1;
         // The io:: vocabulary cancels through the stop token, so the
         // exchange id degrades to a started flag (late terminals are
@@ -105,6 +102,11 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
     friend class QuicDnsTransport;
 
     void start_on_strand();
+    static exec::task<void> run_open(std::shared_ptr<Operation> self,
+                                     core::Destination destination);
+    static exec::task<void> run_deadline(std::shared_ptr<Operation> self, DnsExchangeId id,
+                                         std::chrono::steady_clock::time_point deadline);
+    static exec::task<void> run_idle(std::shared_ptr<Operation> self, std::uint64_t generation);
     void add_exchange(DnsExchangeId id, DnsExchangeRequest request);
     void cancel_exchange(DnsExchangeId id, core::Error error);
     void cancel_all();
@@ -124,6 +126,9 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
 
     void open_pending_http3_exchanges();
     void submit_http3_exchange(const std::shared_ptr<Exchange> &exchange);
+    static exec::task<void> run_http3_exchange(std::shared_ptr<Operation> self, DnsExchangeId id,
+                                               io::ExchangeRequest request,
+                                               std::chrono::steady_clock::time_point deadline);
     void on_http3_result(DnsExchangeId id, core::Result<io::ExchangeResponse> result);
 
     void decode_dns_response(Exchange &exchange, std::span<const std::uint8_t> wire);
@@ -137,7 +142,6 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
 
   private:
     QuicDnsTransport &owner_;
-    boost::asio::steady_timer idle_timer_;
     DnsTransportMode mode_;
     std::string host_;
     std::uint16_t port_;
@@ -146,12 +150,16 @@ class QuicDnsTransport::Operation final : public std::enable_shared_from_this<Op
     std::string path_;
     std::shared_ptr<transport::QuicClientConnection> quic_;
     std::shared_ptr<io::ExchangeSession> http3_;
+    // Owns per-exchange run_http3_exchange tasks, which always end with
+    // a value. Shared with DnsSvc's timer rework; never request_stop()ed.
+    exec::async_scope scope_;
     std::unordered_map<DnsExchangeId, std::shared_ptr<Exchange>> exchanges_;
     std::unordered_map<std::int64_t, std::shared_ptr<Exchange>> stream_exchanges_;
     std::deque<DnsExchangeId> pending_exchanges_;
     bool started_ = false;
     bool handshake_completed_ = false;
     bool idle_ = false;
+    std::uint64_t idle_generation_ = 0;
     bool retired_ = false;
 };
 

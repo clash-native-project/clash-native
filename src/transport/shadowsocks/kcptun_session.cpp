@@ -2,6 +2,7 @@
 
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/io/stream_handle.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 
@@ -9,7 +10,6 @@
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
 
 #include <algorithm>
 #include <array>
@@ -104,8 +104,7 @@ class KcptunMuxStream final : public io::StreamHandle {
 class KcptunMuxSession final : public std::enable_shared_from_this<KcptunMuxSession> {
   public:
     KcptunMuxSession(std::unique_ptr<io::StreamHandle> carrier, KcptunClientOptions options)
-        : carrier_(std::move(carrier)), options_(std::move(options)),
-          keepalive_timer_(carrier_->executor()) {}
+        : carrier_(std::move(carrier)), options_(std::move(options)) {}
 
     ~KcptunMuxSession() { close(); }
 
@@ -162,7 +161,6 @@ class KcptunMuxSession final : public std::enable_shared_from_this<KcptunMuxSess
 
     std::unique_ptr<io::StreamHandle> carrier_;
     KcptunClientOptions options_;
-    boost::asio::steady_timer keepalive_timer_;
     std::array<std::uint8_t, kHeaderSize> header_buffer_{};
     std::deque<QueuedFrame> queued_frames_;
     std::unordered_map<std::uint32_t, std::shared_ptr<KcptunMuxStreamState>> streams_;
@@ -620,32 +618,25 @@ void KcptunMuxSession::pump_write() {
     queued_frames_.pop_front();
     auto bytes = frame.bytes;
     auto completed = std::move(frame.completed);
-    struct WriteReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<KcptunMuxSession> self;
-        std::shared_ptr<std::vector<std::uint8_t>> bytes;
-        std::function<void(const boost::system::error_code &)> completed;
-        void set_value(std::size_t) && noexcept {
-            self->write_in_progress_ = false;
-            if (completed) {
-                completed(boost::system::error_code{});
-            }
-            self->pump_write();
-        }
-        void set_error(std::exception_ptr error) && noexcept {
-            self->write_in_progress_ = false;
-            const auto code = unpack_transport_error(std::move(error));
-            if (completed) {
-                completed(code);
-            }
-            self->fail(code);
-        }
-        void set_stopped() && noexcept { self->write_in_progress_ = false; }
-    };
+    auto self = shared_from_this();
+    // NOTE: name the sender first; argument order is unspecified.
     auto sender = carrier_->async_write(boost::asio::buffer(*bytes));
-    async::start_with_receiver(
-        std::move(sender),
-        WriteReceiver{shared_from_this(), std::move(bytes), std::move(completed)});
+    net::start_write_for_handler(std::move(sender),
+                                 [self, bytes = std::move(bytes), completed = std::move(completed)](
+                                     const boost::system::error_code &error, std::size_t) mutable {
+                                     self->write_in_progress_ = false;
+                                     if (error) {
+                                         if (completed) {
+                                             completed(error);
+                                         }
+                                         self->fail(error);
+                                         return;
+                                     }
+                                     if (completed) {
+                                         completed(boost::system::error_code{});
+                                     }
+                                     self->pump_write();
+                                 });
 }
 
 void KcptunMuxSession::read_header() {
@@ -725,43 +716,50 @@ void KcptunMuxSession::read_exact(boost::asio::mutable_buffer buffer, ReadExactH
         handler({});
         return;
     }
-    struct ExactReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<KcptunMuxSession> self;
-        boost::asio::mutable_buffer buffer;
-        ReadExactHandler handler;
-        std::size_t offset;
-        void set_value(std::optional<std::size_t> size) && noexcept {
-            if (!size || *size == 0) {
-                handler(boost::asio::error::eof);
-                return;
-            }
-            self->read_exact(buffer, std::move(handler), offset + *size);
-        }
-        void set_error(std::exception_ptr error) && noexcept {
-            handler(unpack_transport_error(std::move(error)));
-        }
-        void set_stopped() && noexcept { handler(boost::asio::error::operation_aborted); }
-    };
+    auto self = shared_from_this();
+    // NOTE: name the sender first; argument order is unspecified.
     auto sender = carrier_->async_read_some(boost::asio::buffer(
         static_cast<std::uint8_t *>(buffer.data()) + offset, buffer.size() - offset));
-    async::start_with_receiver(
-        std::move(sender), ExactReceiver{shared_from_this(), buffer, std::move(handler), offset});
+    net::start_read_for_handler(std::move(sender), [self, buffer, handler = std::move(handler),
+                                                    offset](const boost::system::error_code &error,
+                                                            std::size_t size) mutable {
+        if (error && error != boost::asio::error::eof) {
+            handler(unpack_transport_error(
+                std::make_exception_ptr(core::Error{core::ErrorCode::transport_io,
+                                                    "kcptun read",
+                                                    {error.value(), std::system_category()}})));
+            return;
+        }
+        if (error || size == 0) {
+            handler(boost::asio::error::eof);
+            return;
+        }
+        self->read_exact(buffer, std::move(handler), offset + size);
+    });
 }
 
 void KcptunMuxSession::schedule_keepalive() {
     if (closed_ || options_.keepalive_seconds <= 0) {
         return;
     }
-    keepalive_timer_.expires_after(std::chrono::seconds(options_.keepalive_seconds));
-    auto self = shared_from_this();
-    keepalive_timer_.async_wait([self](const boost::system::error_code &error) {
-        if (error || self->closed_) {
-            return;
+    struct SleepReceiver {
+        using receiver_concept = stdexec::receiver_tag;
+        std::weak_ptr<KcptunMuxSession> self;
+        void set_value() && noexcept {
+            auto locked = self.lock();
+            if (!locked || locked->closed_) {
+                return;
+            }
+            locked->enqueue_frame(kNop, 0, {});
+            locked->schedule_keepalive();
         }
-        self->enqueue_frame(kNop, 0, {});
-        self->schedule_keepalive();
-    });
+        void set_error(std::exception_ptr) && noexcept {}
+        void set_stopped() && noexcept {}
+    };
+    // NOTE: name the sender first; argument order is unspecified.
+    auto sender =
+        async::sleep_after(carrier_->executor(), std::chrono::seconds(options_.keepalive_seconds));
+    async::start_with_receiver(std::move(sender), SleepReceiver{weak_from_this()});
 }
 
 boost::system::error_code unpack_transport_error(std::exception_ptr error) noexcept {
@@ -793,7 +791,6 @@ void KcptunMuxSession::fail(const boost::system::error_code &error) {
         return;
     }
     closed_ = true;
-    keepalive_timer_.cancel();
     queued_frames_.clear();
     if (carrier_) {
         carrier_->close();
@@ -810,7 +807,6 @@ void KcptunMuxSession::close() noexcept {
         return;
     }
     closed_ = true;
-    keepalive_timer_.cancel();
     queued_frames_.clear();
     if (carrier_) {
         carrier_->close();
@@ -900,26 +896,34 @@ struct KcptunClientPool::Impl final : public std::enable_shared_from_this<Kcptun
         if (closed) {
             return;
         }
-        scavenger.expires_after(kScavengePeriod);
-        auto self = shared_from_this();
-        scavenger.async_wait([self](const boost::system::error_code &error) {
-            if (error || self->closed) {
-                return;
-            }
-            const auto now = std::chrono::steady_clock::now();
-            for (auto &slot : self->slots) {
-                if (slot.session && slot.session->closed()) {
-                    slot.session.reset();
-                } else if (slot.session && self->options.auto_expire_seconds > 0 &&
-                           now - slot.created >=
-                               std::chrono::seconds(self->options.auto_expire_seconds +
-                                                    self->options.scavenge_ttl_seconds)) {
-                    slot.session->close();
-                    slot.session.reset();
+        struct ScavengeReceiver {
+            using receiver_concept = stdexec::receiver_tag;
+            std::weak_ptr<Impl> self;
+            void set_value() && noexcept {
+                auto locked = self.lock();
+                if (!locked || locked->closed) {
+                    return;
                 }
+                const auto now = std::chrono::steady_clock::now();
+                for (auto &slot : locked->slots) {
+                    if (slot.session && slot.session->closed()) {
+                        slot.session.reset();
+                    } else if (slot.session && locked->options.auto_expire_seconds > 0 &&
+                               now - slot.created >=
+                                   std::chrono::seconds(locked->options.auto_expire_seconds +
+                                                        locked->options.scavenge_ttl_seconds)) {
+                        slot.session->close();
+                        slot.session.reset();
+                    }
+                }
+                locked->schedule_scavenge();
             }
-            self->schedule_scavenge();
-        });
+            void set_error(std::exception_ptr) && noexcept {}
+            void set_stopped() && noexcept {}
+        };
+        // NOTE: name the sender first; argument order is unspecified.
+        auto sender = async::sleep_after(scavenger.get_executor(), kScavengePeriod);
+        async::start_with_receiver(std::move(sender), ScavengeReceiver{weak_from_this()});
     }
 
     runtime::AsioRuntime &runtime;

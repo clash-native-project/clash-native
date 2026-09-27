@@ -1,6 +1,12 @@
 #include "quic_dns_transport_internal.hpp"
 
-#include <utility>
+// DoQ keeps the QUIC engine's callback shape at the C-library boundary on
+// purpose (pitfalls: ngtcp2 driver): stream_data/closed/reset/ready only
+// move bytes into the exchange maps and trigger the guarded emission
+// pump below. The open pump itself opens one stream per pending exchange
+// and writes the framed query; per-exchange cancel shuts the stream down
+// through shutdown_stream, and the deadline fires via the shared
+// sleep_until task in quic_dns_transport.cpp.
 
 namespace clash_native::dns {
 namespace {

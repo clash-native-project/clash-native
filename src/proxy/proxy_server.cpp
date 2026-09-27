@@ -26,6 +26,8 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <exec/asio/use_sender.hpp>
+#include <exec/when_any.hpp>
 #include <functional>
 #include <iterator>
 #include <limits>
@@ -342,6 +344,10 @@ void ProxyServer::stop() noexcept {
 }
 
 void ProxyServer::stop_on_owner() noexcept {
+    try {
+        accept_scope_.request_stop();
+    } catch (...) {
+    }
     if (resolver_) {
         for (const auto request_id : resolver_requests_) {
             resolver_->cancel(request_id);
@@ -420,42 +426,46 @@ core::Status ProxyServer::start_socks5_udp_listener() {
 }
 
 void ProxyServer::accept() {
-    if (!running()) {
-        return;
-    }
+    // Accept loop runs as a task: stop requests scope stop, which completes
+    // the in-flight accept as stopped and exits without re-arming.
+    accept_scope_.spawn(run_accept_loop(this));
+}
 
-    auto client = std::make_shared<boost::asio::ip::tcp::socket>(runtime_.serialized_executor());
-    const auto gate = callback_gate_;
-    acceptor_.async_accept(*client, [this, gate, client](const boost::system::error_code &error) {
-        if (!gate->load(std::memory_order_acquire)) {
-            return;
+exec::task<void> ProxyServer::run_accept_loop(ProxyServer *server) {
+    while (server->running_.load()) {
+        auto client =
+            std::make_shared<boost::asio::ip::tcp::socket>(server->runtime_.serialized_executor());
+        try {
+            co_await server->acceptor_.async_accept(*client, exec::asio::use_sender);
+        } catch (...) {
+            // Stopped (shutdown cancel/close) or accept failure: stop owns
+            // teardown, so just exit the loop without re-arming.
+            co_return;
         }
-        if (!error && running()) {
-            auto session = std::make_shared<ProxySession>(
-                *this, std::move(*client), [this, gate](const SessionPtr &closed_session) {
-                    if (gate->load(std::memory_order_acquire)) {
-                        remove_session(closed_session);
-                    }
-                });
-            bool accepted_session = false;
-            {
-                std::lock_guard lock(sessions_mutex_);
-                if (running()) {
-                    sessions_.insert(session);
-                    accepted_session = true;
+        if (!server->running_.load() || !server->callback_gate_->load(std::memory_order_acquire)) {
+            co_return;
+        }
+        const auto gate = server->callback_gate_;
+        auto session = std::make_shared<ProxySession>(
+            *server, std::move(*client), [server, gate](const SessionPtr &closed_session) {
+                if (gate->load(std::memory_order_acquire)) {
+                    server->remove_session(closed_session);
                 }
-            }
-            if (accepted_session) {
-                session->start();
-            } else {
-                session->stop();
+            });
+        bool accepted_session = false;
+        {
+            std::lock_guard lock(server->sessions_mutex_);
+            if (server->running_.load()) {
+                server->sessions_.insert(session);
+                accepted_session = true;
             }
         }
-
-        if (gate->load(std::memory_order_acquire)) {
-            accept();
+        if (accepted_session) {
+            session->start();
+        } else {
+            session->stop();
         }
-    });
+    }
 }
 
 exec::task<core::StreamOpenResult> ProxyServer::open_stream(
@@ -490,23 +500,27 @@ exec::task<core::StreamOpenResult> ProxyServer::route_stream(
     const auto stopped = [&server] {
         return !server.callback_gate_->load(std::memory_order_acquire);
     };
-    // Resolve bridge: registers the registry request for server stop and
-    // unregisters on terminal; the aborter cancels late.
+    // Resolve leaf: registers the registry request for server stop and
+    // unregisters on terminal; the aborter cancels late. callback_sender
+    // (not bridge_sender) because the result must cross as an in-band
+    // value while stop maps to set_stopped.
     const auto resolve_addresses =
         [&server, snapshot](std::string host,
                             dns::DnsRecordType type) -> exec::task<core::Result<dns::DnsAnswer>> {
         core::Result<dns::DnsAnswer> answer;
         try {
-            answer = co_await async::bridge_sender<core::Result<dns::DnsAnswer>>(
+            answer = co_await async::callback_sender<
+                async::BridgeSignatures<core::Result<dns::DnsAnswer>>>(
                 [&server, snapshot, host = std::move(host),
-                 type](async::BridgeHandler<core::Result<dns::DnsAnswer>> done) mutable {
+                 type](auto terminal) mutable -> async::CallbackAbortFn {
                     auto resolver = snapshot->resolver;
                     auto id = std::make_shared<dns::ResolverService::RequestId>();
                     *id = resolver->resolve(
                         {std::move(host), type, 1},
-                        [&server, id, done](core::Result<dns::DnsAnswer> result) mutable {
+                        [&server, id, terminal = std::move(terminal)](
+                            core::Result<dns::DnsAnswer> result) mutable {
                             server.resolver_requests_.erase(*id);
-                            done(std::move(result));
+                            terminal(std::move(result));
                         },
                         server.runtime_.scheduler());
                     server.resolver_requests_.insert(*id);
@@ -516,7 +530,8 @@ exec::task<core::StreamOpenResult> ProxyServer::route_stream(
                         }
                         server.resolver_requests_.erase(*id);
                     }};
-                });
+                },
+                async::BridgeTranslate<core::Result<dns::DnsAnswer>>{});
         } catch (...) {
             co_return core::fail(
                 core::Error{core::ErrorCode::resolution, "proxy route DNS enrichment failed", {}});

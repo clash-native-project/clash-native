@@ -1,7 +1,6 @@
 #include <clash_native/transport/shadowsocks/kcptun_snappy.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/io/stream_handle.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 
@@ -265,12 +264,21 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
         auto pending = std::move(writes_.front());
         writes_.pop_front();
         auto packet = pending->packet;
-        struct WriteReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<SnappyStreamState> self;
-            std::shared_ptr<PendingWrite> pending;
-            void set_value(std::size_t) && noexcept {
+        auto self = shared_from_this();
+        // NOTE: name the sender first; argument order is unspecified.
+        auto sender = transport_->async_write(boost::asio::buffer(*packet));
+        net::start_write_for_handler(
+            std::move(sender), [self, packet = std::move(packet), pending = std::move(pending)](
+                                   const boost::system::error_code &error, std::size_t) mutable {
                 self->write_in_progress_ = false;
+                if (error) {
+                    if (pending && pending->cancelled) {
+                        self->pump_write();
+                        return;
+                    }
+                    self->close_with_error(error);
+                    return;
+                }
                 if (pending && !pending->cancelled && pending->handler) {
                     auto handler = std::move(pending->handler);
                     if (self->write_handler_ == pending) {
@@ -279,40 +287,7 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
                     handler({}, pending->size);
                 }
                 self->pump_write();
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                self->write_in_progress_ = false;
-                if (pending && pending->cancelled) {
-                    self->pump_write();
-                    return;
-                }
-                self->close_with_error(unpack_transport_error(std::move(error)));
-            }
-            void set_stopped() && noexcept {
-                self->write_in_progress_ = false;
-                if (pending && pending->cancelled) {
-                    return;
-                }
-                self->close_with_error(boost::asio::error::operation_aborted);
-            }
-        };
-        auto sender = transport_->async_write(boost::asio::buffer(*packet));
-        async::start_with_receiver(std::move(sender),
-                                   WriteReceiver{shared_from_this(), std::move(pending)});
-    }
-
-    static boost::system::error_code unpack_transport_error(std::exception_ptr error) noexcept {
-        try {
-            std::rethrow_exception(std::move(error));
-        } catch (const core::Error &failure) {
-            if (failure.cause) {
-                return failure.cause;
-            }
-        } catch (const boost::system::system_error &failure) {
-            return failure.code();
-        } catch (...) {
-        }
-        return boost::asio::error::fault;
+            });
     }
 
     using ReadExactHandler = std::function<void(const boost::system::error_code &)>;
@@ -327,28 +302,20 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
             handler({});
             return;
         }
-        struct ExactReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::shared_ptr<SnappyStreamState> self;
-            boost::asio::mutable_buffer buffer;
-            ReadExactHandler handler;
-            std::size_t offset;
-            void set_value(std::optional<std::size_t> size) && noexcept {
-                if (!size || *size == 0) {
-                    handler(boost::asio::error::eof);
-                    return;
-                }
-                self->read_exact(buffer, std::move(handler), offset + *size);
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                handler(unpack_transport_error(std::move(error)));
-            }
-            void set_stopped() && noexcept { handler(boost::asio::error::operation_aborted); }
-        };
+        auto self = shared_from_this();
+        // NOTE: name the sender first; argument order is unspecified.
         auto sender = transport_->async_read_some(boost::asio::buffer(
             static_cast<std::uint8_t *>(buffer.data()) + offset, buffer.size() - offset));
-        async::start_with_receiver(std::move(sender), ExactReceiver{shared_from_this(), buffer,
-                                                                    std::move(handler), offset});
+        net::start_read_for_handler(
+            std::move(sender),
+            [self, buffer, handler = std::move(handler),
+             offset](const boost::system::error_code &error, std::size_t size) mutable {
+                if (error || size == 0) {
+                    handler(error ? error : boost::asio::error::eof);
+                    return;
+                }
+                self->read_exact(buffer, std::move(handler), offset + size);
+            });
     }
 
     void read_identifier() {

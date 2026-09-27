@@ -1,17 +1,54 @@
 #include <clash_native/app/application.hpp>
 
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/platform/platform_adapter.hpp>
 
 #include <boost/asio/signal_set.hpp>
+#include <exec/task.hpp>
+
+#include <stdexec/execution.hpp>
 
 #include <csignal>
-#include <future>
+#include <exception>
+#include <memory>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
 
 #include <spdlog/spdlog.h>
 
 namespace clash_native::app {
+namespace {
+
+// Awaits one shutdown signal as a task instead of a signal_set.async_wait
+// callback leaf, so the wait composes with stop/when_any/timeout instead
+// of firing a handler into the run() frame. Abortion cancels the set;
+// cancellation or set destruction completes stopped.
+exec::task<void> await_shutdown_signal(std::shared_ptr<boost::asio::signal_set> signals) {
+    using Signatures = stdexec::completion_signatures<stdexec::set_value_t(int),
+                                                      stdexec::set_error_t(std::exception_ptr),
+                                                      stdexec::set_stopped_t()>;
+    co_await async::callback_sender<Signatures>(
+        [signals](auto terminal) mutable -> async::CallbackAbortFn {
+            signals->async_wait([terminal = std::move(terminal),
+                                 signals](const boost::system::error_code &error,
+                                          int signo) mutable { terminal(error, signo); });
+            return async::CallbackAbortFn{[signals = std::move(signals)] { signals->cancel(); }};
+        },
+        [](stdexec::receiver auto &&receiver, const boost::system::error_code &error, int signo) {
+            if (!error) {
+                stdexec::set_value(std::forward<decltype(receiver)>(receiver), signo);
+            } else if (error == boost::asio::error::operation_aborted) {
+                stdexec::set_stopped(std::forward<decltype(receiver)>(receiver));
+            } else {
+                stdexec::set_error(std::forward<decltype(receiver)>(receiver),
+                                   std::make_exception_ptr(boost::system::system_error(error)));
+            }
+        });
+    co_return;
+}
+
+} // namespace
 
 Application::Application() : runtime_(runtime::AsioRuntime::instance()), proxy_server_(runtime_) {}
 
@@ -59,21 +96,16 @@ int Application::run(const ApplicationOptions &options) {
                 boost::asio::ip::tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0)));
     }
 
-    boost::asio::signal_set signals(runtime_.serialized_executor(), SIGINT, SIGTERM);
-    std::promise<void> stopped;
-    auto stopped_future = stopped.get_future();
-    signals.async_wait([this, &stopped](const boost::system::error_code &, int) {
-        if (dns_server_) {
-            dns_server_->stop();
-        }
-        proxy_server_.stop();
-        stopped.set_value();
-    });
+    // The signal set outlives the await below; queued signals deliver to the
+    // wait armed after startup, so no handler needs to be parked across
+    // server startup.
+    auto signals =
+        std::make_shared<boost::asio::signal_set>(runtime_.serialized_executor(), SIGINT, SIGTERM);
 
     runtime_.start();
     const auto start_result = proxy_server_.start();
     if (!start_result) {
-        signals.cancel();
+        signals->cancel();
         if (dns_server_) {
             dns_server_->stop();
         }
@@ -88,7 +120,7 @@ int Application::run(const ApplicationOptions &options) {
     if (dns_server_) {
         const auto dns_start_result = dns_server_->start();
         if (!dns_start_result) {
-            signals.cancel();
+            signals->cancel();
             dns_server_->stop();
             proxy_server_.stop();
             runtime_.stop();
@@ -106,8 +138,11 @@ int Application::run(const ApplicationOptions &options) {
     spdlog::info("{} proxy listening on {}:{} ({}). Press Ctrl+C to stop.", listener_name,
                  endpoint.address().to_string(), endpoint.port(), authentication_name);
 
-    stopped_future.wait();
-    signals.cancel();
+    // Single awaitable signal wait: composable with stop/timeout via the
+    // sender (its aborter cancels the set). The sync_wait below blocks the
+    // calling thread only; Asio work still runs on runtime threads.
+    (void)stdexec::sync_wait(await_shutdown_signal(signals));
+    signals->cancel();
     if (dns_server_) {
         dns_server_->stop();
     }

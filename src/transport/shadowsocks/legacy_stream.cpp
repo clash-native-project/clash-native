@@ -1,7 +1,6 @@
 #include <clash_native/transport/shadowsocks/legacy_stream.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/shadowsocks/simple_obfs.hpp>
@@ -29,45 +28,6 @@ namespace {
 
 using StreamReadHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
 using StreamWriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
-
-// Bridges one carrier pull/push back into a legacy (error, size) handler.
-struct CarrierReadBridge {
-    using receiver_concept = stdexec::receiver_tag;
-    StreamReadHandler handler;
-    void set_value(std::optional<std::size_t> size) && noexcept {
-        auto callback = std::move(handler);
-        if (size) {
-            callback({}, *size);
-        } else {
-            callback(boost::asio::error::eof, 0);
-        }
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto callback = std::move(handler);
-        callback(net::unpack_error(std::move(error)), 0);
-    }
-    void set_stopped() && noexcept {
-        auto callback = std::move(handler);
-        callback(boost::asio::error::operation_aborted, 0);
-    }
-};
-
-struct CarrierWriteBridge {
-    using receiver_concept = stdexec::receiver_tag;
-    StreamWriteHandler handler;
-    void set_value(std::size_t size) && noexcept {
-        auto callback = std::move(handler);
-        callback({}, size);
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto callback = std::move(handler);
-        callback(net::unpack_error(std::move(error)), 0);
-    }
-    void set_stopped() && noexcept {
-        auto callback = std::move(handler);
-        callback(boost::asio::error::operation_aborted, 0);
-    }
-};
 
 class LegacyStreamState final : public std::enable_shared_from_this<LegacyStreamState> {
   public:
@@ -139,19 +99,19 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
                                          });
             return;
         }
-        StreamWriteHandler completion =
-            [self, wire, size = buffer.size()](const boost::system::error_code &error,
-                                               std::size_t) mutable {
-                self->finish_write(error, error ? 0 : size);
-            };
+        auto size = buffer.size();
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = carrier_->async_write(boost::asio::buffer(*wire));
-        async::start_with_receiver(std::move(sender), CarrierWriteBridge{std::move(completion)});
+        net::start_write_for_handler(
+            std::move(sender), [self, wire = std::move(wire),
+                                size](const boost::system::error_code &error, std::size_t) mutable {
+                self->finish_write(error, error ? 0 : size);
+            });
     }
 
-    // Retires a parked read without closing the transport. Lower carrier
-    // pulls are detached through CarrierReadBridge; their late completions
-    // funnel into finish_read/process_plaintext and drop once the parked
+    // Retires a parked read without closing the transport. The carrier pull
+    // is detached through start_read_for_handler; its late completion
+    // funnels into finish_read/process_plaintext and drops once the parked
     // handler is gone.
     void cancel_read() noexcept {
         try {
@@ -290,17 +250,16 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
                                        });
             return;
         }
-        StreamReadHandler completion = [self](const boost::system::error_code &error,
-                                              std::size_t size) {
-            if (error && error != boost::asio::error::eof) {
-                self->finish_read(error, size);
-                return;
-            }
-            self->process_plaintext(error, size);
-        };
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = carrier_->async_read_some(read_buffer_);
-        async::start_with_receiver(std::move(sender), CarrierReadBridge{std::move(completion)});
+        net::start_read_for_handler(
+            std::move(sender), [self](const boost::system::error_code &error, std::size_t size) {
+                if (error && error != boost::asio::error::eof) {
+                    self->finish_read(error, size);
+                    return;
+                }
+                self->process_plaintext(error, size);
+            });
     }
 
     void process_plaintext(const boost::system::error_code &error, std::size_t size) {
@@ -403,28 +362,27 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
 
     void read_exact_carrier(boost::asio::mutable_buffer buffer, ExactReadHandler handler) {
         auto self = shared_from_this();
-        StreamReadHandler completion =
-            [self, buffer, handler = std::move(handler)](const boost::system::error_code &error,
-                                                         std::size_t size) mutable {
-                if (error) {
-                    handler(error);
-                    return;
-                }
-                if (size == 0) {
-                    handler(boost::asio::error::eof);
-                    return;
-                }
-                if (size == buffer.size()) {
-                    handler({});
-                    return;
-                }
-                auto remaining = boost::asio::mutable_buffer(
-                    static_cast<std::uint8_t *>(buffer.data()) + size, buffer.size() - size);
-                self->read_exact_carrier(remaining, std::move(handler));
-            };
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = carrier_->async_read_some(buffer);
-        async::start_with_receiver(std::move(sender), CarrierReadBridge{std::move(completion)});
+        net::start_read_for_handler(std::move(sender), [self, buffer, handler = std::move(handler)](
+                                                           const boost::system::error_code &error,
+                                                           std::size_t size) mutable {
+            if (error) {
+                handler(error);
+                return;
+            }
+            if (size == 0) {
+                handler(boost::asio::error::eof);
+                return;
+            }
+            if (size == buffer.size()) {
+                handler({});
+                return;
+            }
+            auto remaining = boost::asio::mutable_buffer(
+                static_cast<std::uint8_t *>(buffer.data()) + size, buffer.size() - size);
+            self->read_exact_carrier(remaining, std::move(handler));
+        });
     }
 
     void post_read(StreamReadHandler handler, boost::system::error_code error, std::size_t size) {

@@ -1,13 +1,11 @@
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/transport/http_sessions.hpp>
 #include <clash_native/transport/tls_client.hpp>
-
-#include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
 
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
@@ -114,7 +112,7 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     Operation(Doh1DnsTransport &owner, DnsExchangeId exchange_id, DnsExchangeRequest request,
               OpenHandler handler)
         : owner_(owner), exchange_id_(exchange_id), request_(std::move(request)),
-          handler_(std::move(handler)), timer_(owner.runtime_.serialized_executor()) {}
+          handler_(std::move(handler)) {}
 
     void start() {
         if (std::chrono::steady_clock::now() >= request_.deadline) {
@@ -154,13 +152,10 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
             return;
         }
 
-        timer_.expires_at(request_.deadline);
-        const auto self = shared_from_this();
-        timer_.async_wait([self](const boost::system::error_code &error) {
-            if (!error) {
-                self->finish(core::fail(timeout_error()));
-            }
-        });
+        // Per-request deadline task: fires once at the deadline; finish()
+        // drops it when the exchange already completed. Bounded by the
+        // deadline, so no stop is ever requested.
+        scope_.spawn(run_deadline(shared_from_this(), request_.deadline));
         // The scope only owns this exchange task (merge-shaped usage);
         // teardown is guard-driven, so no stop is ever requested: the
         // request deadline bounds any orphaned chain.
@@ -176,6 +171,16 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     OpenHandler take_handler() { return std::move(handler_); }
 
   private:
+    static exec::task<void> run_deadline(std::shared_ptr<Operation> self,
+                                         std::chrono::steady_clock::time_point deadline) {
+        try {
+            co_await async::sleep_until(self->owner_.runtime_.serialized_executor(), deadline);
+        } catch (...) {
+        }
+        self->finish(core::fail(timeout_error()));
+        co_return;
+    }
+
     // Straight-line exchange chain: dial, TLS handshake, HTTP exchange,
     // response validation. Every terminal funnels through finish(), so the
     // spawned task always ends with a value.
@@ -311,7 +316,6 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
             return;
         }
         completed_ = true;
-        (void)timer_.cancel();
         if (http_session_) {
             // Single-use session: stop() fails the in-flight exchange and
             // tears the session down; no per-exchange cancel is needed.
@@ -325,7 +329,6 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     DnsExchangeId exchange_id_;
     DnsExchangeRequest request_;
     OpenHandler handler_;
-    boost::asio::steady_timer timer_;
     std::shared_ptr<io::ExchangeSession> http_session_;
     std::string authority_;
     // Owns the single exchange chain task, which always ends with a value.

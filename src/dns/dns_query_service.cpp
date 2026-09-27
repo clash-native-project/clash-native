@@ -1,11 +1,12 @@
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/held_operation.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_query_service.hpp>
 #include <clash_native/io/sender.hpp>
 
+#include <exec/task.hpp>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -136,66 +137,68 @@ class DnsQueryService::Operation final
 
     std::vector<Waiter> take_waiters() { return std::move(waiters_); }
 
-    struct UpstreamReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<Operation> operation;
-        void set_value(DnsExchangeResult result) noexcept {
-            auto self = std::move(operation);
-            self->owner_.runtime_.scheduler().post(
-                [self, result = std::move(result)]() mutable { self->finish(std::move(result)); });
-        }
-        void set_error(std::exception_ptr error) noexcept {
-            auto self = std::move(operation);
-            DnsExchangeResult result;
+    // Drive: one exchange task co_awaiting the group sender. The task
+    // always ends with a value; finish() drops late terminals on the
+    // completed_ guard and delivers through complete(). Stop from scope
+    // maps to a cancelled value inline (not a rethrow): request_stop
+    // unwinds the await as stopped, and the coroutine must deliver the
+    // waiter terminal itself since nobody else will.
+    static exec::task<void> run(std::shared_ptr<Operation> self) {
+        DnsExchangeResult result = core::fail(cancelled_error());
+        try {
+            const auto deadline = std::chrono::steady_clock::now() + self->upstream_->timeout();
+            auto sender =
+                self->upstream_->exchange(self->packet_, deadline) | stdexec::stopped_as_optional();
+            auto outcome = co_await std::move(sender);
+            if (!outcome) {
+                result = core::fail(cancelled_error());
+            } else {
+                result = std::move(*outcome);
+            }
+        } catch (const core::Error &failure) {
+            result = core::fail(failure);
+        } catch (...) {
             try {
-                std::rethrow_exception(std::move(error));
+                std::rethrow_exception(std::current_exception());
             } catch (const core::Error &failure) {
                 result = core::fail(failure);
             } catch (...) {
                 result = core::fail(
                     core::Error{core::ErrorCode::transport_io, "DNS query exchange failed"});
             }
-            self->owner_.runtime_.scheduler().post(
-                [self, result = std::move(result)]() mutable { self->finish(std::move(result)); });
         }
-        void set_stopped() noexcept {
-            auto self = std::move(operation);
-            self->owner_.runtime_.scheduler().post(
-                [self]() mutable { self->finish(core::fail(cancelled_error())); });
-        }
-    };
-
-    void start() {
-        auto self = shared_from_this();
-        const auto deadline = std::chrono::steady_clock::now() + upstream_->timeout();
-        // NOTE: name the sender first; argument order is unspecified.
-        auto sender = upstream_->exchange(packet_, deadline);
-        drive_ = async::hold_operation(std::move(sender), UpstreamReceiver{self});
-        drive_->start();
-        exchange_started_ = true;
-        if (completed_) {
-            drive_.reset();
-        }
+        // Hop the terminal back onto the owner strand like the old
+        // UpstreamReceiver: finish/complete touch the unguarded
+        // in_flight/cache/request maps. The task itself always ends with
+        // a value right after posting.
+        auto *owner = &self->owner_;
+        auto terminal = [self, result = std::move(result)]() mutable {
+            self->finish(std::move(result));
+        };
+        owner->runtime_.scheduler().post(std::move(terminal));
+        co_return;
     }
+
+    void start() { scope_.spawn(run(shared_from_this())); }
 
     void cancel_shared() {
         if (completed_) {
             return;
         }
         completed_ = true;
-        // Destroying the drive aborts exactly this group exchange; the
-        // late terminal drops on the completed_ guard.
-        drive_.reset();
+        // Request stop so the in-flight exchange await aborts; the late
+        // finish drops on the completed_ guard.
+        try {
+            scope_.request_stop();
+        } catch (...) {
+        }
         owner_.complete(shared_from_this(), core::fail(cancelled_error()));
     }
-
-  private:
     void finish(core::Result<DnsPacket> result) {
         if (completed_) {
             return;
         }
         completed_ = true;
-        drive_.reset();
         owner_.complete(shared_from_this(), std::move(result));
     }
 
@@ -203,10 +206,10 @@ class DnsQueryService::Operation final
     std::string key_;
     DnsPacket packet_;
     std::shared_ptr<DnsUpstreamGroup> upstream_;
-    std::shared_ptr<async::HeldOperation<io::AnySender<DnsExchangeResult>, UpstreamReceiver>>
-        drive_;
+    // Owns this key's exchange task; cancel_shared request_stops it so
+    // the in-flight await aborts instead of leaking until upstream answers.
+    exec::async_scope scope_;
     std::vector<Waiter> waiters_;
-    bool exchange_started_ = false;
     bool completed_ = false;
 };
 
@@ -545,23 +548,30 @@ io::AnySender<core::Result<DnsPacket>> DnsQueryService::query_sender(DnsPacket p
         std::atomic<RequestId> id{0};
         std::atomic_bool started{false};
     };
+    using Signatures = async::BridgeSignatures<core::Result<DnsPacket>>;
     auto shared = std::make_shared<Shared>();
     shared->service = this;
     // NOTE: query() posts to the owner strand; the starter must stay
     // copyable, so the packet lives in a shared box for re-invocation.
     auto box = std::make_shared<std::optional<DnsPacket>>(std::move(packet));
-    return async::bridge_sender<core::Result<DnsPacket>>(
-        [shared, box](async::BridgeHandler<core::Result<DnsPacket>> done) mutable {
+    return async::callback_sender<Signatures>(
+        [shared, box](auto terminal) mutable -> async::CallbackAbortFn {
             if (!box || !*box) {
-                done(core::fail(cancelled_error()));
+                terminal(core::fail(cancelled_error()));
                 return async::CallbackAbortFn{};
             }
+            auto done = std::make_shared<async::BridgeHandler<core::Result<DnsPacket>>>(
+                [terminal = std::move(terminal)](core::Result<DnsPacket> result) mutable {
+                    terminal(std::move(result));
+                });
             const auto id = shared->service->query(
                 std::move(**box),
-                [done](core::Result<DnsPacket> result) mutable { done(std::move(result)); });
-            box->reset();
+                [done](core::Result<DnsPacket> result) mutable { (*done)(std::move(result)); });
+            // Publish before the owner strand runs: query_on_owner may
+            // complete inline on a direct call, and cancel() needs the id.
             shared->id.store(id, std::memory_order_release);
             shared->started.store(true, std::memory_order_release);
+            box->reset();
             return async::CallbackAbortFn{[shared] {
                 // Wait for the id: query() only posts; without this the
                 // aborter could run before the request exists and leak it.
@@ -572,7 +582,8 @@ io::AnySender<core::Result<DnsPacket>> DnsQueryService::query_sender(DnsPacket p
                     shared->service->cancel(id);
                 }
             }};
-        });
+        },
+        async::BridgeTranslate<core::Result<DnsPacket>>{});
 }
 
 void DnsQueryService::query_on_owner(RequestId request_id, DnsPacket packet, Handler handler,
@@ -693,6 +704,9 @@ void DnsQueryService::stop() noexcept {
 }
 
 void DnsQueryService::stop_on_owner() noexcept {
+    // cancel_shared below request_stops each key's task (aborting the
+    // in-flight exchange await; late finish drops on completed_) then
+    // delivers the waiter terminals synchronously.
     while (!in_flight_.empty()) {
         in_flight_.begin()->second->cancel_shared();
     }

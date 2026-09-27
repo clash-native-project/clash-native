@@ -1,12 +1,12 @@
 #include "quic_dns_transport_internal.hpp"
-#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/io/datagram_handle.hpp>
 
-#include <boost/asio/bind_executor.hpp>
+#include <exec/task.hpp>
+
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
 
 #include <algorithm>
@@ -87,9 +87,8 @@ QuicDnsTransport::QuicDnsTransport(runtime::AsioRuntime &runtime, DnsUpstreamCon
 }
 
 QuicDnsTransport::Operation::Operation(QuicDnsTransport &owner)
-    : owner_(owner), idle_timer_(owner.runtime_.serialized_executor()), mode_(owner.config_.mode),
-      host_(remote_name(owner.config_)), port_(remote_port(owner.config_)),
-      remote_endpoint_(owner.config_.endpoint.address(), port_),
+    : owner_(owner), mode_(owner.config_.mode), host_(remote_name(owner.config_)),
+      port_(remote_port(owner.config_)), remote_endpoint_(owner.config_.endpoint.address(), port_),
       authority_(authority(owner.config_, host_, port_)),
       path_(owner.config_.doh_path.empty() ? "/dns-query" : owner.config_.doh_path) {}
 
@@ -110,64 +109,70 @@ void QuicDnsTransport::Operation::start_on_strand() {
         return;
     }
     started_ = true;
-    const auto self = shared_from_this();
-    const auto destination = core::Destination::address(owner_.config_.endpoint.address(), port_);
-    struct OpenReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<Operation> self;
+    // Open as a task: co_await the dialer sender, then hop back onto the
+    // strand through the shared state (ferrying move-only captures through
+    // asio::dispatch directly proved unreliable). The task always ends
+    // with a value; datagram_opened drops late opens when retired/empty.
+    scope_.spawn(run_open(shared_from_this(),
+                          core::Destination::address(owner_.config_.endpoint.address(), port_)));
+}
 
-        void set_value(core::DatagramOpenResult result) && noexcept {
-            auto operation = std::move(self);
-            std::unique_ptr<io::DatagramHandle> handle = std::move(result.handle);
-            std::optional<core::Error> error = std::move(result.error);
-            if (handle) {
-                error.reset();
-            }
-            dispatch_opened(std::move(operation), std::move(handle), std::move(error));
+exec::task<void> QuicDnsTransport::Operation::run_open(std::shared_ptr<Operation> self,
+                                                       core::Destination destination) {
+    core::DatagramOpenResult opened = core::DatagramOpenResult::failed(
+        {core::ErrorCode::endpoint_connection, "QUIC DNS datagram dialer failed to open a handle"});
+    try {
+        opened = co_await self->owner_.config_.dialer->open_datagram({destination});
+    } catch (const core::Error &failure) {
+        opened = core::DatagramOpenResult::failed(failure);
+    } catch (...) {
+        try {
+            std::rethrow_exception(std::current_exception());
+        } catch (const core::Error &failure) {
+            opened = core::DatagramOpenResult::failed(failure);
+        } catch (...) {
         }
-
-        void set_error(std::exception_ptr error) && noexcept {
-            auto operation = std::move(self);
-            std::optional<core::Error> failure =
-                core::Error{core::ErrorCode::endpoint_connection,
-                            "QUIC DNS datagram dialer failed to open a handle"};
-            try {
-                std::rethrow_exception(std::move(error));
-            } catch (const core::Error &open_error) {
-                failure = open_error;
-            } catch (...) {
-            }
-            dispatch_opened(std::move(operation), nullptr, std::move(failure));
-        }
-
-        void set_stopped() && noexcept {
-            auto operation = std::move(self);
-            dispatch_opened(
-                std::move(operation), nullptr,
-                core::Error{core::ErrorCode::cancelled, "QUIC DNS datagram open was cancelled"});
-        }
-
-        // Copyable strand hop: ferrying move-only captures through
-        // asio::dispatch on this path proved unreliable, so the payload
-        // rides a shared state instead.
-        static void dispatch_opened(std::shared_ptr<Operation> operation,
-                                    std::unique_ptr<io::DatagramHandle> handle,
-                                    std::optional<core::Error> error) noexcept {
-            struct StrandState {
-                std::shared_ptr<Operation> operation;
-                std::unique_ptr<io::DatagramHandle> handle;
-                std::optional<core::Error> error;
-            };
-            auto state = std::make_shared<StrandState>(
-                StrandState{std::move(operation), std::move(handle), std::move(error)});
-            boost::asio::dispatch(state->operation->owner_.strand_, [state]() mutable {
-                state->operation->datagram_opened(std::move(state->handle),
-                                                  std::move(state->error));
-            });
-        }
+    }
+    struct StrandState {
+        std::shared_ptr<Operation> operation;
+        std::unique_ptr<io::DatagramHandle> handle;
+        std::optional<core::Error> error;
     };
-    async::start_with_receiver(owner_.config_.dialer->open_datagram({destination}),
-                               OpenReceiver{std::move(self)});
+    auto state = std::make_shared<StrandState>(
+        StrandState{self, std::move(opened.handle), std::move(opened.error)});
+    if (state->handle) {
+        state->error.reset();
+    }
+    boost::asio::dispatch(state->operation->owner_.strand_, [state]() mutable {
+        state->operation->datagram_opened(std::move(state->handle), std::move(state->error));
+    });
+    co_return;
+}
+
+exec::task<void>
+QuicDnsTransport::Operation::run_deadline(std::shared_ptr<Operation> self, DnsExchangeId id,
+                                          std::chrono::steady_clock::time_point deadline) {
+    try {
+        co_await async::sleep_until(self->owner_.runtime_.serialized_executor(), deadline);
+    } catch (...) {
+        co_return;
+    }
+    self->cancel_exchange(id, timeout_error());
+    co_return;
+}
+
+exec::task<void> QuicDnsTransport::Operation::run_idle(std::shared_ptr<Operation> self,
+                                                       std::uint64_t generation) {
+    try {
+        co_await async::sleep_after(self->owner_.runtime_.serialized_executor(),
+                                    std::chrono::seconds(30));
+    } catch (...) {
+        co_return;
+    }
+    if (!self->retired_ && generation == self->idle_generation_ && self->exchanges_.empty()) {
+        self->retire_idle();
+    }
+    co_return;
 }
 
 void QuicDnsTransport::Operation::add_exchange(DnsExchangeId id, DnsExchangeRequest request) {
@@ -175,10 +180,9 @@ void QuicDnsTransport::Operation::add_exchange(DnsExchangeId id, DnsExchangeRequ
         owner_.complete(id, core::fail(transport_error("QUIC DNS session is retired")));
         return;
     }
-    idle_timer_.cancel();
+    ++idle_generation_;
     idle_ = false;
-    auto exchange =
-        std::make_shared<Exchange>(id, std::move(request), owner_.runtime_.serialized_executor());
+    auto exchange = std::make_shared<Exchange>(id, std::move(request));
     exchanges_.emplace(id, exchange);
     const auto &wire = exchange->request.query.wire;
     if (wire.size() < 12 || wire.size() > 0xffff) {
@@ -203,14 +207,12 @@ void QuicDnsTransport::Operation::add_exchange(DnsExchangeId id, DnsExchangeRequ
         drain_exchange_results();
         return;
     }
-    exchange->deadline_timer.expires_at(exchange->request.deadline);
-    const auto self = shared_from_this();
-    exchange->deadline_timer.async_wait(boost::asio::bind_executor(
-        owner_.strand_, [self, id](const boost::system::error_code &error) {
-            if (!error) {
-                self->cancel_exchange(id, timeout_error());
-            }
-        }));
+    // Deadline as a sleep_until task racing the exchange: whichever
+    // finishes first wins via the result guard in set_exchange_error plus
+    // the map lookup in cancel_exchange; the loser observes the exchange
+    // is already gone and drops. The task always ends with a value so the
+    // scope never fails.
+    scope_.spawn(run_deadline(shared_from_this(), id, exchange->request.deadline));
     if (mode_ == DnsTransportMode::doq || !http3_) {
         pending_exchanges_.push_back(id);
     } else {
@@ -337,7 +339,6 @@ void QuicDnsTransport::Operation::complete_exchange(DnsExchangeId id,
         return;
     }
     const auto exchange = found->second;
-    (void)exchange->deadline_timer.cancel();
     if (!result) {
         // The HTTP exchange already reached its terminal to get here; the
         // io:: vocabulary cancels in-flight work through the stop token.
@@ -364,13 +365,10 @@ void QuicDnsTransport::Operation::enter_idle_or_retire() {
     }
     idle_ = true;
     const auto self = shared_from_this();
-    idle_timer_.expires_after(std::chrono::seconds(30));
-    idle_timer_.async_wait(
-        boost::asio::bind_executor(owner_.strand_, [self](const boost::system::error_code &error) {
-            if (!error && self->exchanges_.empty()) {
-                self->retire_idle();
-            }
-        }));
+    // Idle as a sleep task racing new exchanges: the generation guard
+    // drops a stale sleep when add_exchange re-armed idleness meanwhile.
+    // The task always ends with a value so the scope never fails.
+    scope_.spawn(run_idle(self, ++idle_generation_));
     owner_.session_idle(self);
 }
 
@@ -387,7 +385,7 @@ void QuicDnsTransport::Operation::retire_session() noexcept {
     }
     retired_ = true;
     idle_ = false;
-    (void)idle_timer_.cancel();
+    ++idle_generation_;
     if (http3_) {
         http3_->stop();
         http3_.reset();
@@ -410,11 +408,10 @@ void QuicDnsTransport::Operation::fail_session(core::Error error) {
     exchange_ids.reserve(exchanges_.size());
     for (const auto &[id, exchange] : exchanges_) {
         exchange_ids.push_back(id);
-        (void)exchange->deadline_timer.cancel();
     }
     retired_ = true;
     idle_ = false;
-    (void)idle_timer_.cancel();
+    ++idle_generation_;
     if (http3_) {
         http3_->stop();
         http3_.reset();
@@ -435,16 +432,25 @@ void QuicDnsTransport::Operation::fail_session(core::Error error) {
 io::AnySender<DnsExchangeResult> QuicDnsTransport::exchange(DnsExchangeRequest request) {
     auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
     auto self = shared_from_this();
-    return async::bridge_sender<DnsExchangeResult>(
-        [self, box](async::BridgeHandler<DnsExchangeResult> done) mutable {
+    using Signatures = async::BridgeSignatures<DnsExchangeResult>;
+    return async::callback_sender<Signatures>(
+        [self, box](auto terminal) mutable -> async::CallbackAbortFn {
             if (!box || !*box) {
-                done(core::fail(cancelled_error()));
+                terminal(core::fail(cancelled_error()));
                 return async::CallbackAbortFn{};
             }
-            const auto id = self->open_exchange(std::move(**box), std::move(done));
+            auto done = std::make_shared<async::BridgeHandler<DnsExchangeResult>>(
+                [terminal = std::move(terminal)](DnsExchangeResult result) mutable {
+                    terminal(std::move(result));
+                });
+            const auto id =
+                self->open_exchange(std::move(**box), [done](DnsExchangeResult result) mutable {
+                    (*done)(std::move(result));
+                });
             box->reset();
             return async::CallbackAbortFn{[self, id] { self->cancel_exchange(id); }};
-        });
+        },
+        async::BridgeTranslate<DnsExchangeResult>{});
 }
 
 DnsExchangeId QuicDnsTransport::open_exchange(DnsExchangeRequest request,

@@ -1,13 +1,13 @@
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/core/base64.hpp>
-#include <clash_native/io/exchange_session.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/grpc_client.hpp>
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
+
+#include <exec/task.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -482,30 +482,25 @@ void GrpcClientCall::start() {
     }
     request.body = request_body_;
     const auto deadline = options_.deadline.value_or(std::chrono::steady_clock::time_point::max());
-    struct ResponseReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<GrpcClientCall> self;
-        void set_value(io::StreamingExchangeResponse result) && noexcept {
-            self->on_response(std::move(result));
-        }
-        void set_error(std::exception_ptr error) && noexcept {
-            try {
-                std::rethrow_exception(std::move(error));
-            } catch (const core::Error &failure) {
-                self->on_response(core::fail(failure));
-            } catch (...) {
-                self->on_response(core::fail(
-                    make_error(core::ErrorCode::endpoint_connection, "gRPC exchange failed")));
-            }
-        }
-        void set_stopped() && noexcept {
-            self->on_response(
-                core::fail(make_error(core::ErrorCode::cancelled, "gRPC exchange was stopped")));
-        }
-    };
-    const auto self = shared_from_this();
-    async::start_with_receiver(session_->exchange_streaming(std::move(request), deadline),
-                               ResponseReceiver{self});
+    scope_.spawn(run_open(shared_from_this(), std::move(request), deadline));
+}
+
+// Test-only gRPC call: the open exchange and each body pull are plain
+// tasks over the io:: senders (composable with stop/when_any/timeout);
+// the thin terminal below only maps the native completion back into the
+// legacy on_response callback for the frame pump.
+exec::task<void> GrpcClientCall::run_open(std::shared_ptr<GrpcClientCall> self,
+                                          io::StreamingExchangeRequest request,
+                                          std::chrono::steady_clock::time_point deadline) {
+    try {
+        auto response = co_await self->session_->exchange_streaming(std::move(request), deadline);
+        self->on_response(std::move(response));
+    } catch (const core::Error &failure) {
+        self->on_response(core::fail(failure));
+    } catch (...) {
+        self->on_response(
+            core::fail(make_error(core::ErrorCode::endpoint_connection, "gRPC exchange failed")));
+    }
 }
 
 void GrpcClientCall::on_response(core::Result<io::StreamingExchangeResponse> result) {
@@ -705,26 +700,21 @@ void GrpcClientCall::read_response() {
         return;
     }
     reading_body_ = true;
-    struct BodyReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::shared_ptr<GrpcClientCall> self;
-        void set_value(std::optional<std::size_t> size) && noexcept {
-            if (size) {
-                self->on_response_read({}, *size);
-                return;
-            }
+    scope_.spawn(run_body_read(shared_from_this()));
+}
+
+exec::task<void> GrpcClientCall::run_body_read(std::shared_ptr<GrpcClientCall> self) {
+    try {
+        auto pulled =
+            co_await self->response_body_->async_read_some(boost::asio::buffer(self->read_buffer_));
+        if (pulled) {
+            self->on_response_read({}, *pulled);
+        } else {
             self->on_response_read(boost::asio::error::eof, 0);
         }
-        void set_error(std::exception_ptr error) && noexcept {
-            self->on_response_read(net::unpack_error(std::move(error)), 0);
-        }
-        void set_stopped() && noexcept {
-            self->on_response_read(boost::asio::error::operation_aborted, 0);
-        }
-    };
-    const auto self = shared_from_this();
-    async::start_with_receiver(response_body_->async_read_some(boost::asio::buffer(read_buffer_)),
-                               BodyReceiver{self});
+    } catch (...) {
+        self->on_response_read(net::unpack_error(std::current_exception()), 0);
+    }
 }
 
 void GrpcClientCall::on_response_read(const boost::system::error_code &error, std::size_t size) {

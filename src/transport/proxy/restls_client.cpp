@@ -3,8 +3,12 @@
 #include <clash_native/transport/cert_pin.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/proxy/restls.hpp>
+
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include <botan/asn1_obj.h>
 #include <botan/auto_rng.h>
@@ -29,7 +33,6 @@
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -1011,8 +1014,7 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
   public:
     RestlsOpenOperation(std::unique_ptr<io::StreamHandle> stream, RestlsClientOptions options,
                         RestlsOpenHandler handler)
-        : stream_(std::move(stream)), options_(std::move(options)), handler_(std::move(handler)),
-          timer_(stream_->executor()) {}
+        : stream_(std::move(stream)), options_(std::move(options)), handler_(std::move(handler)) {}
 
     void start() {
         if (options_.server_name.empty() || options_.password.empty()) {
@@ -1044,14 +1046,7 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
             return;
         }
         script_ = std::move(script.value());
-        timer_.expires_after(kHandshakeTimeout);
-        auto self = shared_from_this();
-        timer_.async_wait([self](const boost::system::error_code &error) {
-            if (!error && !self->completed_) {
-                self->finish(core::fail(
-                    restls_error(core::ErrorCode::timeout, "ResTLS TLS handshake timed out")));
-            }
-        });
+        // Timeout races each read inside run_open via with_timeout; no timer leaf here.
         try {
             rng_ = std::make_shared<Botan::AutoSeeded_RNG>();
             const auto secret = derive_restls_secret(options_.password);
@@ -1060,6 +1055,7 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
                 return;
             }
             secret_ = secret.value();
+            auto self = shared_from_this();
             callbacks_ = std::make_shared<RestlsCallbacks>(
                 rng_, secret_, [self](std::span<const std::uint8_t> data) { self->emit_tls(data); },
                 [self](std::span<const std::uint8_t> data) { self->record_received(data); },
@@ -1086,11 +1082,10 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
                                                                           std::move(handle));
             }
             policy_ = std::make_shared<RestlsPolicy>(tls13);
-            credentials_ = std::make_shared<RestlsCredentials>();
             tls_client_ = std::make_unique<Botan::TLS::Client>(
                 callbacks_, session_manager_, credentials_, policy_, rng_, info, protocol_version,
                 std::vector<std::string>{});
-            read_tls_records();
+            scope_.spawn(run_open(shared_from_this()));
         } catch (const std::exception &exception) {
             finish(core::fail(restls_exception("failed to initialize native ResTLS", exception)));
         }
@@ -1099,24 +1094,95 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
     void abort() noexcept {
         auto self = shared_from_this();
         try {
-            // timer_ shares the stream executor but outlives the stream
-            // move in open_restls_stream().
-            boost::asio::post(timer_.get_executor(), [self] {
+            auto executor =
+                self->stream_ ? self->stream_->executor() : boost::asio::any_io_executor{};
+            auto cancel = [self] {
                 self->finish(core::fail(restls_error(core::ErrorCode::cancelled,
                                                      "ResTLS TLS handshake was cancelled")));
-            });
+                self->request_scope_stop();
+            };
+            if (!executor) {
+                cancel();
+                return;
+            }
+            boost::asio::post(executor, std::move(cancel));
+        } catch (...) {
+        }
+    }
+
+    void request_scope_stop() noexcept {
+        try {
+            scope_.request_stop();
         } catch (...) {
         }
     }
 
   private:
+    static exec::task<void> run_open(std::shared_ptr<RestlsOpenOperation> self) {
+        if (auto error = co_await run_flush_writes(self); error) {
+            self->finish(core::fail(std::move(*error)));
+            co_return;
+        }
+        using ReadResult = core::Result<std::size_t>;
+        while (!self->completed_ && !self->tls_client_->is_handshake_complete()) {
+            auto executor = self->stream_->executor();
+            auto read = self->stream_->async_read_some(boost::asio::buffer(self->read_temp_)) |
+                        stdexec::then([](std::optional<std::size_t> count) -> ReadResult {
+                            if (!count || *count == 0) {
+                                return core::fail(restls_error(core::ErrorCode::transport_io,
+                                                               "ResTLS TLS handshake reached EOF"));
+                            }
+                            return ReadResult{*count};
+                        });
+            auto timed = co_await async::with_timeout<ReadResult>(
+                executor, kHandshakeTimeout, std::move(read), []() -> ReadResult {
+                    return core::fail(
+                        restls_error(core::ErrorCode::timeout, "ResTLS TLS handshake timed out"));
+                });
+            if (self->completed_) {
+                co_return;
+            }
+            if (!timed) {
+                self->finish(core::fail(timed.error()));
+                co_return;
+            }
+            self->tls_input_.insert(self->tls_input_.end(), self->read_temp_.begin(),
+                                    self->read_temp_.begin() +
+                                        static_cast<std::ptrdiff_t>(timed.value()));
+            self->process_tls_records();
+            if (self->completed_) {
+                co_return;
+            }
+            if (auto error = co_await run_flush_writes(self); error) {
+                self->finish(core::fail(std::move(*error)));
+                co_return;
+            }
+        }
+    }
+
+    static exec::task<std::optional<core::Error>>
+    run_flush_writes(std::shared_ptr<RestlsOpenOperation> self) {
+        while (!self->completed_ && !self->tls_write_queue_.empty()) {
+            auto chunk = std::move(self->tls_write_queue_.front());
+            self->tls_write_queue_.erase(self->tls_write_queue_.begin());
+            try {
+                co_await self->stream_->async_write(boost::asio::buffer(chunk));
+            } catch (const core::Error &failure) {
+                co_return std::optional<core::Error>{failure};
+            } catch (...) {
+                co_return std::optional<core::Error>{restls_error(
+                    core::ErrorCode::transport_io, "failed to write ResTLS TLS handshake")};
+            }
+        }
+        co_return std::optional<core::Error>{};
+    }
+
     void emit_tls(std::span<const std::uint8_t> data) {
         const auto bytes = to_bytes(data);
         if (!tls_client_ || !tls_client_->is_handshake_complete()) {
             remember_finished_record(bytes);
         }
         tls_write_queue_.push_back(bytes);
-        start_tls_write();
     }
 
     void record_received(std::span<const std::uint8_t>) {}
@@ -1139,56 +1205,6 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
             }
             offset += kTlsRecordHeaderLength + size;
         }
-    }
-
-    void start_tls_write() {
-        if (tls_write_in_progress_ || tls_write_queue_.empty() || completed_) {
-            return;
-        }
-        tls_write_in_progress_ = true;
-        tls_write_current_ = std::move(tls_write_queue_.front());
-        tls_write_queue_.erase(tls_write_queue_.begin());
-        auto self = shared_from_this();
-        net::start_write_for_handler(stream_->async_write(boost::asio::buffer(tls_write_current_)),
-                                     [self](const boost::system::error_code &error, std::size_t) {
-                                         self->tls_write_in_progress_ = false;
-                                         if (error) {
-                                             self->finish(core::fail(restls_io_error(
-                                                 "failed to write ResTLS TLS handshake", error)));
-                                             return;
-                                         }
-                                         self->start_tls_write();
-                                     });
-    }
-
-    void read_tls_records() {
-        if (completed_ || read_in_progress_) {
-            return;
-        }
-        read_in_progress_ = true;
-        auto self = shared_from_this();
-        net::start_read_for_handler(
-            stream_->async_read_some(boost::asio::buffer(read_temp_)),
-            [self](const boost::system::error_code &error, std::size_t size) {
-                self->read_in_progress_ = false;
-                if (error) {
-                    self->finish(
-                        core::fail(restls_io_error("failed to read ResTLS TLS handshake", error)));
-                    return;
-                }
-                if (size == 0) {
-                    self->finish(core::fail(restls_error(core::ErrorCode::transport_io,
-                                                         "ResTLS TLS handshake reached EOF")));
-                    return;
-                }
-                self->tls_input_.insert(self->tls_input_.end(), self->read_temp_.begin(),
-                                        self->read_temp_.begin() +
-                                            static_cast<std::ptrdiff_t>(size));
-                self->process_tls_records();
-                if (!self->completed_ && !self->tls_client_->is_handshake_complete()) {
-                    self->read_tls_records();
-                }
-            });
     }
 
     void process_tls_records() {
@@ -1291,7 +1307,6 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
                 "ResTLS TLS handshake did not expose ServerHello and Finished records")));
             return;
         }
-        (void)timer_.cancel();
         auto adapter = std::make_shared<RestlsStream>(
             std::move(stream_), secret_, std::move(server_random_), rng_, std::move(script_),
             std::move(tls_input_), server_tls12_gcm_,
@@ -1305,7 +1320,6 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
             return;
         }
         completed_ = true;
-        (void)timer_.cancel();
         if (!result && stream_) {
             stream_->close();
             stream_.reset();
@@ -1324,7 +1338,6 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
     RestlsClientOptions options_;
     std::optional<std::array<std::uint8_t, 32>> certificate_pin_;
     RestlsOpenHandler handler_;
-    boost::asio::steady_timer timer_;
     std::shared_ptr<Botan::RandomNumberGenerator> rng_;
     std::shared_ptr<RestlsCallbacks> callbacks_;
     std::shared_ptr<Botan::TLS::Session_Manager> session_manager_;
@@ -1342,10 +1355,8 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
     std::vector<std::uint8_t> tls_input_;
     std::vector<std::uint8_t> read_temp_ = std::vector<std::uint8_t>(16 * 1024);
     std::vector<std::vector<std::uint8_t>> tls_write_queue_;
-    std::vector<std::uint8_t> tls_write_current_;
-    bool tls_write_in_progress_ = false;
-    bool read_in_progress_ = false;
     bool completed_ = false;
+    exec::async_scope scope_;
 };
 
 } // namespace
@@ -1375,7 +1386,10 @@ async_open_restls_abortable(std::unique_ptr<io::StreamHandle> stream, RestlsClie
     struct Handle final : public RestlsOpenAborter {
         explicit Handle(std::shared_ptr<RestlsOpenOperation> operation)
             : operation_(std::move(operation)) {}
-        void abort() noexcept override { operation_->abort(); }
+        void abort() noexcept override {
+            operation_->abort();
+            operation_->request_scope_stop();
+        }
         std::shared_ptr<RestlsOpenOperation> operation_;
     };
     auto operation = std::make_shared<RestlsOpenOperation>(std::move(stream), std::move(options),

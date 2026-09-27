@@ -1,15 +1,18 @@
-#include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/held_operation.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/oneshot.hpp>
 #include <clash_native/dns/bootstrap_resolver.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/io/sender.hpp>
 
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
+
 #include <stdexec/execution.hpp>
 
-#include <boost/asio/post.hpp>
-
 #include <algorithm>
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -34,236 +37,277 @@ bool address_matches_endpoint_family(const boost::asio::ip::address &address,
     return address == endpoint_address;
 }
 
+using AddressResult = core::Result<std::vector<boost::asio::ip::address>>;
+
 class BootstrapDnsTransport final : public DnsTransport,
                                     public std::enable_shared_from_this<BootstrapDnsTransport> {
   public:
-    BootstrapDnsTransport(runtime::AsioRuntime &runtime, DnsUpstreamConfig config)
-        : runtime_(runtime), config_(std::move(config)),
-          bootstrap_(config_.bootstrap_resolver
-                         ? config_.bootstrap_resolver
-                         : make_bootstrap_resolver(runtime_, config_.bootstrap_dns_servers)) {}
+    struct DriveTerminal {
+        DnsExchangeResult result;
+    };
 
-    io::AnySender<DnsExchangeResult> exchange(DnsExchangeRequest request) override {
-        auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
-        auto self = shared_from_this();
-        return async::bridge_sender<DnsExchangeResult>(
-            [self, box](async::BridgeHandler<DnsExchangeResult> done) mutable {
-                if (!box || !*box) {
-                    done(core::fail(cancelled_error()));
-                    return async::CallbackAbortFn{};
-                }
-                const auto exchange_id = self->open_exchange(std::move(**box), std::move(done));
-                box->reset();
-                return async::CallbackAbortFn{
-                    [self, exchange_id] { self->cancel_exchange(exchange_id); }};
-            });
-    }
+    class Operation;
 
-    DnsExchangeId open_exchange(DnsExchangeRequest request,
-                                async::BridgeHandler<DnsExchangeResult> handler) {
-        const auto exchange_id = next_exchange_id_++;
-        auto pending = std::make_shared<Pending>();
-        pending->request = std::move(request);
-        pending->handler = std::move(handler);
-        pending_.emplace(exchange_id, pending);
-        if (stopped_) {
-            complete(exchange_id, core::fail(cancelled_error()));
-            return exchange_id;
-        }
+    BootstrapDnsTransport(runtime::AsioRuntime &runtime, DnsUpstreamConfig config);
 
-        const auto self = shared_from_this();
-        pending->bootstrap_id = bootstrap_->resolve(
-            config_.hostname, pending->request.deadline,
-            [self, exchange_id](core::Result<std::vector<boost::asio::ip::address>> result) {
-                self->bootstrap_completed(exchange_id, std::move(result));
-            });
-        return exchange_id;
-    }
+    io::AnySender<DnsExchangeResult> exchange(DnsExchangeRequest request) override;
 
-    void cancel_exchange(DnsExchangeId exchange_id) noexcept {
-        const auto found = pending_.find(exchange_id);
-        if (found == pending_.end()) {
-            return;
-        }
-        const auto pending = found->second;
-        if (pending->bootstrap_id != 0) {
-            bootstrap_->cancel(pending->bootstrap_id);
-        }
-        // Complete first so the late inner terminal drops by map lookup,
-        // then destroy the op (its abort runs outside its own terminal).
-        complete(exchange_id, core::fail(cancelled_error()));
-        abort_inner(exchange_id);
-    }
-
-    void stop() noexcept override {
-        if (stopped_) {
-            return;
-        }
-        stopped_ = true;
-        bootstrap_->stop();
-        if (inner_) {
-            inner_->stop();
-        }
-
-        std::vector<DnsExchangeId> exchange_ids;
-        exchange_ids.reserve(pending_.size());
-        for (const auto &[exchange_id, pending] : pending_) {
-            exchange_ids.push_back(exchange_id);
-        }
-        for (const auto exchange_id : exchange_ids) {
-            complete(exchange_id, core::fail(cancelled_error()));
-        }
-        inner_ops_.clear();
-    }
+    void stop() noexcept override;
 
   private:
-    // Inner drive state, held apart from Pending so terminal delivery
-    // never destroys its own operation state: the receiver completes the
-    // pending entry, and the op entry is erased (or aborted) separately.
-    struct InnerReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::weak_ptr<BootstrapDnsTransport> transport;
-        DnsExchangeId exchange_id;
-        void set_value(DnsExchangeResult result) noexcept {
-            if (auto self = transport.lock()) {
-                self->inner_finished(exchange_id, std::move(result));
-            }
-        }
-        void set_error(std::exception_ptr error) noexcept {
-            if (auto self = transport.lock()) {
-                try {
-                    std::rethrow_exception(std::move(error));
-                } catch (const core::Error &failure) {
-                    self->inner_finished(exchange_id, core::fail(failure));
-                    return;
-                } catch (...) {
-                }
-                self->inner_finished(exchange_id,
-                                     core::fail(core::Error{core::ErrorCode::transport_io,
-                                                            "bootstrap inner exchange failed"}));
-            }
-        }
-        void set_stopped() noexcept {
-            if (auto self = transport.lock()) {
-                self->inner_finished(exchange_id, core::fail(cancelled_error()));
-            }
-        }
-    };
-    // Connected inner op, heap-held and never moved; destroying it
-    // aborts the inner exchange.
-    using InnerDrive = async::HeldOperation<io::AnySender<DnsExchangeResult>, InnerReceiver>;
+    io::AnySender<DnsExchangeResult> wrap(std::shared_ptr<Operation> operation,
+                                          async::oneshot::Receiver<DriveTerminal> receiver);
 
-    struct Pending {
-        DnsExchangeRequest request;
-        async::BridgeHandler<DnsExchangeResult> handler;
-        BootstrapResolver::RequestId bootstrap_id = 0;
-    };
+    void erase(DnsExchangeId exchange_id);
 
-    void abort_inner(DnsExchangeId exchange_id) {
-        const auto found = inner_ops_.find(exchange_id);
-        if (found == inner_ops_.end()) {
-            return;
-        }
-        // Erasing destroys the op state outside its own terminal, which
-        // runs the bridge aborter and cancels the inner exchange.
-        inner_ops_.erase(found);
-    }
-
-    void inner_finished(DnsExchangeId exchange_id, DnsExchangeResult result) {
-        const auto found = pending_.find(exchange_id);
-        if (found == pending_.end()) {
-            return;
-        }
-        // Schedule the op-state cleanup after delivery: complete() may run
-        // inside this terminal, so the entry must outlive this call.
-        const auto self = shared_from_this();
-        runtime_.scheduler().post([self, exchange_id] { self->inner_ops_.erase(exchange_id); });
-        complete(exchange_id, std::move(result));
-    }
-
-    void bootstrap_completed(DnsExchangeId exchange_id,
-                             core::Result<std::vector<boost::asio::ip::address>> result) {
-        const auto found = pending_.find(exchange_id);
-        if (found == pending_.end() || stopped_) {
-            return;
-        }
-        const auto pending = found->second;
-        pending->bootstrap_id = 0;
-        if (!result) {
-            complete(exchange_id, core::fail(result.error()));
-            return;
-        }
-
-        const auto endpoint_address = config_.endpoint.address();
-        const auto selected =
-            std::find_if(result.value().begin(), result.value().end(), [&](const auto &address) {
-                return address_matches_endpoint_family(address, endpoint_address);
-            });
-        if (selected == result.value().end()) {
-            complete(exchange_id, core::fail(resolution_error()));
-            return;
-        }
-
-        if (!inner_) {
-            auto resolved_config = config_;
-            resolved_config.hostname.clear();
-            resolved_config.bootstrap_resolver.reset();
-            resolved_config.endpoint =
-                boost::asio::ip::udp::endpoint(*selected, config_.endpoint.port());
-            if (resolved_config.tcp_endpoint &&
-                resolved_config.tcp_endpoint->address().is_unspecified()) {
-                resolved_config.tcp_endpoint =
-                    boost::asio::ip::tcp::endpoint(*selected, resolved_config.tcp_endpoint->port());
-            }
-            if (resolved_config.fallback_endpoint &&
-                resolved_config.fallback_endpoint->address().is_unspecified()) {
-                resolved_config.fallback_endpoint = boost::asio::ip::udp::endpoint(
-                    *selected, resolved_config.fallback_endpoint->port());
-            }
-            if (resolved_config.fallback_tcp_endpoint &&
-                resolved_config.fallback_tcp_endpoint->address().is_unspecified()) {
-                resolved_config.fallback_tcp_endpoint = boost::asio::ip::tcp::endpoint(
-                    *selected, resolved_config.fallback_tcp_endpoint->port());
-            }
-            inner_ = make_asio_dns_transport(runtime_, std::move(resolved_config));
-        }
-
-        // Drive the inner sender with a held op state so cancel aborts
-        // exactly this exchange; the terminal routes through
-        // inner_finished, which drops late results by map lookup.
-        const auto self = shared_from_this();
-        // NOTE: name the sender first; argument order is unspecified.
-        auto sender = inner_->exchange(std::move(pending->request));
-        auto drive = async::hold_operation(std::move(sender), InnerReceiver{self, exchange_id});
-        inner_ops_.emplace(exchange_id, std::move(drive));
-        inner_ops_[exchange_id]->start();
-    }
-
-    void complete(DnsExchangeId exchange_id, core::Result<DnsPacket> result) {
-        const auto found = pending_.find(exchange_id);
-        if (found == pending_.end()) {
-            return;
-        }
-        auto pending = std::move(found->second);
-        pending_.erase(found);
-        if (pending->handler) {
-            auto handler = std::move(pending->handler);
-            runtime_.scheduler().post(
-                [handler = std::move(handler), result = std::move(result)]() mutable {
-                    handler(std::move(result));
-                });
-        }
-    }
+    std::shared_ptr<DnsTransport> inner_for(const boost::asio::ip::address &selected);
 
     runtime::AsioRuntime &runtime_;
     DnsUpstreamConfig config_;
     std::shared_ptr<BootstrapResolver> bootstrap_;
+    std::mutex mutex_;
     std::shared_ptr<DnsTransport> inner_;
-    std::unordered_map<DnsExchangeId, std::shared_ptr<Pending>> pending_;
-    std::unordered_map<DnsExchangeId, std::shared_ptr<InnerDrive>> inner_ops_;
+    std::unordered_map<DnsExchangeId, std::shared_ptr<Operation>> operations_;
     DnsExchangeId next_exchange_id_ = 1;
     bool stopped_ = false;
 };
+
+class BootstrapDnsTransport::Operation final
+    : public std::enable_shared_from_this<BootstrapDnsTransport::Operation> {
+  public:
+    Operation(BootstrapDnsTransport &owner, DnsExchangeId exchange_id, DnsExchangeRequest request,
+              async::oneshot::Sender<DriveTerminal> terminal)
+        : owner_(owner), exchange_id_(exchange_id), request_(std::move(request)),
+          terminal_(std::move(terminal)) {}
+
+    ~Operation() {
+        // Best effort: an abandoned operation (receiver destroyed without
+        // stop) still aborts its bootstrap resolve and wakes its awaits.
+        cancel_bootstrap();
+        try {
+            scope_.request_stop();
+        } catch (...) {
+        }
+    }
+
+    void start() { scope_.spawn(run(shared_from_this())); }
+
+    void cancel() {
+        if (completed_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        cancel_bootstrap();
+        try {
+            // Aborts the in-flight inner sender await (stop-mapped below)
+            // and detaches any parked oneshot wait.
+            scope_.request_stop();
+        } catch (...) {
+        }
+        terminal_.send(DriveTerminal{core::fail(cancelled_error())});
+    }
+
+  private:
+    // Straight-line chain: bootstrap resolve, address select, inner exchange.
+    // Every terminal funnels through finish(), so the spawned task always
+    // ends with a value.
+    static exec::task<void> run(std::shared_ptr<Operation> self) {
+        auto channel = async::oneshot::channel<AddressResult>();
+        auto sender =
+            std::make_shared<async::oneshot::Sender<AddressResult>>(std::move(channel.sender));
+        BootstrapResolver::RequestId bootstrap_id = 0;
+        try {
+            bootstrap_id = self->owner_.bootstrap_->resolve(
+                self->owner_.config_.hostname, self->request_.deadline,
+                [sender](AddressResult result) mutable { sender->send(std::move(result)); });
+        } catch (...) {
+            self->finish(core::fail(
+                core::Error{core::ErrorCode::transport_io, "DNS bootstrap resolution failed"}));
+            co_return;
+        }
+        self->bootstrap_id_.store(bootstrap_id, std::memory_order_release);
+        if (self->completed_.load(std::memory_order_acquire)) {
+            co_return;
+        }
+        auto outcome = co_await (
+            std::move(channel.receiver) |
+            stdexec::then([](std::optional<AddressResult> terminal) { return terminal; }) |
+            stdexec::let_stopped([] { return stdexec::just(std::optional<AddressResult>()); }));
+        self->bootstrap_id_.store(0, std::memory_order_release);
+        if (!outcome || self->completed_.load(std::memory_order_acquire)) {
+            co_return;
+        }
+        if (!*outcome) {
+            self->finish(core::fail(outcome->error()));
+            co_return;
+        }
+        const auto endpoint_address = self->owner_.config_.endpoint.address();
+        const auto selected = std::find_if(
+            outcome->value().begin(), outcome->value().end(), [&](const auto &address) {
+                return address_matches_endpoint_family(address, endpoint_address);
+            });
+        if (selected == outcome->value().end()) {
+            self->finish(core::fail(resolution_error()));
+            co_return;
+        }
+        auto inner = self->owner_.inner_for(*selected);
+        if (self->completed_.load(std::memory_order_acquire)) {
+            co_return;
+        }
+        std::optional<DnsExchangeResult> inner_result;
+        try {
+            inner_result = co_await (inner->exchange(std::move(self->request_)) |
+                                     stdexec::then([](DnsExchangeResult result) {
+                                         return std::optional<DnsExchangeResult>(std::move(result));
+                                     }) |
+                                     stdexec::let_stopped([] {
+                                         return stdexec::just(std::optional<DnsExchangeResult>());
+                                     }));
+        } catch (const core::Error &failure) {
+            self->finish(core::fail(failure));
+            co_return;
+        } catch (...) {
+            self->finish(core::fail(
+                core::Error{core::ErrorCode::transport_io, "DNS bootstrap inner exchange failed"}));
+            co_return;
+        }
+        if (!inner_result || self->completed_.load(std::memory_order_acquire)) {
+            co_return;
+        }
+        self->finish(std::move(*inner_result));
+        co_return;
+    }
+
+    void finish(DnsExchangeResult result) {
+        if (completed_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        cancel_bootstrap();
+        owner_.erase(exchange_id_);
+        terminal_.send(DriveTerminal{std::move(result)});
+    }
+
+    void cancel_bootstrap() noexcept {
+        const auto bootstrap_id = bootstrap_id_.exchange(0, std::memory_order_acq_rel);
+        if (bootstrap_id != 0) {
+            try {
+                owner_.bootstrap_->cancel(bootstrap_id);
+            } catch (...) {
+            }
+        }
+    }
+
+    BootstrapDnsTransport &owner_;
+    DnsExchangeId exchange_id_;
+    DnsExchangeRequest request_;
+    async::oneshot::Sender<DriveTerminal> terminal_;
+    std::atomic_bool completed_{false};
+    std::atomic<BootstrapResolver::RequestId> bootstrap_id_{0};
+    // Owns the resolve/exchange chain task, which always ends with a value.
+    exec::async_scope scope_;
+};
+
+BootstrapDnsTransport::BootstrapDnsTransport(runtime::AsioRuntime &runtime,
+                                             DnsUpstreamConfig config)
+    : runtime_(runtime), config_(std::move(config)),
+      bootstrap_(config_.bootstrap_resolver
+                     ? config_.bootstrap_resolver
+                     : make_bootstrap_resolver(runtime_, config_.bootstrap_dns_servers)) {}
+
+io::AnySender<DnsExchangeResult> BootstrapDnsTransport::exchange(DnsExchangeRequest request) {
+    std::lock_guard lock(mutex_);
+    if (stopped_) {
+        return io::AnySender<DnsExchangeResult>{stdexec::just(core::fail(cancelled_error()))};
+    }
+    const auto exchange_id = next_exchange_id_++;
+    auto channel = async::oneshot::channel<DriveTerminal>();
+    auto operation = std::make_shared<Operation>(*this, exchange_id, std::move(request),
+                                                 std::move(channel.sender));
+    operations_.emplace(exchange_id, operation);
+    // NOTE: name the sender first; argument order is unspecified.
+    auto sender = wrap(operation, std::move(channel.receiver));
+    operation->start();
+    return sender;
+}
+
+void BootstrapDnsTransport::stop() noexcept {
+    std::vector<std::shared_ptr<Operation>> operations;
+    {
+        std::lock_guard lock(mutex_);
+        if (stopped_) {
+            return;
+        }
+        stopped_ = true;
+        operations.reserve(operations_.size());
+        for (const auto &[exchange_id, operation] : operations_) {
+            (void)exchange_id;
+            operations.push_back(operation);
+        }
+    }
+    bootstrap_->stop();
+    std::shared_ptr<DnsTransport> inner;
+    {
+        std::lock_guard lock(mutex_);
+        inner = inner_;
+    }
+    if (inner) {
+        inner->stop();
+    }
+    for (const auto &operation : operations) {
+        operation->cancel();
+    }
+}
+
+io::AnySender<DnsExchangeResult>
+BootstrapDnsTransport::wrap(std::shared_ptr<Operation> operation,
+                            async::oneshot::Receiver<DriveTerminal> receiver) {
+    auto sender = std::move(receiver) |
+                  stdexec::then([](std::optional<DriveTerminal> terminal) -> DnsExchangeResult {
+                      if (!terminal) {
+                          throw core::Error{core::ErrorCode::cancelled,
+                                            "DNS bootstrap exchange was abandoned"};
+                      }
+                      return std::move(terminal->result);
+                  }) |
+                  stdexec::let_stopped([operation] {
+                      operation->cancel();
+                      return stdexec::just_stopped();
+                  });
+    return io::AnySender<DnsExchangeResult>{std::move(sender)};
+}
+
+void BootstrapDnsTransport::erase(DnsExchangeId exchange_id) {
+    std::lock_guard lock(mutex_);
+    operations_.erase(exchange_id);
+}
+
+std::shared_ptr<DnsTransport>
+BootstrapDnsTransport::inner_for(const boost::asio::ip::address &selected) {
+    std::lock_guard lock(mutex_);
+    if (!inner_) {
+        auto resolved_config = config_;
+        resolved_config.hostname.clear();
+        resolved_config.bootstrap_resolver.reset();
+        resolved_config.endpoint =
+            boost::asio::ip::udp::endpoint(selected, config_.endpoint.port());
+        if (resolved_config.tcp_endpoint &&
+            resolved_config.tcp_endpoint->address().is_unspecified()) {
+            resolved_config.tcp_endpoint =
+                boost::asio::ip::tcp::endpoint(selected, resolved_config.tcp_endpoint->port());
+        }
+        if (resolved_config.fallback_endpoint &&
+            resolved_config.fallback_endpoint->address().is_unspecified()) {
+            resolved_config.fallback_endpoint =
+                boost::asio::ip::udp::endpoint(selected, resolved_config.fallback_endpoint->port());
+        }
+        if (resolved_config.fallback_tcp_endpoint &&
+            resolved_config.fallback_tcp_endpoint->address().is_unspecified()) {
+            resolved_config.fallback_tcp_endpoint = boost::asio::ip::tcp::endpoint(
+                selected, resolved_config.fallback_tcp_endpoint->port());
+        }
+        inner_ = make_asio_dns_transport(runtime_, std::move(resolved_config));
+    }
+    return inner_;
+}
 
 } // namespace
 

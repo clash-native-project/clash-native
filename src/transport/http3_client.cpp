@@ -1,5 +1,5 @@
 #include <clash_native/async/oneshot.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/timer.hpp>
 #include <clash_native/core/result.hpp>
 #include <clash_native/io/exchange_body_stream.hpp>
 #include <clash_native/io/exchange_session.hpp>
@@ -12,7 +12,9 @@
 
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
+
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 
 #include <nghttp3/nghttp3.h>
 
@@ -206,19 +208,14 @@ class Http3ClientSession final : public io::ExchangeSession,
             return wrap_result(exchange_id, std::move(channel.receiver));
         }
 
-        auto pending = std::make_shared<Pending>(executor_);
+        auto pending = std::make_shared<Pending>();
         pending->request = std::move(request);
         pending->handler = std::move(channel.sender);
-        pending->timer.expires_at(deadline);
-        const auto self = shared_from_this();
-        pending->timer.async_wait([self, exchange_id](const boost::system::error_code &error) {
-            if (!error) {
-                self->fail_pending(exchange_id, timeout_error());
-            }
-        });
+        pending->deadline = deadline;
         pending_.emplace(exchange_id, pending);
         pending_order_.push_back(exchange_id);
         open_pending_requests();
+        arm_deadline(exchange_id, pending, deadline);
         return wrap_result(exchange_id, std::move(channel.receiver));
     }
 
@@ -245,23 +242,18 @@ class Http3ClientSession final : public io::ExchangeSession,
             return wrap_streaming(exchange_id, std::move(channel.receiver));
         }
 
-        auto pending = std::make_shared<Pending>(executor_);
+        auto pending = std::make_shared<Pending>();
         pending->request = std::move(request.request);
         pending->request_body_source = std::move(request.body);
         pending->request_content_length = content_length;
         pending->streaming_handler = std::move(channel.sender);
         pending->is_streaming = true;
         pending->head_deadline_only = request.head_deadline_only;
-        pending->timer.expires_at(deadline);
-        const auto self = shared_from_this();
-        pending->timer.async_wait([self, exchange_id](const boost::system::error_code &error) {
-            if (!error) {
-                self->fail_pending(exchange_id, timeout_error());
-            }
-        });
+        pending->deadline = deadline;
         pending_.emplace(exchange_id, pending);
         pending_order_.push_back(exchange_id);
         open_pending_requests();
+        arm_deadline(exchange_id, pending, deadline);
         return wrap_streaming(exchange_id, std::move(channel.receiver));
     }
 
@@ -310,22 +302,17 @@ class Http3ClientSession final : public io::ExchangeSession,
             channel.sender.send(core::fail(timeout_error()));
             return wrap_tunnel(exchange_id, std::move(channel.receiver));
         }
-        auto pending = std::make_shared<Pending>(executor_);
+        auto pending = std::make_shared<Pending>();
         pending->is_tunnel = true;
         pending->tunnel_request = std::move(request);
         pending->tunnel_handler = std::move(channel.sender);
         pending->response.version = 30;
         pending->response.keep_alive = true;
-        pending->timer.expires_at(deadline);
-        const auto self = shared_from_this();
-        pending->timer.async_wait([self, exchange_id](const boost::system::error_code &error) {
-            if (!error) {
-                self->fail_pending(exchange_id, timeout_error());
-            }
-        });
+        pending->deadline = deadline;
         pending_.emplace(exchange_id, pending);
         pending_order_.push_back(exchange_id);
         open_pending_requests();
+        arm_deadline(exchange_id, pending, deadline);
         return wrap_tunnel(exchange_id, std::move(channel.receiver));
     }
 
@@ -364,7 +351,7 @@ class Http3ClientSession final : public io::ExchangeSession,
 
   private:
     struct Pending {
-        explicit Pending(boost::asio::any_io_executor executor) : timer(std::move(executor)) {}
+        Pending() = default;
 
         io::ExchangeRequest request;
         io::StreamUpgradeRequest tunnel_request;
@@ -377,7 +364,11 @@ class Http3ClientSession final : public io::ExchangeSession,
         async::oneshot::Sender<BufferedTerminal> handler;
         async::oneshot::Sender<StreamingTerminal> streaming_handler;
         async::oneshot::Sender<TunnelTerminal> tunnel_handler;
-        boost::asio::steady_timer timer;
+        std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::time_point::max();
+        // Set on every terminal path; the deadline task rechecks it after
+        // the sleep and drops instead of firing into a recycled exchange id.
+        bool timer_done = false;
         std::size_t body_offset = 0;
         std::size_t request_body_offset = 0;
         std::size_t request_body_output_covered = 0;
@@ -417,6 +408,30 @@ class Http3ClientSession final : public io::ExchangeSession,
     };
 
     using PendingPtr = std::shared_ptr<Pending>;
+
+    // Per-exchange deadline task: fires once at the deadline; the map
+    // lookup + timer_done guard drop it when the exchange already won.
+    // Bounded by the deadline, so no stop is ever requested.
+    void arm_deadline(ExchangeId exchange_id, PendingPtr pending,
+                      std::chrono::steady_clock::time_point deadline) {
+        pending->deadline = deadline;
+        scope_.spawn(run_deadline(shared_from_this(), exchange_id, pending, deadline));
+    }
+
+    static exec::task<void> run_deadline(std::shared_ptr<Http3ClientSession> self,
+                                         ExchangeId exchange_id, PendingPtr pending,
+                                         std::chrono::steady_clock::time_point deadline) {
+        auto executor = self->executor_;
+        try {
+            co_await async::sleep_until(executor, deadline);
+        } catch (...) {
+            co_return;
+        }
+        if (pending->timer_done) {
+            co_return;
+        }
+        self->fail_pending(exchange_id, timeout_error());
+    }
 
     static std::optional<core::Error> validate_request(const io::ExchangeRequest &request) {
         if (!is_token(request.method) || !is_token(request.scheme) || request.authority.empty() ||
@@ -608,40 +623,36 @@ class Http3ClientSession final : public io::ExchangeSession,
         pending->request_body_buffer.assign(kHttp3RequestBodyReadSize, 0);
         pending->request_body_offset = 0;
         pending->request_body_read_pending = true;
-        struct BodyReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::weak_ptr<Http3ClientSession> weak_self;
-            std::weak_ptr<Pending> weak_pending;
-            std::int64_t stream_id;
-            void deliver(const boost::system::error_code &error, std::size_t size) {
-                if (const auto self = weak_self.lock()) {
-                    if (const auto pending = weak_pending.lock()) {
-                        boost::asio::post(self->executor_,
-                                          [self, pending, id = stream_id, error, size] {
-                                              self->on_request_body_read(id, pending, error, size);
-                                          });
-                    }
-                }
+        // Thin nghttp3 boundary: the read itself is a task that co_awaits
+        // the body sender and posts the terminal back; owned by the
+        // session scope, guarded by the completed checks in the handler.
+        scope_.spawn(run_request_body_read(shared_from_this(), pending, stream_id));
+    }
+
+    static exec::task<void> run_request_body_read(std::shared_ptr<Http3ClientSession> self,
+                                                  PendingPtr pending, std::int64_t stream_id) {
+        boost::system::error_code terminal = {};
+        std::size_t size = 0;
+        try {
+            auto pulled = co_await pending->request_body_source->async_read_some(
+                boost::asio::buffer(pending->request_body_buffer));
+            if (pulled) {
+                size = *pulled;
+            } else {
+                terminal = boost::asio::error::eof;
             }
-            void set_value(std::optional<std::size_t> size) && noexcept {
-                if (size) {
-                    deliver({}, *size);
-                } else {
-                    deliver(boost::asio::error::eof, 0);
-                }
-            }
-            void set_error(std::exception_ptr error) && noexcept {
-                deliver(net::unpack_error(std::move(error)), 0);
-            }
-            void set_stopped() && noexcept { deliver(boost::asio::error::operation_aborted, 0); }
-        };
-        const auto weak_self = weak_from_this();
+        } catch (...) {
+            terminal = net::unpack_error(std::current_exception());
+        }
+        const auto weak = std::weak_ptr<Http3ClientSession>(self);
         const std::weak_ptr<Pending> weak_pending = pending;
-        // NOTE: name the sender first; argument order is unspecified.
-        auto body_sender = pending->request_body_source->async_read_some(
-            boost::asio::buffer(pending->request_body_buffer));
-        async::start_with_receiver(std::move(body_sender),
-                                   BodyReceiver{weak_self, weak_pending, stream_id});
+        boost::asio::post(self->executor_, [weak, weak_pending, stream_id, terminal, size] {
+            if (const auto locked = weak.lock()) {
+                if (const auto target = weak_pending.lock()) {
+                    locked->on_request_body_read(stream_id, target, terminal, size);
+                }
+            }
+        });
     }
 
     void on_request_body_read(std::int64_t stream_id, const PendingPtr &pending,
@@ -966,7 +977,7 @@ class Http3ClientSession final : public io::ExchangeSession,
                 }
             });
         if (pending->head_deadline_only) {
-            (void)pending->timer.cancel();
+            pending->timer_done = true;
         }
         auto handler = std::move(pending->streaming_handler);
         io::StreamingExchangeResponse response{std::move(pending->response),
@@ -1053,7 +1064,7 @@ class Http3ClientSession final : public io::ExchangeSession,
             pending->deferred_receive_credit = 0;
         }
         pending->completed = true;
-        (void)pending->timer.cancel();
+        pending->timer_done = true;
         pending_.erase(found);
     }
 
@@ -1311,18 +1322,19 @@ class Http3ClientSession final : public io::ExchangeSession,
     void accept_tunnel(ExchangeId exchange_id, const PendingPtr &pending) {
         pending->completed = true;
         pending->tunnel_established = true;
-        (void)pending->timer.cancel();
+        pending->timer_done = true;
         pending_.erase(exchange_id);
         const auto weak = weak_from_this();
         const auto stream_id = pending->stream_id;
+        const auto fallback = executor_;
         pending->tunnel_state = std::make_shared<io::detail::HttpTunnelStreamState>(
             executor_,
-            [weak, pending, stream_id](std::vector<std::uint8_t> bytes,
-                                       StreamWriteHandler handler) mutable {
+            [weak, pending, stream_id, fallback](std::vector<std::uint8_t> bytes,
+                                                 StreamWriteHandler handler) mutable {
                 const auto self = weak.lock();
                 if (!self || self->retired_ || pending->tunnel_write_closed ||
                     pending->tunnel_write_handler) {
-                    const auto executor = self ? self->executor_ : pending->timer.get_executor();
+                    const auto executor = self ? self->executor_ : fallback;
                     boost::asio::post(executor, [handler = std::move(handler)]() mutable {
                         if (handler) {
                             handler(boost::asio::error::operation_aborted, 0);
@@ -1639,7 +1651,7 @@ class Http3ClientSession final : public io::ExchangeSession,
         }
         const auto pending = found->second;
         pending->completed = true;
-        (void)pending->timer.cancel();
+        pending->timer_done = true;
         pending_.erase(found);
         if (pending->response_too_large) {
             if (pending->is_tunnel) {
@@ -1677,7 +1689,7 @@ class Http3ClientSession final : public io::ExchangeSession,
             pending->deferred_receive_credit = 0;
         }
         pending->completed = true;
-        (void)pending->timer.cancel();
+        pending->timer_done = true;
         pending->request_body_read_pending = false;
         if (pending->request_body_source && !pending->request_body_source_eof) {
             pending->request_body_source->cancel();
@@ -1724,7 +1736,7 @@ class Http3ClientSession final : public io::ExchangeSession,
         }
         for (auto &[exchange_id, pending] : pending_) {
             (void)exchange_id;
-            (void)pending->timer.cancel();
+            pending->timer_done = true;
             if (pending->completed) {
                 continue;
             }
@@ -1795,6 +1807,7 @@ class Http3ClientSession final : public io::ExchangeSession,
     bool remote_connect_protocol_enabled_ = false;
     bool retired_ = false;
     bool stopped_ = false;
+    exec::async_scope scope_;
 };
 
 } // namespace

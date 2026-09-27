@@ -1,5 +1,6 @@
 #pragma once
 
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 
 #include <atomic>
