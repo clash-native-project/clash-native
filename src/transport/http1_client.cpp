@@ -6,6 +6,7 @@
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
+#include <clash_native/transport/http_sessions.hpp>
 
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/async_result.hpp>
@@ -815,25 +816,16 @@ class Http1ClientSession final : public io::ExchangeSession,
     }
 
     void post_result(async::oneshot::Sender<BufferedTerminal> sender, BufferedTerminal result) {
-        boost::asio::post(executor_,
-                          [sender = std::move(sender), result = std::move(result)]() mutable {
-                              sender.send(std::move(result));
-                          });
+        transport::post_terminal(executor_, std::move(sender), std::move(result));
     }
 
     void post_tunnel_result(async::oneshot::Sender<TunnelTerminal> sender, TunnelTerminal result) {
-        boost::asio::post(executor_,
-                          [sender = std::move(sender), result = std::move(result)]() mutable {
-                              sender.send(std::move(result));
-                          });
+        transport::post_terminal(executor_, std::move(sender), std::move(result));
     }
 
     void post_streaming_result(async::oneshot::Sender<StreamingTerminal> sender,
                                StreamingTerminal result) {
-        boost::asio::post(executor_,
-                          [sender = std::move(sender), result = std::move(result)]() mutable {
-                              sender.send(std::move(result));
-                          });
+        transport::post_terminal(executor_, std::move(sender), std::move(result));
     }
 
     template <typename Terminal>
