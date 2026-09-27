@@ -1,4 +1,3 @@
-#include <clash_native/async/bridge.hpp>
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 
@@ -129,7 +128,7 @@ core::Result<std::vector<std::uint8_t>> build_request_header(const TrojanOutboun
 // into a scope (the run() shape); every terminal funnels through done.
 struct GrpcSessionOpen {
     using SessionResult = core::Result<std::shared_ptr<io::ExchangeSession>>;
-    using SessionHandler = async::BridgeSender<SessionResult>::Handler;
+    using SessionHandler = async::BridgeHandler<SessionResult>;
     static exec::task<void> run(runtime::AsioRuntime *runtime,
                                 std::shared_ptr<dns::ResolverService> resolver,
                                 TrojanOutboundConfig config, SessionHandler done) {
@@ -146,15 +145,14 @@ struct GrpcSessionOpen {
         };
         auto addresses = co_await async::bridge_sender<core::Result<detail::AddressList>>(
             [runtime, resolver = std::move(resolver), host = config.server_host](
-                async::BridgeSender<core::Result<detail::AddressList>>::Handler open) mutable {
+                async::BridgeHandler<core::Result<detail::AddressList>> open) mutable {
                 // The bridge starter must be copyable: resolve_host takes
                 // its handler by value, so the lambda already copies.
                 detail::resolve_host(*runtime, std::move(resolver), std::move(host),
                                      [open](core::Result<detail::AddressList> result) mutable {
                                          open(std::move(result));
                                      });
-                using AbortFn = async::BridgeSender<core::Result<detail::AddressList>>::AbortFn;
-                return AbortFn{[] {}};
+                return async::CallbackAbortFn{};
             });
         if (!addresses || addresses.value().empty()) {
             finish(!addresses ? core::fail(addresses.error())
@@ -253,8 +251,7 @@ open_grpc_session(runtime::AsioRuntime &runtime, std::shared_ptr<dns::ResolverSe
          config = std::move(config)](SessionHandler done) mutable {
             shared->scope.spawn(GrpcSessionOpen::run(&runtime, std::move(resolver),
                                                      std::move(config), std::move(done)));
-            using AbortFn = async::BridgeSender<SessionResult>::AbortFn;
-            return AbortFn{[] {}};
+            return async::CallbackAbortFn{};
         });
     auto sender = std::move(bridged) | stdexec::then([](SessionResult result) {
                       if (!result) {
@@ -346,7 +343,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
             if (mode == "shadow-tls") {
                 auto boxed = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(stream));
                 co_return co_await async::bridge_sender<Opened>(
-                    [self, boxed](async::BridgeSender<Opened>::Handler done) mutable {
+                    [self, boxed](async::BridgeHandler<Opened> done) mutable {
                         // Mihomo forwards the proxy-level fingerprint (pin)
                         // and client-fingerprint (hello) into the overlay;
                         // explicit overlay options win.
@@ -360,14 +357,13 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                         transport::proxy::async_open_shadow_tls(
                             std::move(*boxed), std::move(options),
                             [done](Opened opened) mutable { done(std::move(opened)); });
-                        using AbortFn = async::BridgeSender<Opened>::AbortFn;
-                        return AbortFn{[self] { self->abort(); }};
+                        return async::CallbackAbortFn{[self] { self->abort(); }};
                     });
             }
             if (mode == "restls") {
                 auto boxed = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(stream));
                 co_return co_await async::bridge_sender<Opened>(
-                    [self, boxed](async::BridgeSender<Opened>::Handler done) mutable {
+                    [self, boxed](async::BridgeHandler<Opened> done) mutable {
                         auto options = self->config_.restls_options;
                         if (options.certificate_pin.empty()) {
                             options.certificate_pin = self->config_.fingerprint;
@@ -375,19 +371,17 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                         transport::proxy::async_open_restls(
                             std::move(*boxed), std::move(options),
                             [done](Opened opened) mutable { done(std::move(opened)); });
-                        using AbortFn = async::BridgeSender<Opened>::AbortFn;
-                        return AbortFn{[self] { self->abort(); }};
+                        return async::CallbackAbortFn{[self] { self->abort(); }};
                     });
             }
             if (mode == "jls") {
                 auto boxed = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(stream));
                 co_return co_await async::bridge_sender<Opened>(
-                    [self, boxed](async::BridgeSender<Opened>::Handler done) mutable {
+                    [self, boxed](async::BridgeHandler<Opened> done) mutable {
                         transport::proxy::async_open_jls(
                             std::move(*boxed), self->config_.jls_options,
                             [done](Opened opened) mutable { done(std::move(opened)); });
-                        using AbortFn = async::BridgeSender<Opened>::AbortFn;
-                        return AbortFn{[self] { self->abort(); }};
+                        return async::CallbackAbortFn{[self] { self->abort(); }};
                     });
             }
             co_return core::fail({core::ErrorCode::configuration,
@@ -448,13 +442,13 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
             opened = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                 [self, plan = std::move(plan.value()),
                  chained_request = std::move(chained_request)](
-                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
                         done) mutable {
                     transport::EndpointDialer dialer(self->runtime_.serialized_executor(),
                                                      std::move(plan));
                     async::start_with_receiver(dialer.connect_stream(std::move(chained_request)),
                                                transport::ChainedStreamReceiver{std::move(done)});
-                    return [self] { self->abort(); };
+                    return async::CallbackAbortFn{[self] { self->abort(); }};
                 });
         } catch (...) {
             fail({core::ErrorCode::transport_io, "Trojan chained dial failed", {}});
@@ -614,16 +608,29 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                     ws_base = std::move(overlay.value());
                 }
                 auto plain_stream = std::move(ws_base);
+                // Shared ownership of the pre-handshake stream so the
+                // aborter can close it after the initiation moved it into
+                // the handshake operation. Closing aborts the in-flight
+                // handshake; the late terminal is dropped by the sender.
+                auto plain =
+                    std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(plain_stream));
                 using WsSigs = stdexec::completion_signatures<
                     stdexec::set_value_t(core::Result<std::unique_ptr<io::StreamHandle>>),
                     stdexec::set_error_t(std::exception_ptr), stdexec::set_stopped_t()>;
                 core::Result<std::unique_ptr<io::StreamHandle>> ws_result;
                 try {
                     ws_result = co_await async::callback_sender<WsSigs>(
-                        [plain = std::move(plain_stream),
-                         ws_options = std::move(ws_options)](auto terminal) mutable {
-                            transport::async_websocket_client_handshake(
-                                std::move(plain), std::move(ws_options), std::move(terminal));
+                        [plain, ws_options = std::move(ws_options)](auto terminal) mutable {
+                            auto *slot = plain.get();
+                            auto handshake = transport::async_websocket_client_handshake(
+                                std::move(*slot), std::move(ws_options), std::move(terminal));
+                            return async::CallbackAbortFn{[plain, handshake] {
+                                if (handshake) {
+                                    handshake->cancel();
+                                } else if (plain && *plain) {
+                                    (*plain)->close();
+                                }
+                            }};
                         },
                         [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> result) {
                             stdexec::set_value(std::move(receiver), std::move(result));
@@ -925,12 +932,12 @@ io::AnySender<core::StreamOpenResult> TrojanOutbound::connect_stream(core::Strea
     return async::bridge_sender<core::StreamOpenResult>(
         [&runtime, resolver = std::move(resolver), chain_registry = std::move(chain_registry),
          config = std::move(config), gun_pool = std::move(gun_pool), request = std::move(request)](
-            async::BridgeSender<core::StreamOpenResult>::Handler terminal) mutable {
+            async::BridgeHandler<core::StreamOpenResult> terminal) mutable {
             auto operation = std::make_shared<TrojanConnectOperation>(
                 runtime, std::move(resolver), std::move(chain_registry), std::move(config),
                 std::move(request), std::move(terminal), 0x01, std::move(gun_pool));
             operation->start();
-            return [operation] { operation->abort(); };
+            return async::CallbackAbortFn{[operation] { operation->abort(); }};
         });
 }
 
@@ -949,13 +956,13 @@ TrojanOutbound::open_datagram(core::DatagramRequest request) {
     return async::bridge_sender<core::DatagramOpenResult>(
         [&runtime, resolver = std::move(resolver), chain_registry = std::move(chain_registry),
          config = std::move(config), gun_pool = std::move(gun_pool), request = std::move(request)](
-            async::BridgeSender<core::DatagramOpenResult>::Handler terminal) mutable {
+            async::BridgeHandler<core::DatagramOpenResult> terminal) mutable {
             auto handler = std::move(terminal);
             if (!request.initial_destination) {
                 handler(core::DatagramOpenResult::failed(
                     {core::ErrorCode::configuration,
                      "Trojan UDP association requires an initial destination"}));
-                return async::BridgeSender<core::DatagramOpenResult>::AbortFn{};
+                return async::CallbackAbortFn{};
             }
             core::StreamRequest stream_request{*request.initial_destination, std::nullopt,
                                                request.dial_trace};
@@ -982,8 +989,7 @@ TrojanOutbound::open_datagram(core::DatagramRequest request) {
                 },
                 transport::trojan::kCommandUdp, std::move(gun_pool));
             operation->start();
-            return async::BridgeSender<core::DatagramOpenResult>::AbortFn{
-                [operation] { operation->abort(); }};
+            return async::CallbackAbortFn{[operation] { operation->abort(); }};
         });
 }
 

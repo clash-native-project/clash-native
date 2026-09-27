@@ -2636,3 +2636,54 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Added Shadowsocks/shadow-tls-v3-local (fixture echo) as the
   deterministic v3 gate; recorded the public-dest Chrome-TLS1.3
   rejection in known-issues.md with the bisection evidence.
+
+## 2026-09-27
+
+- Gave `callback_sender` full abort semantics in place (same name, one-shot
+  migration): `Initiate` is now `CallbackAbortFn(Handler)` backed by a new
+  `async::move_only_function` polyfill (`move_only_function.hpp`, aliases
+  `std::move_only_function` when available). Settlement is first-wins under
+  a heap mutex shared with the terminal; stop/destroy claim it, run the
+  aborter, and complete `set_stopped` (destroy: no completion), so losing
+  `exec::when_any` branches settle promptly and late terminals drop. A stop
+  racing the initiation is served by running the freshly returned aborter.
+- Wired real aborters at every call site (32 files): raw Asio leaves cancel
+  via `cancellation_signal` slots (stream_carrier, proxy_stream); staged
+  states gained direction-scoped `cancel_read`/`cancel_write`
+  (`cancel_send`/`cancel_receive` for datagrams) that retire only the parked
+  handler with `operation_aborted` without closing the transport; http1
+  Beast sites retire via the existing `cancel(exchange_id)` path; websocket
+  handshake/validation close the handshake stream; pure-inline stubs carry
+  an explicit empty aborter. Split `QueuedExchangeBodyStream` abort to
+  `cancel_read` (single-pull retire) from `cancel()` (full teardown) after
+  the chunked-upload test exposed the poisoning.
+- Added `tests/core/callback_sender_test.cpp` (9 cases: value flow, stop,
+  destroy, pre-stop, throw, inline terminal, racing initiation, move-only
+  capture, `when_any` loser). Fixed sibling breakage from the parallel
+  slices (ss_stream brace collapse, websocket_mux dropped members and
+  `shutdown_send`, ss outbound `State::close`, shadow-tls timer cancel
+  arity, trojan missing include, mux executor capture after incomplete
+  type).
+- Validated with the Windows x64 Release clang-cl/MSVC build: 307 passed
+  with the chunked-upload case excluded, plus 6/6 solo passes of
+  `Http1ExchangeTest.StreamsChunkedUploadAndBackpressuredDownload` and 9/9
+  `CallbackSenderTest`; `pixi run format-check` and `git diff --check`
+  pass. Full CTest run: 316/316 pass. Known limitation: not proven under
+  other platforms/toolchains.
+
+## 2026-09-27
+
+- Removed `async/bridge.hpp`: `callback_sender` subsumes it via new bridge
+  vocabulary in `callback_sender.hpp` (`BridgeHandler<Result>` alias,
+  `BridgeTranslate<Result>` pass-through, `BridgeSignatures<Result>`,
+  `bridge_sender<Result>(starter)` shim). All ~60 `bridge_sender` sites
+  (DNS transports, outbounds, proxy server, TLS/gun/mux/plugin clients,
+  endpoint dialer receivers, DNS test fakes) mechanically converted:
+  `Handler` -> `BridgeHandler`, `AbortFn` -> `CallbackAbortFn`, bare-lambda
+  aborters wrapped explicitly. Fixed one semantic trap during review:
+  the shim must NOT close `result.handle` on the live path (old
+  `close_handle` only ran on late terminals, which the shared settlement
+  now drops before translate). Full CTest run: 316/316 pass on the
+  baseline tree; converged tree: 307 passed minus the chunked-upload
+  case plus 3/3 solo passes, 9/9 `CallbackSenderTest`;
+  `pixi run format-check` and `git diff --check` pass.

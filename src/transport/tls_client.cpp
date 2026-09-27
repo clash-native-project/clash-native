@@ -1,4 +1,4 @@
-#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/net/tls_stream.hpp>
 #include <clash_native/transport/cert_pin.hpp>
 #include <clash_native/transport/tls_client.hpp>
@@ -1277,16 +1277,16 @@ async_tls_client_handshake(std::unique_ptr<io::StreamHandle> stream, TlsClientOp
     auto state = std::make_shared<std::pair<std::unique_ptr<io::StreamHandle>, TlsClientOptions>>(
         std::move(stream), std::move(options));
     auto bridged = async::bridge_sender<core::Result<TlsClientConnection>>(
-        [state](async::BridgeSender<core::Result<TlsClientConnection>>::Handler terminal) mutable {
+        [state](async::BridgeHandler<core::Result<TlsClientConnection>> terminal) mutable {
             if (!state->first) {
                 terminal(core::fail(
                     configuration_error("TLS client handshake stream was already consumed")));
-                return async::BridgeSender<core::Result<TlsClientConnection>>::AbortFn{};
+                return async::CallbackAbortFn{};
             }
             auto operation = std::make_shared<detail::TlsClientHandshakeOperationImpl>(
                 std::move(state->first), std::move(state->second), std::move(terminal));
             operation->start();
-            using AbortFn = async::BridgeSender<core::Result<TlsClientConnection>>::AbortFn;
+            using AbortFn = async::CallbackAbortFn;
             return AbortFn{[operation] { operation->cancel(); }};
         });
     auto sender = std::move(bridged) | stdexec::then([](core::Result<TlsClientConnection> result) {

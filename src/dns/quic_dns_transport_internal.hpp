@@ -1,6 +1,6 @@
 #pragma once
 
-#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/io/sender.hpp>
@@ -47,20 +47,20 @@ class QuicDnsTransport final : public DnsTransport,
     io::AnySender<DnsExchangeResult> exchange(DnsExchangeRequest request) override;
     void stop() noexcept override;
     DnsExchangeId open_exchange(DnsExchangeRequest request,
-                                async::BridgeSender<DnsExchangeResult>::Handler handler);
+                                async::BridgeHandler<DnsExchangeResult> handler);
     void cancel_exchange(DnsExchangeId exchange_id) noexcept;
 
   private:
     struct ExchangeRegistration {
         std::shared_ptr<Operation> operation;
-        async::BridgeSender<DnsExchangeResult>::Handler handler;
+        async::BridgeHandler<DnsExchangeResult> handler;
     };
 
     void complete(DnsExchangeId exchange_id, core::Result<DnsPacket> result);
     void session_idle(const std::shared_ptr<Operation> &operation);
     void session_retired(const Operation *operation) noexcept;
     void add_new_exchange(DnsExchangeId id, DnsExchangeRequest request,
-                          async::BridgeSender<DnsExchangeResult>::Handler handler);
+                          async::BridgeHandler<DnsExchangeResult> handler);
 
     runtime::AsioRuntime &runtime_;
     DnsUpstreamConfig config_;

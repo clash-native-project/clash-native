@@ -8,6 +8,7 @@
 #include <stdexec/execution.hpp>
 
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/system/errc.hpp>
 
@@ -172,6 +173,10 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
             post_write_result(std::move(handler), boost::asio::error::operation_aborted, 0);
             return;
         }
+        if (send_in_progress_) {
+            post_write_result(std::move(handler), boost::asio::error::already_started, 0);
+            return;
+        }
         if (buffer.size() > std::numeric_limits<std::uint16_t>::max()) {
             post_write_result(std::move(handler), message_size_error(), 0);
             return;
@@ -211,8 +216,10 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
         const auto *data = static_cast<const std::uint8_t *>(buffer.data());
         wire.insert(wire.end(), data, data + buffer.size());
 
+        send_in_progress_ = true;
+        send_handler_ = std::move(handler);
         writes_.push_back({std::make_shared<std::vector<std::uint8_t>>(std::move(wire)),
-                           std::move(handler), buffer.size(), includes_request});
+                           buffer.size(), includes_request});
         pump_write();
     }
 
@@ -225,15 +232,13 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
         if (options_.version == UdpOverTcpVersion::version2 && !request_written_ &&
             !pending.includes_request) {
             if (!options_.request_destination) {
-                auto handler = std::move(pending.handler);
-                post_write_result(std::move(handler), protocol_error(), 0);
+                fail_queued_write(protocol_error());
                 pump_write();
                 return;
             }
             auto request_address = encode_request_destination(*options_.request_destination);
             if (!request_address) {
-                auto handler = std::move(pending.handler);
-                post_write_result(std::move(handler), protocol_error(), 0);
+                fail_queued_write(protocol_error());
                 pump_write();
                 return;
             }
@@ -247,22 +252,17 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
         write_in_progress_ = true;
         auto self = shared_from_this();
         auto packet = std::move(pending.packet);
-        auto handler = std::move(pending.handler);
         const auto size = pending.size;
         const auto includes_request = pending.includes_request;
         std::function<void(const boost::system::error_code &, std::size_t)> completion =
-            [self, packet, handler = std::move(handler), size,
-             includes_request](const boost::system::error_code &error, std::size_t) mutable {
+            [self, packet, size, includes_request](const boost::system::error_code &error,
+                                                   std::size_t) mutable {
                 self->write_in_progress_ = false;
                 if (includes_request) {
                     self->request_pending_ = false;
                     self->request_written_ = !error;
                 }
-                if (error) {
-                    handler(error, 0);
-                } else {
-                    handler({}, size);
-                }
+                self->finish_send(error, error ? 0 : size);
                 self->pump_write();
             };
         // NOTE: name the sender first; argument order is unspecified.
@@ -311,13 +311,63 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
                     handler(boost::asio::error::operation_aborted, 0, {});
                 });
             }
-            while (!writes_.empty()) {
-                auto handler = std::move(writes_.front().handler);
-                writes_.pop_front();
+            if (send_handler_) {
+                send_in_progress_ = false;
+                auto handler = std::move(send_handler_);
                 boost::asio::post(executor, [handler = std::move(handler)]() mutable {
                     handler(boost::asio::error::operation_aborted, 0);
                 });
             }
+            while (!writes_.empty()) {
+                writes_.pop_front();
+            }
+        }
+    }
+
+    // Retires a parked receive without closing the transport. Lower reads are
+    // detached sender pulls into internal buffers; the parked handler owns
+    // the caller's buffer, so clearing it is memory-safe. Late completions
+    // funnel into finish_receive and drop once the parked handler is gone.
+    void cancel_receive() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(stream_->executor(), [self] {
+                auto handler = std::move(self->receive_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->output_buffer_ = {};
+                self->read_in_progress_ = false;
+                boost::asio::post(self->stream_->executor(),
+                                  [handler = std::move(handler)]() mutable {
+                                      handler(boost::asio::error::operation_aborted, 0, {});
+                                  });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; the late lower completion or
+            // close() retires the parked handler instead.
+        }
+    }
+
+    // Retires a parked send without closing the transport. Queued frames own
+    // their buffers via shared_ptr, so in-flight frames drain safely; their
+    // late completions find no parked send handler and drop in finish_send.
+    void cancel_send() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(stream_->executor(), [self] {
+                auto handler = std::move(self->send_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->send_in_progress_ = false;
+                boost::asio::post(self->stream_->executor(),
+                                  [handler = std::move(handler)]() mutable {
+                                      handler(boost::asio::error::operation_aborted, 0);
+                                  });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; see cancel_receive.
         }
     }
 
@@ -326,7 +376,6 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
 
     struct PendingWrite {
         std::shared_ptr<std::vector<std::uint8_t>> packet;
-        WriteHandler handler;
         std::size_t size = 0;
         bool includes_request = false;
     };
@@ -347,26 +396,37 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
 
     void read_exact(std::shared_ptr<std::vector<std::uint8_t>> buffer, std::size_t offset,
                     Completion completion) {
+        auto guarded = std::make_shared<Completion>(std::move(completion));
+        read_exact_guarded(std::move(buffer), offset, std::move(guarded));
+    }
+
+    void read_exact_guarded(std::shared_ptr<std::vector<std::uint8_t>> buffer, std::size_t offset,
+                            std::shared_ptr<Completion> completion) {
         auto self = shared_from_this();
         auto read_buffer =
             boost::asio::mutable_buffer(buffer->data() + offset, buffer->size() - offset);
         std::function<void(const boost::system::error_code &, std::size_t)> pull =
             [self, buffer = std::move(buffer), offset, completion = std::move(completion)](
                 const boost::system::error_code &error, std::size_t size) mutable {
+                if (!self->receive_handler_) {
+                    // Late lower completion after cancel_receive retired the op.
+                    self->read_in_progress_ = false;
+                    return;
+                }
                 if (error) {
-                    completion(error);
+                    (*completion)(error);
                     return;
                 }
                 if (size == 0) {
-                    completion(boost::asio::error::eof);
+                    (*completion)(boost::asio::error::eof);
                     return;
                 }
                 const auto next = offset + size;
                 if (next == buffer->size()) {
-                    completion({});
+                    (*completion)({});
                     return;
                 }
-                self->read_exact(std::move(buffer), next, std::move(completion));
+                self->read_exact_guarded(std::move(buffer), next, std::move(completion));
             };
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = stream_->async_read_some(read_buffer);
@@ -524,13 +584,39 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
         });
     }
 
+    void finish_send(const boost::system::error_code &error, std::size_t size) {
+        send_in_progress_ = false;
+        auto handler = std::move(send_handler_);
+        if (!handler) {
+            // Late lower completion after cancel_send retired the op.
+            return;
+        }
+        handler(error, size);
+    }
+
+    void fail_queued_write(const boost::system::error_code &error) {
+        // Protocol errors surface through the parked send handler; queued
+        // frames only hold wire bytes. If the send was already cancelled the
+        // error is dropped with the retired handler.
+        send_in_progress_ = false;
+        auto handler = std::move(send_handler_);
+        if (!handler) {
+            return;
+        }
+        boost::asio::post(stream_->executor(),
+                          [handler = std::move(handler), error]() mutable { handler(error, 0); });
+    }
+
     void finish_receive(const boost::system::error_code &error, std::size_t size,
                         io::DatagramAddress source) {
         read_in_progress_ = false;
         auto handler = std::move(receive_handler_);
-        if (handler) {
-            handler(error, size, source);
+        output_buffer_ = {};
+        if (!handler) {
+            // Late lower completion after cancel_receive retired the op.
+            return;
         }
+        handler(error, size, source);
     }
 
     std::unique_ptr<io::StreamHandle> stream_;
@@ -538,10 +624,12 @@ class UdpOverTcpState final : public std::enable_shared_from_this<UdpOverTcpStat
     std::deque<PendingWrite> writes_;
     boost::asio::mutable_buffer output_buffer_;
     ReadHandler receive_handler_;
+    WriteHandler send_handler_;
     bool request_written_ = false;
     bool request_pending_ = false;
     bool connect_mode_ = false;
     bool write_in_progress_ = false;
+    bool send_in_progress_ = false;
     bool read_in_progress_ = false;
     bool closed_ = false;
 };
@@ -556,8 +644,9 @@ class UdpOverTcpHandle final : public io::DatagramHandle {
                                                           stdexec::set_error_t(std::exception_ptr),
                                                           stdexec::set_stopped_t()>;
         return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
-            [state = state_, buffer, destination](auto terminal) mutable {
+            [state = state_, buffer, destination](auto terminal) mutable -> async::CallbackAbortFn {
                 state->send(buffer, std::move(destination), std::move(terminal));
+                return async::CallbackAbortFn{[state] { state->cancel_send(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 if (!error) {
@@ -580,12 +669,13 @@ class UdpOverTcpHandle final : public io::DatagramHandle {
                                                           stdexec::set_error_t(std::exception_ptr),
                                                           stdexec::set_stopped_t()>;
         return io::AnySender<io::DatagramPacket>{async::callback_sender<Signatures>(
-            [state = state_, buffer](auto terminal) mutable {
+            [state = state_, buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 state->receive(buffer, [terminal = std::move(terminal)](
                                            const boost::system::error_code &error, std::size_t size,
                                            io::DatagramAddress source) mutable {
                     terminal(error, size, std::move(source));
                 });
+                return async::CallbackAbortFn{[state] { state->cancel_receive(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size,
                io::DatagramAddress source) {

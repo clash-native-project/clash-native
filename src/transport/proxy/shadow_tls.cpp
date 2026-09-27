@@ -10,6 +10,7 @@
 #include <exec/task.hpp>
 
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/write.hpp>
@@ -189,11 +190,13 @@ class ShadowTlsV2Stream final : public io::StreamHandle,
 
     io::AnySender<std::optional<std::size_t>>
     async_read_some(boost::asio::mutable_buffer buffer) override {
+        auto self = shared_from_this();
         return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
-            [this, buffer](auto terminal) mutable {
-                this->read_impl(buffer, [terminal = std::move(terminal)](
+            [self, buffer](auto terminal) mutable {
+                self->read_impl(buffer, [terminal = std::move(terminal)](
                                             const boost::system::error_code &error,
                                             std::size_t count) mutable { terminal(error, count); });
+                return async::CallbackAbortFn{[self] { self->cancel_read(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 net::translate_read(std::move(receiver), error, count, "shadow-tls read");
@@ -201,13 +204,15 @@ class ShadowTlsV2Stream final : public io::StreamHandle,
     }
 
     io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        auto self = shared_from_this();
         return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
-            [this, buffer](auto terminal) mutable {
-                this->write_impl(
+            [self, buffer](auto terminal) mutable {
+                self->write_impl(
                     buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
                                                              std::size_t count) mutable {
                         terminal(error, count);
                     });
+                return async::CallbackAbortFn{[self] { self->cancel_write(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 net::translate_write(std::move(receiver), error, count, "shadow-tls write");
@@ -256,6 +261,53 @@ class ShadowTlsV2Stream final : public io::StreamHandle,
         const auto *bytes = static_cast<const std::uint8_t *>(buffer.data());
         std::vector<std::uint8_t> payload(bytes, bytes + buffer.size());
         write_payload(std::move(payload));
+    }
+
+    // Retires a parked read without closing the transport. The framed exact
+    // reads already in flight keep their shared handler alive, but the late
+    // chain completes against a cleared handler and drops. Buffered
+    // plaintext stays for the next read.
+    void cancel_read() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(executor(), [self] {
+                auto handler = std::move(self->read_handler_);
+                if (!handler || !*handler) {
+                    return;
+                }
+                self->read_buffer_ = {};
+                self->read_busy_ = false;
+                auto parked = std::move(*handler);
+                boost::asio::post(self->executor(), [parked = std::move(parked)]() mutable {
+                    parked(boost::asio::error::operation_aborted, 0);
+                });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; the late framed completion or
+            // close() retires the parked handler instead.
+        }
+    }
+
+    // Retires a parked write without closing the transport. The framed wire
+    // write already in flight drains against write_wire_; its late
+    // completion finds a cleared handler and drops.
+    void cancel_write() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(executor(), [self] {
+                auto handler = std::move(self->write_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->write_busy_ = false;
+                self->write_size_ = 0;
+                boost::asio::post(self->executor(), [handler = std::move(handler)]() mutable {
+                    handler(boost::asio::error::operation_aborted, 0);
+                });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; see cancel_read.
+        }
     }
 
     void write_payload(std::vector<std::uint8_t> payload) {
@@ -358,6 +410,10 @@ class ShadowTlsV2Stream final : public io::StreamHandle,
 
     bool copy_pending(boost::asio::mutable_buffer buffer,
                       const std::shared_ptr<ReadHandler> &handler) {
+        if (!handler || !*handler) {
+            // Parked read was aborted; keep plaintext buffered for the next read.
+            return false;
+        }
         if (pending_offset_ >= pending_.size()) {
             return false;
         }
@@ -418,6 +474,7 @@ template <typename T> class SharedStreamAdapter final : public io::StreamHandle 
                                                              std::size_t count) mutable {
                         terminal(error, count);
                     });
+                return async::CallbackAbortFn{[stream] { stream->cancel_read(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 net::translate_read(std::move(receiver), error, count, "shadow-tls read");
@@ -433,6 +490,7 @@ template <typename T> class SharedStreamAdapter final : public io::StreamHandle 
                                                              std::size_t count) mutable {
                         terminal(error, count);
                     });
+                return async::CallbackAbortFn{[stream] { stream->cancel_write(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 net::translate_write(std::move(receiver), error, count, "shadow-tls write");
@@ -529,9 +587,10 @@ class ShadowTlsOpenOperation final : public std::enable_shared_from_this<ShadowT
                                                          stdexec::set_stopped_t()>;
         try {
             co_await async::callback_sender<DelaySigs>(
-                [self](auto terminal) mutable {
+                [self](auto terminal) mutable -> async::CallbackAbortFn {
                     self->delay_timer_.expires_after(std::chrono::milliseconds(20));
                     self->delay_timer_.async_wait(std::move(terminal));
+                    return async::CallbackAbortFn{[self] { (void)self->delay_timer_.cancel(); }};
                 },
                 [](auto receiver, const boost::system::error_code &error) {
                     if (error) {

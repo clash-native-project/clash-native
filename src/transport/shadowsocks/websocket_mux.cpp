@@ -9,6 +9,7 @@
 
 #include <stdexec/execution.hpp>
 
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/system/errc.hpp>
@@ -103,13 +104,17 @@ class WebSocketMuxStreamState final : public std::enable_shared_from_this<WebSoc
     using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
 
     WebSocketMuxStreamState(std::shared_ptr<WebSocketMuxSession> session,
-                            io::MultiplexedSession::StreamId operation_id, std::uint32_t wire_id)
-        : session_(std::move(session)), operation_id_(operation_id), wire_id_(wire_id) {}
+                            io::MultiplexedSession::StreamId operation_id, std::uint32_t wire_id,
+                            boost::asio::any_io_executor executor)
+        : session_(std::move(session)), operation_id_(operation_id), wire_id_(wire_id),
+          executor_(std::move(executor)) {}
 
     ~WebSocketMuxStreamState() { close(); }
 
     void read_some(boost::asio::mutable_buffer buffer, ReadHandler handler);
     void write_some(boost::asio::const_buffer buffer, WriteHandler handler);
+    void cancel_read() noexcept;
+    void cancel_write() noexcept;
     boost::asio::any_io_executor executor() noexcept;
     boost::asio::ip::tcp::endpoint local_endpoint(boost::system::error_code &error) const noexcept;
     void shutdown_send(boost::system::error_code &error) noexcept;
@@ -133,6 +138,7 @@ class WebSocketMuxStreamState final : public std::enable_shared_from_this<WebSoc
         std::shared_ptr<std::vector<std::uint8_t>> data;
         std::size_t offset = 0;
         WriteHandler handler;
+        bool cancelled = false;
     };
 
     void deliver_read();
@@ -143,6 +149,7 @@ class WebSocketMuxStreamState final : public std::enable_shared_from_this<WebSoc
     void pump_write();
 
     std::shared_ptr<WebSocketMuxSession> session_;
+    boost::asio::any_io_executor executor_;
     io::MultiplexedSession::StreamId operation_id_ = 0;
     std::uint32_t wire_id_ = 0;
     boost::asio::mutable_buffer read_buffer_;
@@ -175,8 +182,9 @@ class WebSocketMuxStream final : public io::StreamHandle {
                                            stdexec::set_error_t(std::exception_ptr),
                                            stdexec::set_stopped_t()>;
         return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
-            [state = state_, buffer](auto terminal) mutable {
+            [state = state_, buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 state->read_some(buffer, std::move(terminal));
+                return async::CallbackAbortFn{[state] { state->cancel_read(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 net::translate_read(std::move(receiver), error, size, "mux stream read");
@@ -188,8 +196,9 @@ class WebSocketMuxStream final : public io::StreamHandle {
                                                           stdexec::set_error_t(std::exception_ptr),
                                                           stdexec::set_stopped_t()>;
         return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
-            [state = state_, buffer](auto terminal) mutable {
+            [state = state_, buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 state->write_some(buffer, std::move(terminal));
+                return async::CallbackAbortFn{[state] { state->cancel_write(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 net::translate_write(std::move(receiver), error, size, "mux stream write");
@@ -322,9 +331,7 @@ class WebSocketMuxSession final : public io::MultiplexedSession,
     bool closed_ = false;
 };
 
-boost::asio::any_io_executor WebSocketMuxStreamState::executor() noexcept {
-    return session_->executor();
-}
+boost::asio::any_io_executor WebSocketMuxStreamState::executor() noexcept { return executor_; }
 
 boost::asio::ip::tcp::endpoint
 WebSocketMuxStreamState::local_endpoint(boost::system::error_code &error) const noexcept {
@@ -373,6 +380,51 @@ void WebSocketMuxStreamState::write_some(boost::asio::const_buffer buffer, Write
     pending_write_->data = std::move(data);
     pending_write_->handler = std::move(handler);
     pump_write();
+}
+
+// Retires a parked read without closing the session. Session data frames
+// only append to the internal queue; the parked handler owns the caller's
+// buffer, so clearing it is memory-safe. A late on_data/on_remote_end finds
+// no parked handler and keeps bytes queued for the next read.
+void WebSocketMuxStreamState::cancel_read() noexcept {
+    try {
+        auto self = shared_from_this();
+        boost::asio::dispatch(self->executor(), [self] {
+            auto handler = std::move(self->read_handler_);
+            if (!handler) {
+                return;
+            }
+            self->read_buffer_ = {};
+            boost::asio::post(self->executor(), [handler = std::move(handler)]() mutable {
+                handler(boost::asio::error::operation_aborted, 0);
+            });
+        });
+    } catch (...) {
+        // Aborter contract: never throw; the late session completion or
+        // close() retires the parked handler instead.
+    }
+}
+
+// Retires a parked write without closing the session. Staged frames own
+// their buffers via shared_ptr, so in-flight frames drain safely; their
+// late completions find no parked write and drop via the guards below.
+void WebSocketMuxStreamState::cancel_write() noexcept {
+    try {
+        auto self = shared_from_this();
+        boost::asio::dispatch(self->executor(), [self] {
+            auto pending = std::move(self->pending_write_);
+            if (!pending || !pending->handler) {
+                return;
+            }
+            pending->cancelled = true;
+            auto handler = std::move(pending->handler);
+            boost::asio::post(self->executor(), [handler = std::move(handler)]() mutable {
+                handler(boost::asio::error::operation_aborted, 0);
+            });
+        });
+    } catch (...) {
+        // Aborter contract: never throw; see cancel_read.
+    }
 }
 
 void WebSocketMuxStreamState::shutdown_send(boost::system::error_code &error) noexcept {
@@ -485,6 +537,7 @@ void WebSocketMuxStreamState::deliver_read() {
 void WebSocketMuxStreamState::finish_read(const boost::system::error_code &error,
                                           std::size_t size) {
     if (!read_handler_) {
+        // Late session completion after cancel_read retired the op.
         return;
     }
     auto handler = std::move(read_handler_);
@@ -495,13 +548,16 @@ void WebSocketMuxStreamState::finish_read(const boost::system::error_code &error
 void WebSocketMuxStreamState::finish_write(const boost::system::error_code &error,
                                            std::size_t size) {
     if (!pending_write_) {
+        // Late frame completion after cancel_write retired the op.
         return;
     }
     auto pending = std::move(pending_write_);
     auto handler = std::move(pending->handler);
-    if (handler) {
-        handler(error, error ? 0 : (size == 0 ? pending->data->size() : size));
+    if (!handler || pending->cancelled) {
+        // Late frame completion after cancel_write retired the op.
+        return;
     }
+    handler(error, error ? 0 : (size == 0 ? pending->data->size() : size));
 }
 
 void WebSocketMuxStreamState::post_read(ReadHandler handler, const boost::system::error_code &error,
@@ -559,6 +615,10 @@ void WebSocketMuxStreamState::pump_write() {
     session_->enqueue_frame(
         session_->make_data_frame(wire_id_, pending_write_->data->data() + offset, size),
         [self](const boost::system::error_code &error) {
+            if (!self->pending_write_) {
+                // Late frame completion after cancel_write retired the op.
+                return;
+            }
             if (error) {
                 self->finish_write(error, 0);
                 self->on_session_error(error);
@@ -963,8 +1023,8 @@ WebSocketMuxSession::open_stream(io::MultiplexedStreamRequest request,
             {core::ErrorCode::transport_io, "WebSocket mux stream ID space is exhausted", {}});
         return wrap_open(operation_id, std::move(channel.receiver));
     }
-    auto stream =
-        std::make_shared<WebSocketMuxStreamState>(shared_from_this(), operation_id, *wire_id);
+    auto stream = std::make_shared<WebSocketMuxStreamState>(shared_from_this(), operation_id,
+                                                            *wire_id, executor_);
     streams_.emplace(*wire_id, stream);
     pending_opens_.emplace(operation_id, PendingOpen{stream, std::move(*sender)});
     enqueue_frame(make_open_frame(*wire_id), [self = shared_from_this(), operation_id](

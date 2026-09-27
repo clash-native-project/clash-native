@@ -8,6 +8,7 @@
 #include <stdexec/execution.hpp>
 
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/system/errc.hpp>
 
@@ -120,11 +121,14 @@ class TrojanPacketState final : public std::enable_shared_from_this<TrojanPacket
         : stream_(std::move(stream)) {}
 
     boost::asio::any_io_executor executor() noexcept { return stream_->executor(); }
-
     void send(boost::asio::const_buffer buffer, io::DatagramAddress destination,
               WriteHandler handler) {
         if (closed_) {
             post_write_result(std::move(handler), boost::asio::error::operation_aborted, 0);
+            return;
+        }
+        if (send_in_progress_) {
+            post_write_result(std::move(handler), boost::asio::error::already_started, 0);
             return;
         }
         if (buffer.size() > std::numeric_limits<std::uint16_t>::max()) {
@@ -150,13 +154,14 @@ class TrojanPacketState final : public std::enable_shared_from_this<TrojanPacket
             wire->push_back('\r');
             wire->push_back('\n');
             wire->insert(wire->end(), data + offset, data + offset + chunk);
-            writes_.push_back({std::move(wire), nullptr, 0});
+            writes_.push_back({std::move(wire), 0});
             offset += chunk;
         } while (offset < buffer.size());
         // The terminal delivery rides on the last frame; earlier frames
         // only pump the queue.
-        writes_.back().handler = std::move(handler);
-        writes_.back().size = buffer.size();
+        send_in_progress_ = true;
+        send_handler_ = std::move(handler);
+        send_size_ = buffer.size();
         pump_write();
     }
 
@@ -191,19 +196,57 @@ class TrojanPacketState final : public std::enable_shared_from_this<TrojanPacket
             if (read_in_progress_) {
                 read_in_progress_ = false;
                 auto handler = std::move(receive_handler_);
+                output_buffer_ = {};
                 boost::asio::post(executor, [handler = std::move(handler)]() mutable {
                     handler(boost::asio::error::operation_aborted, 0, {});
                 });
             }
-            while (!writes_.empty()) {
-                auto handler = std::move(writes_.front().handler);
-                writes_.pop_front();
-                if (handler) {
-                    boost::asio::post(executor, [handler = std::move(handler)]() mutable {
-                        handler(boost::asio::error::operation_aborted, 0);
-                    });
+            writes_.clear();
+            finish_send(boost::asio::error::operation_aborted, 0);
+        }
+    }
+
+    // Retires a parked receive without closing the stream. The parked read
+    // owns the only caller buffer ref; clearing it is memory-safe. Posted to
+    // the stream executor because the parked state is strand-private. The
+    // read_exact chain keeps running to its own completion, which finds no
+    // parked handler in finish_receive and is dropped.
+    void cancel_receive() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(self->stream_->executor(), [self] {
+                if (!self->read_in_progress_) {
+                    return;
                 }
-            }
+                auto handler = std::move(self->receive_handler_);
+                self->read_in_progress_ = false;
+                self->output_buffer_ = {};
+                self->post_read_result(std::move(handler), boost::asio::error::operation_aborted, 0,
+                                       {});
+            });
+        } catch (...) {
+            // Aborter contract: never throw. A parked handler (if any) is
+            // retired by the late lower completion or close().
+        }
+    }
+
+    // Retires a parked send without closing the stream. Queued frames own
+    // their buffers via shared_ptr, so in-flight frames drain safely; their
+    // late completions find no parked send handler and drop in finish_send.
+    void cancel_send() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(self->stream_->executor(), [self] {
+                auto handler = std::move(self->send_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->send_in_progress_ = false;
+                self->post_write_result(std::move(handler), boost::asio::error::operation_aborted,
+                                        0);
+            });
+        } catch (...) {
+            // Aborter contract: never throw; see cancel_receive.
         }
     }
 
@@ -212,7 +255,6 @@ class TrojanPacketState final : public std::enable_shared_from_this<TrojanPacket
 
     struct PendingWrite {
         std::shared_ptr<std::vector<std::uint8_t>> packet;
-        WriteHandler handler;
         std::size_t size = 0;
     };
 
@@ -239,20 +281,16 @@ class TrojanPacketState final : public std::enable_shared_from_this<TrojanPacket
         write_in_progress_ = true;
         auto self = shared_from_this();
         auto packet = std::move(pending.packet);
-        auto handler = std::move(pending.handler);
-        const auto size = pending.size;
         std::function<void(const boost::system::error_code &, std::size_t)> completion =
-            [self, packet, handler = std::move(handler),
-             size](const boost::system::error_code &error, std::size_t) mutable {
+            [self, packet](const boost::system::error_code &error, std::size_t) mutable {
                 self->write_in_progress_ = false;
-                if (handler) {
-                    if (error) {
-                        handler(error, 0);
-                    } else {
-                        handler({}, size);
-                    }
+                if (!self->writes_.empty()) {
+                    self->pump_write();
+                    return;
                 }
-                self->pump_write();
+                // The terminal delivery rides on the last frame; earlier frames
+                // only pump the queue.
+                self->finish_send(error, error ? 0 : self->send_size_);
             };
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = stream_->async_write(boost::asio::buffer(*packet));
@@ -261,26 +299,37 @@ class TrojanPacketState final : public std::enable_shared_from_this<TrojanPacket
 
     void read_exact(std::shared_ptr<std::vector<std::uint8_t>> buffer, std::size_t offset,
                     Completion completion) {
+        auto guarded = std::make_shared<Completion>(std::move(completion));
+        read_exact_guarded(std::move(buffer), offset, std::move(guarded));
+    }
+
+    void read_exact_guarded(std::shared_ptr<std::vector<std::uint8_t>> buffer, std::size_t offset,
+                            std::shared_ptr<Completion> completion) {
         auto self = shared_from_this();
         auto read_buffer =
             boost::asio::mutable_buffer(buffer->data() + offset, buffer->size() - offset);
         std::function<void(const boost::system::error_code &, std::size_t)> pull =
             [self, buffer = std::move(buffer), offset, completion = std::move(completion)](
                 const boost::system::error_code &error, std::size_t size) mutable {
+                if (!self->receive_handler_) {
+                    // Late lower completion after cancel_receive retired the op.
+                    self->read_in_progress_ = false;
+                    return;
+                }
                 if (error) {
-                    completion(error);
+                    (*completion)(error);
                     return;
                 }
                 if (size == 0) {
-                    completion(boost::asio::error::eof);
+                    (*completion)(boost::asio::error::eof);
                     return;
                 }
                 const auto next = offset + size;
                 if (next == buffer->size()) {
-                    completion({});
+                    (*completion)({});
                     return;
                 }
-                self->read_exact(std::move(buffer), next, std::move(completion));
+                self->read_exact_guarded(std::move(buffer), next, std::move(completion));
             };
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = stream_->async_read_some(read_buffer);
@@ -443,15 +492,32 @@ class TrojanPacketState final : public std::enable_shared_from_this<TrojanPacket
                         io::DatagramAddress source) {
         read_in_progress_ = false;
         auto handler = std::move(receive_handler_);
-        if (handler) {
-            handler(error, size, source);
+        output_buffer_ = {};
+        if (!handler) {
+            // Late lower completion after cancel_receive retired the op.
+            return;
         }
+        handler(error, size, source);
+    }
+
+    void finish_send(const boost::system::error_code &error, std::size_t size) {
+        write_in_progress_ = false;
+        send_in_progress_ = false;
+        auto handler = std::move(send_handler_);
+        if (!handler) {
+            // Late lower completion after cancel_send retired the op.
+            return;
+        }
+        handler(error, size);
     }
 
     std::unique_ptr<io::StreamHandle> stream_;
     std::deque<PendingWrite> writes_;
     boost::asio::mutable_buffer output_buffer_;
     ReadHandler receive_handler_;
+    WriteHandler send_handler_;
+    std::size_t send_size_ = 0;
+    bool send_in_progress_ = false;
     bool write_in_progress_ = false;
     bool read_in_progress_ = false;
     bool closed_ = false;
@@ -470,6 +536,7 @@ class TrojanPacketHandle final : public io::DatagramHandle {
         return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
             [state = state_, buffer, destination](auto terminal) mutable {
                 state->send(buffer, std::move(destination), std::move(terminal));
+                return async::CallbackAbortFn{[state] { state->cancel_send(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 if (!error) {
@@ -498,6 +565,7 @@ class TrojanPacketHandle final : public io::DatagramHandle {
                                            io::DatagramAddress source) mutable {
                     terminal(error, size, std::move(source));
                 });
+                return async::CallbackAbortFn{[state] { state->cancel_receive(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size,
                io::DatagramAddress source) {

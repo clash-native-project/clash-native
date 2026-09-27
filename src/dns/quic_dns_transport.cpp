@@ -436,22 +436,19 @@ io::AnySender<DnsExchangeResult> QuicDnsTransport::exchange(DnsExchangeRequest r
     auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
     auto self = shared_from_this();
     return async::bridge_sender<DnsExchangeResult>(
-        [self, box](async::BridgeSender<DnsExchangeResult>::Handler done) mutable {
+        [self, box](async::BridgeHandler<DnsExchangeResult> done) mutable {
             if (!box || !*box) {
                 done(core::fail(cancelled_error()));
-                using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
-                return AbortFn{[] {}};
+                return async::CallbackAbortFn{};
             }
             const auto id = self->open_exchange(std::move(**box), std::move(done));
             box->reset();
-            using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
-            return AbortFn{[self, id] { self->cancel_exchange(id); }};
+            return async::CallbackAbortFn{[self, id] { self->cancel_exchange(id); }};
         });
 }
 
-DnsExchangeId
-QuicDnsTransport::open_exchange(DnsExchangeRequest request,
-                                async::BridgeSender<DnsExchangeResult>::Handler handler) {
+DnsExchangeId QuicDnsTransport::open_exchange(DnsExchangeRequest request,
+                                              async::BridgeHandler<DnsExchangeResult> handler) {
     const auto id = next_exchange_id_.fetch_add(1, std::memory_order_relaxed);
     const auto self = shared_from_this();
     boost::asio::post(
@@ -462,7 +459,7 @@ QuicDnsTransport::open_exchange(DnsExchangeRequest request,
 }
 
 void QuicDnsTransport::add_new_exchange(DnsExchangeId id, DnsExchangeRequest request,
-                                        async::BridgeSender<DnsExchangeResult>::Handler handler) {
+                                        async::BridgeHandler<DnsExchangeResult> handler) {
     if (stopped_) {
         if (handler) {
             handler(core::fail(cancelled_error()));

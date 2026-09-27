@@ -1,6 +1,5 @@
 #pragma once
 
-#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/io/stream_handle.hpp>

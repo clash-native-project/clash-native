@@ -1336,10 +1336,10 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
 
 namespace {
 
-class QuicStreamHandle final : public io::StreamHandle {
+class QuicStreamState final : public std::enable_shared_from_this<QuicStreamState> {
   public:
-    QuicStreamHandle(std::shared_ptr<QuicClientConnection> connection,
-                     io::MultiplexedSession::StreamId operation_id, std::int64_t stream_id)
+    QuicStreamState(std::shared_ptr<QuicClientConnection> connection,
+                    io::MultiplexedSession::StreamId operation_id, std::int64_t stream_id)
         : connection_(std::move(connection)), operation_id_(operation_id), stream_id_(stream_id),
           executor_(connection_->executor()) {
         observer_id_ = connection_->observe_stream(
@@ -1358,35 +1358,7 @@ class QuicStreamHandle final : public io::StreamHandle {
                         });
     }
 
-    ~QuicStreamHandle() override { close(); }
-
-    io::AnySender<std::optional<std::size_t>>
-    async_read_some(boost::asio::mutable_buffer buffer) override {
-        using Signatures =
-            stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
-                                           stdexec::set_error_t(std::exception_ptr),
-                                           stdexec::set_stopped_t()>;
-        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
-            [self = this, buffer](auto terminal) mutable {
-                self->read(buffer, std::move(terminal));
-            },
-            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
-                net::translate_read(std::move(receiver), error, size, "quic stream read");
-            })};
-    }
-
-    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
-        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
-                                                          stdexec::set_error_t(std::exception_ptr),
-                                                          stdexec::set_stopped_t()>;
-        return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
-            [self = this, buffer](auto terminal) mutable {
-                self->write(buffer, std::move(terminal));
-            },
-            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
-                net::translate_write(std::move(receiver), error, size, "quic stream write");
-            })};
-    }
+    ~QuicStreamState() { close(); }
 
     // The observer machinery below stays callback-parked; each pull/write
     // bridges once through the shells above.
@@ -1427,15 +1399,9 @@ class QuicStreamHandle final : public io::StreamHandle {
         pump_write();
     }
 
-    boost::asio::any_io_executor executor() noexcept override { return executor_; }
+    boost::asio::any_io_executor executor() noexcept { return executor_; }
 
-    boost::asio::ip::tcp::endpoint
-    local_endpoint(boost::system::error_code &error) const noexcept override {
-        error = boost::asio::error::operation_not_supported;
-        return {};
-    }
-
-    void shutdown_send(boost::system::error_code &error) noexcept override {
+    void shutdown_send(boost::system::error_code &error) noexcept {
         if (closed_ || send_shutdown_) {
             error = closed_ ? boost::asio::error::operation_aborted : boost::system::error_code{};
             return;
@@ -1445,7 +1411,7 @@ class QuicStreamHandle final : public io::StreamHandle {
         error.clear();
     }
 
-    void close() noexcept override {
+    void close() noexcept {
         if (closed_) {
             return;
         }
@@ -1453,6 +1419,55 @@ class QuicStreamHandle final : public io::StreamHandle {
         connection_->remove_stream_observer(stream_id_, observer_id_);
         connection_->cancel(operation_id_);
         fail_pending(boost::asio::error::operation_aborted);
+    }
+
+    // Retires a parked read without closing the stream: detaches the caller
+    // buffer alias (read_data_/read_size_) so a late lower completion cannot
+    // touch the caller buffer. Dispatched to the connection executor because
+    // the parked state is strand-private. Queued bytes stay buffered for the
+    // next read; the late completion finds no parked handler and is dropped.
+    void cancel_read() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(self->executor_, [self] {
+                if (!self->read_pending_) {
+                    return;
+                }
+                auto handler = std::move(self->read_handler_);
+                self->read_pending_ = false;
+                // Detach the caller buffer alias first.
+                self->read_data_ = nullptr;
+                self->read_size_ = 0;
+                self->post_read(boost::asio::error::operation_aborted, 0, std::move(handler));
+            });
+        } catch (...) {
+            // Aborter contract: never throw. A parked handler (if any) is
+            // retired by the late lower completion or close().
+        }
+    }
+
+    // Retires the queued/pending write handlers without closing the stream
+    // or touching a parked read. The lower write queue drains on its own;
+    // late completions find no parked handler and are dropped.
+    void cancel_write() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(self->executor_, [self] {
+                if (self->write_in_flight_ && !self->writes_.empty()) {
+                    auto handler = std::move(self->writes_.front().handler);
+                    self->writes_.pop_front();
+                    self->write_in_flight_ = false;
+                    self->post_write(boost::asio::error::operation_aborted, 0, std::move(handler));
+                }
+                while (!self->writes_.empty()) {
+                    auto handler = std::move(self->writes_.front().handler);
+                    self->writes_.pop_front();
+                    self->post_write(boost::asio::error::operation_aborted, 0, std::move(handler));
+                }
+            });
+        } catch (...) {
+            // Aborter contract: never throw; see cancel_read.
+        }
     }
 
   private:
@@ -1510,6 +1525,8 @@ class QuicStreamHandle final : public io::StreamHandle {
         if (terminal_error_) {
             auto handler = std::move(read_handler_);
             read_pending_ = false;
+            read_data_ = nullptr;
+            read_size_ = 0;
             post_read(*terminal_error_, 0, std::move(handler));
             return;
         }
@@ -1517,6 +1534,8 @@ class QuicStreamHandle final : public io::StreamHandle {
             if (eof_) {
                 auto handler = std::move(read_handler_);
                 read_pending_ = false;
+                read_data_ = nullptr;
+                read_size_ = 0;
                 post_read(boost::asio::error::eof, 0, std::move(handler));
             }
             return;
@@ -1569,6 +1588,9 @@ class QuicStreamHandle final : public io::StreamHandle {
         if (read_pending_) {
             auto handler = std::move(read_handler_);
             read_pending_ = false;
+            // Detach the caller buffer alias; see cancel_read.
+            read_data_ = nullptr;
+            read_size_ = 0;
             post_read(error, 0, std::move(handler));
         }
         if (write_in_flight_ && !writes_.empty()) {
@@ -1619,80 +1641,92 @@ class QuicStreamHandle final : public io::StreamHandle {
     bool closed_ = false;
 };
 
-class QuicDatagramHandle final : public io::DatagramHandle {
+class QuicStreamHandle final : public io::StreamHandle {
+  public:
+    static std::shared_ptr<QuicStreamState> create(std::shared_ptr<QuicClientConnection> connection,
+                                                   io::MultiplexedSession::StreamId operation_id,
+                                                   std::int64_t stream_id) {
+        return std::make_shared<QuicStreamState>(std::move(connection), operation_id, stream_id);
+    }
+
+    explicit QuicStreamHandle(std::shared_ptr<QuicStreamState> state) : state_(std::move(state)) {}
+    ~QuicStreamHandle() override { close(); }
+
+    io::AnySender<std::optional<std::size_t>>
+    async_read_some(boost::asio::mutable_buffer buffer) override {
+        using Signatures =
+            stdexec::completion_signatures<stdexec::set_value_t(std::optional<std::size_t>),
+                                           stdexec::set_error_t(std::exception_ptr),
+                                           stdexec::set_stopped_t()>;
+        return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
+            [state = state_, buffer](auto terminal) mutable {
+                state->read(buffer, [terminal = std::move(terminal)](
+                                        const boost::system::error_code &error,
+                                        std::size_t size) mutable { terminal(error, size); });
+                return async::CallbackAbortFn{[state] { state->cancel_read(); }};
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                net::translate_read(std::move(receiver), error, size, "quic stream read");
+            })};
+    }
+
+    io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
+        return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
+            [state = state_, buffer](auto terminal) mutable {
+                state->write(buffer, [terminal = std::move(terminal)](
+                                         const boost::system::error_code &error,
+                                         std::size_t size) mutable { terminal(error, size); });
+                return async::CallbackAbortFn{[state] { state->cancel_write(); }};
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                net::translate_write(std::move(receiver), error, size, "quic stream write");
+            })};
+    }
+
+    boost::asio::any_io_executor executor() noexcept override { return state_->executor(); }
+
+    boost::asio::ip::tcp::endpoint
+    local_endpoint(boost::system::error_code &error) const noexcept override {
+        error = boost::asio::error::operation_not_supported;
+        return {};
+    }
+
+    void shutdown_send(boost::system::error_code &error) noexcept override {
+        state_->shutdown_send(error);
+    }
+
+    void close() noexcept override { state_->close(); }
+
+  private:
+    std::shared_ptr<QuicStreamState> state_;
+};
+
+class QuicDatagramState final : public std::enable_shared_from_this<QuicDatagramState> {
   public:
     using ReadHandler =
         std::function<void(const boost::system::error_code &, std::size_t, io::DatagramAddress)>;
     using WriteHandler = std::function<void(const boost::system::error_code &, std::size_t)>;
 
-    explicit QuicDatagramHandle(std::shared_ptr<QuicClientConnection> connection)
+    explicit QuicDatagramState(std::shared_ptr<QuicClientConnection> connection)
         : connection_(std::move(connection)), executor_(connection_->executor()) {
         observer_id_ = connection_->observe_datagrams(QuicDatagramObserver{
             [this](const std::uint8_t *data, std::size_t size) { on_data(data, size); },
             [this] { on_connection_closed(); }});
     }
 
-    ~QuicDatagramHandle() override { close(); }
-
-    io::AnySender<std::size_t> async_send_to(boost::asio::const_buffer buffer,
-                                             io::DatagramAddress destination) override {
-        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
-                                                          stdexec::set_error_t(std::exception_ptr),
-                                                          stdexec::set_stopped_t()>;
-        return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
-            [self = this, buffer, destination](auto terminal) mutable {
-                self->send(buffer, std::move(destination), std::move(terminal));
-            },
-            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
-                if (!error) {
-                    stdexec::set_value(std::move(receiver), size);
-                    return;
-                }
-                if (error == boost::asio::error::operation_aborted) {
-                    stdexec::set_stopped(std::move(receiver));
-                    return;
-                }
-                stdexec::set_error(std::move(receiver), std::make_exception_ptr(core::Error{
-                                                            core::ErrorCode::transport_io,
-                                                            "QUIC datagram send failed", error}));
-            })};
-    }
-
-    io::AnySender<io::DatagramPacket>
-    async_receive_from(boost::asio::mutable_buffer buffer) override {
-        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(io::DatagramPacket),
-                                                          stdexec::set_error_t(std::exception_ptr),
-                                                          stdexec::set_stopped_t()>;
-        return io::AnySender<io::DatagramPacket>{async::callback_sender<Signatures>(
-            [self = this, buffer](auto terminal) mutable {
-                self->receive(buffer, [terminal = std::move(terminal)](
-                                          const boost::system::error_code &error, std::size_t size,
-                                          io::DatagramAddress source) mutable {
-                    terminal(error, size, std::move(source));
-                });
-            },
-            [](auto receiver, const boost::system::error_code &error, std::size_t size,
-               io::DatagramAddress source) {
-                if (!error) {
-                    stdexec::set_value(std::move(receiver),
-                                       io::DatagramPacket{size, std::move(source)});
-                    return;
-                }
-                if (error == boost::asio::error::operation_aborted) {
-                    stdexec::set_stopped(std::move(receiver));
-                    return;
-                }
-                stdexec::set_error(
-                    std::move(receiver),
-                    std::make_exception_ptr(core::Error{core::ErrorCode::transport_io,
-                                                        "QUIC datagram receive failed", error}));
-            })};
-    }
+    ~QuicDatagramState() { close(); }
 
     void send(boost::asio::const_buffer buffer, io::DatagramAddress destination,
               WriteHandler handler) {
         if (closed_) {
             post_write(boost::asio::error::operation_aborted, 0, std::move(handler));
+            return;
+        }
+        if (send_in_progress_) {
+            post_write(boost::asio::error::already_started, 0, std::move(handler));
             return;
         }
         if (!destination.is_address() ||
@@ -1709,7 +1743,13 @@ class QuicDatagramHandle final : public io::DatagramHandle {
         if (!bytes.empty()) {
             std::memcpy(bytes.data(), buffer.data(), bytes.size());
         }
-        connection_->async_send_datagram(std::move(bytes), std::move(handler));
+        send_in_progress_ = true;
+        send_handler_ = std::move(handler);
+        auto self = shared_from_this();
+        connection_->async_send_datagram(
+            std::move(bytes), [self](const boost::system::error_code &error, std::size_t size) {
+                self->finish_send(error, size);
+            });
     }
 
     void receive(boost::asio::mutable_buffer buffer, ReadHandler handler) {
@@ -1728,26 +1768,71 @@ class QuicDatagramHandle final : public io::DatagramHandle {
         fulfill_read();
     }
 
-    boost::asio::any_io_executor executor() noexcept override { return executor_; }
+    boost::asio::any_io_executor executor() noexcept { return executor_; }
 
-    std::size_t max_datagram_size() const noexcept override {
-        return connection_->max_datagram_size();
-    }
+    std::size_t max_datagram_size() const noexcept { return connection_->max_datagram_size(); }
 
-    void cancel() noexcept override {
+    void cancel() noexcept {
         if (closed_) {
             return;
         }
         fail_read(boost::asio::error::operation_aborted);
     }
 
-    void close() noexcept override {
+    void close() noexcept {
         if (closed_) {
             return;
         }
         closed_ = true;
         connection_->remove_datagram_observer(observer_id_);
         fail_read(boost::asio::error::operation_aborted);
+        finish_send(boost::asio::error::operation_aborted, 0);
+    }
+
+    // Retires a parked datagram receive without closing the handle: detaches
+    // the caller buffer alias (read_data_/read_size_) so a late lower
+    // completion cannot touch the caller buffer. Dispatched to the connection
+    // executor because the parked state is strand-private. Queued datagrams
+    // stay buffered for the next receive; the late completion finds no parked
+    // handler and is dropped.
+    void cancel_read() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(self->executor_, [self] {
+                if (!self->read_pending_) {
+                    return;
+                }
+                auto handler = std::move(self->read_handler_);
+                self->read_pending_ = false;
+                // Detach the caller buffer alias first.
+                self->read_data_ = nullptr;
+                self->read_size_ = 0;
+                self->post_read(boost::asio::error::operation_aborted, 0, {}, std::move(handler));
+            });
+        } catch (...) {
+            // Aborter contract: never throw. A parked handler (if any) is
+            // retired by the late lower completion or close().
+        }
+    }
+
+    // Retires a parked datagram send without closing the handle. The queued
+    // lower datagram drains on its own; its late completion finds no parked
+    // handler and is dropped in finish_send. Dispatched to the connection
+    // executor because the parked state is strand-private.
+    void cancel_send() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(self->executor_, [self] {
+                auto handler = std::move(self->send_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->send_in_progress_ = false;
+                self->post_write(boost::asio::error::operation_aborted, 0, std::move(handler));
+            });
+        } catch (...) {
+            // Aborter contract: never throw; see cancel_read.
+        }
     }
 
   private:
@@ -1773,6 +1858,8 @@ class QuicDatagramHandle final : public io::DatagramHandle {
         queue_.pop_front();
         if (datagram.bytes.size() > read_size_) {
             read_pending_ = false;
+            read_data_ = nullptr;
+            read_size_ = 0;
             post_read(boost::asio::error::message_size, 0,
                       io::DatagramAddress::from_endpoint(connection_->remote_endpoint()),
                       std::move(read_handler_));
@@ -1782,6 +1869,8 @@ class QuicDatagramHandle final : public io::DatagramHandle {
             std::memcpy(read_data_, datagram.bytes.data(), datagram.bytes.size());
         }
         read_pending_ = false;
+        read_data_ = nullptr;
+        read_size_ = 0;
         post_read({}, datagram.bytes.size(),
                   io::DatagramAddress::from_endpoint(connection_->remote_endpoint()),
                   std::move(read_handler_));
@@ -1792,6 +1881,9 @@ class QuicDatagramHandle final : public io::DatagramHandle {
             return;
         }
         read_pending_ = false;
+        // Detach the caller buffer alias; see cancel_read.
+        read_data_ = nullptr;
+        read_size_ = 0;
         post_read(error, 0, {}, std::move(read_handler_));
     }
 
@@ -1801,6 +1893,17 @@ class QuicDatagramHandle final : public io::DatagramHandle {
         }
         closed_ = true;
         fail_read(boost::asio::error::operation_aborted);
+        finish_send(boost::asio::error::operation_aborted, 0);
+    }
+
+    void finish_send(const boost::system::error_code &error, std::size_t size) {
+        send_in_progress_ = false;
+        auto handler = std::move(send_handler_);
+        if (!handler) {
+            // Late lower completion after cancel_send retired the op.
+            return;
+        }
+        post_write(error, size, std::move(handler));
     }
 
     void post_read(const boost::system::error_code &error, std::size_t size,
@@ -1828,8 +1931,88 @@ class QuicDatagramHandle final : public io::DatagramHandle {
     std::uint8_t *read_data_ = nullptr;
     std::size_t read_size_ = 0;
     ReadHandler read_handler_;
+    WriteHandler send_handler_;
     bool read_pending_ = false;
+    bool send_in_progress_ = false;
     bool closed_ = false;
+};
+
+class QuicDatagramHandle final : public io::DatagramHandle {
+  public:
+    explicit QuicDatagramHandle(std::shared_ptr<QuicDatagramState> state)
+        : state_(std::move(state)) {}
+    ~QuicDatagramHandle() override { close(); }
+
+    io::AnySender<std::size_t> async_send_to(boost::asio::const_buffer buffer,
+                                             io::DatagramAddress destination) override {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
+        return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
+            [state = state_, buffer, destination](auto terminal) mutable {
+                state->send(buffer, std::move(destination),
+                            [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                             std::size_t size) mutable {
+                                terminal(error, size);
+                            });
+                return async::CallbackAbortFn{[state] { state->cancel_send(); }};
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size) {
+                if (!error) {
+                    stdexec::set_value(std::move(receiver), size);
+                    return;
+                }
+                if (error == boost::asio::error::operation_aborted) {
+                    stdexec::set_stopped(std::move(receiver));
+                    return;
+                }
+                stdexec::set_error(std::move(receiver), std::make_exception_ptr(core::Error{
+                                                            core::ErrorCode::transport_io,
+                                                            "QUIC datagram send failed", error}));
+            })};
+    }
+
+    io::AnySender<io::DatagramPacket>
+    async_receive_from(boost::asio::mutable_buffer buffer) override {
+        using Signatures = stdexec::completion_signatures<stdexec::set_value_t(io::DatagramPacket),
+                                                          stdexec::set_error_t(std::exception_ptr),
+                                                          stdexec::set_stopped_t()>;
+        return io::AnySender<io::DatagramPacket>{async::callback_sender<Signatures>(
+            [state = state_, buffer](auto terminal) mutable {
+                state->receive(buffer, [terminal = std::move(terminal)](
+                                           const boost::system::error_code &error, std::size_t size,
+                                           io::DatagramAddress source) mutable {
+                    terminal(error, size, std::move(source));
+                });
+                return async::CallbackAbortFn{[state] { state->cancel_read(); }};
+            },
+            [](auto receiver, const boost::system::error_code &error, std::size_t size,
+               io::DatagramAddress source) {
+                if (!error) {
+                    stdexec::set_value(std::move(receiver),
+                                       io::DatagramPacket{size, std::move(source)});
+                    return;
+                }
+                if (error == boost::asio::error::operation_aborted) {
+                    stdexec::set_stopped(std::move(receiver));
+                    return;
+                }
+                stdexec::set_error(
+                    std::move(receiver),
+                    std::make_exception_ptr(core::Error{core::ErrorCode::transport_io,
+                                                        "QUIC datagram receive failed", error}));
+            })};
+    }
+
+    boost::asio::any_io_executor executor() noexcept override { return state_->executor(); }
+
+    std::size_t max_datagram_size() const noexcept override { return state_->max_datagram_size(); }
+
+    void cancel() noexcept override { state_->cancel(); }
+    void close() noexcept override { state_->close(); }
+
+  private:
+    std::shared_ptr<QuicDatagramState> state_;
 };
 
 } // namespace
@@ -1900,8 +2083,8 @@ QuicClientConnection::open_stream(io::MultiplexedStreamRequest request,
     }
     const auto tracked_id = impl_->track_multiplexed_stream(opened.stream_id);
     const auto connection = shared_from_this();
-    std::unique_ptr<io::StreamHandle> stream =
-        std::make_unique<QuicStreamHandle>(connection, tracked_id, opened.stream_id);
+    auto state = QuicStreamHandle::create(connection, tracked_id, opened.stream_id);
+    std::unique_ptr<io::StreamHandle> stream = std::make_unique<QuicStreamHandle>(std::move(state));
     channel.sender.send(QuicOpenTerminal{std::move(stream)});
     return wrap_quic_open(shared_from_this(), operation_id, std::move(channel.receiver));
 }
@@ -1943,7 +2126,8 @@ void QuicClientConnection::async_send_datagram(std::vector<std::uint8_t> data,
 }
 
 std::unique_ptr<io::DatagramHandle> QuicClientConnection::open_datagram() {
-    return std::make_unique<QuicDatagramHandle>(shared_from_this());
+    auto state = std::make_shared<QuicDatagramState>(shared_from_this());
+    return std::make_unique<QuicDatagramHandle>(std::move(state));
 }
 
 std::size_t QuicClientConnection::max_datagram_size() const noexcept {

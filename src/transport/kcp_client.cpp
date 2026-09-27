@@ -8,6 +8,7 @@
 #include <ikcp.h>
 
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -130,6 +131,48 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
 
     void shutdown_send(boost::system::error_code &error) noexcept {
         error = boost::asio::error::operation_not_supported;
+    }
+
+    // Retires a parked read without closing the datagram: the lower
+    // receives keep landing in KCP's internal buffers, so dropping the
+    // caller buffer ref is safe. Dispatched to the datagram executor
+    // because the parked state is strand-private. The late lower
+    // completion finds no parked handler and is dropped.
+    void cancel_read() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(self->executor(), [self] {
+                auto handler = std::move(self->read_handler_);
+                if (!handler) {
+                    return;
+                }
+                // Caller buffer ref; the memory belongs to the caller frame.
+                self->read_buffer_ = {};
+                self->post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
+            });
+        } catch (...) {
+            // Aborter contract: never throw. A parked handler (if any) is
+            // retired by the late lower completion or close().
+        }
+    }
+
+    // Retires a parked write without closing the datagram. The KCP send
+    // queue drains on its own; the late completion finds no parked handler
+    // and is dropped.
+    void cancel_write() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(self->executor(), [self] {
+                auto handler = std::move(self->write_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->write_size_ = 0;
+                self->post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
+            });
+        } catch (...) {
+            // Aborter contract: never throw; see cancel_read.
+        }
     }
 
     void close() noexcept {
@@ -468,6 +511,7 @@ class KcpStream final : public io::StreamHandle {
                                                              std::size_t size) mutable {
                         terminal(error, size);
                     });
+                return async::CallbackAbortFn{[state] { state->cancel_read(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 net::translate_read(std::move(receiver), error, size, "kcp stream read");
@@ -485,6 +529,7 @@ class KcpStream final : public io::StreamHandle {
                                                              std::size_t size) mutable {
                         terminal(error, size);
                     });
+                return async::CallbackAbortFn{[state] { state->cancel_write(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 net::translate_write(std::move(receiver), error, size, "kcp stream write");

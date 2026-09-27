@@ -333,7 +333,7 @@ if(BUILD_TESTING)
         tests/core/async_stream_test.cpp
         tests/core/base64_test.cpp
         tests/core/broadcast_test.cpp
-        tests/core/channel_test.cpp
+        tests/core/callback_sender_test.cpp
         tests/core/watch_test.cpp
         tests/core/error_test.cpp
         tests/core/outbound_contract_test.cpp

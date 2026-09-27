@@ -14,6 +14,7 @@
 #include <botan/tls_server_info.h>
 #include <botan/tls_session_manager_noop.h>
 
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
 
@@ -270,11 +271,13 @@ class JlsStream final : public io::StreamHandle, public std::enable_shared_from_
 
     io::AnySender<std::optional<std::size_t>>
     async_read_some(boost::asio::mutable_buffer buffer) override {
+        auto self = shared_from_this();
         return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
-            [this, buffer](auto terminal) mutable {
-                this->read_impl(buffer, [terminal = std::move(terminal)](
+            [self, buffer](auto terminal) mutable {
+                self->read_impl(buffer, [terminal = std::move(terminal)](
                                             const boost::system::error_code &error,
                                             std::size_t count) mutable { terminal(error, count); });
+                return async::CallbackAbortFn{[self] { self->cancel_read(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 net::translate_read(std::move(receiver), error, count, "jls read");
@@ -282,13 +285,15 @@ class JlsStream final : public io::StreamHandle, public std::enable_shared_from_
     }
 
     io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        auto self = shared_from_this();
         return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
-            [this, buffer](auto terminal) mutable {
-                this->write_impl(
+            [self, buffer](auto terminal) mutable {
+                self->write_impl(
                     buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
                                                              std::size_t count) mutable {
                         terminal(error, count);
                     });
+                return async::CallbackAbortFn{[self] { self->cancel_write(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 net::translate_write(std::move(receiver), error, count, "jls write");
@@ -338,6 +343,50 @@ class JlsStream final : public io::StreamHandle, public std::enable_shared_from_
         }
         start_wire_write();
         maybe_finish_write();
+    }
+
+    // Retires a parked read without closing the transport: the caller
+    // handler completes with operation_aborted so a racing stop settles
+    // promptly. Dispatched to the stream executor because the parked state
+    // is strand-private. The lower read (if any) stays in flight; its late
+    // completion finds no parked handler and is dropped, while fresh wire
+    // bytes are still buffered for the next read.
+    void cancel_read() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(executor(), [self] {
+                auto handler = std::move(self->read_handler_);
+                if (!handler) {
+                    return;
+                }
+                // Caller buffer ref; the memory belongs to the caller frame.
+                self->read_buffer_ = {};
+                self->post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
+            });
+        } catch (...) {
+            // Aborter contract: never throw. A parked handler (if any) is
+            // retired by the late lower completion or close().
+        }
+    }
+
+    // Retires a parked write without closing the transport. The staged wire
+    // queue and its in-flight write are left to drain: the lower write
+    // references wire_current_, and the late completion finds no parked
+    // handler and is dropped.
+    void cancel_write() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(executor(), [self] {
+                auto handler = std::move(self->write_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->write_plain_size_ = 0;
+                self->post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
+            });
+        } catch (...) {
+            // Aborter contract: never throw; see cancel_read.
+        }
     }
 
     boost::asio::any_io_executor executor() noexcept override { return lower_->executor(); }
@@ -565,6 +614,7 @@ class JlsStreamHandle final : public io::StreamHandle {
                                                              std::size_t count) mutable {
                         terminal(error, count);
                     });
+                return async::CallbackAbortFn{[stream] { stream->cancel_read(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 net::translate_read(std::move(receiver), error, count, "jls read");
@@ -580,6 +630,7 @@ class JlsStreamHandle final : public io::StreamHandle {
                                                              std::size_t count) mutable {
                         terminal(error, count);
                     });
+                return async::CallbackAbortFn{[stream] { stream->cancel_write(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 net::translate_write(std::move(receiver), error, count, "jls write");

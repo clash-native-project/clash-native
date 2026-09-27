@@ -1,4 +1,4 @@
-#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/outbound/builtin_outbound.hpp>
@@ -88,7 +88,7 @@ class DirectConnectOperation final : public std::enable_shared_from_this<DirectC
             core::Result<dns::DnsAnswer> answer;
             try {
                 answer = co_await async::bridge_sender<core::Result<dns::DnsAnswer>>(
-                    [self, type](async::BridgeSender<core::Result<dns::DnsAnswer>>::Handler done) {
+                    [self, type](async::BridgeHandler<core::Result<dns::DnsAnswer>> done) {
                         self->resolver_request_id_ = self->resolver_->resolve(
                             {self->request_.destination.domain(), type, 1},
                             [self, done](core::Result<dns::DnsAnswer> result) mutable {
@@ -96,7 +96,7 @@ class DirectConnectOperation final : public std::enable_shared_from_this<DirectC
                                 done(std::move(result));
                             },
                             std::nullopt);
-                        return [self] { self->abort(); };
+                        return async::CallbackAbortFn{[self] { self->abort(); }};
                     });
             } catch (...) {
                 self->complete(
@@ -249,11 +249,11 @@ io::AnySender<core::StreamOpenResult> DirectOutbound::connect_stream(core::Strea
     auto resolver = resolver_;
     return async::bridge_sender<core::StreamOpenResult>(
         [executor, request = std::move(request), resolver = std::move(resolver)](
-            async::BridgeSender<core::StreamOpenResult>::Handler terminal) mutable {
+            async::BridgeHandler<core::StreamOpenResult> terminal) mutable {
             auto operation = std::make_shared<DirectConnectOperation>(
                 executor, std::move(request), std::move(resolver), std::move(terminal));
             operation->start();
-            return [operation] { operation->abort(); };
+            return async::CallbackAbortFn{[operation] { operation->abort(); }};
         });
 }
 

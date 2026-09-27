@@ -5,11 +5,15 @@
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 
+#include <boost/asio/bind_cancellation_slot.hpp>
+#include <boost/asio/cancellation_signal.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 #include <spdlog/spdlog.h>
 
+#include <memory>
 #include <utility>
 
 namespace clash_native::proxy {
@@ -63,19 +67,35 @@ ProxyStream::async_read_some(boost::asio::mutable_buffer buffer) {
                                        stdexec::set_error_t(std::exception_ptr),
                                        stdexec::set_stopped_t()>;
     return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
-        [this, buffer](auto terminal) mutable {
+        [this, buffer](auto terminal) mutable -> async::CallbackAbortFn {
+            // Aborts the in-flight socket read via a shared cancellation
+            // signal bound to the terminal. The aborter owns only the
+            // signal, so it stays safe after this stream is gone; the
+            // terminal itself never touches `this` (a late completion after
+            // destroy observes the settled flag and drops). `this` only
+            // needs to outlive the initiation, which holds because callers
+            // (TcpRelay pumps, handshake tasks) keep the owning handle
+            // alive for the duration of the await.
+            auto handler = [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                            std::size_t size) mutable {
+                terminal(error, size);
+            };
+            auto sig = std::make_shared<boost::asio::cancellation_signal>();
             std::visit(
-                [buffer, terminal = std::move(terminal),
+                [buffer, handler = std::move(handler), sig,
                  executor = executor_](auto &stream) mutable {
                     if (!stream) {
-                        boost::asio::post(executor, [terminal = std::move(terminal)]() mutable {
-                            terminal(boost::asio::error::operation_aborted, std::size_t{0});
+                        boost::asio::post(executor, [handler = std::move(handler)]() mutable {
+                            handler(boost::asio::error::operation_aborted, std::size_t{0});
                         });
                         return;
                     }
-                    stream->async_read_some(buffer, std::move(terminal));
+                    stream->async_read_some(buffer, boost::asio::bind_cancellation_slot(
+                                                        sig->slot(), std::move(handler)));
                 },
                 stream_);
+            return async::CallbackAbortFn{
+                [sig] { sig->emit(boost::asio::cancellation_type::terminal); }};
         },
         [](auto receiver, const boost::system::error_code &error, std::size_t size) {
             net::translate_read(std::move(receiver), error, size, "proxy client read");
@@ -87,19 +107,31 @@ io::AnySender<std::size_t> ProxyStream::async_write(boost::asio::const_buffer bu
                                                       stdexec::set_error_t(std::exception_ptr),
                                                       stdexec::set_stopped_t()>;
     return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
-        [this, buffer](auto terminal) mutable {
+        [this, buffer](auto terminal) mutable -> async::CallbackAbortFn {
+            // Same lifetime story as the read above: the aborter owns only
+            // the cancellation signal bound to the async_write terminal, so
+            // it stays safe after this stream is destroyed.
+            auto handler = [terminal = std::move(terminal)](const boost::system::error_code &error,
+                                                            std::size_t size) mutable {
+                terminal(error, size);
+            };
+            auto sig = std::make_shared<boost::asio::cancellation_signal>();
             std::visit(
-                [buffer, terminal = std::move(terminal),
+                [buffer, handler = std::move(handler), sig,
                  executor = executor_](auto &stream) mutable {
                     if (!stream) {
-                        boost::asio::post(executor, [terminal = std::move(terminal)]() mutable {
-                            terminal(boost::asio::error::operation_aborted, std::size_t{0});
+                        boost::asio::post(executor, [handler = std::move(handler)]() mutable {
+                            handler(boost::asio::error::operation_aborted, std::size_t{0});
                         });
                         return;
                     }
-                    boost::asio::async_write(*stream, buffer, std::move(terminal));
+                    boost::asio::async_write(
+                        *stream, buffer,
+                        boost::asio::bind_cancellation_slot(sig->slot(), std::move(handler)));
                 },
                 stream_);
+            return async::CallbackAbortFn{
+                [sig] { sig->emit(boost::asio::cancellation_type::terminal); }};
         },
         [](auto receiver, const boost::system::error_code &error, std::size_t size) {
             net::translate_write(std::move(receiver), error, size, "proxy client write");
@@ -202,8 +234,9 @@ ProxyRequestBodyStream::async_read_some(boost::asio::mutable_buffer buffer) {
                                        stdexec::set_error_t(std::exception_ptr),
                                        stdexec::set_stopped_t()>;
     return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
-        [self = shared_from_this(), buffer](auto terminal) mutable {
+        [self = shared_from_this(), buffer](auto terminal) mutable -> async::CallbackAbortFn {
             self->read_some(buffer, std::move(terminal));
+            return async::CallbackAbortFn{[self] { self->cancel_read(); }};
         },
         [](auto receiver, const boost::system::error_code &error, std::size_t size) {
             if (!error) {
@@ -236,24 +269,28 @@ void ProxyRequestBodyStream::read_some(boost::asio::mutable_buffer buffer, ReadH
             self->post_read(std::move(handler), boost::asio::error::already_started, 0);
             return;
         }
-        if (self->parser_->is_done()) {
-            self->post_read(std::move(handler), boost::asio::error::eof, 0);
+        if (self->read_abort_) {
+            // cancel_read() fired while the pull hopped through a retry
+            // post: retire it instead of re-parking. read_abort_ is only
+            // ever armed while retry_pending_, so a fresh pull can never
+            // observe a stale abort here.
+            self->read_abort_ = false;
+            self->post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
             return;
         }
-        if (buffer.size() == 0) {
-            self->post_read(std::move(handler), {}, 0);
-            return;
-        }
-
-        self->reading_ = true;
+        self->parked_handler_ = std::move(handler);
         auto &body = self->parser_->get().body();
         body.data = buffer.data();
         body.size = buffer.size();
         boost::beast::http::async_read_some(
             self->socket_, self->buffer_, *self->parser_,
-            [self, buffer, handler = std::move(handler)](const boost::system::error_code &error,
-                                                         std::size_t) mutable {
+            [self, buffer](const boost::system::error_code &error, std::size_t) mutable {
+                auto handler = std::move(self->parked_handler_);
                 self->reading_ = false;
+                if (!handler) {
+                    // Late completion after cancel_read() retired the pull.
+                    return;
+                }
                 auto &parsed_body = self->parser_->get().body();
                 const auto size = buffer.size() - parsed_body.size;
                 if (size != 0 && self->byte_handler_) {
@@ -315,9 +352,35 @@ void ProxyRequestBodyStream::cancel() noexcept {
     });
 }
 
+void ProxyRequestBodyStream::cancel_read() noexcept {
+    try {
+        const auto self = shared_from_this();
+        boost::asio::dispatch(executor_, [self] {
+            auto handler = std::move(self->parked_handler_);
+            if (handler) {
+                self->reading_ = false;
+                self->post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
+                return;
+            }
+            // No Beast read parked: the pull (if any) is hopping through a
+            // retry post. Arm the one-shot so the hop retires instead of
+            // re-parking; armed only while a retry is pending, so it cannot
+            // poison a later pull.
+            if (self->retry_pending_) {
+                self->read_abort_ = true;
+            }
+        });
+    } catch (...) {
+        // Aborter contract: never throw; the late Beast completion or
+        // close() retires the parked handler instead.
+    }
+}
+
 void ProxyRequestBodyStream::retry_read(boost::asio::mutable_buffer buffer, ReadHandler handler) {
     auto self = shared_from_this();
+    self->retry_pending_ = true;
     boost::asio::post(executor_, [self, buffer, handler = std::move(handler)]() mutable {
+        self->retry_pending_ = false;
         self->read_some(buffer, std::move(handler));
     });
 }

@@ -115,7 +115,7 @@ invoked later are unaffected. Rules:
   function shape fits, not by adapting an inline task into a bridge.
 - `exec::task` cannot be type-erased into `AnySender` either (sticky
   scheduler affinity fails `sender_to<any_receiver>`); expose chains as
-  `bridge_sender` + `then`, like `async_tls_client_handshake`.
+  `callback_sender` + `then`, like `async_tls_client_handshake`.
 - A `Guard`-style RAII reservation must be filled in place
   (`make_shared<Guard>()` + assign); a `Guard{...}` temporary runs its
   armed destructor and releases early.

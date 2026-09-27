@@ -1,6 +1,6 @@
 #pragma once
 
-#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/core/outbound.hpp>
 #include <clash_native/core/result.hpp>
 #include <clash_native/io/sender.hpp>
@@ -60,7 +60,7 @@ extend_endpoint_trace(const std::shared_ptr<const core::EndpointDialTrace> &trac
 // StreamOpenResult into the transported handle.
 struct ChainedStreamReceiver {
     using receiver_concept = stdexec::receiver_tag;
-    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler handler;
+    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>> handler;
     void set_value(core::StreamOpenResult result) && noexcept {
         auto done = std::move(handler);
         if (result.status == core::OpenStatus::opened && result.handle) {
@@ -95,7 +95,7 @@ struct ChainedStreamReceiver {
 // Drives a chained datagram open into a bridge handler.
 struct ChainedDatagramReceiver {
     using receiver_concept = stdexec::receiver_tag;
-    async::BridgeSender<core::DatagramOpenResult>::Handler handler;
+    async::BridgeHandler<core::DatagramOpenResult> handler;
     void set_value(core::DatagramOpenResult result) && noexcept {
         auto done = std::move(handler);
         done(std::move(result));

@@ -1,4 +1,4 @@
-#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_policy_router.hpp>
@@ -131,28 +131,24 @@ class FakeDnsTransport final : public clash_native::dns::DnsTransport,
             std::move(request));
         return clash_native::async::bridge_sender<
             clash_native::core::Result<clash_native::dns::DnsPacket>>(
-            [self,
-             box](clash_native::async::BridgeSender<
-                  clash_native::core::Result<clash_native::dns::DnsPacket>>::Handler done) mutable {
+            [self, box](clash_native::async::BridgeHandler<
+                        clash_native::core::Result<clash_native::dns::DnsPacket>>
+                            done) mutable {
                 if (!box || !*box) {
                     done(clash_native::core::fail(clash_native::core::Error{
                         clash_native::core::ErrorCode::cancelled, "fake DNS cancelled"}));
-                    using AbortFn = clash_native::async::BridgeSender<
-                        clash_native::core::Result<clash_native::dns::DnsPacket>>::AbortFn;
-                    return AbortFn{[] {}};
+                    return clash_native::async::CallbackAbortFn{};
                 }
                 self->open_exchange(std::move(**box), std::move(done));
                 box->reset();
-                using AbortFn = clash_native::async::BridgeSender<
-                    clash_native::core::Result<clash_native::dns::DnsPacket>>::AbortFn;
-                return AbortFn{[self] { self->cancel_exchange(); }};
+                return clash_native::async::CallbackAbortFn{[self] { self->cancel_exchange(); }};
             });
     }
 
-    void
-    open_exchange(clash_native::dns::DnsExchangeRequest request,
-                  clash_native::async::BridgeSender<
-                      clash_native::core::Result<clash_native::dns::DnsPacket>>::Handler handler) {
+    void open_exchange(
+        clash_native::dns::DnsExchangeRequest request,
+        clash_native::async::BridgeHandler<clash_native::core::Result<clash_native::dns::DnsPacket>>
+            handler) {
         ++stats_->exchanges;
         if (stats_->exchange_started) {
             stats_->exchange_started->set_value();
@@ -236,8 +232,8 @@ class FakeDnsTransport final : public clash_native::dns::DnsTransport,
     boost::asio::any_io_executor executor_;
     boost::asio::ip::address answer_address_;
     std::shared_ptr<FakeTransportStats> stats_;
-    clash_native::async::BridgeSender<
-        clash_native::core::Result<clash_native::dns::DnsPacket>>::Handler handler_;
+    clash_native::async::BridgeHandler<clash_native::core::Result<clash_native::dns::DnsPacket>>
+        handler_;
     clash_native::dns::DnsPacket query_;
     clash_native::dns::DnsQuestion question_;
     bool respond_;
@@ -2677,8 +2673,8 @@ TEST(ResolverServiceTransportTest, CancellingOneQueryLeavesSiblingFlowing) {
     auto &runtime = clash_native::runtime::AsioRuntime::instance();
     struct Pending {
         clash_native::dns::DnsPacket query;
-        clash_native::async::BridgeSender<
-            clash_native::core::Result<clash_native::dns::DnsPacket>>::Handler handler;
+        clash_native::async::BridgeHandler<clash_native::core::Result<clash_native::dns::DnsPacket>>
+            handler;
     };
     struct MultiFake final : public clash_native::dns::DnsTransport,
                              public std::enable_shared_from_this<MultiFake> {
@@ -2692,21 +2688,19 @@ TEST(ResolverServiceTransportTest, CancellingOneQueryLeavesSiblingFlowing) {
                 std::move(request));
             return clash_native::async::bridge_sender<
                 clash_native::core::Result<clash_native::dns::DnsPacket>>(
-                [self, box](clash_native::async::BridgeSender<clash_native::core::Result<
-                                clash_native::dns::DnsPacket>>::Handler done) mutable {
+                [self, box](clash_native::async::BridgeHandler<
+                            clash_native::core::Result<clash_native::dns::DnsPacket>>
+                                done) mutable {
                     if (!box || !*box) {
                         done(clash_native::core::fail(clash_native::core::Error{
                             clash_native::core::ErrorCode::cancelled, "multi-fake cancelled"}));
-                        using AbortFn = clash_native::async::BridgeSender<
-                            clash_native::core::Result<clash_native::dns::DnsPacket>>::AbortFn;
-                        return AbortFn{[] {}};
+                        return clash_native::async::CallbackAbortFn{};
                     }
                     const auto id = self->next++;
                     self->pending.emplace(id, Pending{std::move((*box)->query), std::move(done)});
                     box->reset();
-                    using AbortFn = clash_native::async::BridgeSender<
-                        clash_native::core::Result<clash_native::dns::DnsPacket>>::AbortFn;
-                    return AbortFn{[self, id] { self->cancel_exchange(id); }};
+                    return clash_native::async::CallbackAbortFn{
+                        [self, id] { self->cancel_exchange(id); }};
                 });
         }
         void answer(clash_native::dns::DnsExchangeId id) {

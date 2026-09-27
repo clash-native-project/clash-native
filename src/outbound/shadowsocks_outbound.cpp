@@ -1,6 +1,5 @@
 #include <clash_native/outbound/shadowsocks_outbound.hpp>
 
-#include <clash_native/async/bridge.hpp>
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/core/base64.hpp>
@@ -28,7 +27,7 @@
 
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/buffer.hpp>
-#include <boost/asio/connect.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
 
@@ -269,23 +268,20 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
 
             write_in_progress = true;
             auto self = shared_from_this();
+            write_handler = std::move(handler);
             auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(encoded));
             if (obfs_mode == ss::ObfsMode::tls) {
                 ss::async_write_tls_obfs_records(
-                    socket, std::move(*wire),
-                    [self, handler = std::move(handler), size](core::Status result) mutable {
-                        self->write_in_progress = false;
-                        handler(result ? boost::system::error_code() : protocol_error(),
-                                result ? size : 0);
+                    socket, std::move(*wire), [self, size](core::Status result) mutable {
+                        self->finish_write(result ? boost::system::error_code() : protocol_error(),
+                                           result ? size : 0);
                     });
                 return;
             }
-            StreamWriteHandler completion = [self, wire, handler = std::move(handler),
-                                             size](const boost::system::error_code &error,
-                                                   std::size_t) mutable {
-                self->write_in_progress = false;
-                handler(error, error ? 0 : size);
-            };
+            StreamWriteHandler completion =
+                [self, wire, size](const boost::system::error_code &error, std::size_t) mutable {
+                    self->finish_write(error, error ? 0 : size);
+                };
             // NOTE: name the sender first; argument order is unspecified.
             auto sender = carrier->async_write(boost::asio::buffer(*wire));
             async::start_with_receiver(std::move(sender),
@@ -305,7 +301,10 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
                 return;
             }
             if (pending_offset < pending_plaintext.size()) {
-                copy_pending(buffer, std::move(handler));
+                read_in_progress = true;
+                read_buffer = buffer;
+                read_handler = std::move(handler);
+                copy_pending(buffer);
                 return;
             }
 
@@ -321,7 +320,56 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
             }
         }
 
-        void close() noexcept { carrier->close(); }
+        // Retires a parked read without closing the transport. The framed
+        // lower reads in flight complete against a cleared handler and drop;
+        // buffered plaintext stays for the next read.
+        void cancel_read() noexcept {
+            try {
+                auto self = shared_from_this();
+                boost::asio::dispatch(carrier->executor(), [self] {
+                    auto handler = std::move(self->read_handler);
+                    if (!handler) {
+                        return;
+                    }
+                    self->read_buffer = {};
+                    self->read_in_progress = false;
+                    boost::asio::post(self->carrier->executor(),
+                                      [handler = std::move(handler)]() mutable {
+                                          handler(boost::asio::error::operation_aborted, 0);
+                                      });
+                });
+            } catch (...) {
+                // Aborter contract: never throw; the late framed completion or
+                // close() retires the parked handler instead.
+            }
+        }
+
+        // Retires a parked write without closing the transport. The staged
+        // wire write in flight (referencing the shared wire buffer) drains;
+        // its late completion finds a cleared write state and drops.
+        void cancel_write() noexcept {
+            try {
+                auto self = shared_from_this();
+                boost::asio::dispatch(carrier->executor(), [self] {
+                    auto handler = std::move(self->write_handler);
+                    if (!handler) {
+                        return;
+                    }
+                    self->write_in_progress = false;
+                    boost::asio::post(self->carrier->executor(),
+                                      [handler = std::move(handler)]() mutable {
+                                          handler(boost::asio::error::operation_aborted, 0);
+                                      });
+                });
+            } catch (...) {
+                // Aborter contract: never throw; see cancel_read.
+            }
+        }
+
+        void close() noexcept {
+            carrier->close();
+            finish_read(boost::asio::error::operation_aborted, 0);
+        }
 
         void receive_salt() {
             const auto method_info = transport::proxy::cipher_method(method);
@@ -418,7 +466,7 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
                            transport::proxy::increment_nonce(self->read_nonce);
                            self->pending_plaintext = std::move(plaintext.value());
                            self->pending_offset = 0;
-                           self->copy_pending(self->read_buffer, std::move(self->read_handler));
+                           self->copy_pending(self->read_buffer);
                        });
         }
 
@@ -483,7 +531,11 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
                 });
         }
 
-        void copy_pending(boost::asio::mutable_buffer buffer, StreamReadHandler handler) {
+        void copy_pending(boost::asio::mutable_buffer buffer) {
+            if (!read_in_progress) {
+                // Parked read was aborted; keep plaintext buffered for the next read.
+                return;
+            }
             const auto remaining = pending_plaintext.size() - pending_offset;
             const auto copied = std::min(buffer.size(), remaining);
             std::memcpy(buffer.data(), pending_plaintext.data() + pending_offset, copied);
@@ -492,8 +544,7 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
                 pending_plaintext.clear();
                 pending_offset = 0;
             }
-            read_in_progress = false;
-            handler({}, copied);
+            finish_read({}, copied);
         }
 
         void read_exact_carrier(boost::asio::mutable_buffer buffer, ExactReadHandler handler) {
@@ -529,12 +580,25 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
             async::start_with_receiver(std::move(sender), CarrierReadBridge{std::move(completion)});
         }
 
+        void finish_write(const boost::system::error_code &error, std::size_t size) {
+            write_in_progress = false;
+            auto handler = std::move(write_handler);
+            if (!handler) {
+                // Late lower completion after cancel_write retired the op.
+                return;
+            }
+            handler(error, size);
+        }
+
         void finish_read(const boost::system::error_code &error, std::size_t size) {
             read_in_progress = false;
             auto handler = std::move(read_handler);
-            if (handler) {
-                handler(error, size);
+            read_buffer = {};
+            if (!handler) {
+                // Late lower completion after cancel_read retired the op.
+                return;
             }
+            handler(error, size);
         }
 
         std::shared_ptr<boost::asio::ip::tcp::socket> socket;
@@ -554,6 +618,7 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
         std::size_t pending_offset = 0;
         boost::asio::mutable_buffer read_buffer;
         StreamReadHandler read_handler;
+        StreamWriteHandler write_handler;
         bool read_key_ready = false;
         ss::ObfsMode obfs_mode = ss::ObfsMode::none;
         bool obfs_response_ready = true;
@@ -589,12 +654,15 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
                 state->read(buffer, [terminal = std::move(terminal)](
                                         const boost::system::error_code &error,
                                         std::size_t count) mutable { terminal(error, count); });
+                return async::CallbackAbortFn{[state] { state->cancel_read(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 if (!error) {
                     stdexec::set_value(std::move(receiver), std::optional<std::size_t>(count));
                 } else if (error == boost::asio::error::eof) {
                     stdexec::set_value(std::move(receiver), std::optional<std::size_t>());
+                } else if (error == boost::asio::error::operation_aborted) {
+                    stdexec::set_stopped(std::move(receiver));
                 } else {
                     stdexec::set_error(
                         std::move(receiver),
@@ -612,10 +680,13 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
                 state->write(buffer, [terminal = std::move(terminal)](
                                          const boost::system::error_code &error,
                                          std::size_t count) mutable { terminal(error, count); });
+                return async::CallbackAbortFn{[state] { state->cancel_write(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 if (!error) {
                     stdexec::set_value(std::move(receiver), count);
+                } else if (error == boost::asio::error::operation_aborted) {
+                    stdexec::set_stopped(std::move(receiver));
                 } else {
                     stdexec::set_error(
                         std::move(receiver),
@@ -720,12 +791,12 @@ class ShadowsocksConnectOperation final
         core::Result<detail::AddressList> resolved;
         try {
             resolved = co_await async::bridge_sender<core::Result<detail::AddressList>>(
-                [self](async::BridgeSender<core::Result<detail::AddressList>>::Handler done) {
+                [self](async::BridgeHandler<core::Result<detail::AddressList>> done) {
                     detail::resolve_host(self->runtime_, self->resolver_, self->config_.server_host,
                                          [done](core::Result<detail::AddressList> result) mutable {
                                              done(std::move(result));
                                          });
-                    return [self] { self->abort(); };
+                    return async::CallbackAbortFn{[self] { self->abort(); }};
                 });
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
@@ -800,13 +871,13 @@ class ShadowsocksConnectOperation final
                 mux_stream =
                     co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                         [self, endpoints](
-                            async::BridgeSender<
-                                core::Result<std::unique_ptr<io::StreamHandle>>>::Handler done) {
+                            async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
+                                done) {
                             self->websocket_mux_pool_->async_open_stream(
                                 std::move(*endpoints), self->websocket_options(),
                                 [done](core::Result<std::unique_ptr<io::StreamHandle>>
                                            stream) mutable { done(std::move(stream)); });
-                            return [self] { self->abort(); };
+                            return async::CallbackAbortFn{[self] { self->abort(); }};
                         });
             } catch (...) {
                 self->finish(core::StreamOpenResult::failed(
@@ -906,13 +977,13 @@ class ShadowsocksConnectOperation final
             opened = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                 [self, plan = std::move(plan.value()),
                  chained_request = std::move(chained_request)](
-                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
                         done) mutable {
                     transport::EndpointDialer dialer(self->runtime_.serialized_executor(),
                                                      std::move(plan));
                     async::start_with_receiver(dialer.connect_stream(std::move(chained_request)),
                                                transport::ChainedStreamReceiver{std::move(done)});
-                    return [self] { self->abort(); };
+                    return async::CallbackAbortFn{[self] { self->abort(); }};
                 });
         } catch (...) {
             fail({core::ErrorCode::transport_io, "Shadowsocks chained dial failed", {}});
@@ -1197,14 +1268,14 @@ class ShadowsocksConnectOperation final
         try {
             result = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                 [self, stream = std::move(stream), options = std::move(options)](
-                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
                         done) mutable {
                     transport::proxy::async_open_shadow_tls(
                         std::move(*stream), std::move(options),
                         [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
                             done(std::move(opened));
                         });
-                    return [self] { self->abort(); };
+                    return async::CallbackAbortFn{[self] { self->abort(); }};
                 });
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
@@ -1236,14 +1307,14 @@ class ShadowsocksConnectOperation final
         try {
             result = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                 [self, stream = std::move(stream), options = std::move(options)](
-                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
                         done) mutable {
                     transport::proxy::async_open_restls(
                         std::move(*stream), std::move(options),
                         [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
                             done(std::move(opened));
                         });
-                    return [self] { self->abort(); };
+                    return async::CallbackAbortFn{[self] { self->abort(); }};
                 });
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
@@ -1274,14 +1345,14 @@ class ShadowsocksConnectOperation final
         try {
             result = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                 [self, stream = std::move(stream), options = std::move(options)](
-                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
                         done) mutable {
                     transport::proxy::async_open_jls(
                         std::move(*stream), std::move(options),
                         [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
                             done(std::move(opened));
                         });
-                    return [self] { self->abort(); };
+                    return async::CallbackAbortFn{[self] { self->abort(); }};
                 });
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
@@ -1317,19 +1388,19 @@ class ShadowsocksConnectOperation final
                 if (self->carrier_) {
                     opened = co_await async::bridge_sender<core::StreamOpenResult>(
                         [self, destination = std::move(address.value())](
-                            async::BridgeSender<core::StreamOpenResult>::Handler done) mutable {
+                            async::BridgeHandler<core::StreamOpenResult> done) mutable {
                             ss::async_open_shadowsocks_2022_stream(
                                 self->runtime_, self->carrier_, self->config_.method,
                                 self->config_.password, std::move(destination),
                                 [done](core::StreamOpenResult result) mutable {
                                     done(std::move(result));
                                 });
-                            return [self] { self->abort(); };
+                            return async::CallbackAbortFn{[self] { self->abort(); }};
                         });
                 } else {
                     opened = co_await async::bridge_sender<core::StreamOpenResult>(
                         [self, destination = std::move(address.value())](
-                            async::BridgeSender<core::StreamOpenResult>::Handler done) mutable {
+                            async::BridgeHandler<core::StreamOpenResult> done) mutable {
                             ss::async_open_shadowsocks_2022_stream(
                                 self->runtime_, self->socket_, self->config_.method,
                                 self->config_.password, std::move(destination),
@@ -1337,7 +1408,7 @@ class ShadowsocksConnectOperation final
                                 [done](core::StreamOpenResult result) mutable {
                                     done(std::move(result));
                                 });
-                            return [self] { self->abort(); };
+                            return async::CallbackAbortFn{[self] { self->abort(); }};
                         });
                 }
             } catch (...) {
@@ -1384,21 +1455,21 @@ class ShadowsocksConnectOperation final
             try {
                 if (obfs->mode == ss::ObfsMode::http) {
                     obfs_result = co_await async::bridge_sender<core::Status>(
-                        [self, wire](async::BridgeSender<core::Status>::Handler done) mutable {
+                        [self, wire](async::BridgeHandler<core::Status> done) mutable {
                             const auto options = self->obfs_options();
                             ss::async_write_http_obfs_request(
                                 self->socket_, std::move(*wire), {options->host, options->port},
                                 [done](core::Status result) mutable { done(std::move(result)); });
-                            return [self] { self->abort(); };
+                            return async::CallbackAbortFn{[self] { self->abort(); }};
                         });
                 } else {
                     obfs_result = co_await async::bridge_sender<core::Status>(
-                        [self, wire](async::BridgeSender<core::Status>::Handler done) mutable {
+                        [self, wire](async::BridgeHandler<core::Status> done) mutable {
                             const auto options = self->obfs_options();
                             ss::async_write_tls_obfs_request(
                                 self->socket_, std::move(*wire), options->host,
                                 [done](core::Status result) mutable { done(std::move(result)); });
-                            return [self] { self->abort(); };
+                            return async::CallbackAbortFn{[self] { self->abort(); }};
                         });
                 }
             } catch (...) {
@@ -1469,14 +1540,14 @@ class ShadowsocksConnectOperation final
         try {
             plugin = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                 [self, stream = std::move(stream)](
-                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
                         done) mutable {
                     ss::async_open_websocket_plugin(
                         std::move(*stream), self->websocket_options(),
                         [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
                             done(std::move(opened));
                         });
-                    return [self] { self->abort(); };
+                    return async::CallbackAbortFn{[self] { self->abort(); }};
                 });
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
@@ -1521,14 +1592,14 @@ class ShadowsocksConnectOperation final
         try {
             plugin = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                 [self, stream = std::move(stream)](
-                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
                         done) mutable {
                     ss::async_open_websocket_plugin(
                         std::move(*stream), self->websocket_options(),
                         [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
                             done(std::move(opened));
                         });
-                    return [self] { self->abort(); };
+                    return async::CallbackAbortFn{[self] { self->abort(); }};
                 });
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
@@ -1547,12 +1618,12 @@ class ShadowsocksConnectOperation final
         try {
             opened = co_await async::bridge_sender<core::StreamOpenResult>(
                 [self, destination = std::move(destination)](
-                    async::BridgeSender<core::StreamOpenResult>::Handler done) mutable {
+                    async::BridgeHandler<core::StreamOpenResult> done) mutable {
                     ss::async_open_shadowsocks_2022_stream(
                         self->runtime_, self->carrier_, self->config_.method,
                         self->config_.password, std::move(destination),
                         [done](core::StreamOpenResult result) mutable { done(std::move(result)); });
-                    return [self] { self->abort(); };
+                    return async::CallbackAbortFn{[self] { self->abort(); }};
                 });
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
@@ -1603,22 +1674,22 @@ class ShadowsocksConnectOperation final
                 if (obfs->mode == ss::ObfsMode::http) {
                     obfs_result = co_await async::bridge_sender<core::Status>(
                         [self, wire,
-                         write_cipher](async::BridgeSender<core::Status>::Handler done) mutable {
+                         write_cipher](async::BridgeHandler<core::Status> done) mutable {
                             const auto options = self->obfs_options();
                             ss::async_write_http_obfs_request(
                                 self->socket_, std::move(*wire), {options->host, options->port},
                                 [done](core::Status result) mutable { done(std::move(result)); });
-                            return [self] { self->abort(); };
+                            return async::CallbackAbortFn{[self] { self->abort(); }};
                         });
                 } else {
                     obfs_result = co_await async::bridge_sender<core::Status>(
                         [self, wire,
-                         write_cipher](async::BridgeSender<core::Status>::Handler done) mutable {
+                         write_cipher](async::BridgeHandler<core::Status> done) mutable {
                             const auto options = self->obfs_options();
                             ss::async_write_tls_obfs_request(
                                 self->socket_, std::move(*wire), options->host,
                                 [done](core::Status result) mutable { done(std::move(result)); });
-                            return [self] { self->abort(); };
+                            return async::CallbackAbortFn{[self] { self->abort(); }};
                         });
                 }
             } catch (...) {
@@ -1700,15 +1771,15 @@ class ShadowsocksConnectOperation final
         core::Result<std::unique_ptr<io::StreamHandle>> plugin;
         try {
             plugin = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
-                [self, stream = std::move(stream), cipher](
-                    async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
-                        done) mutable {
+                [self, stream = std::move(stream),
+                 cipher](async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
+                             done) mutable {
                     ss::async_open_websocket_plugin(
                         std::move(*stream), self->websocket_options(),
                         [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
                             done(std::move(opened));
                         });
-                    return [self] { self->abort(); };
+                    return async::CallbackAbortFn{[self] { self->abort(); }};
                 });
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
@@ -1841,6 +1912,12 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
 
         void send(boost::asio::const_buffer buffer, io::DatagramAddress destination,
                   WriteHandler handler) {
+            if (send_in_progress) {
+                boost::asio::post(transport_->executor(), [handler = std::move(handler)]() mutable {
+                    handler(boost::asio::error::already_started, 0);
+                });
+                return;
+            }
             const auto target = destination.to_destination();
             auto address = detail::encode_proxy_address(detail::to_core_destination(target));
             const auto method_info = transport::proxy::cipher_method(method);
@@ -1864,10 +1941,12 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
                 }
                 auto packet = std::make_shared<std::vector<std::uint8_t>>(std::move(wire.value()));
                 auto self = shared_from_this();
-                WriteHandler completion = [self, packet, handler = std::move(handler),
+                self->send_in_progress = true;
+                self->send_handler = std::move(handler);
+                WriteHandler completion = [self, packet,
                                            payload_size](const boost::system::error_code &error,
                                                          std::size_t) mutable {
-                    handler(error, error ? 0 : payload_size);
+                    self->finish_send(error, error ? 0 : payload_size);
                 };
                 // NOTE: name the sender first; argument order is unspecified.
                 auto sender = transport_->async_send_to(boost::asio::buffer(*packet),
@@ -1887,10 +1966,12 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
             }
             auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(encoded.value()));
             auto self = shared_from_this();
-            WriteHandler completion = [self, wire, handler = std::move(handler),
+            self->send_in_progress = true;
+            self->send_handler = std::move(handler);
+            WriteHandler completion = [self, wire,
                                        payload_size](const boost::system::error_code &error,
                                                      std::size_t) mutable {
-                handler(error, error ? 0 : payload_size);
+                self->finish_send(error, error ? 0 : payload_size);
             };
             // NOTE: name the sender first; argument order is unspecified.
             auto sender = transport_->async_send_to(boost::asio::buffer(*wire),
@@ -1916,6 +1997,11 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
             auto self = shared_from_this();
             ReadHandler completion = [self](const boost::system::error_code &error,
                                             std::size_t size, io::DatagramAddress sender) {
+                if (!self->receive_handler) {
+                    // Late lower completion after cancel_receive retired the op.
+                    self->receive_in_progress = false;
+                    return;
+                }
                 if (error) {
                     self->finish_receive(error, 0, {});
                     return;
@@ -1988,12 +2074,74 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
             finish_receive({}, size, std::move(sender));
         }
 
+        void finish_send(const boost::system::error_code &error, std::size_t size) {
+            send_in_progress = false;
+            auto handler = std::move(send_handler);
+            if (!handler) {
+                // Late lower completion after cancel_send retired the op.
+                return;
+            }
+            handler(error, size);
+        }
+
         void finish_receive(const boost::system::error_code &error, std::size_t size,
                             io::DatagramAddress sender) {
             receive_in_progress = false;
             auto handler = std::move(receive_handler);
-            if (handler) {
-                handler(error, size, std::move(sender));
+            output_buffer = {};
+            if (!handler) {
+                // Late lower completion after cancel_receive retired the op.
+                return;
+            }
+            handler(error, size, std::move(sender));
+        }
+
+        // Retires a parked receive without closing the transport. Dispatched
+        // to the transport executor because the parked state is
+        // strand-private. The lower receive (if any) stays in flight; its
+        // late completion finds no parked handler and is dropped.
+        void cancel_receive() noexcept {
+            try {
+                auto self = shared_from_this();
+                boost::asio::dispatch(transport_->executor(), [self] {
+                    auto handler = std::move(self->receive_handler);
+                    if (!handler) {
+                        return;
+                    }
+                    self->output_buffer = {};
+                    self->receive_in_progress = false;
+                    boost::asio::post(self->transport_->executor(),
+                                      [handler = std::move(handler)]() mutable {
+                                          handler(boost::asio::error::operation_aborted, 0, {});
+                                      });
+                });
+            } catch (...) {
+                // Aborter contract: never throw; the late lower completion or
+                // close() retires the parked handler instead.
+            }
+        }
+
+        // Retires a parked send without closing the transport. Dispatched
+        // to the transport executor because the parked state is
+        // strand-private. The lower send (if any) stays in flight; its
+        // late completion finds no parked handler and is dropped.
+        void cancel_send() noexcept {
+            try {
+                auto self = shared_from_this();
+                boost::asio::dispatch(transport_->executor(), [self] {
+                    auto handler = std::move(self->send_handler);
+                    if (!handler) {
+                        return;
+                    }
+                    self->send_in_progress = false;
+                    boost::asio::post(self->transport_->executor(),
+                                      [handler = std::move(handler)]() mutable {
+                                          handler(boost::asio::error::operation_aborted, 0);
+                                      });
+                });
+            } catch (...) {
+                // Aborter contract: never throw; the late lower completion or
+                // close() retires the parked handler instead.
             }
         }
 
@@ -2027,7 +2175,9 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
         std::array<std::uint8_t, kMaxUdpWireSize> receive_buffer{};
         boost::asio::mutable_buffer output_buffer;
         ReadHandler receive_handler;
+        WriteHandler send_handler;
         bool receive_in_progress = false;
+        bool send_in_progress = false;
     };
 
   public:
@@ -2041,6 +2191,7 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
         return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
             [state = state_, buffer, destination](auto terminal) mutable {
                 state->send(buffer, std::move(destination), std::move(terminal));
+                return async::CallbackAbortFn{[state] { state->cancel_send(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 if (!error) {
@@ -2070,6 +2221,7 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
                                            io::DatagramAddress source) mutable {
                     terminal(error, size, std::move(source));
                 });
+                return async::CallbackAbortFn{[state] { state->cancel_receive(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size,
                io::DatagramAddress source) {
@@ -2270,13 +2422,13 @@ ShadowsocksOutbound::connect_stream(core::StreamRequest request) {
         [&runtime, resolver = std::move(resolver), chain_registry = std::move(chain_registry),
          kcptun_pool = std::move(kcptun_pool), websocket_mux_pool = std::move(websocket_mux_pool),
          config = std::move(config), request = std::move(request)](
-            async::BridgeSender<core::StreamOpenResult>::Handler terminal) mutable {
+            async::BridgeHandler<core::StreamOpenResult> terminal) mutable {
             auto operation = std::make_shared<ShadowsocksConnectOperation>(
                 runtime, std::move(resolver), std::move(chain_registry), std::move(kcptun_pool),
                 std::move(websocket_mux_pool), std::move(config), std::move(request),
                 std::move(terminal));
             operation->start();
-            return [operation] { operation->abort(); };
+            return async::CallbackAbortFn{[operation] { operation->abort(); }};
         });
 }
 
@@ -2284,7 +2436,7 @@ ShadowsocksOutbound::connect_stream(core::StreamRequest request) {
 // the chain's DatagramHandle.
 struct ChainedDatagramOpen {
     using receiver_concept = stdexec::receiver_tag;
-    async::BridgeSender<core::DatagramOpenResult>::Handler handler;
+    async::BridgeHandler<core::DatagramOpenResult> handler;
     boost::asio::ip::udp::endpoint server;
     ShadowsocksOutboundConfig config;
     void set_value(core::DatagramOpenResult result) && noexcept {
@@ -2331,7 +2483,7 @@ void open_chained_datagram_dial(runtime::AsioRuntime &runtime, transport::Endpoi
                                 ShadowsocksOutboundConfig config,
                                 std::shared_ptr<const core::EndpointDialTrace> trace,
                                 boost::asio::ip::udp::endpoint server,
-                                async::BridgeSender<core::DatagramOpenResult>::Handler handler) {
+                                async::BridgeHandler<core::DatagramOpenResult> handler) {
     boost::system::error_code ignored;
     const auto numeric = boost::asio::ip::make_address(config.server_host, ignored);
     core::Destination destination =
@@ -2348,7 +2500,7 @@ void open_chained_datagram(runtime::AsioRuntime &runtime,
                            std::shared_ptr<dns::ResolverService> resolver,
                            OutboundRegistry::Snapshot registry, ShadowsocksOutboundConfig config,
                            core::DatagramRequest request,
-                           async::BridgeSender<core::DatagramOpenResult>::Handler handler) {
+                           async::BridgeHandler<core::DatagramOpenResult> handler) {
     auto fail = [handler](core::Error error) mutable {
         handler(core::DatagramOpenResult::failed(std::move(error)));
     };
@@ -2436,10 +2588,10 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
         return async::bridge_sender<core::DatagramOpenResult>(
             [&runtime, resolver = std::move(resolver), chain_registry = std::move(chain_registry),
              config = std::move(config), request = std::move(chained_request)](
-                async::BridgeSender<core::DatagramOpenResult>::Handler terminal) mutable {
+                async::BridgeHandler<core::DatagramOpenResult> terminal) mutable {
                 open_chained_datagram(runtime, std::move(resolver), std::move(chain_registry),
                                       std::move(config), std::move(request), std::move(terminal));
-                return async::BridgeSender<core::DatagramOpenResult>::AbortFn{};
+                return async::CallbackAbortFn{};
             });
     }
     return async::bridge_sender<
@@ -2447,7 +2599,7 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
                                    chain_registry = chain_registry_, kcptun_pool = kcptun_pool_,
                                    websocket_mux_pool = websocket_mux_pool_, config = config_,
                                    request = std::move(request)](
-                                      async::BridgeSender<core::DatagramOpenResult>::Handler
+                                      async::BridgeHandler<core::DatagramOpenResult>
                                           terminal) mutable {
         auto handler = std::move(terminal);
         if (config.udp_over_tcp || config.plugin == "kcptun") {
@@ -2486,7 +2638,7 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
                     });
                 });
             operation->start();
-            return async::BridgeSender<core::DatagramOpenResult>::AbortFn{};
+            return async::CallbackAbortFn{};
         }
 
         detail::resolve_host(
@@ -2541,7 +2693,7 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
                     std::make_unique<ShadowsocksDatagramHandle>(std::move(state)),
                     core::DatagramSemantics::multi_destination));
             });
-        return async::BridgeSender<core::DatagramOpenResult>::AbortFn{};
+        return async::CallbackAbortFn{};
     });
 }
 

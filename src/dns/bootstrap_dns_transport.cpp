@@ -1,4 +1,4 @@
-#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/held_operation.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/bootstrap_resolver.hpp>
@@ -47,21 +47,20 @@ class BootstrapDnsTransport final : public DnsTransport,
         auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
         auto self = shared_from_this();
         return async::bridge_sender<DnsExchangeResult>(
-            [self, box](async::BridgeSender<DnsExchangeResult>::Handler done) mutable {
+            [self, box](async::BridgeHandler<DnsExchangeResult> done) mutable {
                 if (!box || !*box) {
                     done(core::fail(cancelled_error()));
-                    using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
-                    return AbortFn{[] {}};
+                    return async::CallbackAbortFn{};
                 }
                 const auto exchange_id = self->open_exchange(std::move(**box), std::move(done));
                 box->reset();
-                using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
-                return AbortFn{[self, exchange_id] { self->cancel_exchange(exchange_id); }};
+                return async::CallbackAbortFn{
+                    [self, exchange_id] { self->cancel_exchange(exchange_id); }};
             });
     }
 
     DnsExchangeId open_exchange(DnsExchangeRequest request,
-                                async::BridgeSender<DnsExchangeResult>::Handler handler) {
+                                async::BridgeHandler<DnsExchangeResult> handler) {
         const auto exchange_id = next_exchange_id_++;
         auto pending = std::make_shared<Pending>();
         pending->request = std::move(request);
@@ -156,7 +155,7 @@ class BootstrapDnsTransport final : public DnsTransport,
 
     struct Pending {
         DnsExchangeRequest request;
-        async::BridgeSender<DnsExchangeResult>::Handler handler;
+        async::BridgeHandler<DnsExchangeResult> handler;
         BootstrapResolver::RequestId bootstrap_id = 0;
     };
 

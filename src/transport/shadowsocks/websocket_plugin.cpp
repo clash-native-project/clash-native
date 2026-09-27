@@ -1,6 +1,6 @@
 #include <clash_native/transport/shadowsocks/websocket_plugin.hpp>
 
-#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/net/tcp_stream.hpp>
 
@@ -77,7 +77,7 @@ class WebSocketPluginOperation final
         core::Result<std::unique_ptr<io::StreamHandle>> result;
         try {
             result = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
-                [self](async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
+                [self](async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
                            done) mutable {
                     WebSocketClientOptions options;
                     options.host = self->options_.host;
@@ -101,11 +101,11 @@ class WebSocketPluginOperation final
                             self->websocket_.reset();
                             done(std::move(opened));
                         });
-                    return [self] {
+                    return async::CallbackAbortFn{[self] {
                         if (self->websocket_) {
                             self->websocket_->cancel();
                         }
-                    };
+                    }};
                 });
         } catch (...) {
             self->finish(core::fail(core::Error{
@@ -201,8 +201,8 @@ class WebSocketPluginMuxOperation final
         try {
             ws_result =
                 co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
-                    [self](async::BridgeSender<
-                           core::Result<std::unique_ptr<io::StreamHandle>>>::Handler done) mutable {
+                    [self](async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
+                               done) mutable {
                         WebSocketClientOptions websocket_options;
                         websocket_options.host = self->options_.host;
                         websocket_options.target = self->options_.path;
@@ -217,11 +217,11 @@ class WebSocketPluginMuxOperation final
                                 self->websocket_.reset();
                                 done(std::move(opened));
                             });
-                        return [self] {
+                        return async::CallbackAbortFn{[self] {
                             if (self->websocket_) {
                                 self->websocket_->cancel();
                             }
-                        };
+                        }};
                     });
         } catch (...) {
             self->finish(core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>(
@@ -248,8 +248,9 @@ class WebSocketPluginMuxOperation final
                 [self, mux_options,
                  stream = std::make_shared<std::unique_ptr<io::StreamHandle>>(
                      std::move(ws_result.value()))](
-                    async::BridgeSender<core::Result<std::shared_ptr<
-                        clash_native::io::MultiplexedSession>>>::Handler done) mutable {
+                    async::BridgeHandler<
+                        core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>>
+                        done) mutable {
                     self->mux_ = async_open_websocket_mux(
                         std::move(*stream), mux_options,
                         [self,
@@ -258,11 +259,11 @@ class WebSocketPluginMuxOperation final
                             self->mux_.reset();
                             done(std::move(opened));
                         });
-                    return [self] {
+                    return async::CallbackAbortFn{[self] {
                         if (self->mux_) {
                             self->mux_->cancel();
                         }
-                    };
+                    }};
                 });
         } catch (...) {
             self->finish(

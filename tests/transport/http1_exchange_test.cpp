@@ -19,6 +19,7 @@
 #include <boost/beast/core/flat_buffer.hpp>
 #include <boost/beast/http.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -60,8 +61,10 @@ class TestUploadBody final : public clash_native::io::ExchangeBodyStream,
                                            stdexec::set_stopped_t()>;
         return clash_native::io::AnySender<std::optional<std::size_t>>{
             clash_native::async::callback_sender<Signatures>(
-                [self = shared_from_this(), buffer](auto terminal) mutable {
+                [self = shared_from_this(),
+                 buffer](auto terminal) mutable -> clash_native::async::CallbackAbortFn {
                     self->read_some(buffer, std::move(terminal));
+                    return clash_native::async::CallbackAbortFn{[self] { self->cancel(); }};
                 },
                 [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                     if (!error) {
@@ -86,7 +89,7 @@ class TestUploadBody final : public clash_native::io::ExchangeBodyStream,
     void read_some(boost::asio::mutable_buffer buffer, ReadHandler handler) {
         const auto self = shared_from_this();
         boost::asio::post(executor_, [self, buffer, handler = std::move(handler)]() mutable {
-            if (self->cancelled_) {
+            if (self->cancelled_.load(std::memory_order_acquire)) {
                 handler(boost::asio::error::operation_aborted, 0);
                 return;
             }
@@ -102,14 +105,14 @@ class TestUploadBody final : public clash_native::io::ExchangeBodyStream,
     }
 
     std::vector<ExchangeField> trailers() const override { return trailers_; }
-    void cancel() noexcept override { cancelled_ = true; }
+    void cancel() noexcept override { cancelled_.store(true, std::memory_order_release); }
 
   private:
     boost::asio::any_io_executor executor_;
     std::vector<std::uint8_t> payload_;
     std::vector<ExchangeField> trailers_;
     std::size_t offset_ = 0;
-    bool cancelled_ = false;
+    std::atomic_bool cancelled_ = false;
 };
 
 // Reads a response body stream to EOF on the calling thread. The session

@@ -935,9 +935,11 @@ class Http1ClientSession final : public io::ExchangeSession,
                 std::make_unique<http::request_serializer<http::empty_body>>(
                     pending->streaming_message);
             const auto header_written = co_await async::callback_sender<HttpOpSigs>(
-                [&](auto terminal) {
+                [self, exchange_id, pending](auto terminal) mutable {
                     http::async_write_header(*self->stream_, *pending->streaming_serializer,
                                              std::move(terminal));
+                    return async::CallbackAbortFn{
+                        [self, exchange_id] { self->cancel(exchange_id); }};
                 },
                 [](auto &&receiver, const boost::system::error_code &error, std::size_t size) {
                     stdexec::set_value(std::move(receiver), HttpOpResult{error, size});
@@ -1027,9 +1029,11 @@ class Http1ClientSession final : public io::ExchangeSession,
                         wire->insert(wire->end(), {'\r', '\n'});
                     }
                     const auto body_written = co_await async::callback_sender<HttpOpSigs>(
-                        [self, wire](auto terminal) {
+                        [self, exchange_id, wire](auto terminal) mutable {
                             boost::asio::async_write(*self->stream_, boost::asio::buffer(*wire),
                                                      std::move(terminal));
+                            return async::CallbackAbortFn{
+                                [self, exchange_id] { self->cancel(exchange_id); }};
                         },
                         [](auto &&receiver, const boost::system::error_code &write_error,
                            std::size_t written) {
@@ -1081,10 +1085,12 @@ class Http1ClientSession final : public io::ExchangeSession,
                     auto terminator =
                         std::make_shared<std::vector<std::uint8_t>>(std::move(last_chunk.value()));
                     const auto terminator_written = co_await async::callback_sender<HttpOpSigs>(
-                        [self, terminator](auto terminal) {
+                        [self, exchange_id, terminator](auto terminal) mutable {
                             boost::asio::async_write(*self->stream_,
                                                      boost::asio::buffer(*terminator),
                                                      std::move(terminal));
+                            return async::CallbackAbortFn{
+                                [self, exchange_id] { self->cancel(exchange_id); }};
                         },
                         [](auto &&receiver, const boost::system::error_code &error,
                            std::size_t size) {
@@ -1104,11 +1110,13 @@ class Http1ClientSession final : public io::ExchangeSession,
                 }
             } else if (!pending->streaming_request.request.body.empty()) {
                 const auto buffered = co_await async::callback_sender<HttpOpSigs>(
-                    [&](auto terminal) {
+                    [self, exchange_id, pending](auto terminal) mutable {
                         boost::asio::async_write(
                             *self->stream_,
                             boost::asio::buffer(pending->streaming_request.request.body),
                             std::move(terminal));
+                        return async::CallbackAbortFn{
+                            [self, exchange_id] { self->cancel(exchange_id); }};
                     },
                     [](auto &&receiver, const boost::system::error_code &error, std::size_t size) {
                         stdexec::set_value(std::move(receiver), HttpOpResult{error, size});
@@ -1127,9 +1135,11 @@ class Http1ClientSession final : public io::ExchangeSession,
             }
             while (true) {
                 const auto header = co_await async::callback_sender<HttpOpSigs>(
-                    [&](auto terminal) {
+                    [self, exchange_id, pending](auto terminal) mutable {
                         http::async_read_header(*self->stream_, self->read_buffer_,
                                                 *pending->streaming_parser, std::move(terminal));
+                        return async::CallbackAbortFn{
+                            [self, exchange_id] { self->cancel(exchange_id); }};
                     },
                     [](auto &&receiver, const boost::system::error_code &error, std::size_t size) {
                         stdexec::set_value(std::move(receiver), HttpOpResult{error, size});
@@ -1205,9 +1215,11 @@ class Http1ClientSession final : public io::ExchangeSession,
                 body.data = pending->streaming_response_buffer.data();
                 body.size = capacity;
                 const auto chunk = co_await async::callback_sender<HttpOpSigs>(
-                    [&](auto terminal) {
+                    [self, exchange_id, pending](auto terminal) mutable {
                         http::async_read_some(*self->stream_, self->read_buffer_,
                                               *pending->streaming_parser, std::move(terminal));
+                        return async::CallbackAbortFn{
+                            [self, exchange_id] { self->cancel(exchange_id); }};
                     },
                     [](auto &&receiver, const boost::system::error_code &error, std::size_t size) {
                         stdexec::set_value(std::move(receiver), HttpOpResult{error, size});
@@ -1347,8 +1359,10 @@ class Http1ClientSession final : public io::ExchangeSession,
             pending->parser = std::make_unique<ExchangeResponseParser>();
             pending->parser->body_limit(pending->tunnel_request.rejection_body_limit);
             const auto written = co_await async::callback_sender<HttpOpSigs>(
-                [&](auto terminal) {
+                [self, message, exchange_id](auto terminal) mutable {
                     http::async_write(*self->stream_, *message, std::move(terminal));
+                    return async::CallbackAbortFn{
+                        [self, exchange_id] { self->cancel(exchange_id); }};
                 },
                 [](auto &&receiver, const boost::system::error_code &error, std::size_t size) {
                     stdexec::set_value(std::move(receiver), HttpOpResult{error, size});
@@ -1362,9 +1376,11 @@ class Http1ClientSession final : public io::ExchangeSession,
             }
             while (true) {
                 const auto header = co_await async::callback_sender<HttpOpSigs>(
-                    [&](auto terminal) {
+                    [self, exchange_id, pending](auto terminal) mutable {
                         http::async_read_header(*self->stream_, self->read_buffer_,
                                                 *pending->parser, std::move(terminal));
+                        return async::CallbackAbortFn{
+                            [self, exchange_id] { self->cancel(exchange_id); }};
                     },
                     [](auto &&receiver, const boost::system::error_code &error, std::size_t size) {
                         stdexec::set_value(std::move(receiver), HttpOpResult{error, size});
@@ -1391,9 +1407,11 @@ class Http1ClientSession final : public io::ExchangeSession,
                 co_return;
             }
             const auto rejection = co_await async::callback_sender<HttpOpSigs>(
-                [&](auto terminal) {
+                [self, exchange_id, pending](auto terminal) mutable {
                     http::async_read(*self->stream_, self->read_buffer_, *pending->parser,
                                      std::move(terminal));
+                    return async::CallbackAbortFn{
+                        [self, exchange_id] { self->cancel(exchange_id); }};
                 },
                 [](auto &&receiver, const boost::system::error_code &error, std::size_t size) {
                     stdexec::set_value(std::move(receiver), HttpOpResult{error, size});
@@ -1479,8 +1497,10 @@ class Http1ClientSession final : public io::ExchangeSession,
                 co_return;
             }
             const auto written = co_await async::callback_sender<HttpOpSigs>(
-                [&](auto terminal) {
+                [self, message, exchange_id](auto terminal) mutable {
                     http::async_write(*self->stream_, *message, std::move(terminal));
+                    return async::CallbackAbortFn{
+                        [self, exchange_id] { self->cancel(exchange_id); }};
                 },
                 [](auto &&receiver, const boost::system::error_code &error, std::size_t size) {
                     stdexec::set_value(std::move(receiver), HttpOpResult{error, size});
@@ -1493,9 +1513,11 @@ class Http1ClientSession final : public io::ExchangeSession,
                 co_return;
             }
             const auto received = co_await async::callback_sender<HttpOpSigs>(
-                [&](auto terminal) {
+                [self, exchange_id, pending](auto terminal) mutable {
                     http::async_read(*self->stream_, self->read_buffer_, *pending->parser,
                                      std::move(terminal));
+                    return async::CallbackAbortFn{
+                        [self, exchange_id] { self->cancel(exchange_id); }};
                 },
                 [](auto &&receiver, const boost::system::error_code &error, std::size_t size) {
                     stdexec::set_value(std::move(receiver), HttpOpResult{error, size});

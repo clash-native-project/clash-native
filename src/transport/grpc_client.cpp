@@ -229,8 +229,9 @@ class GrpcClientCall::RequestBody final : public io::ExchangeBodyStream,
                                            stdexec::set_error_t(std::exception_ptr),
                                            stdexec::set_stopped_t()>;
         return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
-            [self = shared_from_this(), buffer](auto terminal) mutable {
+            [self = shared_from_this(), buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 self->read_some(buffer, std::move(terminal));
+                return async::CallbackAbortFn{[self] { self->cancel(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 if (!error) {

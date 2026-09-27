@@ -1,4 +1,4 @@
-#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/core/base64.hpp>
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
@@ -420,13 +420,13 @@ HttpProxyOutbound::connect_stream(core::StreamRequest request) {
     auto config = config_;
     return async::bridge_sender<core::StreamOpenResult>(
         [&runtime, resolver = std::move(resolver), config = std::move(config),
-         request = std::move(request)](
-            async::BridgeSender<core::StreamOpenResult>::Handler terminal) mutable {
+         request =
+             std::move(request)](async::BridgeHandler<core::StreamOpenResult> terminal) mutable {
             auto operation = std::make_shared<HttpProxyConnectOperation>(
                 runtime, std::move(resolver), std::move(config), std::move(request),
                 std::move(terminal));
             operation->start();
-            return [operation] { operation->abort(); };
+            return async::CallbackAbortFn{[operation] { operation->abort(); }};
         });
 }
 

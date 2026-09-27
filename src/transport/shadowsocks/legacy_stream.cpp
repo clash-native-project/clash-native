@@ -7,6 +7,7 @@
 #include <clash_native/transport/shadowsocks/simple_obfs.hpp>
 
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
@@ -127,26 +128,73 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
             return;
         }
         write_in_progress_ = true;
+        write_handler_ = std::move(handler);
         auto self = shared_from_this();
         if (obfs_mode_ == ObfsMode::tls) {
-            async_write_tls_obfs_records(
-                socket_, std::move(*wire),
-                [self, handler = std::move(handler), size = buffer.size()](core::Status result) {
-                    self->write_in_progress_ = false;
-                    handler(result ? boost::system::error_code() : boost::asio::error::fault,
-                            result ? size : 0);
-                });
+            async_write_tls_obfs_records(socket_, std::move(*wire),
+                                         [self, size = buffer.size()](core::Status result) {
+                                             self->finish_write(result ? boost::system::error_code()
+                                                                       : boost::asio::error::fault,
+                                                                result ? size : 0);
+                                         });
             return;
         }
         StreamWriteHandler completion =
-            [self, wire, handler = std::move(handler),
-             size = buffer.size()](const boost::system::error_code &error, std::size_t) mutable {
-                self->write_in_progress_ = false;
-                handler(error, error ? 0 : size);
+            [self, wire, size = buffer.size()](const boost::system::error_code &error,
+                                               std::size_t) mutable {
+                self->finish_write(error, error ? 0 : size);
             };
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = carrier_->async_write(boost::asio::buffer(*wire));
         async::start_with_receiver(std::move(sender), CarrierWriteBridge{std::move(completion)});
+    }
+
+    // Retires a parked read without closing the transport. Lower carrier
+    // pulls are detached through CarrierReadBridge; their late completions
+    // funnel into finish_read/process_plaintext and drop once the parked
+    // handler is gone.
+    void cancel_read() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(carrier_->executor(), [self] {
+                auto handler = std::move(self->read_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->read_buffer_ = {};
+                self->read_in_progress_ = false;
+                boost::asio::post(self->carrier_->executor(),
+                                  [handler = std::move(handler)]() mutable {
+                                      handler(boost::asio::error::operation_aborted, 0);
+                                  });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; the late lower completion or
+            // close() retires the parked handler instead.
+        }
+    }
+
+    // Retires a parked write without closing the transport. The staged wire
+    // write owns its buffer via the captured shared_ptr, so it drains safely;
+    // its late completion finds no parked write handler and drops in
+    // finish_write.
+    void cancel_write() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(carrier_->executor(), [self] {
+                auto handler = std::move(self->write_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->write_in_progress_ = false;
+                boost::asio::post(self->carrier_->executor(),
+                                  [handler = std::move(handler)]() mutable {
+                                      handler(boost::asio::error::operation_aborted, 0);
+                                  });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; see cancel_read.
+        }
     }
 
     void close() noexcept {
@@ -256,6 +304,12 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
     }
 
     void process_plaintext(const boost::system::error_code &error, std::size_t size) {
+        if (!read_handler_) {
+            // Parked read was aborted; drop the late lower completion.
+            read_in_progress_ = false;
+            read_buffer_ = {};
+            return;
+        }
         if (const auto result = read_cipher_->update(
                 std::span<std::uint8_t>(static_cast<std::uint8_t *>(read_buffer_.data()), size));
             !result) {
@@ -329,9 +383,22 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
     void finish_read(const boost::system::error_code &error, std::size_t size) {
         read_in_progress_ = false;
         auto handler = std::move(read_handler_);
-        if (handler) {
-            handler(error, size);
+        read_buffer_ = {};
+        if (!handler) {
+            // Late lower completion after cancel_read retired the op.
+            return;
         }
+        handler(error, size);
+    }
+
+    void finish_write(const boost::system::error_code &error, std::size_t size) {
+        write_in_progress_ = false;
+        auto handler = std::move(write_handler_);
+        if (!handler) {
+            // Late lower completion after cancel_write retired the op.
+            return;
+        }
+        handler(error, size);
     }
 
     void read_exact_carrier(boost::asio::mutable_buffer buffer, ExactReadHandler handler) {
@@ -383,6 +450,7 @@ class LegacyStreamState final : public std::enable_shared_from_this<LegacyStream
     bool obfs_response_ready_ = true;
     boost::asio::mutable_buffer read_buffer_;
     StreamReadHandler read_handler_;
+    StreamWriteHandler write_handler_;
     bool read_in_progress_ = false;
     bool write_in_progress_ = false;
 };
@@ -404,10 +472,11 @@ class LegacyStreamHandle final : public io::StreamHandle {
     async_read_some(boost::asio::mutable_buffer buffer) override {
         auto state = state_;
         return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
-            [state, buffer](auto terminal) mutable {
+            [state, buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 state->read(buffer, [terminal = std::move(terminal)](
                                         const boost::system::error_code &error,
                                         std::size_t count) mutable { terminal(error, count); });
+                return async::CallbackAbortFn{[state] { state->cancel_read(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 net::translate_read(std::move(receiver), error, count, "legacy read");
@@ -416,10 +485,11 @@ class LegacyStreamHandle final : public io::StreamHandle {
     io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
         auto state = state_;
         return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
-            [state, buffer](auto terminal) mutable {
+            [state, buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 state->write(buffer, [terminal = std::move(terminal)](
                                          const boost::system::error_code &error,
                                          std::size_t count) mutable { terminal(error, count); });
+                return async::CallbackAbortFn{[state] { state->cancel_write(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 net::translate_write(std::move(receiver), error, count, "legacy write");

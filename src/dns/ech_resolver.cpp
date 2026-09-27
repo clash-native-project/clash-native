@@ -1,6 +1,6 @@
 #include <clash_native/dns/ech_resolver.hpp>
 
-#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/core/error.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 
@@ -26,8 +26,8 @@ core::Error not_found_error(const std::string &name) {
 } // namespace
 
 struct EchLookup : public std::enable_shared_from_this<EchLookup> {
-    using Handler = async::BridgeSender<core::Result<std::vector<std::uint8_t>>>::Handler;
-    using AbortFn = async::BridgeSender<core::Result<std::vector<std::uint8_t>>>::AbortFn;
+    using Handler = async::BridgeHandler<core::Result<std::vector<std::uint8_t>>>;
+    using AbortFn = async::CallbackAbortFn;
 
     DnsQueryService *service = nullptr;
     std::atomic<DnsQueryService::RequestId> query_id{0};
@@ -129,12 +129,10 @@ async_query_ech_config(DnsQueryService &query_service, std::string name,
     lookup->original = std::move(query_server_name).value_or(std::move(name));
     lookup->visited.push_back(normalize_name(lookup->original));
     return async::bridge_sender<core::Result<std::vector<std::uint8_t>>>(
-        [lookup](async::BridgeSender<core::Result<std::vector<std::uint8_t>>>::Handler
-                     terminal) mutable {
+        [lookup](async::BridgeHandler<core::Result<std::vector<std::uint8_t>>> terminal) mutable {
             lookup->terminal = std::move(terminal);
             lookup->issue(lookup->original);
-            using AbortFn = async::BridgeSender<core::Result<std::vector<std::uint8_t>>>::AbortFn;
-            return AbortFn{[lookup]() mutable {
+            return async::CallbackAbortFn{[lookup]() mutable {
                 const auto query_id = lookup->query_id.load(std::memory_order_acquire);
                 if (query_id != 0) {
                     lookup->service->cancel(query_id);

@@ -1,12 +1,12 @@
 #include <clash_native/transport/shadowsocks/ss2022_stream.hpp>
 
-#include <clash_native/async/bridge.hpp>
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/proxy/crypto.hpp>
 
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
@@ -207,7 +207,10 @@ class Shadowsocks2022StreamState final
             return;
         }
         if (pending_offset_ < pending_plaintext_.size()) {
-            copy_pending(buffer, std::move(handler));
+            read_in_progress_ = true;
+            read_buffer_ = buffer;
+            read_handler_ = std::move(handler);
+            copy_pending(buffer);
             return;
         }
         pending_plaintext_.clear();
@@ -250,22 +253,21 @@ class Shadowsocks2022StreamState final
         }
         auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(encoded));
         write_in_progress_ = true;
+        write_handler_ = std::move(handler);
         auto self = shared_from_this();
         if (obfs_mode_ == ObfsMode::tls) {
-            async_write_tls_obfs_records(
-                socket_, std::move(*wire),
-                [self, handler = std::move(handler), size = buffer.size()](core::Status result) {
-                    self->write_in_progress_ = false;
-                    handler(result ? boost::system::error_code() : boost::asio::error::fault,
-                            result ? size : 0);
-                });
+            async_write_tls_obfs_records(socket_, std::move(*wire),
+                                         [self, size = buffer.size()](core::Status result) {
+                                             self->finish_write(result ? boost::system::error_code()
+                                                                       : boost::asio::error::fault,
+                                                                result ? size : 0);
+                                         });
             return;
         }
         StreamWriteHandler completion =
-            [self, wire, handler = std::move(handler),
-             size = buffer.size()](const boost::system::error_code &error, std::size_t) mutable {
-                self->write_in_progress_ = false;
-                handler(error, error ? 0 : size);
+            [self, wire, size = buffer.size()](const boost::system::error_code &error,
+                                               std::size_t) mutable {
+                self->finish_write(error, error ? 0 : size);
             };
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = carrier_->async_write(boost::asio::buffer(*wire));
@@ -280,6 +282,56 @@ class Shadowsocks2022StreamState final
 
     void shutdown_send(boost::system::error_code &error) noexcept {
         carrier_->shutdown_send(error);
+    }
+
+    // Retires a parked read without closing the transport. The read keys off
+    // read_in_progress_/read_handler_, so a cancel racing terminal delivery
+    // either preempts it (late completion then drops in finish_read) or finds
+    // no parked handler and is a no-op. The lower carrier pulls stay detached
+    // through CarrierReadBridge; their late completions funnel into
+    // finish_read and are dropped once the parked handler is gone.
+    void cancel_read() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(carrier_->executor(), [self] {
+                auto handler = std::move(self->read_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->read_buffer_ = {};
+                self->read_in_progress_ = false;
+                boost::asio::post(self->carrier_->executor(),
+                                  [handler = std::move(handler)]() mutable {
+                                      handler(boost::asio::error::operation_aborted, 0);
+                                  });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; the late lower completion or
+            // close() retires the parked handler instead.
+        }
+    }
+
+    // Retires a parked write without closing the transport. The staged wire
+    // write owns its buffer via the captured shared_ptr, so it drains safely;
+    // its late completion finds no parked write handler and drops in
+    // finish_write.
+    void cancel_write() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(carrier_->executor(), [self] {
+                auto handler = std::move(self->write_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->write_in_progress_ = false;
+                boost::asio::post(self->carrier_->executor(),
+                                  [handler = std::move(handler)]() mutable {
+                                      handler(boost::asio::error::operation_aborted, 0);
+                                  });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; see cancel_read.
+        }
     }
 
     void close() noexcept {
@@ -397,8 +449,12 @@ class Shadowsocks2022StreamState final
     }
 
     void finish_pending_or_receive() {
+        if (!read_handler_) {
+            // Parked read was aborted; keep plaintext buffered for the next read.
+            return;
+        }
         if (!pending_plaintext_.empty()) {
-            copy_pending(read_buffer_, std::move(read_handler_));
+            copy_pending(read_buffer_);
             return;
         }
         receive_record_for_payload();
@@ -408,7 +464,7 @@ class Shadowsocks2022StreamState final
         read_record([self = shared_from_this()](std::vector<std::uint8_t> payload) {
             self->pending_plaintext_ = std::move(payload);
             self->pending_offset_ = 0;
-            self->copy_pending(self->read_buffer_, std::move(self->read_handler_));
+            self->copy_pending(self->read_buffer_);
         });
     }
 
@@ -527,7 +583,11 @@ class Shadowsocks2022StreamState final
 
     void increment_read_nonce() { transport::proxy::increment_nonce(read_nonce_); }
 
-    void copy_pending(boost::asio::mutable_buffer buffer, StreamReadHandler handler) {
+    void copy_pending(boost::asio::mutable_buffer buffer) {
+        if (!read_handler_) {
+            // Parked read was aborted; keep plaintext buffered for the next read.
+            return;
+        }
         const auto count = std::min(buffer.size(), pending_plaintext_.size() - pending_offset_);
         std::memcpy(buffer.data(), pending_plaintext_.data() + pending_offset_, count);
         pending_offset_ += count;
@@ -535,19 +595,28 @@ class Shadowsocks2022StreamState final
             pending_plaintext_.clear();
             pending_offset_ = 0;
         }
-        finish_read({}, count, std::move(handler));
+        finish_read({}, count);
     }
 
     void finish_read(const boost::system::error_code &error, std::size_t size) {
-        finish_read(error, size, std::move(read_handler_));
+        read_in_progress_ = false;
+        auto handler = std::move(read_handler_);
+        read_buffer_ = {};
+        if (!handler) {
+            // Late lower completion after cancel_read retired the op.
+            return;
+        }
+        handler(error, size);
     }
 
-    void finish_read(const boost::system::error_code &error, std::size_t size,
-                     StreamReadHandler handler) {
-        read_in_progress_ = false;
-        if (handler) {
-            handler(error, size);
+    void finish_write(const boost::system::error_code &error, std::size_t size) {
+        write_in_progress_ = false;
+        auto handler = std::move(write_handler_);
+        if (!handler) {
+            // Late lower completion after cancel_write retired the op.
+            return;
         }
+        handler(error, size);
     }
 
     void post_read(StreamReadHandler handler, boost::system::error_code error, std::size_t size) {
@@ -607,16 +676,18 @@ class Shadowsocks2022StreamState final
     bool write_in_progress_ = false;
     boost::asio::mutable_buffer read_buffer_;
     StreamReadHandler read_handler_;
+    StreamWriteHandler write_handler_;
 };
 
 io::AnySender<std::optional<std::size_t>>
 Shadowsocks2022StreamHandle::async_read_some(boost::asio::mutable_buffer buffer) {
     auto state = state_;
     return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
-        [state, buffer](auto terminal) mutable {
+        [state, buffer](auto terminal) mutable -> async::CallbackAbortFn {
             state->read(buffer, [terminal = std::move(terminal)](
                                     const boost::system::error_code &error,
                                     std::size_t count) mutable { terminal(error, count); });
+            return async::CallbackAbortFn{[state] { state->cancel_read(); }};
         },
         [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
             net::translate_read(std::move(receiver), error, count, "shadowsocks-2022 read");
@@ -627,10 +698,11 @@ io::AnySender<std::size_t>
 Shadowsocks2022StreamHandle::async_write(boost::asio::const_buffer buffer) {
     auto state = state_;
     return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
-        [state, buffer](auto terminal) mutable {
+        [state, buffer](auto terminal) mutable -> async::CallbackAbortFn {
             state->write(buffer, [terminal = std::move(terminal)](
                                      const boost::system::error_code &error,
                                      std::size_t count) mutable { terminal(error, count); });
+            return async::CallbackAbortFn{[state] { state->cancel_write(); }};
         },
         [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
             net::translate_write(std::move(receiver), error, count, "shadowsocks-2022 write");
@@ -743,20 +815,20 @@ class Shadowsocks2022OpenOperation final
             try {
                 if (self->obfs_options_->mode == ObfsMode::http) {
                     obfs_result = co_await async::bridge_sender<core::Status>(
-                        [self, wire](async::BridgeSender<core::Status>::Handler done) mutable {
+                        [self, wire](async::BridgeHandler<core::Status> done) mutable {
                             async_write_http_obfs_request(
                                 self->socket_, std::move(*wire),
                                 {self->obfs_options_->host, self->obfs_options_->port},
                                 [done](core::Status result) mutable { done(std::move(result)); });
-                            return async::BridgeSender<core::Status>::AbortFn{};
+                            return async::CallbackAbortFn{};
                         });
                 } else {
                     obfs_result = co_await async::bridge_sender<core::Status>(
-                        [self, wire](async::BridgeSender<core::Status>::Handler done) mutable {
+                        [self, wire](async::BridgeHandler<core::Status> done) mutable {
                             async_write_tls_obfs_request(
                                 self->socket_, std::move(*wire), self->obfs_options_->host,
                                 [done](core::Status result) mutable { done(std::move(result)); });
-                            return async::BridgeSender<core::Status>::AbortFn{};
+                            return async::CallbackAbortFn{};
                         });
                 }
             } catch (...) {

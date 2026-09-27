@@ -8,6 +8,7 @@
 #include <snappy.h>
 
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/system/error_code.hpp>
@@ -126,6 +127,10 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
             post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
             return;
         }
+        if (write_handler_) {
+            post_write(std::move(handler), boost::asio::error::already_started, 0);
+            return;
+        }
         if (buffer.size() == 0) {
             post_write(std::move(handler), {}, 0);
             return;
@@ -141,8 +146,61 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
             append_chunk(*packet, std::span<const std::uint8_t>(data + offset, size));
             offset += size;
         }
-        writes_.push_back({std::move(packet), std::move(handler), buffer.size()});
+        auto pending = std::make_shared<PendingWrite>();
+        pending->packet = std::move(packet);
+        pending->handler = std::move(handler);
+        pending->size = buffer.size();
+        write_handler_ = pending;
+        writes_.push_back(pending);
         pump_write();
+    }
+
+    // Retires a parked read without closing the session. Lower pulls are
+    // detached sender pulls into internal buffers; the parked handler owns
+    // the caller's buffer, so clearing it is memory-safe. A late lower
+    // completion only appends to the internal queue and drops without
+    // touching the retired handler.
+    void cancel_read() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(transport_->executor(), [self] {
+                auto handler = std::move(self->read_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->read_buffer_ = {};
+                boost::asio::post(self->transport_->executor(),
+                                  [handler = std::move(handler)]() mutable {
+                                      handler(boost::asio::error::operation_aborted, 0);
+                                  });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; the late lower completion or
+            // close() retires the parked handler instead.
+        }
+    }
+
+    // Retires a parked write without closing the session. Queued frames own
+    // their buffers via shared_ptr, so in-flight frames drain safely; their
+    // late completions find no parked write and drop via the guards below.
+    void cancel_write() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(transport_->executor(), [self] {
+                auto pending = std::move(self->write_handler_);
+                if (!pending || !pending->handler) {
+                    return;
+                }
+                pending->cancelled = true;
+                auto handler = std::move(pending->handler);
+                boost::asio::post(self->transport_->executor(),
+                                  [handler = std::move(handler)]() mutable {
+                                      handler(boost::asio::error::operation_aborted, 0);
+                                  });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; see cancel_read.
+        }
     }
 
     void shutdown_send(boost::system::error_code &error) noexcept {
@@ -161,7 +219,6 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
         if (transport_) {
             transport_->close();
         }
-        writes_.clear();
         finish_read(boost::asio::error::operation_aborted, 0);
         finish_write(boost::asio::error::operation_aborted, 0);
     }
@@ -171,6 +228,7 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
         std::shared_ptr<std::vector<std::uint8_t>> packet;
         WriteHandler handler;
         std::size_t size = 0;
+        bool cancelled = false;
     };
 
     void append_chunk(std::vector<std::uint8_t> &output, std::span<const std::uint8_t> plaintext) {
@@ -206,23 +264,37 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
         write_in_progress_ = true;
         auto pending = std::move(writes_.front());
         writes_.pop_front();
-        auto packet = pending.packet;
+        auto packet = pending->packet;
         struct WriteReceiver {
             using receiver_concept = stdexec::receiver_tag;
             std::shared_ptr<SnappyStreamState> self;
-            PendingWrite pending;
+            std::shared_ptr<PendingWrite> pending;
             void set_value(std::size_t) && noexcept {
                 self->write_in_progress_ = false;
-                if (pending.handler) {
-                    pending.handler({}, pending.size);
+                if (pending && !pending->cancelled && pending->handler) {
+                    auto handler = std::move(pending->handler);
+                    if (self->write_handler_ == pending) {
+                        self->write_handler_.reset();
+                    }
+                    handler({}, pending->size);
                 }
                 self->pump_write();
             }
             void set_error(std::exception_ptr error) && noexcept {
                 self->write_in_progress_ = false;
+                if (pending && pending->cancelled) {
+                    self->pump_write();
+                    return;
+                }
                 self->close_with_error(unpack_transport_error(std::move(error)));
             }
-            void set_stopped() && noexcept { self->write_in_progress_ = false; }
+            void set_stopped() && noexcept {
+                self->write_in_progress_ = false;
+                if (pending && pending->cancelled) {
+                    return;
+                }
+                self->close_with_error(boost::asio::error::operation_aborted);
+            }
         };
         auto sender = transport_->async_write(boost::asio::buffer(*packet));
         async::start_with_receiver(std::move(sender),
@@ -414,6 +486,7 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
 
     void finish_read(const boost::system::error_code &error, std::size_t size) {
         if (!read_handler_) {
+            // Late lower completion after cancel_read retired the op.
             return;
         }
         auto handler = std::move(read_handler_);
@@ -422,12 +495,17 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
     }
 
     void finish_write(const boost::system::error_code &error, std::size_t) {
-        for (auto &pending : writes_) {
-            if (pending.handler) {
-                pending.handler(error, 0);
+        auto pending = std::move(write_handler_);
+        write_handler_.reset();
+        for (auto &queued : writes_) {
+            if (queued && !queued->cancelled && queued->handler) {
+                queued->handler(error, 0);
             }
         }
         writes_.clear();
+        if (pending && !pending->cancelled && pending->handler) {
+            pending->handler(error, 0);
+        }
     }
 
     void post_read(ReadHandler handler, const boost::system::error_code &error, std::size_t size) {
@@ -444,7 +522,8 @@ class SnappyStreamState final : public std::enable_shared_from_this<SnappyStream
     }
 
     std::unique_ptr<io::StreamHandle> transport_;
-    std::deque<PendingWrite> writes_;
+    std::deque<std::shared_ptr<PendingWrite>> writes_;
+    std::shared_ptr<PendingWrite> write_handler_;
     std::deque<std::shared_ptr<std::vector<std::uint8_t>>> incoming_;
     boost::asio::mutable_buffer read_buffer_;
     ReadHandler read_handler_;
@@ -466,12 +545,13 @@ class SnappyStream final : public io::StreamHandle {
                                            stdexec::set_error_t(std::exception_ptr),
                                            stdexec::set_stopped_t()>;
         return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
-            [state = state_, buffer](auto terminal) mutable {
+            [state = state_, buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 state->async_read_some(
                     buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
                                                              std::size_t size) mutable {
                         terminal(error, size);
                     });
+                return async::CallbackAbortFn{[state] { state->cancel_read(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 net::translate_read(std::move(receiver), error, size, "snappy stream read");
@@ -482,12 +562,13 @@ class SnappyStream final : public io::StreamHandle {
                                                           stdexec::set_error_t(std::exception_ptr),
                                                           stdexec::set_stopped_t()>;
         return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
-            [state = state_, buffer](auto terminal) mutable {
+            [state = state_, buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 state->async_write(
                     buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
                                                              std::size_t size) mutable {
                         terminal(error, size);
                     });
+                return async::CallbackAbortFn{[state] { state->cancel_write(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 net::translate_write(std::move(receiver), error, size, "snappy stream write");

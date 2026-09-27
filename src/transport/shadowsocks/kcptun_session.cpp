@@ -6,6 +6,7 @@
 #include <clash_native/net/stream_handle_adapter.hpp>
 
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -239,6 +240,54 @@ class KcptunMuxStreamState final : public std::enable_shared_from_this<KcptunMux
         error.clear();
     }
 
+    // Retires a parked read without closing the session. The lower pulls are
+    // detached sender pulls into internal buffers; the parked handler owns
+    // the caller's buffer, so clearing it is memory-safe. A late lower
+    // completion only appends to the internal queue and drops without
+    // touching the retired handler.
+    void cancel_read() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(session_->executor(), [self] {
+                auto handler = std::move(self->read_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->read_buffer_ = {};
+                boost::asio::post(self->session_->executor(),
+                                  [handler = std::move(handler)]() mutable {
+                                      handler(boost::asio::error::operation_aborted, 0);
+                                  });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; the late lower completion or
+            // close() retires the parked handler instead.
+        }
+    }
+
+    // Retires a parked write without closing the session. Staged frames own
+    // their buffers via shared_ptr, so in-flight frames drain safely; their
+    // late completions find no parked write and drop via the state guards.
+    void cancel_write() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(session_->executor(), [self] {
+                auto pending = std::move(self->write_pending_);
+                if (!pending || !pending->handler) {
+                    return;
+                }
+                pending->failed = true;
+                auto handler = std::move(pending->handler);
+                boost::asio::post(self->session_->executor(),
+                                  [handler = std::move(handler)]() mutable {
+                                      handler(boost::asio::error::operation_aborted, 0);
+                                  });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; see cancel_read.
+        }
+    }
+
     void close() noexcept {
         if (closed_) {
             return;
@@ -364,6 +413,10 @@ class KcptunMuxStreamState final : public std::enable_shared_from_this<KcptunMux
         auto self = shared_from_this();
         session_->enqueue_frame(kPush, stream_id_, std::move(payload),
                                 [self](const boost::system::error_code &error) {
+                                    if (!self->write_pending_) {
+                                        // Late frame completion after cancel_write retired the op.
+                                        return;
+                                    }
                                     if (error) {
                                         self->on_session_error(error);
                                         return;
@@ -415,6 +468,7 @@ class KcptunMuxStreamState final : public std::enable_shared_from_this<KcptunMux
 
     void finish_read(const boost::system::error_code &error, std::size_t size) {
         if (!read_handler_) {
+            // Late lower completion after cancel_read retired the op.
             return;
         }
         auto handler = std::move(read_handler_);
@@ -424,14 +478,17 @@ class KcptunMuxStreamState final : public std::enable_shared_from_this<KcptunMux
 
     void finish_write(const boost::system::error_code &error, std::size_t size = 0) {
         if (!write_pending_) {
+            // Late lower completion after cancel_write retired the op.
             return;
         }
         auto pending = std::move(write_pending_);
         pending->failed = static_cast<bool>(error);
         auto handler = std::move(pending->handler);
-        if (handler) {
-            handler(error, error ? 0 : (size == 0 ? pending->size : size));
+        if (!handler) {
+            // Late lower completion after cancel_write retired the op.
+            return;
         }
+        handler(error, error ? 0 : (size == 0 ? pending->size : size));
     }
 
     void post_read(ReadHandler handler, const boost::system::error_code &error, std::size_t size) {
@@ -473,12 +530,13 @@ io::AnySender<std::optional<std::size_t>>
 KcptunMuxStream::async_read_some(boost::asio::mutable_buffer buffer) {
     auto state = state_;
     return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
-        [state, buffer](auto terminal) mutable {
+        [state, buffer](auto terminal) mutable -> async::CallbackAbortFn {
             state->async_read_some(
                 buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
                                                          std::size_t count) mutable {
                     terminal(error, count);
                 });
+            return async::CallbackAbortFn{[state] { state->cancel_read(); }};
         },
         [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
             net::translate_read(std::move(receiver), error, count, "kcptun read");
@@ -488,10 +546,11 @@ KcptunMuxStream::async_read_some(boost::asio::mutable_buffer buffer) {
 io::AnySender<std::size_t> KcptunMuxStream::async_write(boost::asio::const_buffer buffer) {
     auto state = state_;
     return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
-        [state, buffer](auto terminal) mutable {
+        [state, buffer](auto terminal) mutable -> async::CallbackAbortFn {
             state->async_write(buffer, [terminal = std::move(terminal)](
                                            const boost::system::error_code &error,
                                            std::size_t count) mutable { terminal(error, count); });
+            return async::CallbackAbortFn{[state] { state->cancel_write(); }};
         },
         [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
             net::translate_write(std::move(receiver), error, count, "kcptun write");

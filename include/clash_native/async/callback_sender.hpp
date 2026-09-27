@@ -1,39 +1,62 @@
 #pragma once
 
+#include <clash_native/async/move_only_function.hpp>
+
 #include <stdexec/execution.hpp>
 
-#include <atomic>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <utility>
 
 namespace clash_native::async {
-namespace detail {
-
-struct CallbackShared {
-    std::atomic<bool> done{false};
-};
-
-} // namespace detail
 
 // Turns a handler-style initiation into a sender, for wrapping callback-based
 // internals behind sender-based interfaces without rewriting their state
 // machines:
 //
-// - Initiate: void(Handler). Starts the internal work; Handler is invoked
-//   exactly once with the implementation's native completion arguments.
+// - Initiate: CallbackAbortFn(Handler). Starts the internal work and returns
+//   an aborter for it. Handler is invoked exactly once with the
+//   implementation's native completion arguments. Even an empty aborter must
+//   be returned explicitly; omitting the return is a compile error.
+// - Aborter: void(). Aborts the internal work (cancel the Asio operation,
+//   retire the parked handler, close the stream). Requirements:
+//   - Idempotent and callable from any thread, because stop, destroy, and the
+//     start() tail can each invoke it, and a stop racing the initiation is
+//     served by invoking the freshly returned aborter.
+//   - Never blocks: it runs on the stop/destroy path.
+//   - Tolerates invocation after the terminal already fired (for example an
+//     inline terminal that won before the initiation returned). Back the
+//     implementation with its own completed guard when needed.
+//   - Must not throw; a throwing aborter is swallowed on the teardown path.
+//   - Must own everything it touches (typically shared_ptr state): it can run
+//     after the operation state and its initiating frame are gone.
+//   An empty aborter is an explicit opt-out for work that cannot be aborted
+//   (already-completed stubs, pure inline completions); say why in a comment.
 // - Translate: void(Rcvr&&, Args...). Delivers exactly one terminal signal
 //   (set_value, set_error, or set_stopped at its discretion) into the moved
 //   receiver. Runs on the terminal thread with the operation state known
-//   alive (see below).
+//   alive (see below). It receives a moved-from receiver on failure paths,
+//   so it must not throw.
 // - Sigs: the completion_signatures the sender advertises.
 //
-// Settlement is first-wins through a heap flag: stop or destroy before the
-// terminal marks done (stop additionally completes set_stopped); a late
-// terminal observes done and drops without touching the operation state.
-// Teardown races across threads follow the same contract as the channel
-// operation states. Initiation throwing out of start() completes set_error.
+// Settlement is first-wins under a heap mutex shared with the terminal: the
+// terminal, a stop request, or operation-state destruction each claim
+// settlement at most once. The winner either delivers the translated terminal
+// (terminal path) or runs the aborter and completes set_stopped (stop path)
+// or just runs the aborter (destroy path); a late terminal observes the claim
+// and drops without touching the operation state.
+//
+// This makes the sender composable with racing adaptors such as
+// exec::when_any: a losing branch is claimed by request_stop, runs its
+// aborter, and completes set_stopped promptly without waiting for the
+// underlying work; the late underlying completion is dropped. Cooperative
+// caveat: prompt completion still depends on the aborter actually aborting
+// the work, not merely ignoring its result.
+//
+// Initiation throwing out of start() completes set_error; work launched
+// before the throw still terminates later and its terminal is dropped.
 template <class Sigs, class Initiate, class Translate> class CallbackSender {
   public:
     using sender_concept = stdexec::sender_tag;
@@ -51,20 +74,30 @@ template <class Sigs, class Initiate, class Translate> class CallbackSender {
         using StopToken = stdexec::stop_token_of_t<stdexec::env_of_t<Rcvr>>;
         using StopCallback = stdexec::stop_callback_for_t<StopToken, StopFn>;
 
+        struct Shared {
+            std::mutex mutex;
+            bool done = false;
+            CallbackAbortFn aborter;
+        };
+
       public:
         using operation_state_concept = stdexec::operation_state_tag;
 
         OpState(Initiate initiate, Translate translate, Rcvr receiver)
             : initiate_(std::move(initiate)), translate_(std::move(translate)),
-              receiver_(std::move(receiver)), shared_(std::make_shared<detail::CallbackShared>()) {}
+              receiver_(std::move(receiver)), shared_(std::make_shared<Shared>()) {}
 
         OpState(const OpState &) = delete;
         OpState &operator=(const OpState &) = delete;
 
         ~OpState() {
-            // Cancel-by-destroy: settle so the late terminal drops. Never
-            // blocks; teardown races follow the channel contract.
-            shared_->done.exchange(true, std::memory_order_acq_rel);
+            // Cancel-by-destroy: claim settlement so the late terminal drops,
+            // and abort the internal work. Never blocks; the aborter runs
+            // without the lock.
+            CallbackAbortFn aborter;
+            if (claim(aborter) && aborter) {
+                invoke_aborter(aborter);
+            }
         }
 
         void start() noexcept {
@@ -77,33 +110,89 @@ template <class Sigs, class Initiate, class Translate> class CallbackSender {
             auto shared = shared_;
             OpState *self = this;
             try {
-                initiate_([shared, self](auto &&...args) {
-                    if (shared->done.exchange(true, std::memory_order_acq_rel)) {
-                        return;
+                CallbackAbortFn aborter = initiate_([shared, self](auto &&...args) {
+                    // Terminal from the internal work. First claimer wins;
+                    // the flag lives on the heap so this stays sound even if
+                    // the operation state is already gone (claim first, touch
+                    // the operation only when still alive).
+                    CallbackAbortFn dropped;
+                    {
+                        std::lock_guard lock(shared->mutex);
+                        if (shared->done) {
+                            return;
+                        }
+                        shared->done = true;
+                        dropped = std::move(shared->aborter);
                     }
+                    dropped.reset();
                     self->stop_callback_.reset();
                     self->translate_(std::move(self->receiver_),
                                      std::forward<decltype(args)>(args)...);
                 });
+                // A stop (or an inline terminal) may have settled the
+                // operation while the initiation was still running; the
+                // returned aborter then has no operation left to protect, so
+                // run it immediately instead of leaking the underlying work.
+                CallbackAbortFn orphan;
+                {
+                    std::lock_guard lock(shared->mutex);
+                    if (shared->done) {
+                        orphan = std::move(aborter);
+                    } else {
+                        shared->aborter = std::move(aborter);
+                    }
+                }
+                if (orphan) {
+                    invoke_aborter(orphan);
+                }
             } catch (...) {
                 stop_callback_.reset();
-                shared->done.exchange(true, std::memory_order_acq_rel);
+                {
+                    std::lock_guard lock(shared->mutex);
+                    shared->done = true;
+                    shared->aborter.reset();
+                }
                 stdexec::set_error(std::move(receiver_), std::current_exception());
             }
         }
 
       private:
-        void on_stop() noexcept {
-            if (!shared_->done.exchange(true, std::memory_order_acq_rel)) {
-                stop_callback_.reset();
-                stdexec::set_stopped(std::move(receiver_));
+        // Claims settlement; true means this call won. The stored aborter is
+        // moved out regardless so it is destroyed exactly once.
+        bool claim(CallbackAbortFn &out) {
+            std::lock_guard lock(shared_->mutex);
+            if (shared_->done) {
+                return false;
             }
+            shared_->done = true;
+            out = std::move(shared_->aborter);
+            return true;
+        }
+
+        static void invoke_aborter(CallbackAbortFn &aborter) noexcept {
+            try {
+                aborter();
+            } catch (...) {
+                // Aborter contract violation; teardown must not throw.
+            }
+        }
+
+        void on_stop() noexcept {
+            CallbackAbortFn aborter;
+            if (!claim(aborter)) {
+                return;
+            }
+            if (aborter) {
+                invoke_aborter(aborter);
+            }
+            stop_callback_.reset();
+            stdexec::set_stopped(std::move(receiver_));
         }
 
         Initiate initiate_;
         Translate translate_;
         Rcvr receiver_;
-        std::shared_ptr<detail::CallbackShared> shared_;
+        std::shared_ptr<Shared> shared_;
         // Declared last so it is destroyed first.
         std::optional<StopCallback> stop_callback_;
     };
@@ -122,6 +211,36 @@ CallbackSender<Sigs, Initiate, Translate> callback_sender(Initiate &&initiate,
                                                           Translate &&translate) {
     return CallbackSender<Sigs, std::decay_t<Initiate>, std::decay_t<Translate>>(
         std::forward<Initiate>(initiate), std::forward<Translate>(translate));
+}
+
+// Bridge vocabulary: callback_sender subsumes the old bridge_sender. A
+// bridge starter launches handler-style work returning an aborter, and the
+// native result always completes set_value(result) (tri-state results stay
+// in band; set_error is reserved for sender-machinery failures). Handler is
+// std::function so registry-style internals can store it; the translate
+// below closes a late delivered handle (StreamOpenResult/DatagramOpenResult
+// shape) instead of leaking it.
+template <typename Result> using BridgeHandler = std::function<void(Result)>;
+
+template <typename Result> struct BridgeTranslate {
+    // Live terminal: forward the result untouched; the receiver owns it.
+    // A late terminal never reaches this translate (the shared settlement
+    // drops it), so unlike the old bridge there is no late-handle cleanup
+    // here: closing a stale handle belongs to the aborter, which runs on
+    // the stop/destroy path while it still owns the operation.
+    void operator()(stdexec::receiver auto &&receiver, Result result) const {
+        stdexec::set_value(std::forward<decltype(receiver)>(receiver), std::move(result));
+    }
+};
+
+template <typename Result>
+using BridgeSignatures = stdexec::completion_signatures<stdexec::set_value_t(Result),
+                                                        stdexec::set_error_t(std::exception_ptr),
+                                                        stdexec::set_stopped_t()>;
+
+template <typename Result, typename Starter> auto bridge_sender(Starter &&starter) {
+    return callback_sender<BridgeSignatures<Result>>(std::forward<Starter>(starter),
+                                                     BridgeTranslate<Result>{});
 }
 
 } // namespace clash_native::async

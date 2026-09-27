@@ -27,11 +27,9 @@
 
 #include <openssl/curve25519.h>
 
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
-
-#include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -541,11 +539,13 @@ class RestlsStream final : public io::StreamHandle,
 
     io::AnySender<std::optional<std::size_t>>
     async_read_some(boost::asio::mutable_buffer buffer) override {
+        auto self = shared_from_this();
         return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
-            [this, buffer](auto terminal) mutable {
-                this->read_impl(buffer, [terminal = std::move(terminal)](
+            [self, buffer](auto terminal) mutable {
+                self->read_impl(buffer, [terminal = std::move(terminal)](
                                             const boost::system::error_code &error,
                                             std::size_t count) mutable { terminal(error, count); });
+                return async::CallbackAbortFn{[self] { self->cancel_read(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 net::translate_read(std::move(receiver), error, count, "restls read");
@@ -553,13 +553,15 @@ class RestlsStream final : public io::StreamHandle,
     }
 
     io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
+        auto self = shared_from_this();
         return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
-            [this, buffer](auto terminal) mutable {
-                this->write_impl(
+            [self, buffer](auto terminal) mutable {
+                self->write_impl(
                     buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
                                                              std::size_t count) mutable {
                         terminal(error, count);
                     });
+                return async::CallbackAbortFn{[self] { self->cancel_write(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 net::translate_write(std::move(receiver), error, count, "restls write");
@@ -598,6 +600,48 @@ class RestlsStream final : public io::StreamHandle,
         pending_write_size_ = buffer.size();
         write_handler_ = std::move(handler);
         pump_write();
+    }
+
+    // Retires a parked read without closing the transport. The late lower
+    // read finds no parked handler and is dropped; buffered wire/plaintext
+    // stays for the next read.
+    void cancel_read() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(executor(), [self] {
+                auto handler = std::move(self->read_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->read_buffer_ = {};
+                self->post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
+            });
+        } catch (...) {
+            // Aborter contract: never throw; the late completion or close()
+            // retires the parked handler instead.
+        }
+    }
+
+    // Retires a parked write without closing the transport. Staged
+    // plaintext and script progress stay as-is; the late lower write
+    // drains against wire_current_ and is dropped without a handler.
+    void cancel_write() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(executor(), [self] {
+                auto handler = std::move(self->write_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->pending_write_.clear();
+                self->pending_write_offset_ = 0;
+                self->pending_write_size_ = 0;
+                self->write_waiting_response_ = false;
+                self->post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
+            });
+        } catch (...) {
+            // Aborter contract: never throw; see cancel_read.
+        }
     }
 
     boost::asio::any_io_executor executor() noexcept override { return lower_->executor(); }
@@ -643,6 +687,10 @@ class RestlsStream final : public io::StreamHandle,
     }
 
     bool deliver_pending() {
+        if (!read_handler_) {
+            // Parked read was aborted; keep plaintext buffered for the next read.
+            return false;
+        }
         if (pending_plain_offset_ >= pending_plain_.size()) {
             pending_plain_.clear();
             pending_plain_offset_ = 0;
@@ -914,6 +962,7 @@ class RestlsStreamHandle final : public io::StreamHandle {
                                                              std::size_t count) mutable {
                         terminal(error, count);
                     });
+                return async::CallbackAbortFn{[stream] { stream->cancel_read(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 net::translate_read(std::move(receiver), error, count, "restls read");
@@ -929,6 +978,7 @@ class RestlsStreamHandle final : public io::StreamHandle {
                                                              std::size_t count) mutable {
                         terminal(error, count);
                     });
+                return async::CallbackAbortFn{[stream] { stream->cancel_write(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 net::translate_write(std::move(receiver), error, count, "restls write");

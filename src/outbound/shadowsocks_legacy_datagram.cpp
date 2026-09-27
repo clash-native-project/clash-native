@@ -13,8 +13,8 @@
 #include <stdexec/execution.hpp>
 
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/system/errc.hpp>
 
 #include <algorithm>
 #include <array>
@@ -90,6 +90,12 @@ class LegacyDatagramState final : public std::enable_shared_from_this<LegacyData
 
     void send(boost::asio::const_buffer buffer, io::DatagramAddress destination,
               WriteHandler handler) {
+        if (send_in_progress_) {
+            boost::asio::post(socket_->executor(), [handler = std::move(handler)]() mutable {
+                handler(boost::asio::error::already_started, 0);
+            });
+            return;
+        }
         auto address = encode_proxy_address(
             outbound::detail::to_core_destination(destination.to_destination()));
         if (!address) {
@@ -110,10 +116,11 @@ class LegacyDatagramState final : public std::enable_shared_from_this<LegacyData
         }
         auto packet = std::make_shared<std::vector<std::uint8_t>>(std::move(wire.value()));
         auto self = shared_from_this();
-        WriteHandler completion = [self, packet, handler = std::move(handler),
-                                   size = buffer.size()](const boost::system::error_code &error,
-                                                         std::size_t) mutable {
-            handler(error, error ? 0 : size);
+        self->send_in_progress_ = true;
+        self->send_handler_ = std::move(handler);
+        WriteHandler completion = [self, packet, size = buffer.size()](
+                                      const boost::system::error_code &error, std::size_t) mutable {
+            self->finish_send(error, error ? 0 : size);
         };
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = socket_->async_send_to(boost::asio::buffer(*packet),
@@ -132,6 +139,65 @@ class LegacyDatagramState final : public std::enable_shared_from_this<LegacyData
         output_buffer_ = buffer;
         receive_handler_ = std::move(handler);
         receive_next();
+    }
+
+    // Retires a parked receive without closing the transport. Dispatched
+    // to the socket executor because the parked state is strand-private.
+    // The lower receive (if any) stays in flight; its late completion
+    // finds no parked handler and is dropped.
+    void cancel_receive() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(socket_->executor(), [self] {
+                auto handler = std::move(self->receive_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->output_buffer_ = {};
+                self->receive_in_progress_ = false;
+                boost::asio::post(self->socket_->executor(),
+                                  [handler = std::move(handler)]() mutable {
+                                      handler(boost::asio::error::operation_aborted, 0, {});
+                                  });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; the late lower completion or
+            // close() retires the parked handler instead.
+        }
+    }
+
+    // Retires a parked send without closing the transport. Dispatched
+    // to the socket executor because the parked state is strand-private.
+    // The lower send (if any) stays in flight; its late completion
+    // finds no parked handler and is dropped.
+    void cancel_send() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(socket_->executor(), [self] {
+                auto handler = std::move(self->send_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->send_in_progress_ = false;
+                boost::asio::post(self->socket_->executor(),
+                                  [handler = std::move(handler)]() mutable {
+                                      handler(boost::asio::error::operation_aborted, 0);
+                                  });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; the late lower completion or
+            // close() retires the parked handler instead.
+        }
+    }
+
+    void finish_send(const boost::system::error_code &error, std::size_t size) {
+        send_in_progress_ = false;
+        auto handler = std::move(send_handler_);
+        if (!handler) {
+            // Late lower completion after cancel_send retired the op.
+            return;
+        }
+        handler(error, size);
     }
 
     void close() noexcept { socket_->close(); }
@@ -154,6 +220,11 @@ class LegacyDatagramState final : public std::enable_shared_from_this<LegacyData
         auto self = shared_from_this();
         ReadHandler completion = [self](const boost::system::error_code &error, std::size_t size,
                                         io::DatagramAddress sender) {
+            if (!self->receive_handler_) {
+                // Late lower completion after cancel_receive retired the op.
+                self->receive_in_progress_ = false;
+                return;
+            }
             if (error) {
                 self->finish_receive(error, 0, {});
                 return;
@@ -211,9 +282,12 @@ class LegacyDatagramState final : public std::enable_shared_from_this<LegacyData
                         io::DatagramAddress sender) {
         receive_in_progress_ = false;
         auto handler = std::move(receive_handler_);
-        if (handler) {
-            handler(error, size, std::move(sender));
+        output_buffer_ = {};
+        if (!handler) {
+            // Late lower completion after cancel_receive retired the op.
+            return;
         }
+        handler(error, size, std::move(sender));
     }
 
     std::shared_ptr<net::UdpStream> socket_;
@@ -223,7 +297,9 @@ class LegacyDatagramState final : public std::enable_shared_from_this<LegacyData
     std::array<std::uint8_t, kMaxUdpWireSize> receive_buffer_{};
     boost::asio::mutable_buffer output_buffer_;
     ReadHandler receive_handler_;
+    WriteHandler send_handler_;
     bool receive_in_progress_ = false;
+    bool send_in_progress_ = false;
 };
 
 class LegacyDatagramHandle final : public io::DatagramHandle {
@@ -239,6 +315,7 @@ class LegacyDatagramHandle final : public io::DatagramHandle {
         return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
             [state = state_, buffer, destination](auto terminal) mutable {
                 state->send(buffer, std::move(destination), std::move(terminal));
+                return async::CallbackAbortFn{[state] { state->cancel_send(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 if (!error) {
@@ -267,6 +344,7 @@ class LegacyDatagramHandle final : public io::DatagramHandle {
                                            io::DatagramAddress source) mutable {
                     terminal(error, size, std::move(source));
                 });
+                return async::CallbackAbortFn{[state] { state->cancel_receive(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size,
                io::DatagramAddress source) {

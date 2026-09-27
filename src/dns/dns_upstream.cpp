@@ -1,4 +1,4 @@
-#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/held_operation.hpp>
 #include <clash_native/dns/dns_upstream.hpp>
 #include <clash_native/io/sender.hpp>
@@ -45,7 +45,7 @@ DnsUpstream::~DnsUpstream() { stop(); }
 struct DriveReceiver {
     using receiver_concept = stdexec::receiver_tag;
     runtime::AsioRuntime *runtime;
-    async::BridgeSender<DnsExchangeResult>::Handler done;
+    async::BridgeHandler<DnsExchangeResult> done;
     void set_value(DnsExchangeResult result) noexcept {
         auto terminal = std::move(done);
         runtime->scheduler().post(
@@ -92,14 +92,13 @@ DnsUpstream::exchange(DnsPacket query, std::chrono::steady_clock::time_point dea
     auto *runtime = &runtime_;
     return async::bridge_sender<DnsExchangeResult>(
         [shared, transport, runtime, query = std::move(query),
-         deadline](async::BridgeSender<DnsExchangeResult>::Handler done) mutable {
+         deadline](async::BridgeHandler<DnsExchangeResult> done) mutable {
             // NOTE: name the sender first; argument order is unspecified.
             auto sender = transport->exchange({std::move(query), deadline});
             shared->drive =
                 async::hold_operation(std::move(sender), DriveReceiver{runtime, std::move(done)});
             shared->drive->start();
-            using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
-            return AbortFn{[shared] { shared->drive.reset(); }};
+            return async::CallbackAbortFn{[shared] { shared->drive.reset(); }};
         });
 }
 
@@ -112,7 +111,7 @@ void DnsUpstream::stop() noexcept {
 class DnsUpstreamGroup::Operation final
     : public std::enable_shared_from_this<DnsUpstreamGroup::Operation> {
   public:
-    using MemberTerminal = async::BridgeSender<DnsExchangeResult>::Handler;
+    using MemberTerminal = async::BridgeHandler<DnsExchangeResult>;
     struct MemberReceiver {
         using receiver_concept = stdexec::receiver_tag;
         std::shared_ptr<Operation> operation;
@@ -388,7 +387,7 @@ DnsUpstreamGroup::exchange(DnsPacket query, std::chrono::steady_clock::time_poin
     auto self = shared_from_this();
     return async::bridge_sender<DnsExchangeResult>(
         [self, query = std::move(query),
-         deadline](async::BridgeSender<DnsExchangeResult>::Handler done) mutable {
+         deadline](async::BridgeHandler<DnsExchangeResult> done) mutable {
             auto operation =
                 std::make_shared<Operation>(*self, std::move(query), deadline, std::move(done));
             self->operations_.insert(operation);
@@ -397,8 +396,7 @@ DnsUpstreamGroup::exchange(DnsPacket query, std::chrono::steady_clock::time_poin
             } else {
                 operation->start();
             }
-            using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
-            return AbortFn{[self, operation] {
+            return async::CallbackAbortFn{[self, operation] {
                 self->operations_.erase(operation);
                 operation->cancel();
             }};

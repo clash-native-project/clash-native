@@ -11,6 +11,7 @@
 #include <clash_native/transport/shadowsocks/kcptun_snappy.hpp>
 
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -151,6 +152,55 @@ class SmuxStreamState final : public std::enable_shared_from_this<SmuxStreamStat
         fin_requested_ = true;
         pump_write();
         error.clear();
+    }
+
+    // Retires a parked read without closing the session. The lower pulls are
+    // detached sender pulls into internal buffers; the parked handler owns
+    // the caller's buffer, so clearing it is memory-safe. A late lower
+    // completion only appends to the internal queue and drops without
+    // touching the retired handler.
+    void cancel_read() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(transport_->executor(), [self] {
+                auto handler = std::move(self->read_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->read_buffer_ = {};
+                boost::asio::post(self->transport_->executor(),
+                                  [handler = std::move(handler)]() mutable {
+                                      handler(boost::asio::error::operation_aborted, 0);
+                                  });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; the late lower completion or
+            // close() retires the parked handler instead.
+        }
+    }
+
+    // Retires a parked write without closing the session. The queued frame
+    // writes own their buffers via shared_ptr, so they drain safely; staged
+    // lower completions pump remaining frames and the retired write completes
+    // only via the aborter below.
+    void cancel_write() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(transport_->executor(), [self] {
+                auto pending = std::move(self->write_handler_);
+                if (!pending || !pending->handler) {
+                    return;
+                }
+                pending->failed = true;
+                auto handler = std::move(pending->handler);
+                boost::asio::post(self->transport_->executor(),
+                                  [handler = std::move(handler)]() mutable {
+                                      handler(boost::asio::error::operation_aborted, 0);
+                                  });
+            });
+        } catch (...) {
+            // Aborter contract: never throw; see cancel_read.
+        }
     }
 
     void close() noexcept {
@@ -458,6 +508,7 @@ class SmuxStreamState final : public std::enable_shared_from_this<SmuxStreamStat
 
     void finish_read(const boost::system::error_code &error, std::size_t size) {
         if (!read_handler_) {
+            // Late lower completion after cancel_read retired the op.
             return;
         }
         auto handler = std::move(read_handler_);
@@ -468,6 +519,7 @@ class SmuxStreamState final : public std::enable_shared_from_this<SmuxStreamStat
     void finish_pending_write(const std::shared_ptr<PendingWrite> &pending,
                               const boost::system::error_code &error) {
         if (!pending || pending->failed) {
+            // Late lower completion after cancel_write retired the op.
             return;
         }
         pending->failed = static_cast<bool>(error);
@@ -533,12 +585,13 @@ class SmuxStream final : public io::StreamHandle {
                                            stdexec::set_error_t(std::exception_ptr),
                                            stdexec::set_stopped_t()>;
         return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
-            [state = state_, buffer](auto terminal) mutable {
+            [state = state_, buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 state->async_read_some(
                     buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
                                                              std::size_t size) mutable {
                         terminal(error, size);
                     });
+                return async::CallbackAbortFn{[state] { state->cancel_read(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 net::translate_read(std::move(receiver), error, size, "smux stream read");
@@ -549,12 +602,13 @@ class SmuxStream final : public io::StreamHandle {
                                                           stdexec::set_error_t(std::exception_ptr),
                                                           stdexec::set_stopped_t()>;
         return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
-            [state = state_, buffer](auto terminal) mutable {
+            [state = state_, buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 state->async_write(
                     buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
                                                              std::size_t size) mutable {
                         terminal(error, size);
                     });
+                return async::CallbackAbortFn{[state] { state->cancel_write(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 net::translate_write(std::move(receiver), error, size, "smux stream write");

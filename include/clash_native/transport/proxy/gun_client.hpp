@@ -5,7 +5,7 @@
 #include <clash_native/io/stream_handle.hpp>
 #include <clash_native/transport/proxy/gun_stream.hpp>
 
-#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
@@ -97,7 +97,7 @@ class GunClient final : public std::enable_shared_from_this<GunClient> {
     };
 
     using OpenResult = core::Result<std::unique_ptr<io::StreamHandle>>;
-    using OpenHandler = async::BridgeSender<OpenResult>::Handler;
+    using OpenHandler = async::BridgeHandler<OpenResult>;
 
     static exec::task<void> run_open(std::shared_ptr<GunClient> client,
                                      std::shared_ptr<TransportEntry> entry, SessionMaker maker,

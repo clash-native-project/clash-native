@@ -54,8 +54,9 @@ class HttpTunnelStreamState final : public std::enable_shared_from_this<HttpTunn
                                            stdexec::set_error_t(std::exception_ptr),
                                            stdexec::set_stopped_t()>;
         return AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
-            [self = shared_from_this(), buffer](auto terminal) mutable {
+            [self = shared_from_this(), buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 self->read_some(buffer, std::move(terminal));
+                return async::CallbackAbortFn{[self] { self->cancel_read(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 if (!error) {
@@ -81,8 +82,9 @@ class HttpTunnelStreamState final : public std::enable_shared_from_this<HttpTunn
                                                           stdexec::set_error_t(std::exception_ptr),
                                                           stdexec::set_stopped_t()>;
         return AnySender<std::size_t>{async::callback_sender<Signatures>(
-            [self = shared_from_this(), buffer](auto terminal) mutable {
+            [self = shared_from_this(), buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 self->write_some(buffer, std::move(terminal));
+                return async::CallbackAbortFn{[self] { self->cancel_write(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 if (!error) {
@@ -120,6 +122,36 @@ class HttpTunnelStreamState final : public std::enable_shared_from_this<HttpTunn
                 shutdown_send_();
             }
         }
+    }
+
+    // Abort for a single parked read pull: retires the parked handler with
+    // operation_aborted without closing the stream. A late session-side
+    // deliver/close completion finds no parked handler and is dropped.
+    void cancel_read() noexcept {
+        const auto self = shared_from_this();
+        boost::asio::post(executor_, [self] {
+            if (!self->read_handler_) {
+                return;
+            }
+            auto handler = std::move(self->read_handler_);
+            self->read_buffer_ = {};
+            self->post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
+        });
+    }
+
+    // Abort for a single parked write pull: retires the parked handler with
+    // operation_aborted without closing the stream. A late lower write
+    // completion finds no parked handler in finish_write and is dropped.
+    void cancel_write() noexcept {
+        const auto self = shared_from_this();
+        boost::asio::post(executor_, [self] {
+            if (!self->write_handler_) {
+                return;
+            }
+            auto handler = std::move(self->write_handler_);
+            self->write_size_ = 0;
+            self->post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
+        });
     }
 
     void close() noexcept {

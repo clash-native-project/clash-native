@@ -1,6 +1,6 @@
 #include <clash_native/transport/proxy/gun_client.hpp>
 
-#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/io/sender.hpp>
 
@@ -63,47 +63,48 @@ exec::task<void> GunClient::run_open(std::shared_ptr<GunClient> client,
     OpenResult result = core::fail({core::ErrorCode::transport_io, "gun dial failed"});
     try {
         if (!entry->session) {
-            auto session = co_await async::bridge_sender<
-                core::Result<std::shared_ptr<io::ExchangeSession>>>(
-                [maker](
-                    async::BridgeSender<core::Result<std::shared_ptr<io::ExchangeSession>>>::Handler
-                        open) mutable {
-                    // The bridge starter must be copyable: drive the
-                    // maker sender straight into the terminal.
-                    struct MakerReceiver {
-                        using receiver_concept = stdexec::receiver_tag;
-                        async::BridgeSender<
-                            core::Result<std::shared_ptr<io::ExchangeSession>>>::Handler open;
-                        void set_value(std::shared_ptr<io::ExchangeSession> session) && noexcept {
-                            auto terminal = std::move(open);
-                            terminal(core::Result<std::shared_ptr<io::ExchangeSession>>{
-                                std::move(session)});
-                        }
-                        void set_error(std::exception_ptr error) && noexcept {
-                            auto terminal = std::move(open);
-                            try {
-                                std::rethrow_exception(std::move(error));
-                            } catch (const core::Error &failure) {
-                                terminal(core::fail(failure));
-                                return;
-                            } catch (...) {
+            auto session =
+                co_await async::bridge_sender<core::Result<std::shared_ptr<io::ExchangeSession>>>(
+                    [maker](async::BridgeHandler<core::Result<std::shared_ptr<io::ExchangeSession>>>
+                                open) mutable {
+                        // The bridge starter must be copyable: drive the
+                        // maker sender straight into the terminal.
+                        struct MakerReceiver {
+                            using receiver_concept = stdexec::receiver_tag;
+                            async::BridgeHandler<core::Result<std::shared_ptr<io::ExchangeSession>>>
+                                open;
+                            void
+                            set_value(std::shared_ptr<io::ExchangeSession> session) && noexcept {
+                                auto terminal = std::move(open);
+                                terminal(core::Result<std::shared_ptr<io::ExchangeSession>>{
+                                    std::move(session)});
                             }
-                            terminal(core::fail(
-                                {core::ErrorCode::transport_io, "gun session open failed"}));
-                        }
-                        void set_stopped() && noexcept {
-                            auto terminal = std::move(open);
-                            terminal(core::fail(
-                                {core::ErrorCode::cancelled, "gun session open cancelled"}));
-                        }
-                    };
-                    // NOTE: name the sender first; argument order is unspecified.
-                    auto sender = maker();
-                    async::start_with_receiver(std::move(sender), MakerReceiver{std::move(open)});
-                    using AbortFn = async::BridgeSender<
-                        core::Result<std::shared_ptr<io::ExchangeSession>>>::AbortFn;
-                    return AbortFn{[] {}};
-                });
+                            void set_error(std::exception_ptr error) && noexcept {
+                                auto terminal = std::move(open);
+                                try {
+                                    std::rethrow_exception(std::move(error));
+                                } catch (const core::Error &failure) {
+                                    terminal(core::fail(failure));
+                                    return;
+                                } catch (...) {
+                                }
+                                terminal(core::fail(
+                                    {core::ErrorCode::transport_io, "gun session open failed"}));
+                            }
+                            void set_stopped() && noexcept {
+                                auto terminal = std::move(open);
+                                terminal(core::fail(
+                                    {core::ErrorCode::cancelled, "gun session open cancelled"}));
+                            }
+                        };
+                        // NOTE: name the sender first; argument order is unspecified.
+                        auto sender = maker();
+                        async::start_with_receiver(std::move(sender),
+                                                   MakerReceiver{std::move(open)});
+                        using AbortFn = async::CallbackAbortFn;
+                        // No abort possible: the maker runs detached via start_with_receiver.
+                        return AbortFn{};
+                    });
             if (!session) {
                 result = core::fail(session.error());
                 done(std::move(result));
@@ -116,8 +117,9 @@ exec::task<void> GunClient::run_open(std::shared_ptr<GunClient> client,
                 gun::async_open_gun_stream(
                     entry->session, options,
                     [open](OpenResult opened) mutable { open(std::move(opened)); });
-                using AbortFn = async::BridgeSender<OpenResult>::AbortFn;
-                return AbortFn{[] {}};
+                using AbortFn = async::CallbackAbortFn;
+                // No abort possible: gun stream open has no cancel handle.
+                return AbortFn{};
             });
         if (stream) {
             guard->armed = false;
@@ -160,14 +162,13 @@ io::AnySender<std::unique_ptr<io::StreamHandle>> GunClient::dial() {
     // exactly once. Failures stay values; stop can only come from a
     // scope stop, which this client never requests.
     auto bridged = async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
-        [shared, self, entry, maker = std::move(maker), options = std::move(options),
-         guard](async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::Handler
-                    done) mutable {
+        [shared, self, entry, maker = std::move(maker), options = std::move(options), guard](
+            async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>> done) mutable {
             shared->scope.spawn(run_open(self, entry, std::move(maker), std::move(options),
                                          std::move(guard), std::move(done)));
-            using AbortFn =
-                async::BridgeSender<core::Result<std::unique_ptr<io::StreamHandle>>>::AbortFn;
-            return AbortFn{[] {}};
+            using AbortFn = async::CallbackAbortFn;
+            // No abort possible: run_open drives a detached scope spawn.
+            return AbortFn{};
         });
     auto sender = std::move(bridged) |
                   stdexec::then([](core::Result<std::unique_ptr<io::StreamHandle>> result) {

@@ -1,4 +1,4 @@
-#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/core/base64.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
@@ -499,7 +499,7 @@ exec::task<core::StreamOpenResult> ProxyServer::route_stream(
         try {
             answer = co_await async::bridge_sender<core::Result<dns::DnsAnswer>>(
                 [&server, snapshot, host = std::move(host),
-                 type](async::BridgeSender<core::Result<dns::DnsAnswer>>::Handler done) mutable {
+                 type](async::BridgeHandler<core::Result<dns::DnsAnswer>> done) mutable {
                     auto resolver = snapshot->resolver;
                     auto id = std::make_shared<dns::ResolverService::RequestId>();
                     *id = resolver->resolve(
@@ -510,12 +510,12 @@ exec::task<core::StreamOpenResult> ProxyServer::route_stream(
                         },
                         server.runtime_.scheduler());
                     server.resolver_requests_.insert(*id);
-                    return [&server, snapshot, id] {
+                    return async::CallbackAbortFn{[&server, snapshot, id] {
                         if (snapshot->resolver) {
                             snapshot->resolver->cancel(*id);
                         }
                         server.resolver_requests_.erase(*id);
-                    };
+                    }};
                 });
         } catch (...) {
             co_return core::fail(
@@ -585,15 +585,15 @@ exec::task<core::StreamOpenResult> ProxyServer::route_stream(
                     resolved =
                         co_await async::bridge_sender<core::Result<outbound::detail::AddressList>>(
                             [&server, domain](
-                                async::BridgeSender<core::Result<outbound::detail::AddressList>>::
-                                    Handler done) mutable {
+                                async::BridgeHandler<core::Result<outbound::detail::AddressList>>
+                                    done) mutable {
                                 outbound::detail::resolve_host(
                                     server.runtime_, server.snapshot_store_->load()->resolver,
                                     domain,
                                     [done](core::Result<outbound::detail::AddressList>
                                                result) mutable { done(std::move(result)); });
-                                return async::BridgeSender<
-                                    core::Result<outbound::detail::AddressList>>::AbortFn{};
+                                // Nothing to abort: resolve_host has no cancel handle here.
+                                return async::CallbackAbortFn{};
                             });
                 } catch (...) {
                     co_return failed(
@@ -675,15 +675,15 @@ ProxyServer::open_datagram_resolved(ProxyServer &server, runtime::RuntimeSnapsho
     core::Result<outbound::detail::AddressList> resolved;
     try {
         resolved = co_await async::bridge_sender<core::Result<outbound::detail::AddressList>>(
-            [&server,
-             domain](async::BridgeSender<core::Result<outbound::detail::AddressList>>::Handler
-                         done) mutable {
+            [&server, domain](
+                async::BridgeHandler<core::Result<outbound::detail::AddressList>> done) mutable {
                 outbound::detail::resolve_host(
                     server.runtime_, server.snapshot_store_->load()->resolver, domain,
                     [done](core::Result<outbound::detail::AddressList> result) mutable {
                         done(std::move(result));
                     });
-                return async::BridgeSender<core::Result<outbound::detail::AddressList>>::AbortFn{};
+                // Nothing to abort: resolve_host has no cancel handle here.
+                return async::CallbackAbortFn{};
             });
     } catch (...) {
         co_return RoutedDatagram{core::DatagramOpenResult::failed(

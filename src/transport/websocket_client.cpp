@@ -1,6 +1,5 @@
 #include <clash_native/transport/websocket_client.hpp>
 
-#include <clash_native/async/bridge.hpp>
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/transport/tls_client.hpp>
@@ -405,6 +404,47 @@ class WebSocketStreamState final : public std::enable_shared_from_this<WebSocket
         message_available_ = false;
     }
 
+    // Retires a parked read without closing the socket. Beast reads land in
+    // the internal message buffer, so dropping the caller buffer ref is safe:
+    // the late completion finds no parked handler in deliver_read and keeps
+    // the message for the next pull. Dispatched to the stream executor
+    // because the parked state is strand-private.
+    void cancel_read() noexcept {
+        try {
+            const auto self = shared_from_this();
+            boost::asio::dispatch(executor_, [self] {
+                auto handler = std::move(self->read_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->read_buffer_ = {};
+                self->post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
+            });
+        } catch (...) {
+            // Aborter contract: never throw; the late completion or close()
+            // retires any parked handler.
+        }
+    }
+
+    // Retires a parked write without closing the socket. The wire bytes are
+    // already copied into the in-flight Beast write; its late completion
+    // finds no parked handler in finish_write and is dropped.
+    void cancel_write() noexcept {
+        try {
+            const auto self = shared_from_this();
+            boost::asio::dispatch(executor_, [self] {
+                auto handler = std::move(self->write_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->write_size_ = 0;
+                self->post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
+            });
+        } catch (...) {
+            // Aborter contract: never throw; see cancel_read.
+        }
+    }
+
   private:
     void read(boost::asio::mutable_buffer buffer, StreamReadHandler handler) {
         if (buffer.size() == 0) {
@@ -623,12 +663,13 @@ class WebSocketStream final : public io::StreamHandle {
     async_read_some(boost::asio::mutable_buffer buffer) override {
         auto state = state_;
         return io::AnySender<std::optional<std::size_t>>{async::callback_sender<ReadSignatures>(
-            [state, buffer](auto terminal) mutable {
+            [state, buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 state->async_read_some(
                     buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
                                                              std::size_t count) mutable {
                         terminal(error, count);
                     });
+                return async::CallbackAbortFn{[state] { state->cancel_read(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 if (!error) {
@@ -648,12 +689,13 @@ class WebSocketStream final : public io::StreamHandle {
     io::AnySender<std::size_t> async_write(boost::asio::const_buffer buffer) override {
         auto state = state_;
         return io::AnySender<std::size_t>{async::callback_sender<WriteSignatures>(
-            [state, buffer](auto terminal) mutable {
+            [state, buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 state->async_write(
                     buffer, [terminal = std::move(terminal)](const boost::system::error_code &error,
                                                              std::size_t count) mutable {
                         terminal(error, count);
                     });
+                return async::CallbackAbortFn{[state] { state->cancel_write(); }};
             },
             [](auto &&receiver, const boost::system::error_code &error, std::size_t count) {
                 if (!error) {
@@ -712,7 +754,11 @@ class FastOpenUpgradeStream final : public io::StreamHandle {
                 auto failure = shared->failure_;
                 lock.unlock();
                 return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
-                    [failure](auto terminal) mutable { terminal(core::fail(failure)); },
+                    [failure](auto terminal) mutable -> async::CallbackAbortFn {
+                        terminal(core::fail(failure));
+                        // Inline completion: nothing to abort.
+                        return async::CallbackAbortFn{};
+                    },
                     Translate{})};
             }
             if (shared->validated_ && !shared->remainder_.empty()) {
@@ -731,8 +777,19 @@ class FastOpenUpgradeStream final : public io::StreamHandle {
             }
         }
         return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
-            [shared, buffer](auto terminal) mutable {
+            [shared, buffer](auto terminal) mutable -> async::CallbackAbortFn {
+                auto abortable = shared;
                 ValidationLoop::start(std::move(shared), buffer, std::move(terminal));
+                // Handshake-phase stream is owned solely by State; abort closes it to unblock
+                // the validation loop. Serialized with finish()/close() under the state mutex.
+                return async::CallbackAbortFn{[abortable] {
+                    try {
+                        std::unique_lock<std::mutex> lock(abortable->mutex_);
+                        abortable->inner_->close();
+                    } catch (...) {
+                        // Aborter contract: never throw.
+                    }
+                }};
             },
             Translate{})};
     }
@@ -1152,9 +1209,10 @@ class WebSocketClientHandshakeOperation final
                                            stdexec::set_stopped_t()>;
         try {
             co_await async::callback_sender<HandshakeSigs>(
-                [self, target](auto terminal) mutable {
+                [self, target](auto terminal) mutable -> async::CallbackAbortFn {
                     self->websocket_->async_handshake(self->options_.host, target,
                                                       std::move(terminal));
+                    return async::CallbackAbortFn{[self] { self->cancel(); }};
                 },
                 [](auto receiver, const boost::system::error_code &error) {
                     if (error) {
@@ -1186,11 +1244,13 @@ class WebSocketClientHandshakeOperation final
                                                stdexec::set_stopped_t()>;
             try {
                 co_await async::callback_sender<WriteSigs>(
-                    [state, remainder = early.remainder](auto terminal) mutable {
+                    [state,
+                     remainder = early.remainder](auto terminal) mutable -> async::CallbackAbortFn {
                         state->async_write(boost::asio::buffer(remainder),
                                            [terminal = std::move(terminal)](
                                                const boost::system::error_code &error,
                                                std::size_t) mutable { terminal(error); });
+                        return async::CallbackAbortFn{[state] { state->cancel_write(); }};
                     },
                     [](auto receiver, const boost::system::error_code &error) {
                         if (error) {

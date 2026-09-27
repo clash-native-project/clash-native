@@ -132,6 +132,10 @@ class ProxyRequestBodyStream final : public io::ExchangeBodyStream,
     async_read_some(boost::asio::mutable_buffer buffer) override;
     std::vector<io::ExchangeField> trailers() const override;
     void cancel() noexcept override;
+    // Per-op abort for a single async_read_some pull. Marks the in-flight
+    // Beast read so its completion retires with operation_aborted; unlike
+    // cancel() it leaves the stream usable for later pulls.
+    void cancel_read() noexcept;
 
   private:
     void read_some(boost::asio::mutable_buffer buffer, ReadHandler handler);
@@ -147,6 +151,17 @@ class ProxyRequestBodyStream final : public io::ExchangeBodyStream,
     ByteHandler byte_handler_;
     bool reading_ = false;
     bool cancelled_ = false;
+    // Handler parked while a Beast read is outstanding. cancel_read() takes
+    // it to retire the pull; the late Beast completion then finds it empty
+    // and drops.
+    ReadHandler parked_handler_;
+    // True while a pull is hopping through a retry post (no parked handler
+    // yet). Lets cancel_read() arm read_abort_ instead of missing the hop.
+    bool retry_pending_ = false;
+    // One-shot: a cancel_read() that arrived during the retry hop. Consumed
+    // by the next read_some on the executor; never poisons a later pull
+    // because it is only armed while retry_pending_.
+    bool read_abort_ = false;
 };
 
 class ProxySession final : public std::enable_shared_from_this<ProxySession> {

@@ -1,4 +1,4 @@
-#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
@@ -50,7 +50,7 @@ class DotDnsTransport final : public DnsTransport,
     class Operation;
     class Session;
 
-    using OpenHandler = async::BridgeSender<DnsExchangeResult>::Handler;
+    using OpenHandler = async::BridgeHandler<DnsExchangeResult>;
 
   public:
     DotDnsTransport(runtime::AsioRuntime &runtime, DnsUpstreamConfig config)
@@ -599,16 +599,15 @@ io::AnySender<DnsExchangeResult> DotDnsTransport::exchange(DnsExchangeRequest re
     auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
     auto self = shared_from_this();
     return async::bridge_sender<DnsExchangeResult>(
-        [self, box](async::BridgeSender<DnsExchangeResult>::Handler done) mutable {
+        [self, box](async::BridgeHandler<DnsExchangeResult> done) mutable {
             if (!box || !*box) {
                 done(core::fail(cancelled_error()));
-                using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
-                return AbortFn{[] {}};
+                return async::CallbackAbortFn{};
             }
             const auto exchange_id = self->open_exchange(std::move(**box), std::move(done));
             box->reset();
-            using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
-            return AbortFn{[self, exchange_id] { self->cancel_exchange(exchange_id); }};
+            return async::CallbackAbortFn{
+                [self, exchange_id] { self->cancel_exchange(exchange_id); }};
         });
 }
 

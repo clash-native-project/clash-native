@@ -50,8 +50,12 @@ class QueuedExchangeBodyStream final
                                            stdexec::set_error_t(std::exception_ptr),
                                            stdexec::set_stopped_t()>;
         return AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
-            [self = shared_from_this(), buffer](auto terminal) mutable {
+            [self = shared_from_this(), buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 self->read_some(buffer, std::move(terminal));
+                // Single-pull abort: retire only this parked read. The
+                // stream stays usable for later pulls; cancel() (full abort
+                // with on_cancel) is reserved for session teardown.
+                return async::CallbackAbortFn{[self] { self->cancel_read(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 if (!error) {
@@ -96,6 +100,23 @@ class QueuedExchangeBodyStream final
                 self->read_buffer_ = {};
                 self->post_read(std::move(handler), self->terminal_error_, 0);
             }
+        });
+    }
+
+    // Aborts a single parked read pull: retires the parked handler with
+    // operation_aborted without marking the stream terminal. Queued bytes
+    // stay for the next pull; a late session-side deliver/finish finds no
+    // parked handler and keeps bytes queued. Unlike cancel(), this never
+    // fires on_cancel/on_drained and never poisons the stream.
+    void cancel_read() noexcept {
+        const auto self = shared_from_this();
+        boost::asio::post(executor_, [self] {
+            if (!self->read_handler_) {
+                return;
+            }
+            auto handler = std::move(self->read_handler_);
+            self->read_buffer_ = {};
+            self->post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
         });
     }
 

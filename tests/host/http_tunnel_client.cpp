@@ -78,8 +78,10 @@ class TestBodyStream final : public clash_native::io::ExchangeBodyStream,
                                            stdexec::set_stopped_t()>;
         return clash_native::io::AnySender<std::optional<std::size_t>>{
             clash_native::async::callback_sender<Signatures>(
-                [self = shared_from_this(), buffer](auto terminal) mutable {
+                [self = shared_from_this(),
+                 buffer](auto terminal) mutable -> clash_native::async::CallbackAbortFn {
                     self->read_some(buffer, std::move(terminal));
+                    return clash_native::async::CallbackAbortFn{[self] { self->cancel(); }};
                 },
                 [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                     if (!error) {

@@ -1,4 +1,4 @@
-#include <clash_native/async/bridge.hpp>
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
@@ -229,7 +229,7 @@ class AsioDnsTransport final : public DnsTransport,
     io::AnySender<DnsExchangeResult> exchange(DnsExchangeRequest request) override;
     void stop() noexcept override;
     DnsExchangeId open_exchange(DnsExchangeRequest request,
-                                async::BridgeSender<DnsExchangeResult>::Handler handler);
+                                async::BridgeHandler<DnsExchangeResult> handler);
     void cancel_exchange(DnsExchangeId exchange_id) noexcept;
 
   private:
@@ -599,7 +599,7 @@ class AsioDnsTransport::Operation final
     : public std::enable_shared_from_this<AsioDnsTransport::Operation> {
   public:
     Operation(AsioDnsTransport &owner, DnsExchangeId exchange_id, DnsExchangeRequest request,
-              async::BridgeSender<DnsExchangeResult>::Handler handler)
+              async::BridgeHandler<DnsExchangeResult> handler)
         : owner_(owner), exchange_id_(exchange_id), request_(std::move(request)),
           handler_(std::move(handler)), timeout_timer_(owner.runtime_.serialized_executor()),
           udp_endpoint_(owner.config_.endpoint) {}
@@ -639,7 +639,7 @@ class AsioDnsTransport::Operation final
         owner_.complete(exchange_id_, core::fail(cancelled_error()));
     }
 
-    async::BridgeSender<DnsExchangeResult>::Handler take_handler() { return std::move(handler_); }
+    async::BridgeHandler<DnsExchangeResult> take_handler() { return std::move(handler_); }
     std::uint16_t query_id() const noexcept { return query_id_; }
 
   private:
@@ -896,7 +896,7 @@ class AsioDnsTransport::Operation final
     AsioDnsTransport &owner_;
     DnsExchangeId exchange_id_;
     DnsExchangeRequest request_;
-    async::BridgeSender<DnsExchangeResult>::Handler handler_;
+    async::BridgeHandler<DnsExchangeResult> handler_;
     boost::asio::steady_timer timeout_timer_;
     boost::asio::ip::udp::endpoint udp_endpoint_;
     std::vector<std::uint8_t> response_buffer_ = std::vector<std::uint8_t>(65535);
@@ -937,22 +937,20 @@ io::AnySender<DnsExchangeResult> AsioDnsTransport::exchange(DnsExchangeRequest r
     auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
     auto self = shared_from_this();
     return async::bridge_sender<DnsExchangeResult>(
-        [self, box](async::BridgeSender<DnsExchangeResult>::Handler done) mutable {
+        [self, box](async::BridgeHandler<DnsExchangeResult> done) mutable {
             if (!box || !*box) {
                 done(core::fail(cancelled_error()));
-                using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
-                return AbortFn{[] {}};
+                return async::CallbackAbortFn{};
             }
             const auto exchange_id = self->open_exchange(std::move(**box), std::move(done));
             box->reset();
-            using AbortFn = async::BridgeSender<DnsExchangeResult>::AbortFn;
-            return AbortFn{[self, exchange_id] { self->cancel_exchange(exchange_id); }};
+            return async::CallbackAbortFn{
+                [self, exchange_id] { self->cancel_exchange(exchange_id); }};
         });
 }
 
-DnsExchangeId
-AsioDnsTransport::open_exchange(DnsExchangeRequest request,
-                                async::BridgeSender<DnsExchangeResult>::Handler handler) {
+DnsExchangeId AsioDnsTransport::open_exchange(DnsExchangeRequest request,
+                                              async::BridgeHandler<DnsExchangeResult> handler) {
     const auto exchange_id = next_exchange_id_++;
     auto operation =
         std::make_shared<Operation>(*this, exchange_id, std::move(request), std::move(handler));

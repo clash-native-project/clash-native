@@ -22,6 +22,7 @@
 #include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/io/sender.hpp>
 
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
 
@@ -361,6 +362,7 @@ class ShadowTlsV3Stream final : public io::StreamHandle,
         return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
             [self = shared_from_this(), buffer](auto terminal) mutable {
                 self->read(buffer, std::move(terminal));
+                return async::CallbackAbortFn{[self] { self->cancel_read(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 net::translate_read(std::move(receiver), error, size, "shadow-tls-v3 read");
@@ -374,6 +376,7 @@ class ShadowTlsV3Stream final : public io::StreamHandle,
         return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
             [self = shared_from_this(), buffer](auto terminal) mutable {
                 self->write(buffer, std::move(terminal));
+                return async::CallbackAbortFn{[self] { self->cancel_write(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 net::translate_write(std::move(receiver), error, size, "shadow-tls-v3 write");
@@ -436,6 +439,46 @@ class ShadowTlsV3Stream final : public io::StreamHandle,
         // NOTE: name the sender first; argument order is unspecified.
         auto sender = lower_->async_write(boost::asio::buffer(write_wire_));
         async::start_with_receiver(std::move(sender), LowerWriteBridge{std::move(completion)});
+    }
+
+    // Retires a parked read without closing the transport. Framed lower
+    // reads in flight complete against a cleared handler and drop; buffered
+    // plaintext stays for the next read.
+    void cancel_read() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(executor(), [self] {
+                auto handler = std::move(self->read_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->read_buffer_ = {};
+                self->post_read(std::move(handler), boost::asio::error::operation_aborted, 0);
+            });
+        } catch (...) {
+            // Aborter contract: never throw; the late framed completion or
+            // close() retires the parked handler instead.
+        }
+    }
+
+    // Retires a parked write without closing the transport. The staged
+    // framed wire (and its in-flight lower write, which references
+    // write_wire_) drains; the late completion finds no parked handler and
+    // drops.
+    void cancel_write() noexcept {
+        try {
+            auto self = shared_from_this();
+            boost::asio::dispatch(executor(), [self] {
+                auto handler = std::move(self->write_handler_);
+                if (!handler) {
+                    return;
+                }
+                self->write_size_ = 0;
+                self->post_write(std::move(handler), boost::asio::error::operation_aborted, 0);
+            });
+        } catch (...) {
+            // Aborter contract: never throw; see cancel_read.
+        }
     }
 
     boost::asio::any_io_executor executor() noexcept override { return lower_->executor(); }
@@ -661,6 +704,7 @@ class ShadowTlsV3Handle final : public io::StreamHandle {
         return io::AnySender<std::optional<std::size_t>>{async::callback_sender<Signatures>(
             [stream = stream_, buffer](auto terminal) mutable {
                 stream->read(buffer, std::move(terminal));
+                return async::CallbackAbortFn{[stream] { stream->cancel_read(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 net::translate_read(std::move(receiver), error, size, "shadow-tls-v3 read");
@@ -674,6 +718,7 @@ class ShadowTlsV3Handle final : public io::StreamHandle {
         return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
             [stream = stream_, buffer](auto terminal) mutable {
                 stream->write(buffer, std::move(terminal));
+                return async::CallbackAbortFn{[stream] { stream->cancel_write(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size) {
                 net::translate_write(std::move(receiver), error, size, "shadow-tls-v3 write");
