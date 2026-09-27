@@ -143,17 +143,8 @@ struct GrpcSessionOpen {
             }
             done(std::move(result));
         };
-        auto addresses = co_await async::bridge_sender<core::Result<detail::AddressList>>(
-            [runtime, resolver = std::move(resolver), host = config.server_host](
-                async::BridgeHandler<core::Result<detail::AddressList>> open) mutable {
-                // The bridge starter must be copyable: resolve_host takes
-                // its handler by value, so the lambda already copies.
-                detail::resolve_host(*runtime, std::move(resolver), std::move(host),
-                                     [open](core::Result<detail::AddressList> result) mutable {
-                                         open(std::move(result));
-                                     });
-                return async::CallbackAbortFn{};
-            });
+        const auto addresses =
+            co_await detail::resolve_host_sender(*runtime, std::move(resolver), config.server_host);
         if (!addresses || addresses.value().empty()) {
             finish(!addresses ? core::fail(addresses.error())
                               : core::fail(core::Error{core::ErrorCode::resolution,
@@ -251,7 +242,7 @@ open_grpc_session(runtime::AsioRuntime &runtime, std::shared_ptr<dns::ResolverSe
          config = std::move(config)](SessionHandler done) mutable {
             shared->scope.spawn(GrpcSessionOpen::run(&runtime, std::move(resolver),
                                                      std::move(config), std::move(done)));
-            return async::CallbackAbortFn{};
+            return async::CallbackAbortFn{[shared] { shared->scope.request_stop(); }};
         });
     auto sender = std::move(bridged) | stdexec::then([](SessionResult result) {
                       if (!result) {

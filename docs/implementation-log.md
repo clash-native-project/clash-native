@@ -2687,3 +2687,25 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   baseline tree; converged tree: 307 passed minus the chunked-upload
   case plus 3/3 solo passes, 9/9 `CallbackSenderTest`;
   `pixi run format-check` and `git diff --check` pass.
+
+### 2026-09-27 — Close three cancellation gaps (adapter token, resolve, gun)
+
+- `net/stream_handle_adapter.hpp`: `read_some`/`write_some` now bridge the
+  caller's associated Asio cancellation slot into a shared
+  `inplace_stop_source` whose token the inner `io::` pull observes via
+  `StopReceiver`. TLS (`use_sender` over `ssl::stream`) can now preempt
+  in-flight wire I/O; disconnected/occupied slots keep prior behavior.
+- `outbound/outbound_utils.hpp`: `HostResolveOperation` gained
+  `abort()`/`set_handler()` plus `resolve_host_sender()` returning
+  `AnySender<Result<AddressList>>` with a real aborter (timer +
+  resolver cancel). Migrated `shadowsocks_outbound`, trojan gRPC resolve,
+  and both `proxy_server` resolve bridges off empty-`AbortFn{}` bridges.
+- `transport/proxy/gun_client.cpp`: the session-maker bridge now holds its
+  drive via `HeldOperation` (abort destroys it), and `dial()`'s scope
+  spawn aborts via `request_stop()`; trojan gRPC session bridge likewise.
+- Validation: Release build clean, 315/316 CTest pass (sole exclusion
+  `DnsTransportTest.UsesTheConfiguredDialerForPlainTcp`, SEGV pre-existing
+  on the clean tree per stash check); `format-check` and `git diff --check`
+  pass. Left for follow-up: JLS/ResTLS/Shadow-TLS overlay opens still
+  first-wins-drop at the caller (`self->abort()` closes the chain socket,
+  not the handshake itself); `start_read/write_for_handler` stays detached.

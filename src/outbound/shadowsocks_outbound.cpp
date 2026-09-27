@@ -790,14 +790,8 @@ class ShadowsocksConnectOperation final
         }
         core::Result<detail::AddressList> resolved;
         try {
-            resolved = co_await async::bridge_sender<core::Result<detail::AddressList>>(
-                [self](async::BridgeHandler<core::Result<detail::AddressList>> done) {
-                    detail::resolve_host(self->runtime_, self->resolver_, self->config_.server_host,
-                                         [done](core::Result<detail::AddressList> result) mutable {
-                                             done(std::move(result));
-                                         });
-                    return async::CallbackAbortFn{[self] { self->abort(); }};
-                });
+            resolved = co_await detail::resolve_host_sender(self->runtime_, self->resolver_,
+                                                            self->config_.server_host);
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
                 {core::ErrorCode::resolution, "failed to resolve Shadowsocks server"}));

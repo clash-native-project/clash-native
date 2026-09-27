@@ -5,9 +5,9 @@
 #include <clash_native/io/stream_handle.hpp>
 
 #include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/associated_cancellation_slot.hpp>
 #include <boost/asio/buffer.hpp>
-#include <boost/system/error_code.hpp>
-
+#include <boost/asio/cancellation_signal.hpp>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -64,9 +64,64 @@ void translate_write(Rcvr &&receiver, const boost::system::error_code &error, st
     }
 }
 
+// Environment bridge carrying a stop token into a sender started from
+// handler-style code. StreamHandleAdapter::async_read_some/async_write_some
+// satisfy Asio's stream concepts with handler-style initiations, but the
+// inner io:: pull is a sender: without this envelope the initiation would
+// only see never_stop_token and an Asio cancellation (e.g. the TLS layer
+// above aborting via use_sender) could never preempt in-flight wire I/O.
+template <class Token> struct StopEnv {
+    Token token;
+    auto query(stdexec::get_stop_token_t) const noexcept { return token; }
+};
+
+// Receiver wrapper injecting the shared stop source's token into the inner
+// sender's environment while forwarding the terminal untouched.
+template <class Rcvr> struct StopReceiver {
+    using receiver_concept = stdexec::receiver_tag;
+    Rcvr receiver;
+    std::shared_ptr<stdexec::inplace_stop_source> stop;
+    auto get_env() const noexcept {
+        return StopEnv<stdexec::inplace_stop_token>{stop->get_token()};
+    }
+    template <class... Args> void set_value(Args &&...args) noexcept {
+        stdexec::set_value(std::move(receiver), std::forward<Args>(args)...);
+    }
+    void set_error(std::exception_ptr error) noexcept {
+        stdexec::set_error(std::move(receiver), std::move(error));
+    }
+    void set_stopped() noexcept { stdexec::set_stopped(std::move(receiver)); }
+};
+
+// Forwards the handler's associated Asio cancellation slot (when the caller
+// connected one, e.g. ssl::stream driven through use_sender) into the shared
+// stop source. Disconnected slots stay detached; occupied slots are left
+// alone. A stale forwarder left in the slot after completion only
+// re-requests stop on a sourceless source.
+inline void connect_slot_to_stop(const auto &handler,
+                                 const std::shared_ptr<stdexec::inplace_stop_source> &stop) {
+    struct Forward {
+        std::shared_ptr<stdexec::inplace_stop_source> stop;
+        void operator()(boost::asio::cancellation_type_t) const noexcept {
+            if (stop) {
+                stop->request_stop();
+            }
+        }
+    };
+    auto slot = boost::asio::get_associated_cancellation_slot(handler);
+    if (!slot.is_connected() || slot.has_handler()) {
+        return;
+    }
+    try {
+        slot.emplace<Forward>(Forward{stop});
+    } catch (...) {
+    }
+}
+
 // Starts an io:: read pull from handler-style code, translating the terminal
-// back into an (error_code, size) call: bytes as success, clean end as eof,
-// failures unpacked, cancellation as aborted.
+// back into an (error_code, size) call. No Asio initiation sits on this side,
+// so there is no associated slot to observe: the pull runs with whatever
+// environment the sender captured at construction (detached bridging).
 template <class Sender, class Handler>
 void start_read_for_handler(Sender &&sender, Handler &&handler) {
     struct Receiver {
@@ -151,7 +206,12 @@ class StreamHandleAdapter final {
     // Drives the sender to completion on the heap and translates the
     // terminal signal back into a handler call. End-of-stream surfaces as
     // eof (Asio convention); core::Error failures surface through their
-    // preserved error_code, falling back to fault when absent.
+    // preserved error_code, falling back to fault when absent. A shared
+    // stop source bridges the handler world back into the sender world: the
+    // caller's associated cancellation slot (when bound, e.g. ssl::stream
+    // driven through use_sender) forwards into the source, whose token the
+    // inner pull observes through StopReceiver. Without this the inner
+    // sender would only see never_stop_token.
     template <typename Handler>
     static void read_some(std::unique_ptr<io::StreamHandle> &handle,
                           boost::asio::mutable_buffer buffer, Handler &&handler) {
@@ -179,8 +239,12 @@ class StreamHandleAdapter final {
                 callback(boost::asio::error::operation_aborted, 0);
             }
         };
-        async::start_with_receiver(handle->async_read_some(buffer),
-                                   Receiver{std::forward<Handler>(handler), buffer});
+        auto stop = std::make_shared<stdexec::inplace_stop_source>();
+        connect_slot_to_stop(handler, stop);
+        async::start_with_receiver(
+            handle->async_read_some(buffer),
+            StopReceiver<Receiver>{Receiver{std::forward<Handler>(handler), buffer},
+                                   std::move(stop)});
     }
 
     template <typename Handler>
@@ -205,8 +269,11 @@ class StreamHandleAdapter final {
                 callback(boost::asio::error::operation_aborted, 0);
             }
         };
-        async::start_with_receiver(handle->async_write(buffer),
-                                   Receiver{std::forward<Handler>(handler)});
+        auto stop = std::make_shared<stdexec::inplace_stop_source>();
+        connect_slot_to_stop(handler, stop);
+        async::start_with_receiver(
+            handle->async_write(buffer),
+            StopReceiver<Receiver>{Receiver{std::forward<Handler>(handler)}, std::move(stop)});
     }
 
     std::unique_ptr<io::StreamHandle> handle_;

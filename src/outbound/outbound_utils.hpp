@@ -1,8 +1,10 @@
 #pragma once
 
+#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/core/result.hpp>
 #include <clash_native/dns/dns_types.hpp>
 #include <clash_native/dns/resolver_service.hpp>
+#include <clash_native/io/sender.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 
 #include <boost/asio/ip/address.hpp>
@@ -64,6 +66,29 @@ class HostResolveOperation final : public std::enable_shared_from_this<HostResol
         resolve(dns::DnsRecordType::a);
     }
 
+    // Abort for sender-driven cancellation: idempotent with finish().
+    // Cancels the timer and any in-flight resolver request; the late
+    // terminal then drops at the completed_ guard or the empty handler.
+    void abort() noexcept {
+        auto self = shared_from_this();
+        try {
+            boost::asio::post(runtime_.serialized_executor(), [self] {
+                if (self->completed_) {
+                    return;
+                }
+                self->completed_ = true;
+                (void)self->timer_.cancel();
+                if (self->resolver_ && self->request_id_) {
+                    self->resolver_->cancel(*self->request_id_);
+                    self->request_id_.reset();
+                }
+            });
+        } catch (...) {
+        }
+    }
+
+    void set_handler(ResolveHandler handler) noexcept { handler_ = std::move(handler); }
+
   private:
     void resolve(dns::DnsRecordType type) {
         auto self = shared_from_this();
@@ -110,6 +135,10 @@ class HostResolveOperation final : public std::enable_shared_from_this<HostResol
             request_id_.reset();
         }
         auto handler = std::move(handler_);
+        // Aborted operations park an empty handler: drop the terminal.
+        if (!handler) {
+            return;
+        }
         handler(std::move(result));
     }
 
@@ -130,6 +159,22 @@ inline void resolve_host(runtime::AsioRuntime &runtime,
     auto operation = std::make_shared<HostResolveOperation>(runtime, std::move(resolver),
                                                             std::move(host), std::move(handler));
     operation->start();
+}
+
+// Sender-native resolve with real cancellation: the bridge aborter aborts
+// the shared operation (timer + resolver request), so caller stop preempts
+// the DNS wait instead of leaking until timeout.
+inline io::AnySender<core::Result<AddressList>>
+resolve_host_sender(runtime::AsioRuntime &runtime, std::shared_ptr<dns::ResolverService> resolver,
+                    std::string host) {
+    auto operation = std::make_shared<HostResolveOperation>(runtime, std::move(resolver),
+                                                            std::move(host), ResolveHandler{});
+    return async::bridge_sender<core::Result<AddressList>>(
+        [operation](async::BridgeHandler<core::Result<AddressList>> done) mutable {
+            operation->set_handler(std::move(done));
+            operation->start();
+            return async::CallbackAbortFn{[operation] { operation->abort(); }};
+        });
 }
 
 } // namespace clash_native::outbound::detail

@@ -582,19 +582,8 @@ exec::task<core::StreamOpenResult> ProxyServer::route_stream(
                 const auto domain = metadata.destination.domain();
                 core::Result<outbound::detail::AddressList> resolved;
                 try {
-                    resolved =
-                        co_await async::bridge_sender<core::Result<outbound::detail::AddressList>>(
-                            [&server, domain](
-                                async::BridgeHandler<core::Result<outbound::detail::AddressList>>
-                                    done) mutable {
-                                outbound::detail::resolve_host(
-                                    server.runtime_, server.snapshot_store_->load()->resolver,
-                                    domain,
-                                    [done](core::Result<outbound::detail::AddressList>
-                                               result) mutable { done(std::move(result)); });
-                                // Nothing to abort: resolve_host has no cancel handle here.
-                                return async::CallbackAbortFn{};
-                            });
+                    resolved = co_await outbound::detail::resolve_host_sender(
+                        server.runtime_, server.snapshot_store_->load()->resolver, domain);
                 } catch (...) {
                     co_return failed(
                         {core::ErrorCode::resolution, "direct destination resolution failed"});
@@ -674,17 +663,8 @@ ProxyServer::open_datagram_resolved(ProxyServer &server, runtime::RuntimeSnapsho
     const auto domain = metadata.destination.domain();
     core::Result<outbound::detail::AddressList> resolved;
     try {
-        resolved = co_await async::bridge_sender<core::Result<outbound::detail::AddressList>>(
-            [&server, domain](
-                async::BridgeHandler<core::Result<outbound::detail::AddressList>> done) mutable {
-                outbound::detail::resolve_host(
-                    server.runtime_, server.snapshot_store_->load()->resolver, domain,
-                    [done](core::Result<outbound::detail::AddressList> result) mutable {
-                        done(std::move(result));
-                    });
-                // Nothing to abort: resolve_host has no cancel handle here.
-                return async::CallbackAbortFn{};
-            });
+        resolved = co_await outbound::detail::resolve_host_sender(
+            server.runtime_, server.snapshot_store_->load()->resolver, domain);
     } catch (...) {
         co_return RoutedDatagram{core::DatagramOpenResult::failed(
                                      {core::ErrorCode::resolution, "UDP resolution failed", {}}),
