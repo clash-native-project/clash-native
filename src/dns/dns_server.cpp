@@ -406,6 +406,7 @@ exec::task<void> DnsServer::TcpConnection::run(std::shared_ptr<TcpConnection> se
             }
         }
     } catch (...) {
+        log_wire_error("run loop", std::current_exception());
     }
     self->close();
     co_return;
