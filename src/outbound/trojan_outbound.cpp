@@ -345,10 +345,15 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                         if (options.certificate_pin.empty()) {
                             options.certificate_pin = self->config_.fingerprint;
                         }
-                        transport::proxy::async_open_shadow_tls(
+                        auto handle = transport::proxy::async_open_shadow_tls_abortable(
                             std::move(*boxed), std::move(options),
                             [done](Opened opened) mutable { done(std::move(opened)); });
-                        return async::CallbackAbortFn{[self] { self->abort(); }};
+                        return async::CallbackAbortFn{[self, handle] {
+                            self->abort();
+                            if (handle) {
+                                handle->abort();
+                            }
+                        }};
                     });
             }
             if (mode == "restls") {
@@ -359,20 +364,30 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                         if (options.certificate_pin.empty()) {
                             options.certificate_pin = self->config_.fingerprint;
                         }
-                        transport::proxy::async_open_restls(
+                        auto handle = transport::proxy::async_open_restls_abortable(
                             std::move(*boxed), std::move(options),
                             [done](Opened opened) mutable { done(std::move(opened)); });
-                        return async::CallbackAbortFn{[self] { self->abort(); }};
+                        return async::CallbackAbortFn{[self, handle] {
+                            self->abort();
+                            if (handle) {
+                                handle->abort();
+                            }
+                        }};
                     });
             }
             if (mode == "jls") {
                 auto boxed = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(stream));
                 co_return co_await async::bridge_sender<Opened>(
                     [self, boxed](async::BridgeHandler<Opened> done) mutable {
-                        transport::proxy::async_open_jls(
+                        auto handle = transport::proxy::async_open_jls_abortable(
                             std::move(*boxed), self->config_.jls_options,
                             [done](Opened opened) mutable { done(std::move(opened)); });
-                        return async::CallbackAbortFn{[self] { self->abort(); }};
+                        return async::CallbackAbortFn{[self, handle] {
+                            self->abort();
+                            if (handle) {
+                                handle->abort();
+                            }
+                        }};
                     });
             }
             co_return core::fail({core::ErrorCode::configuration,

@@ -10,4 +10,8 @@ namespace clash_native::transport::proxy {
 void async_open_shadow_tls_v3(std::unique_ptr<io::StreamHandle> stream,
                               ShadowTlsClientOptions options, ShadowTlsOpenHandler handler);
 
+std::shared_ptr<ShadowTlsOpenAborter>
+async_open_shadow_tls_v3_abortable(std::unique_ptr<io::StreamHandle> stream,
+                                   ShadowTlsClientOptions options, ShadowTlsOpenHandler handler);
+
 } // namespace clash_native::transport::proxy

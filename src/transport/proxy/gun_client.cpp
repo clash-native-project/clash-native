@@ -121,12 +121,17 @@ exec::task<void> GunClient::run_open(std::shared_ptr<GunClient> client,
         }
         auto stream =
             co_await async::bridge_sender<OpenResult>([entry, options](OpenHandler open) mutable {
-                gun::async_open_gun_stream(
+                std::shared_ptr<gun::GunStreamOpenAborter> handle;
+                gun::async_open_gun_stream_abortable(
                     entry->session, options,
-                    [open](OpenResult opened) mutable { open(std::move(opened)); });
+                    [open](OpenResult opened) mutable { open(std::move(opened)); }, &handle);
                 using AbortFn = async::CallbackAbortFn;
-                // No abort possible: gun stream open has no cancel handle.
-                return AbortFn{};
+                // Poison the eager stream; the late head drops at the state.
+                return AbortFn{[handle] {
+                    if (handle) {
+                        handle->abort();
+                    }
+                }};
             });
         if (stream) {
             guard->armed = false;

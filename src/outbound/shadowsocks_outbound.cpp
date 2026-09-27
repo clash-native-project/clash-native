@@ -1264,12 +1264,17 @@ class ShadowsocksConnectOperation final
                 [self, stream = std::move(stream), options = std::move(options)](
                     async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
                         done) mutable {
-                    transport::proxy::async_open_shadow_tls(
+                    auto handle = transport::proxy::async_open_shadow_tls_abortable(
                         std::move(*stream), std::move(options),
                         [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
                             done(std::move(opened));
                         });
-                    return async::CallbackAbortFn{[self] { self->abort(); }};
+                    return async::CallbackAbortFn{[self, handle] {
+                        self->abort();
+                        if (handle) {
+                            handle->abort();
+                        }
+                    }};
                 });
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
@@ -1303,12 +1308,17 @@ class ShadowsocksConnectOperation final
                 [self, stream = std::move(stream), options = std::move(options)](
                     async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
                         done) mutable {
-                    transport::proxy::async_open_restls(
+                    auto handle = transport::proxy::async_open_restls_abortable(
                         std::move(*stream), std::move(options),
                         [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
                             done(std::move(opened));
                         });
-                    return async::CallbackAbortFn{[self] { self->abort(); }};
+                    return async::CallbackAbortFn{[self, handle] {
+                        self->abort();
+                        if (handle) {
+                            handle->abort();
+                        }
+                    }};
                 });
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
@@ -1341,12 +1351,17 @@ class ShadowsocksConnectOperation final
                 [self, stream = std::move(stream), options = std::move(options)](
                     async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
                         done) mutable {
-                    transport::proxy::async_open_jls(
+                    auto handle = transport::proxy::async_open_jls_abortable(
                         std::move(*stream), std::move(options),
                         [done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
                             done(std::move(opened));
                         });
-                    return async::CallbackAbortFn{[self] { self->abort(); }};
+                    return async::CallbackAbortFn{[self, handle] {
+                        self->abort();
+                        if (handle) {
+                            handle->abort();
+                        }
+                    }};
                 });
         } catch (...) {
             self->finish(core::StreamOpenResult::failed(
@@ -1451,19 +1466,29 @@ class ShadowsocksConnectOperation final
                     obfs_result = co_await async::bridge_sender<core::Status>(
                         [self, wire](async::BridgeHandler<core::Status> done) mutable {
                             const auto options = self->obfs_options();
-                            ss::async_write_http_obfs_request(
+                            auto handle = ss::async_write_http_obfs_request_abortable(
                                 self->socket_, std::move(*wire), {options->host, options->port},
                                 [done](core::Status result) mutable { done(std::move(result)); });
-                            return async::CallbackAbortFn{[self] { self->abort(); }};
+                            return async::CallbackAbortFn{[self, handle] {
+                                self->abort();
+                                if (handle) {
+                                    handle->abort();
+                                }
+                            }};
                         });
                 } else {
                     obfs_result = co_await async::bridge_sender<core::Status>(
                         [self, wire](async::BridgeHandler<core::Status> done) mutable {
                             const auto options = self->obfs_options();
-                            ss::async_write_tls_obfs_request(
+                            auto handle = ss::async_write_tls_obfs_request_abortable(
                                 self->socket_, std::move(*wire), options->host,
                                 [done](core::Status result) mutable { done(std::move(result)); });
-                            return async::CallbackAbortFn{[self] { self->abort(); }};
+                            return async::CallbackAbortFn{[self, handle] {
+                                self->abort();
+                                if (handle) {
+                                    handle->abort();
+                                }
+                            }};
                         });
                 }
             } catch (...) {
@@ -1670,20 +1695,30 @@ class ShadowsocksConnectOperation final
                         [self, wire,
                          write_cipher](async::BridgeHandler<core::Status> done) mutable {
                             const auto options = self->obfs_options();
-                            ss::async_write_http_obfs_request(
+                            auto handle = ss::async_write_http_obfs_request_abortable(
                                 self->socket_, std::move(*wire), {options->host, options->port},
                                 [done](core::Status result) mutable { done(std::move(result)); });
-                            return async::CallbackAbortFn{[self] { self->abort(); }};
+                            return async::CallbackAbortFn{[self, handle] {
+                                self->abort();
+                                if (handle) {
+                                    handle->abort();
+                                }
+                            }};
                         });
                 } else {
                     obfs_result = co_await async::bridge_sender<core::Status>(
                         [self, wire,
                          write_cipher](async::BridgeHandler<core::Status> done) mutable {
                             const auto options = self->obfs_options();
-                            ss::async_write_tls_obfs_request(
+                            auto handle = ss::async_write_tls_obfs_request_abortable(
                                 self->socket_, std::move(*wire), options->host,
                                 [done](core::Status result) mutable { done(std::move(result)); });
-                            return async::CallbackAbortFn{[self] { self->abort(); }};
+                            return async::CallbackAbortFn{[self, handle] {
+                                self->abort();
+                                if (handle) {
+                                    handle->abort();
+                                }
+                            }};
                         });
                 }
             } catch (...) {

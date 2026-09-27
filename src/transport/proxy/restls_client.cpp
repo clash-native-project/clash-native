@@ -1096,6 +1096,19 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
         }
     }
 
+    void abort() noexcept {
+        auto self = shared_from_this();
+        try {
+            // timer_ shares the stream executor but outlives the stream
+            // move in open_restls_stream().
+            boost::asio::post(timer_.get_executor(), [self] {
+                self->finish(core::fail(restls_error(core::ErrorCode::cancelled,
+                                                     "ResTLS TLS handshake was cancelled")));
+            });
+        } catch (...) {
+        }
+    }
+
   private:
     void emit_tls(std::span<const std::uint8_t> data) {
         const auto bytes = to_bytes(data);
@@ -1351,6 +1364,25 @@ void async_open_restls(std::unique_ptr<io::StreamHandle> stream, RestlsClientOpt
     }
     std::make_shared<RestlsOpenOperation>(std::move(stream), std::move(options), std::move(handler))
         ->start();
+}
+std::shared_ptr<RestlsOpenAborter>
+async_open_restls_abortable(std::unique_ptr<io::StreamHandle> stream, RestlsClientOptions options,
+                            RestlsOpenHandler handler) {
+    if (!stream || !handler) {
+        async_open_restls(std::move(stream), std::move(options), std::move(handler));
+        return nullptr;
+    }
+    struct Handle final : public RestlsOpenAborter {
+        explicit Handle(std::shared_ptr<RestlsOpenOperation> operation)
+            : operation_(std::move(operation)) {}
+        void abort() noexcept override { operation_->abort(); }
+        std::shared_ptr<RestlsOpenOperation> operation_;
+    };
+    auto operation = std::make_shared<RestlsOpenOperation>(std::move(stream), std::move(options),
+                                                           std::move(handler));
+    auto handle = std::make_shared<Handle>(operation);
+    operation->start();
+    return handle;
 }
 
 } // namespace clash_native::transport::proxy

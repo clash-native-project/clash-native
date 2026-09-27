@@ -167,6 +167,17 @@ class TlsObfsWrite final : public std::enable_shared_from_this<TlsObfsWrite> {
                                  });
     }
 
+    void abort() noexcept {
+        auto self = shared_from_this();
+        try {
+            boost::asio::post(socket_->get_executor(), [self] {
+                boost::system::error_code ignored;
+                self->socket_->cancel(ignored);
+            });
+        } catch (...) {
+        }
+    }
+
   private:
     void finish(core::Status result) {
         if (completed_) {
@@ -327,6 +338,17 @@ class HttpObfsRequest final : public std::enable_shared_from_this<HttpObfsReques
             });
     }
 
+    void abort() noexcept {
+        auto self = shared_from_this();
+        try {
+            boost::asio::post(socket_->get_executor(), [self] {
+                boost::system::error_code ignored;
+                self->socket_->cancel(ignored);
+            });
+        } catch (...) {
+        }
+    }
+
   private:
     void finish(core::Status result) {
         if (completed_) {
@@ -429,6 +451,49 @@ void async_write_http_obfs_request(std::shared_ptr<boost::asio::ip::tcp::socket>
     std::make_shared<HttpObfsRequest>(std::move(socket), std::move(initial_payload),
                                       std::move(options), std::move(handler))
         ->start();
+}
+std::shared_ptr<ObfsRequestAborter> async_write_http_obfs_request_abortable(
+    std::shared_ptr<boost::asio::ip::tcp::socket> socket, std::vector<std::uint8_t> initial_payload,
+    HttpObfsClientOptions options, HttpObfsRequestHandler handler) {
+    struct Handle final : public ObfsRequestAborter {
+        explicit Handle(std::shared_ptr<HttpObfsRequest> operation)
+            : operation_(std::move(operation)) {}
+        void abort() noexcept override { operation_->abort(); }
+        std::shared_ptr<HttpObfsRequest> operation_;
+    };
+    auto operation = std::make_shared<HttpObfsRequest>(
+        std::move(socket), std::move(initial_payload), std::move(options), std::move(handler));
+    auto handle = std::make_shared<Handle>(operation);
+    operation->start();
+    return handle;
+}
+
+std::shared_ptr<ObfsRequestAborter>
+async_write_tls_obfs_request_abortable(std::shared_ptr<boost::asio::ip::tcp::socket> socket,
+                                       std::vector<std::uint8_t> initial_payload,
+                                       std::string server_name, TlsObfsRequestHandler handler) {
+    if (server_name.empty() || has_invalid_header_value(server_name)) {
+        async_write_tls_obfs_request(std::move(socket), std::move(initial_payload),
+                                     std::move(server_name), std::move(handler));
+        return nullptr;
+    }
+    auto wire = make_tls_client_hello(initial_payload, server_name);
+    if (wire.empty()) {
+        async_write_tls_obfs_request(std::move(socket), std::move(initial_payload),
+                                     std::move(server_name), std::move(handler));
+        return nullptr;
+    }
+    struct Handle final : public ObfsRequestAborter {
+        explicit Handle(std::shared_ptr<TlsObfsWrite> operation)
+            : operation_(std::move(operation)) {}
+        void abort() noexcept override { operation_->abort(); }
+        std::shared_ptr<TlsObfsWrite> operation_;
+    };
+    auto operation =
+        std::make_shared<TlsObfsWrite>(std::move(socket), std::move(wire), std::move(handler));
+    auto handle = std::make_shared<Handle>(operation);
+    operation->start();
+    return handle;
 }
 
 void async_read_http_obfs_response(std::shared_ptr<boost::asio::ip::tcp::socket> socket,

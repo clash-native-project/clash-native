@@ -41,6 +41,18 @@ void async_write_http_obfs_request(std::shared_ptr<boost::asio::ip::tcp::socket>
                                    std::vector<std::uint8_t> initial_payload,
                                    HttpObfsClientOptions options, HttpObfsRequestHandler handler);
 
+// Abort handle for an in-flight obfs request write: cancels the socket write;
+// the late terminal drops at the operation's completed_ guard.
+class ObfsRequestAborter {
+  public:
+    virtual ~ObfsRequestAborter() = default;
+    virtual void abort() noexcept = 0;
+};
+
+std::shared_ptr<ObfsRequestAborter> async_write_http_obfs_request_abortable(
+    std::shared_ptr<boost::asio::ip::tcp::socket> socket, std::vector<std::uint8_t> initial_payload,
+    HttpObfsClientOptions options, HttpObfsRequestHandler handler);
+
 // Consumes the HTTP simple-obfs 101 response. Any bytes received after the
 // response headers are returned for the Shadowsocks stream decoder.
 void async_read_http_obfs_response(std::shared_ptr<boost::asio::ip::tcp::socket> socket,
@@ -59,6 +71,11 @@ using TlsObfsResponseHandler = std::function<void(core::Result<std::vector<std::
 void async_write_tls_obfs_request(std::shared_ptr<boost::asio::ip::tcp::socket> socket,
                                   std::vector<std::uint8_t> initial_payload,
                                   std::string server_name, TlsObfsRequestHandler handler);
+
+std::shared_ptr<ObfsRequestAborter>
+async_write_tls_obfs_request_abortable(std::shared_ptr<boost::asio::ip::tcp::socket> socket,
+                                       std::vector<std::uint8_t> initial_payload,
+                                       std::string server_name, TlsObfsRequestHandler handler);
 
 // Wraps Shadowsocks wire bytes in fake TLS application records.
 void async_write_tls_obfs_records(std::shared_ptr<boost::asio::ip::tcp::socket> socket,

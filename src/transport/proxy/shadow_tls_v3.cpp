@@ -796,6 +796,19 @@ class ShadowTlsV3OpenOperation final
         }
     }
 
+    void abort() noexcept {
+        auto self = shared_from_this();
+        try {
+            // timer_ shares the stream executor but outlives the stream
+            // move in maybe_open().
+            boost::asio::post(timer_.get_executor(), [self] {
+                self->finish(core::fail(
+                    v3_error(core::ErrorCode::cancelled, "Shadow-TLS v3 handshake was cancelled")));
+            });
+        } catch (...) {
+        }
+    }
+
   private:
     void emit_tls(std::span<const std::uint8_t> data) {
         if (completed_) {
@@ -1003,6 +1016,25 @@ void async_open_shadow_tls_v3(std::unique_ptr<io::StreamHandle> stream,
     std::make_shared<ShadowTlsV3OpenOperation>(std::move(stream), std::move(options),
                                                std::move(handler))
         ->start();
+}
+std::shared_ptr<ShadowTlsOpenAborter>
+async_open_shadow_tls_v3_abortable(std::unique_ptr<io::StreamHandle> stream,
+                                   ShadowTlsClientOptions options, ShadowTlsOpenHandler handler) {
+    if (!stream || !handler) {
+        async_open_shadow_tls_v3(std::move(stream), std::move(options), std::move(handler));
+        return nullptr;
+    }
+    struct Handle final : public ShadowTlsOpenAborter {
+        explicit Handle(std::shared_ptr<ShadowTlsV3OpenOperation> operation)
+            : operation_(std::move(operation)) {}
+        void abort() noexcept override { operation_->abort(); }
+        std::shared_ptr<ShadowTlsV3OpenOperation> operation_;
+    };
+    auto operation = std::make_shared<ShadowTlsV3OpenOperation>(
+        std::move(stream), std::move(options), std::move(handler));
+    auto handle = std::make_shared<Handle>(operation);
+    operation->start();
+    return handle;
 }
 
 } // namespace clash_native::transport::proxy

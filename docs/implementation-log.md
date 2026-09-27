@@ -2709,3 +2709,28 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   pass. Left for follow-up: JLS/ResTLS/Shadow-TLS overlay opens still
   first-wins-drop at the caller (`self->abort()` closes the chain socket,
   not the handshake itself); `start_read/write_for_handler` stays detached.
+
+### 2026-09-27 — Abortable overlay, obfs, and gun-stream opens
+
+- JLS/ResTLS/Shadow-TLS(v3) open operations gained `abort()` (timer cancel
+  plus lower-stream close via `finish(cancelled)`, posted to the timer
+  executor that outlives the stream move) and `*_abortable` factories
+  returning `JlsOpenAborter`/`RestlsOpenAborter`/`ShadowTlsOpenAborter`
+  handles. Shadow-TLS v1/v2 additionally stops its `async_scope` drive.
+- All six overlay callers (ss plugin opens x3, trojan security overlay x3)
+  now hold both the parent `self->abort()` and the overlay handle in the
+  bridge aborter, so stop preempts the handshake instead of leaking to
+  timeout. The late terminal drops at each op's `completed_` guard.
+- simple-obfs request writes gained `ObfsRequestAborter` plus
+  `async_write_{http,tls}_obfs_request_abortable` (socket `cancel()`);
+  all six open-path sites (ss aead/legacy x4, ss2022 x2) wire the handle
+  alongside the parent abort.
+- `async_open_gun_stream_abortable` returns a `GunStreamOpenAborter` that
+  poisons the eager `GunStreamState` (parked/future reads/writes fail
+  fast); `GunClient::run_open` aborts it on stop. The late head drops at
+  the poisoned state.
+- Validation: Release build clean, 315/315 CTest pass (excluding the known
+  `UsesTheConfiguredDialerForPlainTcp` SEGV, pre-existing on clean tree);
+  `format-check` and `git diff --check` pass. Remaining gaps (not touched):
+  ss/trojan chained + UDP datagram resolve bridges, DNS `!box` inline
+  stubs (legit), tls/websocket inline stubs (legit).

@@ -55,5 +55,20 @@ using GunStreamHandler = std::function<void(core::Result<std::unique_ptr<io::Str
 void async_open_gun_stream(std::shared_ptr<io::ExchangeSession> session, GunStreamOptions options,
                            GunStreamHandler handler);
 
+// Abort handle for an in-flight gun stream open: poisons the eager stream so
+// parked and future reads/writes fail fast; the late head terminal then drops
+// at the poisoned state.
+class GunStreamOpenAborter {
+  public:
+    virtual ~GunStreamOpenAborter() = default;
+    virtual void abort() noexcept = 0;
+};
+
+// Abortable variant: on success the aborter is delivered through aborter_out
+// (may be nullptr to ignore); the handler still receives the eager handle.
+void async_open_gun_stream_abortable(std::shared_ptr<io::ExchangeSession> session,
+                                     GunStreamOptions options, GunStreamHandler handler,
+                                     std::shared_ptr<GunStreamOpenAborter> *aborter_out);
+
 } // namespace gun
 } // namespace clash_native::transport::proxy

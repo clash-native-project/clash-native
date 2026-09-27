@@ -615,6 +615,29 @@ class ShadowTlsOpenOperation final : public std::enable_shared_from_this<ShadowT
         self->finish(std::move(self->delayed_stream_));
     }
 
+    void abort() noexcept {
+        auto self = shared_from_this();
+        try {
+            // delay_timer_ shares the stream executor and outlives every
+            // stream move below; finish() closes whichever leg still exists.
+            boost::asio::post(delay_timer_.get_executor(), [self] {
+                if (self->delayed_stream_) {
+                    self->delayed_stream_->close();
+                    self->delayed_stream_.reset();
+                }
+                self->finish(core::fail(cancelled_error()));
+            });
+        } catch (...) {
+        }
+    }
+
+    void request_scope_stop() noexcept {
+        try {
+            scope_.request_stop();
+        } catch (...) {
+        }
+    }
+
     void finish(core::Result<std::unique_ptr<io::StreamHandle>> result) {
         if (completed_) {
             return;
@@ -661,6 +684,34 @@ void async_open_shadow_tls(std::unique_ptr<io::StreamHandle> stream, ShadowTlsCl
     std::make_shared<ShadowTlsOpenOperation>(std::move(stream), std::move(options),
                                              std::move(handler))
         ->start();
+}
+std::shared_ptr<ShadowTlsOpenAborter>
+async_open_shadow_tls_abortable(std::unique_ptr<io::StreamHandle> stream,
+                                ShadowTlsClientOptions options, ShadowTlsOpenHandler handler) {
+    if (!stream || !handler) {
+        async_open_shadow_tls(std::move(stream), std::move(options), std::move(handler));
+        return nullptr;
+    }
+    if (options.version == 3) {
+        return async_open_shadow_tls_v3_abortable(std::move(stream), std::move(options),
+                                                  std::move(handler));
+    }
+    struct Handle final : public ShadowTlsOpenAborter {
+        explicit Handle(std::shared_ptr<ShadowTlsOpenOperation> operation)
+            : operation_(std::move(operation)) {}
+        void abort() noexcept override {
+            operation_->abort();
+            // The v1/v2 open drives itself from an async_scope task; the
+            // scope would otherwise keep running until its co_awaits settle.
+            operation_->request_scope_stop();
+        }
+        std::shared_ptr<ShadowTlsOpenOperation> operation_;
+    };
+    auto operation = std::make_shared<ShadowTlsOpenOperation>(std::move(stream), std::move(options),
+                                                              std::move(handler));
+    auto handle = std::make_shared<Handle>(operation);
+    operation->start();
+    return handle;
 }
 
 } // namespace clash_native::transport::proxy

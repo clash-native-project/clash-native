@@ -819,5 +819,106 @@ void async_open_gun_stream(std::shared_ptr<io::ExchangeSession> session, GunStre
     opener->head = std::move(head);
     opener->start();
 }
+void async_open_gun_stream_abortable(std::shared_ptr<io::ExchangeSession> session,
+                                     GunStreamOptions options, GunStreamHandler handler,
+                                     std::shared_ptr<GunStreamOpenAborter> *aborter_out) {
+    struct Opener : public std::enable_shared_from_this<Opener> {
+        std::shared_ptr<io::ExchangeSession> session;
+        GunStreamOptions options;
+        GunStreamHandler handler;
+        io::ExchangeRequest head;
+        std::shared_ptr<GunRequestBody> request_body;
+        std::shared_ptr<GunStreamState> state;
+        struct Handle final : public GunStreamOpenAborter {
+            explicit Handle(std::weak_ptr<GunStreamState> state) : state_(std::move(state)) {}
+            void abort() noexcept override {
+                if (auto state = state_.lock()) {
+                    state->poison({core::ErrorCode::cancelled, "gun handshake cancelled"});
+                }
+            }
+            std::weak_ptr<GunStreamState> state_;
+        };
+        struct OpenBridge {
+            using receiver_concept = stdexec::receiver_tag;
+            std::shared_ptr<Opener> opener;
+            void set_value(io::StreamingExchangeResponse response) && noexcept {
+                auto self = std::move(opener);
+                if (response.response.status != 200) {
+                    self->state->poison({core::ErrorCode::protocol_framing,
+                                         "gun handshake saw unexpected HTTP status"});
+                    return;
+                }
+                self->state->attach_response_body(std::move(response.body));
+            }
+            void set_error(std::exception_ptr error) && noexcept {
+                auto self = std::move(opener);
+                core::Error failure{core::ErrorCode::transport_io, "gun handshake failed"};
+                try {
+                    std::rethrow_exception(std::move(error));
+                } catch (const core::Error &open_failure) {
+                    failure = open_failure;
+                } catch (...) {
+                }
+                self->state->poison(failure);
+            }
+            void set_stopped() && noexcept {
+                auto self = std::move(opener);
+                self->state->poison({core::ErrorCode::cancelled, "gun handshake cancelled"});
+            }
+        };
+        void start(std::shared_ptr<GunStreamOpenAborter> *aborter_out) {
+            auto self = shared_from_this();
+            request_body = std::make_shared<GunRequestBody>(options.executor);
+            state = std::make_shared<GunStreamState>(request_body, options.executor);
+            if (aborter_out) {
+                *aborter_out = std::make_shared<Handle>(state);
+            }
+            auto state_copy = state;
+            auto user_handler = std::move(handler);
+            handler = [user_handler = std::move(user_handler),
+                       state_copy](core::Result<std::unique_ptr<io::StreamHandle>> result) mutable {
+                // The state is already poisoned on the abort path; the open
+                // below only re-delivers the eager handle.
+                (void)state_copy;
+                user_handler(std::move(result));
+            };
+            handler(std::unique_ptr<io::StreamHandle>(std::make_unique<GunStreamHandle>(state)));
+            io::StreamingExchangeRequest streaming;
+            streaming.request = std::move(head);
+            streaming.body = request_body;
+            streaming.content_length = std::nullopt;
+            streaming.head_deadline_only = true;
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = session->exchange_streaming(std::move(streaming), options.deadline);
+            async::start_with_receiver(std::move(sender), OpenBridge{self});
+        }
+    };
+    if (!session) {
+        handler(core::fail(
+            {core::ErrorCode::configuration, "gun stream requires an exchange session"}));
+        return;
+    }
+    if (!options.executor) {
+        handler(core::fail({core::ErrorCode::configuration, "gun stream requires an executor"}));
+        return;
+    }
+    const auto service = options.service_name.empty() ? "GunService" : options.service_name;
+    const auto target = service.front() == '/' ? service : "/" + service + "/Tun";
+    io::ExchangeRequest head;
+    head.method = "POST";
+    head.scheme = "https";
+    head.authority = options.host;
+    head.target = target;
+    head.headers.push_back({"content-type", "application/grpc"});
+    head.headers.push_back(
+        {"user-agent", options.user_agent.empty() ? "grpc-go/1.36.0" : options.user_agent});
+    head.keep_alive = true;
+    auto opener = std::make_shared<Opener>();
+    opener->session = std::move(session);
+    opener->options = std::move(options);
+    opener->handler = std::move(handler);
+    opener->head = std::move(head);
+    opener->start(aborter_out);
+}
 
 } // namespace clash_native::transport::proxy::gun

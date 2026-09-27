@@ -712,6 +712,19 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
         }
     }
 
+    void abort() noexcept {
+        auto self = shared_from_this();
+        try {
+            // timer_ shares the stream executor but outlives the stream
+            // move in maybe_open().
+            boost::asio::post(timer_.get_executor(), [self] {
+                self->finish(core::fail(
+                    jls_error(core::ErrorCode::cancelled, "JLS TLS handshake was cancelled")));
+            });
+        } catch (...) {
+        }
+    }
+
   private:
     void emit_tls(std::span<const std::uint8_t> data) {
         if (completed_) {
@@ -863,6 +876,25 @@ void async_open_jls(std::unique_ptr<io::StreamHandle> stream, JlsClientOptions o
     }
     std::make_shared<JlsOpenOperation>(std::move(stream), std::move(options), std::move(handler))
         ->start();
+}
+std::shared_ptr<JlsOpenAborter> async_open_jls_abortable(std::unique_ptr<io::StreamHandle> stream,
+                                                         JlsClientOptions options,
+                                                         JlsOpenHandler handler) {
+    if (!stream || !handler) {
+        async_open_jls(std::move(stream), std::move(options), std::move(handler));
+        return nullptr;
+    }
+    struct Handle final : public JlsOpenAborter {
+        explicit Handle(std::shared_ptr<JlsOpenOperation> operation)
+            : operation_(std::move(operation)) {}
+        void abort() noexcept override { operation_->abort(); }
+        std::shared_ptr<JlsOpenOperation> operation_;
+    };
+    auto operation = std::make_shared<JlsOpenOperation>(std::move(stream), std::move(options),
+                                                        std::move(handler));
+    auto handle = std::make_shared<Handle>(operation);
+    operation->start();
+    return handle;
 }
 
 } // namespace clash_native::transport::proxy

@@ -24,7 +24,19 @@ struct RestlsClientOptions {
 
 using RestlsOpenHandler = std::function<void(core::Result<std::unique_ptr<io::StreamHandle>>)>;
 
+// Abort handle for an in-flight ResTLS open: timer cancel plus lower-stream
+// close; the late terminal drops at the operation's completed_ guard.
+class RestlsOpenAborter {
+  public:
+    virtual ~RestlsOpenAborter() = default;
+    virtual void abort() noexcept = 0;
+};
+
 void async_open_restls(std::unique_ptr<io::StreamHandle> stream, RestlsClientOptions options,
                        RestlsOpenHandler handler);
+
+std::shared_ptr<RestlsOpenAborter>
+async_open_restls_abortable(std::unique_ptr<io::StreamHandle> stream, RestlsClientOptions options,
+                            RestlsOpenHandler handler);
 
 } // namespace clash_native::transport::proxy
