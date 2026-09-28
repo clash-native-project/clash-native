@@ -15,6 +15,7 @@
 
 TEST(ProxyServerTest, TracksLifecycle) {
     auto &runtime = clash_native::runtime::AsioRuntime::instance();
+    runtime.start();
     clash_native::proxy::ProxyServer proxy_server(runtime, {boost::asio::ip::tcp::v4(), 0});
 
     EXPECT_FALSE(proxy_server.running());
@@ -28,6 +29,10 @@ TEST(ProxyServerTest, TracksLifecycle) {
 
     proxy_server.stop();
     EXPECT_FALSE(proxy_server.running());
+    // The runtime was started here, so stop it: otherwise the pending
+    // use_sender accept completes during process teardown into a dead
+    // async_scope.
+    runtime.stop();
 }
 
 TEST(ProxyServerTest, DirectOutboundDoesNotUseTheSystemResolver) {

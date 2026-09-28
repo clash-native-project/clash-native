@@ -2808,3 +2808,33 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   2026-09-27 stash check), `TracksLifecycle` passes standalone (exit 0)
   and only fails under ctest teardown ordering (same park note as 2026-09-27
   accept_tcp entry).
+
+### 2026-09-28 - Fix callback_sender inline-terminal UAF and proxy teardown race
+
+- `callback_sender::OpState::start()` hoists `initiate_` into a local
+  before invoking it: an inline terminal (e.g. `ProbeDnsDialer`'s
+  `just(opened)`) delivers through the receiver synchronously, and the
+  erased `any_sender` chain destroys the whole opstate (including the
+  member `initiate_`) before the initiation returns. The old code then
+  touched `box->reset()` on a moved-from lambda (`baadf00d`) and crashed
+  in `optional::reset`. Orphan-aborter dispatch now runs only off the
+  heap flag, never off members after the initiation returns. This fixes
+  `DnsTransportTest.UsesTheConfiguredDialerForPlainTcp` (was SEGV, now
+  passes). Proven with PDB-symbolicated CDB: fault in
+  `exchange::<lambda_1>::operator()` via `CallbackSender::OpState::start`.
+- `ProxyServer::stop()` drains `accept_scope_.on_empty()` on the owner
+  strand before returning, closes the acceptor before requesting scope
+  stop, and `TracksLifecycle` now owns the runtime (`start`/`stop` in
+  the test): the `use_sender` accept op used to complete during process
+  teardown into a dead scope (`__nest_receiver::__complete` throwing
+  through mutex lock at `io_context` shutdown). `TracksLifecycle` now
+  passes; `AsioRuntime::stop()` also drops its already-stopped debug log
+  (dead spdlog registry at teardown AV).
+- Validation: RelWithDebInfo build clean, both target tests pass,
+  `format-check` + `git diff --check` pass. Full suite: 318/321 -- the
+  3 remaining SEGFAULTs (`ExchangesOverDot`, `ReusesDotTlsSession`,
+  `MultiplexesDoh2`) reproduce on the stashed clean tree
+  (`89d0eaf` baseline: 2 of them SEGFAULT there too; full-suite run adds
+  the third), all heap-use-after-free in TLS/HTTP2 write paths, not from
+  this change. `ReloadsTheRuntimeSnapshot` passes isolated; it only
+  SEGFAULTs in the full-suite run (same heap pattern).

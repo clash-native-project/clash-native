@@ -109,8 +109,12 @@ template <class Sigs, class Initiate, class Translate> class CallbackSender {
             stop_callback_.emplace(token, StopFn{this});
             auto shared = shared_;
             OpState *self = this;
+            // Hoist the initiation off the operation state: an inline
+            // terminal destroys the chain (and this state) through the
+            // receiver, so `initiate_` must not be on the call stack.
+            auto initiate = std::move(initiate_);
             try {
-                CallbackAbortFn aborter = initiate_([shared, self](auto &&...args) {
+                CallbackAbortFn aborter = initiate([shared, self](auto &&...args) {
                     // Terminal from the internal work. First claimer wins;
                     // the flag lives on the heap so this stays sound even if
                     // the operation state is already gone (claim first, touch
@@ -130,17 +134,32 @@ template <class Sigs, class Initiate, class Translate> class CallbackSender {
                                      std::forward<decltype(args)>(args)...);
                 });
                 // A stop (or an inline terminal) may have settled the
-                // operation while the initiation was still running; the
-                // returned aborter then has no operation left to protect, so
-                // run it immediately instead of leaking the underlying work.
+                // operation while the initiation was still running. When the
+                // initiation returns, the operation state (`this`) may
+                // already be gone: an inline terminal delivers through the
+                // receiver, which can destroy the whole chain (e.g. an erased
+                // any_sender opstate owning this OpState). So the returned
+                // aborter must be dispatched without touching any member:
+                // claim settlement on the heap flag and run the freshly
+                // returned aborter instead of leaking the underlying work.
+                // When a stop won instead, the stop path already ran the
+                // stored aborter, and this fresh one still needs invoking.
                 CallbackAbortFn orphan;
+                CallbackAbortFn stored;
                 {
                     std::lock_guard lock(shared->mutex);
                     if (shared->done) {
+                        // Stop (or an inline terminal) already settled while
+                        // the initiation was running; the operation state may
+                        // already be gone, so only touch the heap flag here.
                         orphan = std::move(aborter);
+                        stored = std::move(shared->aborter);
                     } else {
                         shared->aborter = std::move(aborter);
                     }
+                }
+                if (stored) {
+                    invoke_aborter(stored);
                 }
                 if (orphan) {
                     invoke_aborter(orphan);
@@ -196,6 +215,14 @@ template <class Sigs, class Initiate, class Translate> class CallbackSender {
         // Declared last so it is destroyed first.
         std::optional<StopCallback> stop_callback_;
     };
+
+    // The sender must be connected as an rvalue: the initiation and the
+    // translation are moved into the operation state, so an inline terminal
+    // can never observe a moved-from sender member through `initiate_`.
+    // The deleted lvalue overload keeps a const/mutable lvalue sender from
+    // silently compiling through the member connect below.
+    template <stdexec::receiver Rcvr>
+    OpState<Rcvr> connect(CallbackSender &self, Rcvr receiver) = delete;
 
     template <stdexec::receiver Rcvr> OpState<Rcvr> connect(Rcvr receiver) && {
         return OpState<Rcvr>(std::move(initiate_), std::move(translate_), std::move(receiver));

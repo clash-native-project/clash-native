@@ -1,5 +1,5 @@
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/core/base64.hpp>
+#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
 #include <clash_native/proxy/tcp_relay.hpp>
@@ -55,6 +55,17 @@ core::Error listener_error(std::string_view operation, const boost::system::erro
     return {core::ErrorCode::transport_io, fmt::format("failed to {} proxy listener", operation),
             std::error_code(error.value(), std::system_category())};
 }
+
+// Detached drain receiver: releases the stop semaphore; errors are
+// impossible here (on_empty only fails on misuse, and the loop swallows
+// its own failures), so terminate rather than hang the stop path.
+struct DetachedRelease {
+    using receiver_concept = stdexec::receiver_tag;
+    std::binary_semaphore *completed;
+    void set_value() && noexcept { completed->release(); }
+    void set_error(std::exception_ptr) && noexcept { std::terminate(); }
+    void set_stopped() && noexcept { completed->release(); }
+};
 
 } // namespace
 
@@ -338,12 +349,28 @@ void ProxyServer::stop() noexcept {
     std::binary_semaphore completed(0);
     boost::asio::dispatch(runtime_.serialized_executor(), [this, &completed] {
         stop_on_owner();
-        completed.release();
+        // The accept loop only exits after its in-flight accept completes
+        // stopped; draining the scope here keeps the spawn's __active_
+        // count alive until the task (and its use_sender op) is destroyed,
+        // instead of racing the ProxyServer destructor at teardown. The
+        // drain runs on the owner strand, and the accept completion posts
+        // back here, so stop only returns once the loop is gone.
+        auto drained =
+            accept_scope_.on_empty() | stdexec::then([&completed] { completed.release(); });
+        async::start_with_receiver(std::move(drained), DetachedRelease{&completed});
     });
     completed.acquire();
 }
 
 void ProxyServer::stop_on_owner() noexcept {
+    // Destroy the pending accept before requesting scope stop: the
+    // use_sender accept op completes through the IO thread, which can
+    // otherwise race process teardown (io_context shutdown completing the
+    // accept into a dying scope). Closing first turns the in-flight accept
+    // into an immediate error on the owner strand.
+    boost::system::error_code ignored;
+    acceptor_.cancel(ignored);
+    acceptor_.close(ignored);
     try {
         accept_scope_.request_stop();
     } catch (...) {
@@ -355,9 +382,6 @@ void ProxyServer::stop_on_owner() noexcept {
     }
     resolver_requests_.clear();
 
-    boost::system::error_code ignored;
-    acceptor_.cancel(ignored);
-    acceptor_.close(ignored);
     if (socks5_udp_listener_) {
         socks5_udp_listener_->stop();
         socks5_udp_listener_.reset();

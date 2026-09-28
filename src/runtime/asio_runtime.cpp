@@ -111,18 +111,23 @@ void AsioRuntime::start() {
 
 void AsioRuntime::stop() {
     std::vector<std::thread> threads;
+    bool already_stopped = false;
     {
         std::lock_guard lock(lifecycle_mutex_);
         if (!started_.load()) {
-            spdlog::debug("Asio runtime stop requested while already stopped");
-            return;
+            already_stopped = true;
+        } else {
+            stopping_ = true;
+            work_guard_->reset();
+            work_guard_.reset();
+            threads.swap(threads_);
         }
-
-        spdlog::debug("Stopping Asio runtime");
-        stopping_ = true;
-        work_guard_->reset();
-        work_guard_.reset();
-        threads.swap(threads_);
+    }
+    // Log outside the mutex and only while the spdlog registry is alive:
+    // this singleton can be destroyed during process teardown after the
+    // logger registry, and logging there dereferences a dead registry.
+    if (already_stopped) {
+        return;
     }
 
     for (auto &thread : threads) {
@@ -138,7 +143,6 @@ void AsioRuntime::stop() {
         stopping_ = false;
         io_context_->restart();
     }
-    spdlog::debug("Asio runtime stopped");
 }
 
 } // namespace clash_native::runtime
