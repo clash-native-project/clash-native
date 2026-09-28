@@ -2838,3 +2838,39 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   the third), all heap-use-after-free in TLS/HTTP2 write paths, not from
   this change. `ReloadsTheRuntimeSnapshot` passes isolated; it only
   SEGFAULTs in the full-suite run (same heap pattern).
+
+### 2026-09-28 - Remaining SEGFAULT triage: BoringSSL heap corruption, not session pumps
+
+- Full suite: 318/321. Remaining: `ExchangesOverDot` (127),
+  `ReusesDotTlsSession` (129) deterministic SEGFAULT; `Reloads...` (180)
+  flakes only in full-suite runs (passes isolated 3/3 and in proxy-group
+  runs). All Doh2 tests pass, including `MultiplexesDoh2` 3/3 isolated.
+- Evidence chain (PDB-symbolicated CDB on each):
+  - 127 post-fix: fault moved from `run_write_loop` TLS write into
+    `bssl::SSLAEADContext::Create <- tls13_set_traffic_key <-
+    do_read_client_finished <- tls13_server_handshake <-
+    SSL_do_handshake` on the *test server* handshake path
+    (`dns_transport_test.cpp:665`).
+  - `RejectsUntrustedDotCertificate` (passes) shows the same heap
+    corruption signature at thread teardown -- the corruption is present
+    even when the test passes, so the session pump code is not the
+    writer.
+  - `Reloads...` under debugger: corruption at
+    `make_shared<ProxySession>` inside `run_accept_loop
+    (proxy_server.cpp:474)` -- again a bare allocation point, no TLS in
+    the frame. Same delayed-detection pattern.
+- Ruled out: `TlsStream::async_write` buffer ownership (tried owning the
+  bytes in the sender chain; identical crash, reverted), DoT
+  read/write pump sharing `tls_stream_` (snapshot experiment; identical
+  crash, reverted -- and the final stack has no session frame at all).
+- Working hypothesis: BoringSSL (vcpkg overlay `third_party/vcpkg/ports/
+  boringssl`, linked as `OpenSSL::SSL/Crypto`) heap corruption under
+  concurrent handshakes on this box. The test binary links OpenSSL
+  headers directly (`openssl/evp.h` etc. in the test) against the
+  BoringSSL overlay, and both DoT tests drive a real client+server TLS
+  1.3 handshake on loopback workers. Not proven (needs page-heap, which
+  requires elevation: gflags 740). Next step: run 127 alone under
+  elevated page-heap, or pin whether the corruption predates the
+  coroutine migration by testing an older tag.
+- No code changed in this round (experiments reverted, tree clean);
+  `format-check` + `git diff --check` pass.
