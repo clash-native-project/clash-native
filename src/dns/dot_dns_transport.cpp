@@ -304,10 +304,10 @@ class DotDnsTransport::Session final
         } catch (...) {
         }
         self->write_in_progress_ = false;
-        if (!self->stopped_ && !self->retired_ && generation == self->connection_generation_ &&
-            self->connected_) {
-            self->ensure_write_loop(generation);
-        }
+        // Do not re-arm from the tail: this runs inside the completing
+        // task's own unwind (__complete path), and ensure_write_loop would
+        // spawn a fresh task frame re-entrantly (stack overflow under the
+        // test's write burst). New arrivals re-arm through exchange().
         co_return;
     }
 

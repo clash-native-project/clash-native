@@ -1066,6 +1066,7 @@ class TlsClientHandshakeOperationImpl final
         if (completed_) {
             return;
         }
+        scope_anchor_ = shared_from_this();
         scope_.spawn(run_handshake(shared_from_this()));
     }
 
@@ -1157,6 +1158,9 @@ class TlsClientHandshakeOperationImpl final
             stream_.reset();
         }
         auto handler = std::move(handler_);
+        // Release the anchor only after the terminal is delivered: the
+        // completing task still needs scope_ alive while unwinding.
+        auto anchor = std::move(scope_anchor_);
         if (handler) {
             handler(std::move(result));
         }
@@ -1217,6 +1221,12 @@ class TlsClientHandshakeOperationImpl final
     TlsClientHandler handler_;
     std::shared_ptr<boost::asio::ssl::context> context_;
     std::unique_ptr<net::TlsStream> stream_;
+    // Lifetime anchor: tasks spawned on scope_ hold only `self` (this same
+    // object). When finish() runs the caller's continuation inline, the
+    // continuation may drop the last external owner; without this anchor
+    // scope_ dies while the completing task still unwinds through
+    // __scope::__complete (page-heap mutex AV). Released in finish().
+    std::shared_ptr<void> scope_anchor_;
     exec::async_scope scope_;
     bool completed_ = false;
     RealityState reality_state_{};

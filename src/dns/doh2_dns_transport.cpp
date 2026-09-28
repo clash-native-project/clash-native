@@ -199,6 +199,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
                 // Per-request deadline task: fires once at the deadline;
                 // the map lookup drops it when the exchange already won.
                 // Bounded by the deadline, so no stop is ever requested.
+                self->scope_anchor_ = self;
                 self->scope_.spawn(run_deadline(self, query_id, owned_deadline));
                 return async::CallbackAbortFn{
                     [self, query_id] { self->fail_pending(query_id, cancelled_error()); }};
@@ -400,6 +401,9 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         // exchange still terminates on its own deadline and its late
         // terminal finds no pending and is dropped.
         auto handler = std::move(pending->handler);
+        if (pending_.empty()) {
+            scope_anchor_.reset();
+        }
         if (handler) {
             handler(core::fail(std::move(error)));
         }
@@ -417,6 +421,9 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
             retired_ = true;
         }
         auto handler = std::move(pending->handler);
+        if (pending_.empty()) {
+            scope_anchor_.reset();
+        }
         if (handler) {
             handler(std::move(result));
         }
@@ -468,6 +475,11 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     bool verify_peer_;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
     std::shared_ptr<io::ExchangeSession> http_session_;
+    // Lifetime anchor (same shape as the TLS handshake operation): tasks
+    // spawned on scope_ hold only `self`; finish paths run continuations
+    // inline, which may drop the last owner while a task still unwinds
+    // through __complete. Released after the terminal is delivered.
+    std::shared_ptr<void> scope_anchor_;
     // Owns the connect/exchange chain tasks, which always end with a value.
     exec::async_scope scope_;
     std::unordered_map<std::uint16_t, std::shared_ptr<Pending>> pending_;

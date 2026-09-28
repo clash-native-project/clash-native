@@ -2874,3 +2874,34 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   coroutine migration by testing an older tag.
 - No code changed in this round (experiments reverted, tree clean);
   `format-check` + `git diff --check` pass.
+
+### 2026-09-28 - Fix scope-lifetime AVs: TLS anchor, DoT tail, DoH2 anchor
+
+- Page-heap (user-enabled gflags, since disabled) gave the first live
+  catch: `mtx_do_lock` AV in `async_scope::__complete`, completing a TLS
+  handshake write chain (`handshake_op -> write_op<StreamHandleAdapter>
+  -> StopReceiver -> TcpStream write -> io_context::run`). The scope
+  mutex was already freed when the terminal unwound -- scope died with
+  its owner while the completing task was still on the stack. This
+  retracts the BoringSSL hypothesis from the prior triage entry.
+- `tls_client.cpp`: `TlsClientHandshakeOperationImpl` gains
+  `scope_anchor_` (self-pin set in `configure_and_handshake`, released
+  in `finish()` after the terminal is delivered), so the scope outlives
+  the completing handshake task even when the continuation drops the
+  last owner inline.
+- `dot_dns_transport.cpp`: `run_write_loop` no longer re-arms itself
+  from its tail. The tail runs inside the completing task's own unwind;
+  `ensure_write_loop` there spawned a fresh task frame re-entrantly and
+  the new stack showed `run_write_loop -> ensure_write_loop ->
+  run_write_loop` recursion ending in stack overflow. New arrivals
+  re-arm through `exchange()`.
+- `doh2_dns_transport.cpp`: Session gains the same `scope_anchor_`
+  discipline (set on first exchange spawn, released when pending
+  drains), covering the identical inline-terminal shape.
+- Validation: DoT pair 2/2 pass; DoH2 pair + DNS group + proxy group
+  pass (16/16 in the grouped run); Socks5 group 5/5. Full suite:
+  319/321 unit (remaining 2 SEGFAULTs -- `ExchangesOverDoh2`,
+  `KeepsHttp11Keepalive` -- both pass isolated/retry and are
+  order-dependent flakes in the full run; interop Go suite has a
+  separate QUIC/TLS-cert failure set, out of scope). `format-check` +
+  `git diff --check` pass.
