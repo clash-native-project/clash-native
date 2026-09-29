@@ -15,17 +15,19 @@
 // async_scope's __complete touches scope->__active_ as its first access on
 // memory the task frame may already have freed (frame destroy runs inside
 // await_resume's scope_guard, before __complete). Four ASan rounds proved
-// every scope variant dies the same way: owner's scope_, frame-held
-// DetachedScope (direct or via wrapper frame), sentinel second spawn
-// (its own __complete races the same teardown).
+// every owner-tied scope variant dies the same way: owner's scope_,
+// frame-held DetachedScope (direct or via wrapper frame), sentinel second
+// spawn (its own __complete races the same teardown).
 //
-// Fix: the heap async_scope is intentionally never deleted (one 104-byte
-// leak per detached task, reclaimed at process exit). A leaked scope is
-// always alive for __complete: no UAF by construction. Detached tasks are
-// teardown-race escapes (deadlines, UDP control loops), not steady-state
-// load; the leak is bounded by detached-task count. exec::task drives
-// through async_scope::spawn's internal submit path (tasks are awaitable,
-// not directly connectable -- five rounds of connect/submit/start_detached
+// Fix: detached tasks share one process-lifetime heap async_scope that is
+// intentionally never deleted (a single 104-byte allocation, reclaimed at
+// process exit). The scope outlives every owner by construction, so
+// __complete always touches live memory: no UAF. Sharing is safe -- spawn
+// only touches the atomic active count plus the never-fired stop source;
+// detached tasks never request_stop and are never drained via on_empty,
+// so no join ordering exists to violate. exec::task drives through
+// async_scope::spawn's internal submit path (tasks are awaitable, not
+// directly connectable -- five rounds of connect/submit/start_detached
 // attempts confirmed no public sender path exists for bare tasks).
 
 #include <exec/async_scope.hpp>
@@ -60,16 +62,21 @@ exec::task<void> detach_wrap(std::shared_ptr<DetachedScope> scope, MakeTask make
     co_return;
 }
 
+// Process-lifetime scope shared by all detached tasks. Intentionally
+// leaked (one allocation, reclaimed at exit): outlives every owner, so
+// __complete always touches live memory. See ownership note above.
+inline exec::async_scope &detached_scope() {
+    static auto *scope = new exec::async_scope{};
+    return *scope;
+}
+
 template <typename MakeTask>
     requires std::invocable<MakeTask &, std::shared_ptr<DetachedScope>> &&
              std::same_as<std::invoke_result_t<MakeTask &, std::shared_ptr<DetachedScope>>,
                           exec::task<void>>
 void spawn_detached(MakeTask &&make_task) {
     auto scope = std::make_shared<DetachedScope>();
-    // Intentionally leaked heap scope: __complete's scope->__active_
-    // access is always alive. See ownership note above.
-    auto *leaked = new exec::async_scope{};
-    leaked->spawn(detach_wrap(scope, std::forward<MakeTask>(make_task)));
+    detached_scope().spawn(detach_wrap(scope, std::forward<MakeTask>(make_task)));
 }
 
 } // namespace clash_native::async

@@ -3014,3 +3014,14 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   `#194` test `--gtest_repeat=20` 20/20 with zero heap-use-after-free
   (only the documented per-task immortal-scope leaks remain, reported by
   LeakSanitizer at exit). Windows `RelWithDebInfo` build passes.
+
+### 2026-09-30 - Elegant #194 scope: share one process-lifetime detached scope
+
+- Replaced the per-task leaked `new exec::async_scope` in
+  `async::spawn_detached` with a single function-local `detached_scope()`
+  singleton (one 104-byte allocation, never deleted, reclaimed at exit).
+  Sharing is safe: spawn only touches the atomic active count and the
+  never-fired stop source; detached tasks never request_stop/on_empty.
+- Validation (Linux ASan): `Socks5ProxyTest.*` 5/5, target repeat-20 20/20,
+  zero heap-use-after-free and zero LeakSanitizer output (previously 12320
+  bytes in 140 allocations). Windows `RelWithDebInfo` build passes.
