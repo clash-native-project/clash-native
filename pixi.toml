@@ -21,6 +21,14 @@ lldb = ">=22.1.8,<23"
 # /usr/include headers are mixed in with `-target x86_64-linux-gnu.2.17`.
 [target.linux-64.dependencies]
 zig = ">=0.16.0,<0.17"
+# Full LLVM toolchain (ASan/debug lane): clang + libc++ headers come from
+# clangxx/libstdcxx-devel + sysroot; zig is NOT used here. Keep the zig
+# portable-release lane and this lane separate, never mix their headers.
+clang = ">=23.1.2,<24"
+clangxx = ">=23.1.2,<24"
+lld = ">=23.1.2,<24"
+compiler-rt = ">=23.1.2,<24"
+llvm = ">=23.1.2,<24"
 curl = "*"
 unzip = "*"
 zip = "*"

@@ -4,15 +4,15 @@ Linux is a build/validation target for memory-safety diagnosis only
 (`#194` Socks5 UDP SEGFAULT). It is not a release target: no portable
 artifact, no glibc-floor promise, no coverage claim beyond the named scope.
 
-## Layout
-
-- Toolchain: pixi-pinned `zig 0.16.0` (`[target.linux-64.dependencies]`
-  in `pixi.toml`), providing `zig c++` for portable experiments.
+- Toolchain: pixi-pinned `zig 0.16.0` (portable-release lane) plus full
+  LLVM `clang/clangxx/lld/compiler-rt/llvm 23.1.2` (ASan/debug lane),
+  both under `[target.linux-64.dependencies]` in `pixi.toml`. The two
+  lanes share nothing: zig uses bundled libc++, pixi-clang uses
+  conda `libstdcxx-devel` + `sysroot_linux-64`.
 - Linux env lives in `.pixi-linux/` (detached-environments, WSL-only,
   git-ignored) so the Windows `.pixi/` is never clobbered: each OS runs
   its own `pixi install`. The WSL global config
   (`~/.pixi/config.toml` inside Debian) points at
-  `/mnt/d/Project/cpp/clash-native/.pixi-linux`.
 - Verified 2026-09-29: `zig c++ -target x86_64-linux-gnu.2.17 -std=c++20`
   builds a libc++ hello with no system-header mixing (`ldd` shows no
   `libstdc++`/`libc++.so`); the C++ runtime is statically linked.
@@ -35,12 +35,10 @@ artifact, no glibc-floor promise, no coverage claim beyond the named scope.
 - `zig cc -fsanitize=address` is unsupported upstream (no ASan runtime
   shipped; `__asan_unregister_elf_globals` undefined). Do not wire
   sanitizers into zig wrappers.
-- Memory bugs: use system `clang++-19 -fsanitize=address` (Debian ships
-  `libclang_rt.asan-x86_64.so` + `libclang_rt.asan_static-x86_64.a`;
-  verified on a heap-overflow probe). Known-good link consumes both
-  runtime files as local operands plus `-Wl,--allow-shlib-undefined`
-  for zig's bundled glibc-2.17 objects, with `LD_LIBRARY_PATH` covering
-  the ASan `.so` at runtime.
+- Memory bugs: use pixi `clang++ 23.1.2 -fsanitize=address` (conda
+  `compiler-rt` ships `lib/libclang_rt.asan-x86_64.so`; verified
+  2026-09-29 on hello + heap-overflow probes, `libstdc++.so.6` resolves
+  to the pixi env). No manual runtime operands, no `LD_LIBRARY_PATH`.
 - The deleted `scripts/zig-cc.sh`, `scripts/zig-cxx.sh`, and
   `cmake/toolchains/debian-zig-cc.cmake` mixed zig driver + system
   libstdc++ + clang-19 ASan runtime and are removed; do not resurrect.

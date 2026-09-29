@@ -2979,3 +2979,13 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validation: `zig c++ -target x86_64-linux-gnu.2.17` hello builds and
   runs (no libstdc++/libc++.so in `ldd`); `format-check` +
   `git diff --check` pass. No build/test run this round per instruction.
+
+### 2026-09-30 - Pin full LLVM toolchain for Linux ASan lane
+
+- `pixi.toml` `[target.linux-64]`: added `clang/clangxx/lld/compiler-rt/llvm
+  >=23.1.2,<24` (ASan/debug lane) next to `zig 0.16.0` (portable-release
+  lane). The lanes share nothing: zig uses bundled libc++, pixi-clang uses
+  conda `libstdcxx-devel` + `sysroot_linux-64`.
+- Validation: pixi `clang++ 23.1.2 -fsanitize=address` builds and runs a
+  hello (`libstdc++.so.6` resolves to the pixi env) and catches a
+  heap-buffer-overflow probe. `format-check` + `git diff --check` pass.
