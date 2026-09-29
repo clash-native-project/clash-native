@@ -2962,3 +2962,20 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - The two hanging proxy tests set 60s: keepalive + upgrade teardown now
   waits out the upstream deadline instead of the full 5 minutes.
 - Validation: both tests pass at ~60s each (was ~300s ctest-killed).
+
+### 2026-09-30 - WSL Debian diagnosis lane (zig c++ + platform doc)
+
+- `pixi.toml`: `platforms = ["win-64", "linux-64"]`, `[target.linux-64]`
+  pins `zig >=0.16.0,<0.17` plus curl/unzip/autotools helpers missing
+  from the Debian WSL image. C++ uses `zig c++` bundled LLVM libc++
+  (static); no `/usr/include` mixing with `-target x86_64-linux-gnu.2.17`.
+- Linux env moved to `.pixi-linux/` (WSL `detached-environments`,
+  git-ignored) so Windows `.pixi/` is never clobbered; deleted the
+  skew-mixing `scripts/zig-cc.sh`, `scripts/zig-cxx.sh`, and
+  `cmake/toolchains/debian-zig-cc.cmake`.
+- Added `docs/platform/debian.md` (diagnosis-only scope, libc++ rule,
+  ASan-via-system-clang-19 rule) and linked it from
+  `docs/platform/README.md`.
+- Validation: `zig c++ -target x86_64-linux-gnu.2.17` hello builds and
+  runs (no libstdc++/libc++.so in `ldd`); `format-check` +
+  `git diff --check` pass. No build/test run this round per instruction.
