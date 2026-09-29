@@ -1,2 +1,6 @@
 # SCM syntax highlighting & preventing 3-way merges
 pixi.lock merge=binary linguist-language=YAML linguist-generated=true -diff
+
+# Linux-executed shell/configure scripts must keep LF (WSL breaks on CRLF shebangs)
+third_party/vcpkg/ports/botan/configure text eol=lf
+scripts/build_linux_asan.py text eol=lf

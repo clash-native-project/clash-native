@@ -11,7 +11,6 @@
 #include <mutex>
 #include <vector>
 
-#include <exec/async_scope.hpp>
 #include <exec/task.hpp>
 
 namespace clash_native::proxy {
@@ -68,7 +67,8 @@ class TcpRelay final : public std::enable_shared_from_this<TcpRelay> {
     // across an await.
     std::mutex activity_mutex_;
     std::chrono::steady_clock::time_point last_activity_{std::chrono::steady_clock::now()};
-    exec::async_scope scope_;
+    // No member scope: the supervisor runs detached (immortal heap scope)
+    // so its completion cannot free the scope it completes into (#194).
     CompletionHandler completion_handler_;
     RelayStats stats_;
     std::atomic_bool finished_{false};

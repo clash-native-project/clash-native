@@ -14,6 +14,7 @@
 #include <boost/beast/core/flat_buffer.hpp>
 #include <boost/beast/http.hpp>
 
+#include <clash_native/async/detached.hpp>
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
 
@@ -192,16 +193,20 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
         http,
     };
 
-    static exec::task<void> run_handshake(std::shared_ptr<ProxySession> self);
-    static exec::task<void> run_socks4_request(std::shared_ptr<ProxySession> self);
+    static exec::task<void> run_handshake(std::shared_ptr<ProxySession> self,
+                                          std::shared_ptr<async::DetachedScope> scope);
+    static exec::task<void> run_socks4_request(std::shared_ptr<ProxySession> self,
+                                               std::shared_ptr<async::DetachedScope> scope);
     static exec::task<void> run_socks4_reply(std::shared_ptr<ProxySession> self,
+                                             std::shared_ptr<async::DetachedScope> scope,
                                              std::uint8_t status, bool start_relay);
     static exec::task<std::vector<std::uint8_t>>
     read_socks4_cstring(std::shared_ptr<ProxySession> self);
     void open_socks4_target();
     void open_target(core::Destination destination);
     static exec::task<void>
-    run_open_target(std::shared_ptr<ProxySession> self, core::ConnectionMetadata metadata,
+    run_open_target(std::shared_ptr<ProxySession> self, std::shared_ptr<async::DetachedScope> scope,
+                    core::ConnectionMetadata metadata,
                     std::optional<observability::ConnectionRegistry::ConnectionId> connection_id);
     void handle_open_result(core::StreamOpenResult result);
     void start_relay();
@@ -211,28 +216,37 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
                                                  boost::asio::mutable_buffer buffer);
     static exec::task<void> write_handshake_all(std::shared_ptr<ProxySession> self,
                                                 boost::asio::const_buffer buffer);
-    static exec::task<void> run_socks5_handshake(std::shared_ptr<ProxySession> self);
+    static exec::task<void> run_socks5_handshake(std::shared_ptr<ProxySession> self,
+                                                 std::shared_ptr<async::DetachedScope> scope);
     std::uint16_t request_port() const noexcept;
     void open_socks_target();
     void open_socks_udp_association();
     void send_socks_udp_associate_reply(const boost::asio::ip::udp::endpoint &endpoint);
-    static exec::task<void> run_socks_udp_associate_reply(std::shared_ptr<ProxySession> self,
-                                                          boost::asio::ip::udp::endpoint endpoint);
-    static exec::task<void> run_udp_control(std::shared_ptr<ProxySession> self);
-    static exec::task<void> run_socks_udp_ingress(std::shared_ptr<ProxySession> self);
+    static exec::task<void>
+    run_socks_udp_associate_reply(std::shared_ptr<ProxySession> self,
+                                  std::shared_ptr<async::DetachedScope> scope,
+                                  boost::asio::ip::udp::endpoint endpoint);
+    static exec::task<void> run_udp_control(std::shared_ptr<ProxySession> self,
+                                            std::shared_ptr<async::DetachedScope> scope);
+    static exec::task<void> run_socks_udp_ingress(std::shared_ptr<ProxySession> self,
+                                                  std::shared_ptr<async::DetachedScope> scope);
     static exec::task<void> run_udp_route(std::shared_ptr<ProxySession> self,
+                                          std::shared_ptr<async::DetachedScope> scope,
                                           runtime::RuntimeSnapshotPtr snapshot,
                                           core::ConnectionMetadata metadata, std::string key);
     bool accept_udp_sender(const boost::asio::ip::udp::endpoint &sender);
     void process_socks_udp_packet(std::size_t size);
     static exec::task<void> run_udp_send(std::shared_ptr<ProxySession> self,
+                                         std::shared_ptr<async::DetachedScope> scope,
                                          std::shared_ptr<UdpPath> path,
                                          std::shared_ptr<std::vector<std::uint8_t>> payload);
     static exec::task<void> run_udp_response_loop(std::shared_ptr<ProxySession> self,
+                                                  std::shared_ptr<async::DetachedScope> scope,
                                                   std::shared_ptr<UdpPath> path);
     static std::shared_ptr<std::vector<std::uint8_t>>
     build_socks_udp_response(io::DatagramAddress source, std::span<const std::uint8_t> payload);
     static exec::task<void> run_udp_client_send(std::shared_ptr<ProxySession> self,
+                                                std::shared_ptr<async::DetachedScope> scope,
                                                 std::shared_ptr<std::vector<std::uint8_t>> packet);
     void send_socks4_reply(std::uint8_t status, bool start_relay);
     void send_socks_reply(std::uint8_t reply, bool start_relay);
@@ -240,49 +254,61 @@ class ProxySession final : public std::enable_shared_from_this<ProxySession> {
                           std::shared_ptr<std::vector<std::uint8_t>> payload);
     void receive_udp_response(const std::shared_ptr<UdpPath> &path);
     void send_socks_udp_response(io::DatagramAddress source, std::span<const std::uint8_t> payload);
-    static exec::task<void> run_socks_reply(std::shared_ptr<ProxySession> self, std::uint8_t reply,
-                                            bool start_relay);
+    static exec::task<void> run_socks_reply(std::shared_ptr<ProxySession> self,
+                                            std::shared_ptr<async::DetachedScope> scope,
+                                            std::uint8_t reply, bool start_relay);
 
     void read_http_headers();
-    static exec::task<void> run_http_headers(std::shared_ptr<ProxySession> self);
+    static exec::task<void> run_http_headers(std::shared_ptr<ProxySession> self,
+                                             std::shared_ptr<async::DetachedScope> scope);
     void handle_http_headers(boost::beast::http::request<boost::beast::http::buffer_body> &request);
     HttpAuthenticationResult authenticate_http_request(
         const boost::beast::http::request<boost::beast::http::buffer_body> &request) const;
     bool http_request_keep_alive(
         const boost::beast::http::request<boost::beast::http::buffer_body> &request) const;
     void send_http_auth_response(bool missing, bool keep_alive);
-    static exec::task<void> run_http_auth_response(std::shared_ptr<ProxySession> self, bool missing,
-                                                   bool keep_alive);
+    static exec::task<void> run_http_auth_response(std::shared_ptr<ProxySession> self,
+                                                   std::shared_ptr<async::DetachedScope> scope,
+                                                   bool missing, bool keep_alive);
     void begin_http_forward();
     void open_http_forward_target(core::Destination destination);
     void start_http_upgrade_exchange();
     void start_http_forward_exchange();
-    static exec::task<void> run_http_upgrade_exchange(std::shared_ptr<ProxySession> self);
-    static exec::task<void> run_http_forward_exchange(std::shared_ptr<ProxySession> self);
+    static exec::task<void> run_http_upgrade_exchange(std::shared_ptr<ProxySession> self,
+                                                      std::shared_ptr<async::DetachedScope> scope);
+    static exec::task<void> run_http_forward_exchange(std::shared_ptr<ProxySession> self,
+                                                      std::shared_ptr<async::DetachedScope> scope);
     static exec::task<void>
     run_http_upgrade_response(std::shared_ptr<ProxySession> self,
+                              std::shared_ptr<async::DetachedScope> scope,
                               core::Result<io::StreamUpgradeResponse> result);
     static exec::task<void>
     run_http_forward_response(std::shared_ptr<ProxySession> self,
+                              std::shared_ptr<async::DetachedScope> scope,
                               core::Result<io::StreamingExchangeResponse> result);
     bool http_forward_request_method_is(std::string_view method) const noexcept;
     std::string build_http_upgrade_response_headers(const io::ExchangeResponse &response) const;
     std::string build_http_forward_response_headers(const io::ExchangeResponse &response,
                                                     bool has_body);
-    static exec::task<void> run_http_forward_body(std::shared_ptr<ProxySession> self);
-    static exec::task<void> write_http_forward_trailers(std::shared_ptr<ProxySession> self);
+    static exec::task<void> run_http_forward_body(std::shared_ptr<ProxySession> self,
+                                                  std::shared_ptr<async::DetachedScope> scope);
+    static exec::task<void>
+    write_http_forward_trailers(std::shared_ptr<ProxySession> self,
+                                std::shared_ptr<async::DetachedScope> scope);
     void reset_http_forward_exchange();
     void finish_http_forward();
     void send_http_forward_response(int status, std::string_view reason,
                                     std::string_view extra_headers = {}, bool keep_alive = false);
-    static exec::task<void> run_http_forward_response_send(std::shared_ptr<ProxySession> self,
-                                                           int status, std::string reason,
-                                                           std::string extra_headers,
-                                                           bool keep_alive);
+    static exec::task<void>
+    run_http_forward_response_send(std::shared_ptr<ProxySession> self,
+                                   std::shared_ptr<async::DetachedScope> scope, int status,
+                                   std::string reason, std::string extra_headers, bool keep_alive);
     void send_http_response(int status, std::string_view reason, bool start_relay);
-    static exec::task<void> run_http_response(std::shared_ptr<ProxySession> self, int status,
-                                              std::string reason, bool start_relay);
+    static exec::task<void> run_http_response(std::shared_ptr<ProxySession> self,
+                                              std::shared_ptr<async::DetachedScope> scope,
+                                              int status, std::string reason, bool start_relay);
     static exec::task<void> run_client_write_then_open(std::shared_ptr<ProxySession> self,
+                                                       std::shared_ptr<async::DetachedScope> scope,
                                                        std::string payload,
                                                        core::Destination destination);
 

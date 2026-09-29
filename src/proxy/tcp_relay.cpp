@@ -1,5 +1,6 @@
 #include <clash_native/proxy/tcp_relay.hpp>
 
+#include <clash_native/async/async.hpp>
 #include <clash_native/async/timer.hpp>
 
 #include <boost/asio/buffer.hpp>
@@ -59,7 +60,18 @@ void TcpRelay::launch(std::vector<std::uint8_t> initial_left_data) {
     // opstate self-deletion (and the join opstate could outlive the scope
     // member being joined on). Closing handles to abort pulls is prompt
     // enough here and keeps every teardown on refcounted state.
-    scope_.spawn(run(std::move(self), std::move(initial_left_data)));
+    //
+    // The supervisor task must NOT run on the member scope_: run() holds
+    // the last TcpRelay reference, so its completion would free the scope
+    // before __complete touches scope->__active_ (ASan #194, same shape as
+    // ProxySession::run_udp_control and Socks5UdpListener::run_response_loop
+    // -- heap-use-after-free at async_scope.hpp:162). Detached launch keeps
+    // the task's scope on the immortal heap scope instead.
+    async::spawn_detached([self, data = std::move(initial_left_data)](
+                              std::shared_ptr<async::DetachedScope> scope) mutable {
+        (void)scope;
+        return run(std::move(self), std::move(data));
+    });
 }
 exec::task<void> TcpRelay::join_pumps(std::shared_ptr<TcpRelay> self,
                                       std::vector<std::uint8_t> initial) {

@@ -113,7 +113,7 @@ inline void connect_slot_to_stop(const auto &handler,
         return;
     }
     try {
-        slot.emplace<Forward>(Forward{stop});
+        slot.template emplace<Forward>(Forward{stop});
     } catch (...) {
     }
 }

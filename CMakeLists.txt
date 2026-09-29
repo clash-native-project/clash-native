@@ -91,7 +91,26 @@ find_path(CLASH_NATIVE_BORINGSSL_INCLUDE_DIR
 )
 set(CLASH_NATIVE_BORINGSSL_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
 
+# Linux-only diagnosis switch (Debian WSL, pixi clang): address + undefined
+# sanitizers for the SEGFAULT hunt. Global compile/link options so
+# vcpkg-built static archives instrument consistently too.
+option(CLASH_NATIVE_ENABLE_SANITIZERS "Enable ASan+UBSan (Linux diagnosis only)" OFF)
+if(CLASH_NATIVE_ENABLE_SANITIZERS)
+    if(WIN32)
+        message(FATAL_ERROR "CLASH_NATIVE_ENABLE_SANITIZERS is Linux-only")
+    endif()
+    add_compile_options(-fsanitize=address,undefined -g -fno-omit-frame-pointer
+        -fno-sanitize-recover=all)
+    add_link_options(-fsanitize=address,undefined -g -fno-omit-frame-pointer
+        -fno-sanitize-recover=all)
+    # <env>/include/openssl hiding is handled by scripts/build_linux_asan.py
+    # (rename aside during configure+build); no include reordering here.
+endif()
+
 add_library(clash-native-boringssl INTERFACE)
+# NOTE: keep SYSTEM even for the Linux ASan lane (third-party headers must
+# not trip -Werror); the conda-OpenSSL collision is handled by hiding
+# <env>/include/openssl in scripts/build_linux_asan.py, not by -I.
 target_include_directories(clash-native-boringssl SYSTEM INTERFACE
     "${CLASH_NATIVE_BORINGSSL_INCLUDE_DIR}")
 target_link_libraries(clash-native-boringssl INTERFACE

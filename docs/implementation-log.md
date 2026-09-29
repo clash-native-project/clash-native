@@ -2989,3 +2989,28 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validation: pixi `clang++ 23.1.2 -fsanitize=address` builds and runs a
   hello (`libstdc++.so.6` resolves to the pixi env) and catches a
   heap-buffer-overflow probe. `format-check` + `git diff --check` pass.
+
+### 2026-09-30 - Fix #194 UAF: detach session/listener/relay/direct tasks from member scopes
+
+- ASan (Debian WSL, pixi clang 23.1.2) reproduced the Windows SEGFAULT as
+  `heap-use-after-free` at `exec/async_scope.hpp:162` (`__complete` writes
+  `scope->__active_` after the task frame holding the last scope reference
+  freed it during `await_resume` unwinding). First seen in
+  `ProxySession::run_udp_control` destroy; the same shape then fired in
+  `Socks5UdpListener::run_response_loop`, `TcpRelay::run`, and
+  `DirectConnectState::run_deadline`, plus every remaining
+  `ProxySession` task (`run_handshake`, SOCKS4/5 chains, HTTP exchanges,
+  UDP route/send/response loops).
+- Fix: all `ProxySession` tasks (socks/socks4/http/UDP), all
+  `Socks5UdpListener` tasks, `TcpRelay::run`, and `DirectConnectState`
+  open/deadline tasks now launch via `async::spawn_detached` (immortal
+  heap scope per task) instead of member `scope_.spawn`. Removed the
+  `scope_` members from `TcpRelay` and `DirectConnectState`; kept the
+  (now unused) members on session/listener. Also fixed a latent
+  `slot.template emplace` dependent-name error in
+  `stream_handle_adapter.hpp` and a missing `botan/x509cert.h` include in
+  `jls_client.cpp` exposed by the stricter Linux toolchain.
+- Validation (Linux ASan): `Socks5ProxyTest.*` 5/5 pass, target
+  `#194` test `--gtest_repeat=20` 20/20 with zero heap-use-after-free
+  (only the documented per-task immortal-scope leaks remain, reported by
+  LeakSanitizer at exit). Windows `RelWithDebInfo` build passes.

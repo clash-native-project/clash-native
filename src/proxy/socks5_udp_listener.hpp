@@ -7,6 +7,7 @@
 
 #include <boost/asio/ip/udp.hpp>
 
+#include <clash_native/async/detached.hpp>
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
 
@@ -42,21 +43,25 @@ class Socks5UdpListener final : public std::enable_shared_from_this<Socks5UdpLis
         std::vector<std::uint8_t> receive_buffer;
     };
 
-    static exec::task<void> run_receive(std::shared_ptr<Socks5UdpListener> self);
+    static exec::task<void> run_receive(std::shared_ptr<Socks5UdpListener> self,
+                                        std::shared_ptr<async::DetachedScope> scope);
     static std::string path_key(const boost::asio::ip::udp::endpoint &client,
                                 const core::Destination &destination);
     void process(std::size_t size, boost::asio::ip::udp::endpoint client);
     static exec::task<void> run_route(std::shared_ptr<Socks5UdpListener> self,
+                                      std::shared_ptr<async::DetachedScope> scope,
                                       runtime::RuntimeSnapshotPtr snapshot,
                                       core::ConnectionMetadata metadata, std::string key,
                                       boost::asio::ip::udp::endpoint client);
     void send_payload(const std::shared_ptr<Path> &path,
                       std::shared_ptr<std::vector<std::uint8_t>> payload);
     static exec::task<void> run_send(std::shared_ptr<Socks5UdpListener> self,
+                                     std::shared_ptr<async::DetachedScope> scope,
                                      std::shared_ptr<Path> path,
                                      std::shared_ptr<std::vector<std::uint8_t>> payload);
     void receive_response(const std::shared_ptr<Path> &path);
     static exec::task<void> run_response_loop(std::shared_ptr<Socks5UdpListener> self,
+                                              std::shared_ptr<async::DetachedScope> scope,
                                               std::shared_ptr<Path> path);
     static void retire_path(std::shared_ptr<Socks5UdpListener> self,
                             const std::shared_ptr<Path> &path);
@@ -66,6 +71,7 @@ class Socks5UdpListener final : public std::enable_shared_from_this<Socks5UdpLis
     build_response_packet(const std::shared_ptr<Path> &path, io::DatagramAddress source,
                           std::span<const std::uint8_t> payload);
     static exec::task<void> run_respond(std::shared_ptr<Socks5UdpListener> self,
+                                        std::shared_ptr<async::DetachedScope> scope,
                                         std::shared_ptr<Path> path,
                                         std::shared_ptr<std::vector<std::uint8_t>> packet);
 

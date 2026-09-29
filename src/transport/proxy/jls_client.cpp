@@ -10,6 +10,7 @@
 
 #include <botan/auto_rng.h>
 #include <botan/credentials_manager.h>
+#include <botan/pk_keys.h>
 #include <botan/tls_callbacks.h>
 #include <botan/tls_client.h>
 #include <botan/tls_exceptn.h>
@@ -17,6 +18,7 @@
 #include <botan/tls_policy.h>
 #include <botan/tls_server_info.h>
 #include <botan/tls_session_manager_noop.h>
+#include <botan/x509cert.h>
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>

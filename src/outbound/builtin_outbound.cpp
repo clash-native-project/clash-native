@@ -1,3 +1,4 @@
+#include <clash_native/async/async.hpp>
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/timer.hpp>
 #include <clash_native/net/tcp_stream.hpp>
@@ -10,7 +11,6 @@
 #include <boost/asio/post.hpp>
 
 #include <exec/asio/use_sender.hpp>
-#include <exec/async_scope.hpp>
 #include <exec/task.hpp>
 
 #include <stdexec/execution.hpp>
@@ -54,10 +54,19 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
 
     void start() {
         auto self = shared_from_this();
-        // Deadline task races the open chain; teardown stays guard-driven,
-        // so no stop is ever requested.
-        scope_.spawn(run_open(self));
-        scope_.spawn(run_deadline(self));
+        // Deadline task races the open chain; both run detached (immortal
+        // heap scope): either task holds the last state reference at
+        // completion, which would free a member scope_ before __complete
+        // touches scope->__active_ (ASan #194, async_scope.hpp:162 --
+        // same shape as ProxySession UDP tasks and Socks5UdpListener).
+        async::spawn_detached([self](std::shared_ptr<async::DetachedScope> scope) {
+            (void)scope;
+            return run_open(self);
+        });
+        async::spawn_detached([self](std::shared_ptr<async::DetachedScope> scope) {
+            (void)scope;
+            return run_deadline(self);
+        });
     }
 
     // Abort for sender-driven cancellation: idempotent with finish().
@@ -72,7 +81,9 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
                     return;
                 }
                 self->completed_ = true;
-                self->scope_.request_stop();
+                // No request_stop: detached tasks have no shared scope to
+                // stop; closing the socket aborts the open chain, and the
+                // deadline task drops at its completed_ guard.
                 boost::system::error_code ignored;
                 self->socket_.close(ignored);
             });
@@ -203,8 +214,8 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
     boost::asio::ip::tcp::socket socket_;
     core::StreamOpenHandler handler_;
     bool completed_ = false;
-    // Owns the open/deadline chain tasks, which always end with a value.
-    exec::async_scope scope_;
+    // No member scope: open/deadline tasks run detached (immortal heap
+    // scope) so the last state reference cannot free their scope (#194).
 };
 
 core::StreamOpenResult rejected_stream() {

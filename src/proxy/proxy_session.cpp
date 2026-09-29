@@ -1,5 +1,6 @@
 #include "proxy_session.hpp"
 
+#include <clash_native/async/async.hpp>
 #include <clash_native/async/timer.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 
@@ -28,10 +29,14 @@ void ProxySession::start() {
     // leaf, then the protocol dispatch runs inline. Timeout closes the
     // session; stop closes the socket, which aborts the in-flight I/O.
     auto self = shared_from_this();
-    scope_.spawn(run_handshake(self));
+    async::spawn_detached([self](std::shared_ptr<async::DetachedScope> scope) {
+        return run_handshake(self, std::move(scope));
+    });
 }
 
-exec::task<void> ProxySession::run_handshake(std::shared_ptr<ProxySession> self) {
+exec::task<void> ProxySession::run_handshake(std::shared_ptr<ProxySession> self,
+                                             std::shared_ptr<async::DetachedScope> scope) {
+    (void)scope;
     const auto executor = self->client_.get_executor();
     try {
         // Tri-state race: true = handshake done, false = timeout; a
@@ -77,7 +82,9 @@ exec::task<void> ProxySession::run_handshake(std::shared_ptr<ProxySession> self)
         }
         self->protocol_ = Protocol::socks4;
         self->socks4_request_[0] = self->protocol_byte_[0];
-        self->scope_.spawn(run_socks4_request(self));
+        async::spawn_detached([self](std::shared_ptr<async::DetachedScope> scope) {
+            return run_socks4_request(self, std::move(scope));
+        });
         co_return;
     }
     if (self->protocol_byte_[0] == kSocksVersion) {
@@ -87,7 +94,9 @@ exec::task<void> ProxySession::run_handshake(std::shared_ptr<ProxySession> self)
         }
         self->protocol_ = Protocol::socks5;
         self->method_header_[0] = self->protocol_byte_[0];
-        self->scope_.spawn(run_socks5_handshake(self));
+        async::spawn_detached([self](std::shared_ptr<async::DetachedScope> scope) {
+            return run_socks5_handshake(self, std::move(scope));
+        });
         co_return;
     }
     if (self->owner_.inbound_mode_ == ProxyInboundMode::socks) {
@@ -140,12 +149,19 @@ void ProxySession::open_target(core::Destination destination) {
         connection_id_.store(*connection_id, std::memory_order_release);
     }
     auto self = shared_from_this();
-    self->scope_.spawn(run_open_target(self, std::move(metadata), std::move(connection_id)));
+    async::spawn_detached(
+        [self, metadata = std::move(metadata), connection_id = std::move(connection_id)](
+            std::shared_ptr<async::DetachedScope> scope) mutable {
+            return run_open_target(self, std::move(scope), std::move(metadata),
+                                   std::move(connection_id));
+        });
 }
 
 exec::task<void> ProxySession::run_open_target(
-    std::shared_ptr<ProxySession> self, core::ConnectionMetadata metadata,
+    std::shared_ptr<ProxySession> self, std::shared_ptr<async::DetachedScope> scope,
+    core::ConnectionMetadata metadata,
     std::optional<observability::ConnectionRegistry::ConnectionId> connection_id) {
+    (void)scope;
     core::StreamOpenResult result;
     try {
         result = co_await self->owner_.open_stream(std::move(metadata), connection_id);
