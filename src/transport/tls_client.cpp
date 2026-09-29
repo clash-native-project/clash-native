@@ -1,4 +1,5 @@
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/detached.hpp>
 #include <clash_native/async/timer.hpp>
 #include <clash_native/net/tls_stream.hpp>
 #include <clash_native/transport/cert_pin.hpp>
@@ -1100,19 +1101,20 @@ class TlsClientHandshakeOperationImpl final
         // Deadline is a sleep_until task racing the handshake: whichever
         // finishes first wins via the completed_ guard in finish(); the
         // loser observes completed_ and drops. No when_any over tasks.
-        // Detached on a private heap scope, not scope_: the deadline only
-        // posts back, and sharing the operation scope would race
-        // __complete with the handshake task during teardown (same AV as
-        // the DNS session deadline).
+        // Detached via async::spawn_detached (not scope_): sharing the
+        // operation scope races __complete with the handshake task during
+        // teardown.
         auto deadline = *self->options_.deadline;
         auto executor = self->executor_;
-        auto *detached = new exec::async_scope{};
-        detached->spawn(run_deadline(self, executor, deadline));
-        (void)detached;
+        async::spawn_detached(
+            [self, executor, deadline](std::shared_ptr<async::DetachedScope> keep) {
+                return run_deadline(self, std::move(keep), executor, deadline);
+            });
         co_await do_handshake(self);
     }
 
     static exec::task<void> run_deadline(std::shared_ptr<TlsClientHandshakeOperationImpl> self,
+                                         std::shared_ptr<async::DetachedScope> /*keep*/,
                                          boost::asio::any_io_executor executor,
                                          std::chrono::steady_clock::time_point deadline) {
         try {

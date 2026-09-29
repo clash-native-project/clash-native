@@ -1,7 +1,9 @@
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/detached.hpp>
 #include <clash_native/async/timer.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
+#include <clash_native/io/exchange_session.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/transport/http_sessions.hpp>
 #include <clash_native/transport/tls_client.hpp>
@@ -251,15 +253,6 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     bool retired() const noexcept { return retired_.load(); }
 
   private:
-    // Detached deadline: heap-owned scope, not the Session scope_. The
-    // deadline only posts a lambda holding `self`; it never touches the
-    // Session scope_ itself, so it must not contribute to its active
-    // count. A private scope per deadline dies with the task instead of
-    // racing another task's __complete on the shared scope.
-    struct DetachedDeadline {
-        exec::async_scope scope;
-    };
-
     // Snapshot carried from the IO-thread connect chain back to the
     // strand. Holds no Session state; the strand step decides from it.
     struct ConnectEvent {
@@ -311,10 +304,13 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         fail_all(cancelled_error());
     }
 
-    // Per-request deadline task: fires once at the deadline; the map
-    // lookup drops it when the exchange already won. Bounded by the
-    // deadline, so no stop is ever requested.
-    static exec::task<void> run_deadline(std::shared_ptr<Session> self, std::uint16_t query_id,
+    // Per-request deadline: fires once at the deadline; the map lookup
+    // drops it when the exchange already won. Runs detached (not on
+    // scope_): the DetachedScope parameter lives in the coroutine frame
+    // and keeps the single-task scope alive through __complete.
+    static exec::task<void> run_deadline(std::shared_ptr<Session> self,
+                                         std::shared_ptr<async::DetachedScope> /*keep*/,
+                                         std::uint16_t query_id,
                                          std::chrono::steady_clock::time_point deadline) {
         try {
             co_await async::sleep_until(self->runtime_.serialized_executor(), deadline);
@@ -489,18 +485,14 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         scope_.spawn(run_exchange(self, query_id, http_session_, std::move(request), deadline));
     }
 
-    // Detached deadline: NOT spawned on scope_. The deadline only posts a
-    // lambda holding `self`; it never touches scope_ itself, so it must
-    // not contribute to scope_'s active count. A private heap scope per
-    // deadline dies with the task instead of racing another task's
-    // __complete on the shared scope.
+    // Detached deadline via async::spawn_detached: the task's own frame
+    // keeps its single-task scope alive, so teardown cannot race.
     static void spawn_detached_deadline(std::shared_ptr<Session> self, std::uint16_t query_id,
                                         std::chrono::steady_clock::time_point deadline) {
-        auto *detached = new DetachedDeadline{};
-        detached->scope.spawn(run_deadline(std::move(self), query_id, deadline));
-        // Keep the scope alive until the task completes. Leaks one small
-        // scope per exchange (bounded by test lifetime). Diagnostic only.
-        (void)detached;
+        async::spawn_detached([self = std::move(self), query_id,
+                               deadline](std::shared_ptr<async::DetachedScope> keep) {
+            return run_deadline(self, std::move(keep), query_id, deadline);
+        });
     }
 
     void fail_pending(std::uint16_t query_id, core::Error error) {

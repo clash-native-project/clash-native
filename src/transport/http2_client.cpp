@@ -1,10 +1,10 @@
+#include <clash_native/async/detached.hpp>
 #include <clash_native/async/oneshot.hpp>
 #include <clash_native/async/timer.hpp>
 #include <clash_native/core/result.hpp>
 #include <clash_native/io/exchange_body_stream.hpp>
 #include <clash_native/io/exchange_session.hpp>
 #include <clash_native/io/exchange_tunnel_stream.hpp>
-#include <clash_native/io/multiplexed_session.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
 #include <clash_native/transport/http_sessions.hpp>
@@ -223,21 +223,21 @@ class Http2ClientSession final : public io::ExchangeSession,
         ping_misses_ = 0;
     }
 
-    // Per-exchange deadline task: fires once at the deadline; the map
-    // lookup + timer_done guard drop it when the exchange already won.
-    // Bounded by the deadline, so no stop is ever requested. Detached on
-    // a private heap scope, not scope_: sharing the session scope races
-    // __complete with sibling tasks during teardown (same AV as the DNS
-    // session deadline).
+    // Per-exchange deadline: fires once at the deadline; the map lookup +
+    // timer_done guard drop it when the exchange already won. Detached via
+    // async::spawn_detached (not scope_): sharing the session scope races
+    // __complete with sibling tasks during teardown.
     void arm_deadline(ExchangeId exchange_id, PendingPtr pending,
                       std::chrono::steady_clock::time_point deadline) {
         pending->deadline = deadline;
-        auto *detached = new exec::async_scope{};
-        detached->spawn(run_deadline(shared_from_this(), exchange_id, pending, deadline));
-        (void)detached;
+        async::spawn_detached([self = shared_from_this(), exchange_id, pending,
+                               deadline](std::shared_ptr<async::DetachedScope> keep) {
+            return run_deadline(self, std::move(keep), exchange_id, pending, deadline);
+        });
     }
 
     static exec::task<void> run_deadline(std::shared_ptr<Http2ClientSession> self,
+                                         std::shared_ptr<async::DetachedScope> /*keep*/,
                                          ExchangeId exchange_id, PendingPtr pending,
                                          std::chrono::steady_clock::time_point deadline) {
         auto executor = self->executor_;

@@ -2936,3 +2936,19 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   detached-task primitive; every other run_deadline+run pair in the repo
   (DoT/DoH1/QUIC/outbounds/proxy sessions) shares the same shape and
   will hit the same teardown race under stop()-during-flight.
+
+### 2026-09-30 - Add async detached-task primitive, remove heap-scope leaks
+
+- New `include/clash_native/async/detached.hpp` (`async::spawn_detached`
+  + `DetachedScope`): each detached task gets a private single-task scope
+  whose lifetime is held by the task's own coroutine frame (passed as the
+  first coroutine parameter). One task per scope removes the sibling
+  __complete race by construction; frame-held ownership removes the
+  owner-dies-first use-after-free. No leak: the last frame reference
+  drops right after completion. Exported via `async/async.hpp`.
+- Converted the 3 diagnostic heap-scope leaks to it: DoH2 session
+  deadline (`doh2_dns_transport.cpp`), TLS handshake deadline
+  (`tls_client.cpp`), HTTP/2 exchange deadline (`http2_client.cpp`).
+  `grep "new exec::async_scope"` is now clean.
+- Validation: ExchangesOverDoh2 solo 8/8, DNS group 13/13.
+  `format-check` + `git diff --check` pass.
