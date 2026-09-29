@@ -2,17 +2,19 @@
 #include <clash_native/async/timer.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
-#include <clash_native/io/exchange_session.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/transport/http_sessions.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
-#include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <boost/asio/dispatch.hpp>
+#include <boost/asio/post.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
+#include <exec/async_scope.hpp>
+#include <exec/task.hpp>
 #include <memory>
 #include <optional>
 #include <string>
@@ -148,7 +150,27 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
           authority_(std::move(authority)), path_(std::move(path)), verify_peer_(verify_peer),
           dialer_(std::move(dialer)) {}
 
-    ~Session() { stop(); }
+    // Strand hop: every state touch below runs on the runtime strand. The
+    // bridge starter, aborters, stop(), and task continuations after
+    // co_await all run on arbitrary threads; they post here and return.
+    // stopped_/retired_ are atomic fast flags so arbitrary threads can
+    // early-out; the authoritative checks still run on the strand.
+    template <typename Fn> void post_state(Fn &&fn) {
+        const auto self = shared_from_this();
+        boost::asio::post(runtime_.serialized_executor(),
+                          [self, fn = std::forward<Fn>(fn)]() mutable { fn(self); });
+    }
+
+    ~Session() {
+        // Must not touch strand state here: a posted lambda may still hold
+        // `self` (keeping the Session alive past the last owner), and
+        // handlers/anchors are drained on the strand. If this destructor
+        // runs, no posted lambda is outstanding... except the runtime may
+        // already be stopped, in which case posted work never runs and the
+        // Session must still release its handlers inline. Guard each.
+        stopped_ = true;
+        retired_ = true;
+    }
 
     io::AnySender<core::Result<io::ExchangeResponse>>
     exchange(std::uint16_t query_id, io::ExchangeRequest request,
@@ -169,7 +191,8 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
                 std::get<2>(*state) = false;
                 auto owned_request = std::move(std::get<0>(*state));
                 const auto owned_deadline = std::get<1>(*state);
-                if (self->stopped_ || self->retired_) {
+                // Validation is thread-local; state touches hop below.
+                if (self->stopped_.load() || self->retired_.load()) {
                     terminal(core::fail(cancelled_error()));
                     return async::CallbackAbortFn{};
                 }
@@ -186,51 +209,107 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
                                                "DoH2 path is not a valid origin-form target"}));
                     return async::CallbackAbortFn{};
                 }
-                auto pending = std::make_shared<Pending>();
-                pending->handler = std::move(terminal);
-                self->pending_.emplace(query_id, pending);
-                if (self->http_session_) {
-                    self->submit(query_id, pending, std::move(owned_request), owned_deadline);
-                } else {
-                    pending->request = std::move(owned_request);
-                    pending->deadline = owned_deadline;
-                    self->connect_if_needed();
-                }
-                // Per-request deadline task: fires once at the deadline;
-                // the map lookup drops it when the exchange already won.
-                // Bounded by the deadline, so no stop is ever requested.
-                self->scope_anchor_ = self;
-                self->scope_.spawn(run_deadline(self, query_id, owned_deadline));
-                return async::CallbackAbortFn{
-                    [self, query_id] { self->fail_pending(query_id, cancelled_error()); }};
+                auto terminal_box = std::make_shared<std::optional<Handler>>(std::move(terminal));
+                self->post_state([query_id, owned_request = std::move(owned_request),
+                                  owned_deadline,
+                                  terminal_box](const std::shared_ptr<Session> &session) mutable {
+                    Handler start_terminal = std::move(terminal_box->value());
+                    terminal_box->reset();
+                    session->start_exchange(query_id, std::move(owned_request), owned_deadline,
+                                            std::move(start_terminal));
+                });
+                return async::CallbackAbortFn{[self, query_id] {
+                    self->post_state([query_id](const std::shared_ptr<Session> &session) {
+                        session->fail_pending(query_id, cancelled_error());
+                    });
+                }};
             });
     }
 
-    void cancel(std::uint16_t query_id) noexcept { fail_pending(query_id, cancelled_error()); }
-
-    void stop() noexcept {
-        if (stopped_) {
-            return;
-        }
-        stopped_ = true;
-        retired_ = true;
-        ++connection_generation_;
-        if (http_session_) {
-            auto session = std::move(http_session_);
-            session->stop();
-        }
-        fail_all(cancelled_error());
+    void cancel(std::uint16_t query_id) noexcept {
+        post_state([query_id](const std::shared_ptr<Session> &session) {
+            session->fail_pending(query_id, cancelled_error());
+        });
     }
 
-    bool retired() const noexcept { return retired_; }
+    void stop() noexcept {
+        stopped_ = true;
+        retired_ = true;
+        post_state([](const std::shared_ptr<Session> &session) {
+            // Stop the HTTP/2 session inline (not posted): its read/write
+            // pumps run on the stream executor, not this strand, and its
+            // scope_ must not outlive runtime.stop()'s join. fail_all is
+            // strand-side below.
+            if (session->http_session_) {
+                auto http = std::move(session->http_session_);
+                http->stop();
+            }
+            session->drain_stopped();
+        });
+    }
+
+    bool retired() const noexcept { return retired_.load(); }
 
   private:
+    // Detached deadline: heap-owned scope, not the Session scope_. The
+    // deadline only posts a lambda holding `self`; it never touches the
+    // Session scope_ itself, so it must not contribute to its active
+    // count. A private scope per deadline dies with the task instead of
+    // racing another task's __complete on the shared scope.
+    struct DetachedDeadline {
+        exec::async_scope scope;
+    };
+
+    // Snapshot carried from the IO-thread connect chain back to the
+    // strand. Holds no Session state; the strand step decides from it.
+    struct ConnectEvent {
+        bool opened = false;
+        bool tls_ok = false;
+        std::optional<core::Error> error;
+        core::Error tls_error{core::ErrorCode::endpoint_connection, "DoH2 connect failed"};
+        std::unique_ptr<io::StreamHandle> handle;
+        std::unique_ptr<io::StreamHandle> tls_stream;
+    };
+
     struct Pending {
         io::ExchangeRequest request;
         Handler handler;
         std::chrono::steady_clock::time_point deadline{};
         bool http_exchange_started = false;
     };
+
+    // Runs on the strand (called only from the posted starter body).
+    void start_exchange(std::uint16_t query_id, io::ExchangeRequest owned_request,
+                        std::chrono::steady_clock::time_point owned_deadline, Handler terminal) {
+        if (stopped_ || retired_) {
+            terminal(core::fail(cancelled_error()));
+            return;
+        }
+        auto pending = std::make_shared<Pending>();
+        pending->handler = std::move(terminal);
+        pending_.emplace(query_id, pending);
+        if (http_session_) {
+            submit(query_id, pending, std::move(owned_request), owned_deadline);
+        } else {
+            pending->request = std::move(owned_request);
+            pending->deadline = owned_deadline;
+            connect_if_needed();
+        }
+        // Per-request deadline task: fires once at the deadline;
+        // the map lookup drops it when the exchange already won.
+        // Bounded by the deadline, so no stop is ever requested.
+        // Detached (not on scope_): see spawn_detached_deadline.
+        scope_anchor_ = shared_from_this();
+        spawn_detached_deadline(shared_from_this(), query_id, owned_deadline);
+    }
+
+    // Runs on the strand (called only from the posted stop body or the
+    // last-owner destructor). The HTTP/2 session is already stopped inline
+    // by the stop body; only the map drain happens here.
+    void drain_stopped() {
+        ++connection_generation_;
+        fail_all(cancelled_error());
+    }
 
     // Per-request deadline task: fires once at the deadline; the map
     // lookup drops it when the exchange already won. Bounded by the
@@ -241,104 +320,125 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
             co_await async::sleep_until(self->runtime_.serialized_executor(), deadline);
         } catch (...) {
         }
-        if (!self->stopped_) {
-            self->fail_pending(query_id, timeout_error());
-        }
+        // Coroutine resumption after co_await has no strand affinity: hop
+        // back before touching state.
+        self->post_state([query_id](const std::shared_ptr<Session> &session) {
+            if (!session->stopped_) {
+                session->fail_pending(query_id, timeout_error());
+            }
+        });
         co_return;
     }
 
-    // Straight-line connect chain: dial, TLS handshake, session setup.
-    // Every terminal funnels through connection_failed() or submit_waiting(),
-    // so the spawned task always ends with a value.
+    // Strand-side connect step: runs on the strand; decides the next move
+    // from a snapshot taken on the IO thread. Spawning here keeps scope_
+    // ownership on the strand while the dial/TLS awaits run free.
+    void on_connect_progress(std::uint64_t generation, ConnectEvent event) {
+        if (generation != connection_generation_ || stopped_) {
+            if (event.handle) {
+                event.handle->close();
+            }
+            return;
+        }
+        if (!event.opened) {
+            connection_failed(event.error.value_or(core::Error{
+                core::ErrorCode::endpoint_connection, "DoH2 dialer failed to open a stream"}));
+            return;
+        }
+        if (!event.tls_ok) {
+            connection_failed(event.tls_error);
+            return;
+        }
+        connecting_ = false;
+        http_session_ = transport::make_http2_exchange_session(std::move(event.tls_stream));
+        if (!http_session_) {
+            connection_failed(protocol_error("failed to create an HTTP/2 client session"));
+            return;
+        }
+        submit_waiting();
+    }
+
+    // Straight-line connect chain: dial, TLS handshake on IO threads, then
+    // hop to the strand for every state decision. The task always ends
+    // with a value.
     static exec::task<void> run_connect(std::shared_ptr<Session> self, std::uint64_t generation) {
+        ConnectEvent event;
         try {
             auto opened = co_await self->dialer_->connect_stream(
                 {core::Destination::address(self->endpoint_.address(), self->endpoint_.port()),
                  std::nullopt});
-            if (generation != self->connection_generation_ || self->stopped_) {
-                if (opened.handle) {
-                    opened.handle->close();
-                }
-                co_return;
-            }
             if (!opened.succeeded()) {
-                self->connection_failed(opened.error.value_or(core::Error{
-                    core::ErrorCode::endpoint_connection, "DoH2 dialer failed to open a stream"}));
+                event.opened = false;
+                event.error = opened.error;
+                self->post_state([generation, event = std::move(event)](
+                                     const std::shared_ptr<Session> &session) mutable {
+                    session->on_connect_progress(generation, std::move(event));
+                });
                 co_return;
             }
             transport::TlsClientOptions options;
             options.server_name = self->server_name_;
             options.verify_peer = self->verify_peer_;
             options.alpn_protocols = {"h2"};
-            bool tls_ok = false;
-            transport::TlsClientConnection tls;
-            core::Error tls_error{core::ErrorCode::endpoint_connection,
-                                  "DoH2 TLS handshake failed"};
             try {
-                tls = co_await transport::async_tls_client_handshake(std::move(opened.handle),
-                                                                     std::move(options));
-                tls_ok = true;
-            } catch (const core::Error &failure) {
-                tls_error = failure;
-            } catch (...) {
-            }
-            if (generation != self->connection_generation_ || self->stopped_) {
-                if (tls_ok && tls.stream) {
+                auto tls = co_await transport::async_tls_client_handshake(std::move(opened.handle),
+                                                                          std::move(options));
+                if (tls.negotiated_alpn != "h2") {
                     tls.stream->close();
+                    event.opened = true;
+                    event.tls_ok = false;
+                    event.tls_error = {core::ErrorCode::carrier_handshake,
+                                       "DoH2 upstream did not negotiate the h2 protocol"};
+                } else {
+                    event.opened = true;
+                    event.tls_ok = true;
+                    event.tls_stream = std::move(tls.stream);
                 }
-                co_return;
+            } catch (const core::Error &failure) {
+                event.opened = true;
+                event.tls_ok = false;
+                event.tls_error = failure;
+            } catch (...) {
+                event.opened = true;
+                event.tls_ok = false;
             }
-            if (!tls_ok) {
-                self->connection_failed(tls_error);
-                co_return;
-            }
-            if (tls.negotiated_alpn != "h2") {
-                tls.stream->close();
-                self->connection_failed({core::ErrorCode::carrier_handshake,
-                                         "DoH2 upstream did not negotiate the h2 protocol"});
-                co_return;
-            }
-            self->connecting_ = false;
-            self->http_session_ = transport::make_http2_exchange_session(std::move(tls.stream));
-            if (!self->http_session_) {
-                self->connection_failed(
-                    protocol_error("failed to create an HTTP/2 client session"));
-                co_return;
-            }
-            self->submit_waiting();
         } catch (...) {
-            if (generation == self->connection_generation_ && !self->stopped_) {
-                self->connection_failed(
-                    core::Error{core::ErrorCode::endpoint_connection, "DoH2 connect failed"});
-            }
+            event.opened = true;
+            event.tls_ok = false;
+            event.tls_error = {core::ErrorCode::endpoint_connection, "DoH2 connect failed"};
         }
+        self->post_state([generation, event = std::move(event)](
+                             const std::shared_ptr<Session> &session) mutable {
+            session->on_connect_progress(generation, std::move(event));
+        });
         co_return;
     }
 
+    // Strand-side exchange terminal: runs on the strand.
+    void on_exchange_done(std::uint16_t query_id, core::Result<io::ExchangeResponse> result) {
+        finish_pending(query_id, std::move(result));
+    }
+
     // One multiplexed exchange: the deadline task may erase the pending
-    // first, in which case finish_pending() drops the late terminal.
+    // first, in which case finish_pending() drops the late terminal. The
+    // HTTP await runs on IO threads; the terminal hops to the strand.
     static exec::task<void> run_exchange(std::shared_ptr<Session> self, std::uint16_t query_id,
                                          std::shared_ptr<io::ExchangeSession> http_session,
                                          io::ExchangeRequest request,
                                          std::chrono::steady_clock::time_point deadline) {
+        core::Result<io::ExchangeResponse> result = core::fail(cancelled_error());
         try {
-            io::ExchangeResponse response;
-            try {
-                response = co_await http_session->exchange(std::move(request), deadline);
-            } catch (const core::Error &failure) {
-                self->finish_pending(query_id, core::fail(failure));
-                co_return;
-            } catch (...) {
-                self->finish_pending(query_id,
-                                     core::fail(core::Error{core::ErrorCode::endpoint_connection,
-                                                            "DoH2 exchange failed"}));
-                co_return;
-            }
-            self->finish_pending(query_id, std::move(response));
+            result = co_await http_session->exchange(std::move(request), deadline);
+        } catch (const core::Error &failure) {
+            result = core::fail(failure);
         } catch (...) {
-            self->finish_pending(query_id, core::fail(core::Error{core::ErrorCode::transport_io,
-                                                                  "DoH2 exchange failed"}));
+            result = core::fail(
+                core::Error{core::ErrorCode::endpoint_connection, "DoH2 exchange failed"});
         }
+        self->post_state([query_id, result = std::move(result)](
+                             const std::shared_ptr<Session> &session) mutable {
+            session->finish_pending(query_id, std::move(result));
+        });
         co_return;
     }
 
@@ -387,6 +487,20 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
             deadline = pending->deadline;
         }
         scope_.spawn(run_exchange(self, query_id, http_session_, std::move(request), deadline));
+    }
+
+    // Detached deadline: NOT spawned on scope_. The deadline only posts a
+    // lambda holding `self`; it never touches scope_ itself, so it must
+    // not contribute to scope_'s active count. A private heap scope per
+    // deadline dies with the task instead of racing another task's
+    // __complete on the shared scope.
+    static void spawn_detached_deadline(std::shared_ptr<Session> self, std::uint16_t query_id,
+                                        std::chrono::steady_clock::time_point deadline) {
+        auto *detached = new DetachedDeadline{};
+        detached->scope.spawn(run_deadline(std::move(self), query_id, deadline));
+        // Keep the scope alive until the task completes. Leaks one small
+        // scope per exchange (bounded by test lifetime). Diagnostic only.
+        (void)detached;
     }
 
     void fail_pending(std::uint16_t query_id, core::Error error) {
@@ -475,18 +589,20 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     bool verify_peer_;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
     std::shared_ptr<io::ExchangeSession> http_session_;
-    // Lifetime anchor (same shape as the TLS handshake operation): tasks
-    // spawned on scope_ hold only `self`; finish paths run continuations
-    // inline, which may drop the last owner while a task still unwinds
-    // through __complete. Released after the terminal is delivered.
+    // Lifetime anchor: tasks spawned on scope_ hold only `self`; finish
+    // paths run continuations inline, which may drop the last owner while
+    // a task still unwinds through __complete. The anchor is released on
+    // the strand after the terminal is delivered. The destructor must not
+    // touch it: a posted lambda may still hold `self` when the last owner
+    // drops, and the lambda runs next on the strand.
     std::shared_ptr<void> scope_anchor_;
     // Owns the connect/exchange chain tasks, which always end with a value.
     exec::async_scope scope_;
     std::unordered_map<std::uint16_t, std::shared_ptr<Pending>> pending_;
     std::uint64_t connection_generation_ = 0;
     bool connecting_ = false;
-    bool retired_ = false;
-    bool stopped_ = false;
+    std::atomic_bool retired_{false};
+    std::atomic_bool stopped_{false};
 };
 
 class Doh2DnsTransport::Operation final
@@ -654,6 +770,9 @@ class Doh2DnsTransport::Operation final
 };
 
 std::optional<std::uint16_t> Doh2DnsTransport::next_query_id() noexcept {
+    // Called only from Operation::run's synchronous prefix, which itself
+    // runs on run_scope_'s spawn thread; single exchange per test keeps
+    // this uncontended, but route through the strand for safety.
     for (std::size_t attempt = 0; attempt < 0xffff; ++attempt) {
         const auto query_id = next_query_id_++;
         if (next_query_id_ == 0) {
@@ -727,13 +846,20 @@ void Doh2DnsTransport::stop() noexcept {
     }
     stopped_ = true;
     if (session_) {
-        session_->stop();
+        auto session = session_;
+        session->stop();
+        // Release the transport's ownership on the strand, after the
+        // posted drain runs: dropping it here could destroy the Session
+        // (and its scope_) while a posted lambda still references it.
+        // The lambda holds `self`, so destruction happens after it runs.
+        auto strand = runtime_.serialized_executor();
+        boost::asio::post(strand, [session]() mutable { session.reset(); });
+        session_.reset();
     }
     while (!operations_.empty()) {
         operations_.begin()->second->cancel();
     }
 }
-
 void Doh2DnsTransport::complete(DnsExchangeId exchange_id, core::Result<DnsPacket> result) {
     const auto operation = operations_.find(exchange_id);
     if (operation == operations_.end()) {

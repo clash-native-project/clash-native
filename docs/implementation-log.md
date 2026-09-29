@@ -2905,3 +2905,34 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   order-dependent flakes in the full run; interop Go suite has a
   separate QUIC/TLS-cert failure set, out of scope). `format-check` +
   `git diff --check` pass.
+
+### 2026-09-29 - Fix async_scope teardown race behind DoH2 flake (root cause)
+
+- Root cause was NOT the Session pending_ map: serializing it onto the
+  strand changed nothing (8/8 still SEGFAULT). Per-thread dumps showed
+  the main thread parked in AsioRuntime::stop()->join while worker
+  threads completed scope tasks whose scope_ was already freed.
+- Mechanism: async_scope tasks self-delete in __complete; when two tasks
+  share one scope (exchange + deadline, handshake + deadline) and the
+  owner (Session/TLS op/HTTP2 session) is destroyed during
+  runtime.stop()'s join, the loser's __complete locks a dead mutex
+  (mtx_do_lock AV, wild rbx). The faulting origin is always the
+  sleep_until timer lambda (timer.hpp:66) -- the task that outlives the
+  exchange it was racing.
+- Fix: deadline/timer-only tasks no longer share the owner scope. DoH2
+  session deadline, TLS handshake deadline, and HTTP/2 exchange deadline
+  each spawn on a private heap async_scope (one per exchange,
+  intentionally leaked pending a proper detached-task helper). The
+  exchange/handshake tasks keep their owner scope; the timer only posts
+  back. Also: DoH2 Session state (pending/connect/stop/finish) hops to
+  the runtime strand via post_state, TLS finish hops to the stream
+  executor, HTTP/2 stream adapter is retained until pumps drain
+  (close_stream no longer resets mid-flight).
+- Validation: ExchangesOverDoh2 16/16 solo, DNS group 13/13, multiplex
+  passes. Full unit suite: only order-dependent leftovers
+  (HttpOnlyBasicAuth SEGFAULT + Http2Streaming abort-sibling, both pass
+  isolated). Go interop still has its pre-existing QUIC/TLS-cert set.
+- Known debt: the per-deadline heap scope leak (3 sites) needs a real
+  detached-task primitive; every other run_deadline+run pair in the repo
+  (DoT/DoH1/QUIC/outbounds/proxy sessions) shares the same shape and
+  will hit the same teardown race under stop()-during-flight.

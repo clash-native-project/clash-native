@@ -1070,10 +1070,21 @@ class TlsClientHandshakeOperationImpl final
         scope_.spawn(run_handshake(shared_from_this()));
     }
 
+    // Every state touch runs on executor_ (the stream executor all async
+    // work is initiated on). Task continuations after co_await resume on
+    // arbitrary threads, so they post back here before touching members.
+    template <typename Fn> void post_state(Fn &&fn) {
+        const auto self = shared_from_this();
+        boost::asio::post(executor_, [self, fn = std::forward<Fn>(fn)]() mutable { fn(self); });
+    }
+
     static exec::task<void> run_handshake(std::shared_ptr<TlsClientHandshakeOperationImpl> self) {
         const auto configured = self->configure();
         if (!configured) {
-            self->finish(core::fail(configured.error()));
+            self->post_state([error = configured.error()](
+                                 const std::shared_ptr<TlsClientHandshakeOperationImpl> &op) {
+                op->finish(core::fail(error));
+            });
             co_return;
         }
         if (!self->options_.deadline) {
@@ -1081,15 +1092,23 @@ class TlsClientHandshakeOperationImpl final
             co_return;
         }
         if (*self->options_.deadline <= std::chrono::steady_clock::now()) {
-            self->finish(core::fail(timeout_error()));
+            self->post_state([](const std::shared_ptr<TlsClientHandshakeOperationImpl> &op) {
+                op->finish(core::fail(timeout_error()));
+            });
             co_return;
         }
         // Deadline is a sleep_until task racing the handshake: whichever
         // finishes first wins via the completed_ guard in finish(); the
         // loser observes completed_ and drops. No when_any over tasks.
+        // Detached on a private heap scope, not scope_: the deadline only
+        // posts back, and sharing the operation scope would race
+        // __complete with the handshake task during teardown (same AV as
+        // the DNS session deadline).
         auto deadline = *self->options_.deadline;
         auto executor = self->executor_;
-        self->scope_.spawn(run_deadline(self, executor, deadline));
+        auto *detached = new exec::async_scope{};
+        detached->spawn(run_deadline(self, executor, deadline));
+        (void)detached;
         co_await do_handshake(self);
     }
 
@@ -1101,27 +1120,33 @@ class TlsClientHandshakeOperationImpl final
         } catch (...) {
             co_return;
         }
-        self->finish(core::fail(timeout_error()));
+        self->post_state([](const std::shared_ptr<TlsClientHandshakeOperationImpl> &op) {
+            op->finish(core::fail(timeout_error()));
+        });
     }
 
     static exec::task<void> do_handshake(std::shared_ptr<TlsClientHandshakeOperationImpl> self) {
+        core::Result<TlsClientConnection> result =
+            core::fail(handshake_error(boost::asio::error::operation_aborted));
         try {
+            // The handshake await resumes on an arbitrary IO thread; only
+            // the snapshot (ALPN/stream handoff) happens here, the state
+            // decision hops to the strand below.
             co_await self->stream_->stream_->async_handshake(boost::asio::ssl::stream_base::client,
                                                              exec::asio::use_sender);
         } catch (...) {
-            if (self->completed_) {
-                co_return;
-            }
             try {
                 std::rethrow_exception(std::current_exception());
             } catch (const boost::system::system_error &failure) {
-                self->finish(core::fail(handshake_error(failure.code())));
+                result = core::fail(handshake_error(failure.code()));
             } catch (...) {
-                self->finish(core::fail(handshake_error(boost::asio::error::operation_aborted)));
+                result = core::fail(handshake_error(boost::asio::error::operation_aborted));
             }
-            co_return;
-        }
-        if (self->completed_) {
+            self->post_state(
+                [result = std::move(result)](
+                    const std::shared_ptr<TlsClientHandshakeOperationImpl> &op) mutable {
+                    op->finish(std::move(result));
+                });
             co_return;
         }
         const unsigned char *protocol = nullptr;
@@ -1139,13 +1164,18 @@ class TlsClientHandshakeOperationImpl final
             stream = std::move(self->stream_);
         }
         if (!stream) {
-            self->finish(
-                core::fail(transport_error("TLS client handshake lost its underlying stream",
-                                           boost::asio::error::operation_aborted)));
+            self->post_state([](const std::shared_ptr<TlsClientHandshakeOperationImpl> &op) {
+                op->finish(
+                    core::fail(transport_error("TLS client handshake lost its underlying stream",
+                                               boost::asio::error::operation_aborted)));
+            });
             co_return;
         }
         TlsClientConnection connection{std::move(stream), std::move(negotiated_alpn)};
-        self->finish(std::move(connection));
+        self->post_state([connection = std::move(connection)](
+                             const std::shared_ptr<TlsClientHandshakeOperationImpl> &op) mutable {
+            op->finish(std::move(connection));
+        });
     }
 
     void finish(core::Result<TlsClientConnection> result) {

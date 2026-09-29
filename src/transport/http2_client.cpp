@@ -225,11 +225,16 @@ class Http2ClientSession final : public io::ExchangeSession,
 
     // Per-exchange deadline task: fires once at the deadline; the map
     // lookup + timer_done guard drop it when the exchange already won.
-    // Bounded by the deadline, so no stop is ever requested.
+    // Bounded by the deadline, so no stop is ever requested. Detached on
+    // a private heap scope, not scope_: sharing the session scope races
+    // __complete with sibling tasks during teardown (same AV as the DNS
+    // session deadline).
     void arm_deadline(ExchangeId exchange_id, PendingPtr pending,
                       std::chrono::steady_clock::time_point deadline) {
         pending->deadline = deadline;
-        scope_.spawn(run_deadline(shared_from_this(), exchange_id, pending, deadline));
+        auto *detached = new exec::async_scope{};
+        detached->spawn(run_deadline(shared_from_this(), exchange_id, pending, deadline));
+        (void)detached;
     }
 
     static exec::task<void> run_deadline(std::shared_ptr<Http2ClientSession> self,
@@ -1642,11 +1647,15 @@ class Http2ClientSession final : public io::ExchangeSession,
     }
 
     void close_stream() noexcept {
+        // Mark closed so no new pump spawns, but retain the adapter until
+        // the in-flight read/write lambdas observe the flags and return.
+        // Resetting stream_ here would free the object the lambdas' `this`
+        // capture belongs to while they still run (use-after-free on the
+        // raw this pointer, not just the socket).
         if (stream_ && !stream_closed_) {
             stream_closed_ = true;
             stream_->close();
         }
-        release_closed_stream();
     }
 
     void release_closed_stream() noexcept {
