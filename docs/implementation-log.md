@@ -3025,3 +3025,24 @@ separate from `docs/architecture.md`, which describes the project blueprint.
 - Validation (Linux ASan): `Socks5ProxyTest.*` 5/5, target repeat-20 20/20,
   zero heap-use-after-free and zero LeakSanitizer output (previously 12320
   bytes in 140 allocations). Windows `RelWithDebInfo` build passes.
+
+### 2026-09-30 - Elegant #194: direct spawn_detached(task), immortal scope rationale
+
+- Spike results (Debian WSL, pixi clang 23.1.2 + ASan): exec::task IS a
+  sender, but only under a spawn-like env -- sender_in<root_env> is false
+  for both exec::task and stdexec::task, true under stop token + start
+  scheduler. So exec::start_detached rejects bare tasks at compile time
+  ("sender_in<root_env> evaluated to false"); async_scope::spawn's internal
+  submit path is the only public driver. Upstream examples
+  (server_theme/then_upon.cpp) always join() before destroying the scope --
+  a shape that cannot fit owners dying from inside their own completions.
+  Hence one immortal process scope, not one per owner.
+- `async::spawn_detached` now takes `exec::task<void>` directly: the
+  DetachedScope factory ballast is gone (~40 run_* signatures simplified,
+  ~40 call sites `spawn_detached(run_(...))`). Shared immortal scope stays
+  (one 104-byte allocation, exit-reclaimed).
+- Also fixed a latent stack-use-after-return in ProxyServer::stop(): the
+  drain semaphore was stack-borrowed while the on_empty completion posts
+  after stop() returns; now heap-owned via shared_ptr.
+- Validation (Linux ASan): Socks5ProxyTest.* 5/5, target repeat-20 20/20,
+  zero UAF/leak reports. Windows RelWithDebInfo build passes.

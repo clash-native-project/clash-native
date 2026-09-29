@@ -58,10 +58,15 @@ core::Error listener_error(std::string_view operation, const boost::system::erro
 
 // Detached drain receiver: releases the stop semaphore; errors are
 // impossible here (on_empty only fails on misuse, and the loop swallows
-// its own failures), so terminate rather than hang the stop path.
+// its own failures), so terminate rather than hang the stop path. Owns the
+// semaphore: the drain completion can post to the owner strand after
+// stop()'s stack frame is gone (ASan stack-use-after-return), so the
+// semaphore must outlive the call, not borrow it.
 struct DetachedRelease {
     using receiver_concept = stdexec::receiver_tag;
-    std::binary_semaphore *completed;
+    std::shared_ptr<std::binary_semaphore> completed;
+    // NOLINTNEXTLINE(google-explicit-constructor): implicit for start API.
+    DetachedRelease(std::shared_ptr<std::binary_semaphore> done) : completed(std::move(done)) {}
     void set_value() && noexcept { completed->release(); }
     void set_error(std::exception_ptr) && noexcept { std::terminate(); }
     void set_stopped() && noexcept { completed->release(); }
@@ -353,8 +358,8 @@ void ProxyServer::stop() noexcept {
         return;
     }
 
-    std::binary_semaphore completed(0);
-    boost::asio::dispatch(runtime_.serialized_executor(), [this, &completed] {
+    auto completed = std::make_shared<std::binary_semaphore>(0);
+    boost::asio::dispatch(runtime_.serialized_executor(), [this, completed] {
         stop_on_owner();
         // The accept loop only exits after its in-flight accept completes
         // stopped; draining the scope here keeps the spawn's __active_
@@ -363,10 +368,10 @@ void ProxyServer::stop() noexcept {
         // drain runs on the owner strand, and the accept completion posts
         // back here, so stop only returns once the loop is gone.
         auto drained =
-            accept_scope_.on_empty() | stdexec::then([&completed] { completed.release(); });
-        async::start_with_receiver(std::move(drained), DetachedRelease{&completed});
+            accept_scope_.on_empty() | stdexec::then([completed] { completed->release(); });
+        async::start_with_receiver(std::move(drained), DetachedRelease{completed});
     });
-    completed.acquire();
+    completed->acquire();
 }
 
 void ProxyServer::stop_on_owner() noexcept {

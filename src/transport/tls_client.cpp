@@ -1106,15 +1106,11 @@ class TlsClientHandshakeOperationImpl final
         // teardown.
         auto deadline = *self->options_.deadline;
         auto executor = self->executor_;
-        async::spawn_detached(
-            [self, executor, deadline](std::shared_ptr<async::DetachedScope> keep) {
-                return run_deadline(self, std::move(keep), executor, deadline);
-            });
+        async::spawn_detached(run_deadline(self, executor, deadline));
         co_await do_handshake(self);
     }
 
     static exec::task<void> run_deadline(std::shared_ptr<TlsClientHandshakeOperationImpl> self,
-                                         std::shared_ptr<async::DetachedScope> /*keep*/,
                                          boost::asio::any_io_executor executor,
                                          std::chrono::steady_clock::time_point deadline) {
         try {

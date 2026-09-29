@@ -59,14 +59,8 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
         // completion, which would free a member scope_ before __complete
         // touches scope->__active_ (ASan #194, async_scope.hpp:162 --
         // same shape as ProxySession UDP tasks and Socks5UdpListener).
-        async::spawn_detached([self](std::shared_ptr<async::DetachedScope> scope) {
-            (void)scope;
-            return run_open(self);
-        });
-        async::spawn_detached([self](std::shared_ptr<async::DetachedScope> scope) {
-            (void)scope;
-            return run_deadline(self);
-        });
+        async::spawn_detached(run_open(self));
+        async::spawn_detached(run_deadline(self));
     }
 
     // Abort for sender-driven cancellation: idempotent with finish().

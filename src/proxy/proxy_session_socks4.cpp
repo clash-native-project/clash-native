@@ -43,9 +43,7 @@ std::optional<std::size_t> null_position(const std::vector<std::uint8_t> &payloa
 
 } // namespace
 
-exec::task<void> ProxySession::run_socks4_request(std::shared_ptr<ProxySession> self,
-                                                  std::shared_ptr<async::DetachedScope> scope) {
-    (void)scope;
+exec::task<void> ProxySession::run_socks4_request(std::shared_ptr<ProxySession> self) {
     try {
         co_await read_handshake_exact(self, boost::asio::buffer(self->socks4_request_.data() + 1,
                                                                 self->socks4_request_.size() - 1));
@@ -150,16 +148,11 @@ void ProxySession::open_socks4_target() {
 
 void ProxySession::send_socks4_reply(std::uint8_t status, bool start_relay) {
     auto self = shared_from_this();
-    async::spawn_detached(
-        [self, status, start_relay](std::shared_ptr<async::DetachedScope> scope) mutable {
-            return run_socks4_reply(self, std::move(scope), status, start_relay);
-        });
+    async::spawn_detached(run_socks4_reply(self, status, start_relay));
 }
 
 exec::task<void> ProxySession::run_socks4_reply(std::shared_ptr<ProxySession> self,
-                                                std::shared_ptr<async::DetachedScope> scope,
                                                 std::uint8_t status, bool start_relay) {
-    (void)scope;
     if (self->closed_.load(std::memory_order_acquire)) {
         co_return;
     }

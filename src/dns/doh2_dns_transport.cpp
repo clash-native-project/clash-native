@@ -306,11 +306,8 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
 
     // Per-request deadline: fires once at the deadline; the map lookup
     // drops it when the exchange already won. Runs detached (not on
-    // scope_): the DetachedScope parameter lives in the coroutine frame
-    // and keeps the single-task scope alive through __complete.
-    static exec::task<void> run_deadline(std::shared_ptr<Session> self,
-                                         std::shared_ptr<async::DetachedScope> /*keep*/,
-                                         std::uint16_t query_id,
+    // scope_).
+    static exec::task<void> run_deadline(std::shared_ptr<Session> self, std::uint16_t query_id,
                                          std::chrono::steady_clock::time_point deadline) {
         try {
             co_await async::sleep_until(self->runtime_.serialized_executor(), deadline);
@@ -485,14 +482,10 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         scope_.spawn(run_exchange(self, query_id, http_session_, std::move(request), deadline));
     }
 
-    // Detached deadline via async::spawn_detached: the task's own frame
-    // keeps its single-task scope alive, so teardown cannot race.
+    // Detached deadline via async::spawn_detached.
     static void spawn_detached_deadline(std::shared_ptr<Session> self, std::uint16_t query_id,
                                         std::chrono::steady_clock::time_point deadline) {
-        async::spawn_detached([self = std::move(self), query_id,
-                               deadline](std::shared_ptr<async::DetachedScope> keep) {
-            return run_deadline(self, std::move(keep), query_id, deadline);
-        });
+        async::spawn_detached(run_deadline(std::move(self), query_id, deadline));
     }
 
     void fail_pending(std::uint16_t query_id, core::Error error) {

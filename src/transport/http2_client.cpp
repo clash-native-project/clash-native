@@ -230,14 +230,10 @@ class Http2ClientSession final : public io::ExchangeSession,
     void arm_deadline(ExchangeId exchange_id, PendingPtr pending,
                       std::chrono::steady_clock::time_point deadline) {
         pending->deadline = deadline;
-        async::spawn_detached([self = shared_from_this(), exchange_id, pending,
-                               deadline](std::shared_ptr<async::DetachedScope> keep) {
-            return run_deadline(self, std::move(keep), exchange_id, pending, deadline);
-        });
+        async::spawn_detached(run_deadline(shared_from_this(), exchange_id, pending, deadline));
     }
 
     static exec::task<void> run_deadline(std::shared_ptr<Http2ClientSession> self,
-                                         std::shared_ptr<async::DetachedScope> /*keep*/,
                                          ExchangeId exchange_id, PendingPtr pending,
                                          std::chrono::steady_clock::time_point deadline) {
         auto executor = self->executor_;

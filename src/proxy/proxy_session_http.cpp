@@ -39,13 +39,10 @@ using HttpOpSignatures = stdexec::completion_signatures<stdexec::set_value_t(Htt
 
 void ProxySession::read_http_headers() {
     auto self = shared_from_this();
-    async::spawn_detached([self](std::shared_ptr<async::DetachedScope> scope) {
-        return run_http_headers(self, std::move(scope));
-    });
+    async::spawn_detached(run_http_headers(self));
 }
 
-exec::task<void> ProxySession::run_http_headers(std::shared_ptr<ProxySession> self,
-                                                std::shared_ptr<async::DetachedScope>) {
+exec::task<void> ProxySession::run_http_headers(std::shared_ptr<ProxySession> self) {
     self->http_request_parser_ = std::make_shared<ProxyRequestBodyStream::Parser>();
     self->http_request_parser_->header_limit(64 * 1024);
     self->http_request_parser_->body_limit((std::numeric_limits<std::uint64_t>::max)());
@@ -156,13 +153,10 @@ bool ProxySession::http_request_keep_alive(const http::request<http::buffer_body
 
 void ProxySession::send_http_auth_response(bool missing, bool keep_alive) {
     auto self = shared_from_this();
-    async::spawn_detached([self, missing, keep_alive](std::shared_ptr<async::DetachedScope> scope) {
-        return run_http_auth_response(self, std::move(scope), missing, keep_alive);
-    });
+    async::spawn_detached(run_http_auth_response(self, missing, keep_alive));
 }
 
 exec::task<void> ProxySession::run_http_auth_response(std::shared_ptr<ProxySession> self,
-                                                      std::shared_ptr<async::DetachedScope>,
                                                       bool missing, bool keep_alive) {
     if (self->closed_.load(std::memory_order_acquire)) {
         co_return;
@@ -347,11 +341,8 @@ void ProxySession::begin_http_forward() {
         auto self = shared_from_this();
         const auto destination = parsed_target->destination;
         self->interim_http_response_ = "HTTP/1.1 100 Continue\r\n\r\n";
-        async::spawn_detached([self, payload = self->interim_http_response_,
-                               destination](std::shared_ptr<async::DetachedScope> scope) mutable {
-            return run_client_write_then_open(self, std::move(scope), std::move(payload),
-                                              std::move(destination));
-        });
+        async::spawn_detached(
+            run_client_write_then_open(self, self->interim_http_response_, destination));
         return;
     }
     open_http_forward_target(parsed_target->destination);
@@ -364,13 +355,10 @@ void ProxySession::open_http_forward_target(core::Destination destination) {
 
 void ProxySession::start_http_upgrade_exchange() {
     auto self = shared_from_this();
-    async::spawn_detached([self](std::shared_ptr<async::DetachedScope> scope) {
-        return run_http_upgrade_exchange(self, std::move(scope));
-    });
+    async::spawn_detached(run_http_upgrade_exchange(self));
 }
 
-exec::task<void> ProxySession::run_http_upgrade_exchange(std::shared_ptr<ProxySession> self,
-                                                         std::shared_ptr<async::DetachedScope>) {
+exec::task<void> ProxySession::run_http_upgrade_exchange(std::shared_ptr<ProxySession> self) {
     self->http_tunnel_session_ = transport::make_http1_exchange_session(std::move(self->remote_));
     if (!self->http_tunnel_session_) {
         self->send_http_forward_response(502, "Bad Gateway");
@@ -389,21 +377,15 @@ exec::task<void> ProxySession::run_http_upgrade_exchange(std::shared_ptr<ProxySe
         result = core::fail(
             core::Error{core::ErrorCode::endpoint_connection, "HTTP upgrade tunnel failed"});
     }
-    async::spawn_detached(
-        [self, result = std::move(result)](std::shared_ptr<async::DetachedScope> scope) mutable {
-            return run_http_upgrade_response(self, std::move(scope), std::move(result));
-        });
+    async::spawn_detached(run_http_upgrade_response(self, std::move(result)));
 }
 
 void ProxySession::start_http_forward_exchange() {
     auto self = shared_from_this();
-    async::spawn_detached([self](std::shared_ptr<async::DetachedScope> scope) {
-        return run_http_forward_exchange(self, std::move(scope));
-    });
+    async::spawn_detached(run_http_forward_exchange(self));
 }
 
-exec::task<void> ProxySession::run_http_forward_exchange(std::shared_ptr<ProxySession> self,
-                                                         std::shared_ptr<async::DetachedScope>) {
+exec::task<void> ProxySession::run_http_forward_exchange(std::shared_ptr<ProxySession> self) {
     self->http_session_ = transport::make_http1_exchange_session(std::move(self->remote_));
     if (!self->http_session_) {
         self->send_http_forward_response(502, "Bad Gateway");
@@ -422,14 +404,10 @@ exec::task<void> ProxySession::run_http_forward_exchange(std::shared_ptr<ProxySe
         result = core::fail(
             core::Error{core::ErrorCode::endpoint_connection, "HTTP forward exchange failed"});
     }
-    async::spawn_detached(
-        [self, result = std::move(result)](std::shared_ptr<async::DetachedScope> scope) mutable {
-            return run_http_forward_response(self, std::move(scope), std::move(result));
-        });
+    async::spawn_detached(run_http_forward_response(self, std::move(result)));
 }
 
 exec::task<void> ProxySession::run_client_write_then_open(std::shared_ptr<ProxySession> self,
-                                                          std::shared_ptr<async::DetachedScope>,
                                                           std::string payload,
                                                           core::Destination destination) {
     try {
@@ -442,7 +420,6 @@ exec::task<void> ProxySession::run_client_write_then_open(std::shared_ptr<ProxyS
 }
 exec::task<void>
 ProxySession::run_http_upgrade_response(std::shared_ptr<ProxySession> self,
-                                        std::shared_ptr<async::DetachedScope>,
                                         core::Result<io::StreamUpgradeResponse> result) {
     if (self->closed_.load(std::memory_order_acquire)) {
         co_return;
@@ -482,7 +459,6 @@ ProxySession::run_http_upgrade_response(std::shared_ptr<ProxySession> self,
 
 exec::task<void>
 ProxySession::run_http_forward_response(std::shared_ptr<ProxySession> self,
-                                        std::shared_ptr<async::DetachedScope>,
                                         core::Result<io::StreamingExchangeResponse> result) {
     if (self->closed_.load(std::memory_order_acquire)) {
         co_return;
@@ -520,9 +496,7 @@ ProxySession::run_http_forward_response(std::shared_ptr<ProxySession> self,
         self->finish_http_forward();
         co_return;
     }
-    async::spawn_detached([self](std::shared_ptr<async::DetachedScope> scope) {
-        return run_http_forward_body(self, std::move(scope));
-    });
+    async::spawn_detached(run_http_forward_body(self));
 }
 
 bool ProxySession::http_forward_request_method_is(std::string_view method) const noexcept {
@@ -598,8 +572,7 @@ std::string ProxySession::build_http_forward_response_headers(const io::Exchange
     return output;
 }
 
-exec::task<void> ProxySession::run_http_forward_body(std::shared_ptr<ProxySession> self,
-                                                     std::shared_ptr<async::DetachedScope>) {
+exec::task<void> ProxySession::run_http_forward_body(std::shared_ptr<ProxySession> self) {
     // Chunked download loop: pull from the upstream body, frame as chunk,
     // write to the client, all inline. EOF writes trailers; stop aborts
     // both pulls via close() and exits.
@@ -640,9 +613,7 @@ exec::task<void> ProxySession::run_http_forward_body(std::shared_ptr<ProxySessio
             co_return;
         }
         if (!pulled) {
-            async::spawn_detached([self](std::shared_ptr<async::DetachedScope> scope) {
-                return write_http_forward_trailers(self, std::move(scope));
-            });
+            async::spawn_detached(write_http_forward_trailers(self));
             co_return;
         }
         if (*pulled == 0) {
@@ -667,8 +638,7 @@ exec::task<void> ProxySession::run_http_forward_body(std::shared_ptr<ProxySessio
     }
 }
 
-exec::task<void> ProxySession::write_http_forward_trailers(std::shared_ptr<ProxySession> self,
-                                                           std::shared_ptr<async::DetachedScope>) {
+exec::task<void> ProxySession::write_http_forward_trailers(std::shared_ptr<ProxySession> self) {
     if (self->closed_.load(std::memory_order_acquire)) {
         co_return;
     }
@@ -758,16 +728,11 @@ void ProxySession::finish_http_forward() {
 void ProxySession::send_http_forward_response(int status, std::string_view reason,
                                               std::string_view extra_headers, bool keep_alive) {
     auto self = shared_from_this();
-    async::spawn_detached([self, status, reason = std::string(reason),
-                           extra_headers = std::string(extra_headers),
-                           keep_alive](std::shared_ptr<async::DetachedScope> scope) mutable {
-        return run_http_forward_response_send(self, std::move(scope), status, std::move(reason),
-                                              std::move(extra_headers), keep_alive);
-    });
+    async::spawn_detached(run_http_forward_response_send(self, status, std::string(reason),
+                                                         std::string(extra_headers), keep_alive));
 }
 
 exec::task<void> ProxySession::run_http_forward_response_send(std::shared_ptr<ProxySession> self,
-                                                              std::shared_ptr<async::DetachedScope>,
                                                               int status, std::string reason,
                                                               std::string extra_headers,
                                                               bool keep_alive) {
@@ -796,14 +761,10 @@ exec::task<void> ProxySession::run_http_forward_response_send(std::shared_ptr<Pr
 
 void ProxySession::send_http_response(int status, std::string_view reason, bool start_relay) {
     auto self = shared_from_this();
-    async::spawn_detached([self, status, reason = std::string(reason),
-                           start_relay](std::shared_ptr<async::DetachedScope> scope) mutable {
-        return run_http_response(self, std::move(scope), status, std::move(reason), start_relay);
-    });
+    async::spawn_detached(run_http_response(self, status, std::string(reason), start_relay));
 }
 
-exec::task<void> ProxySession::run_http_response(std::shared_ptr<ProxySession> self,
-                                                 std::shared_ptr<async::DetachedScope>, int status,
+exec::task<void> ProxySession::run_http_response(std::shared_ptr<ProxySession> self, int status,
                                                  std::string reason, bool start_relay) {
     if (self->closed_.load(std::memory_order_acquire)) {
         co_return;

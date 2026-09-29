@@ -51,9 +51,7 @@ core::Status Socks5UdpListener::start(boost::asio::ip::udp::endpoint endpoint) {
     spdlog::info("SOCKS5 UDP listener listening on {}:{}", endpoint_->address().to_string(),
                  endpoint_->port());
     auto self = shared_from_this();
-    async::spawn_detached([self](std::shared_ptr<async::DetachedScope> scope) {
-        return run_receive(self, std::move(scope));
-    });
+    async::spawn_detached(run_receive(self));
     return {};
 }
 
@@ -85,8 +83,7 @@ std::optional<boost::asio::ip::udp::endpoint> Socks5UdpListener::endpoint() cons
     return endpoint_;
 }
 
-exec::task<void> Socks5UdpListener::run_receive(std::shared_ptr<Socks5UdpListener> self,
-                                                std::shared_ptr<async::DetachedScope>) {
+exec::task<void> Socks5UdpListener::run_receive(std::shared_ptr<Socks5UdpListener> self) {
     // Ingress loop: each datagram routes per path inline; teardown aborts
     // exit quietly while other failures only warn and continue.
     while (!self->stopped_) {
@@ -188,16 +185,10 @@ void Socks5UdpListener::process(std::size_t size, boost::asio::ip::udp::endpoint
         {},
         {}};
     auto self = shared_from_this();
-    async::spawn_detached([self, snapshot = snapshot_, metadata = std::move(metadata),
-                           key = std::move(key),
-                           client](std::shared_ptr<async::DetachedScope> scope) mutable {
-        return run_route(self, std::move(scope), std::move(snapshot), std::move(metadata),
-                         std::move(key), client);
-    });
+    async::spawn_detached(run_route(self, snapshot_, std::move(metadata), std::move(key), client));
 }
 
 exec::task<void> Socks5UdpListener::run_route(std::shared_ptr<Socks5UdpListener> self,
-                                              std::shared_ptr<async::DetachedScope>,
                                               runtime::RuntimeSnapshotPtr snapshot,
                                               core::ConnectionMetadata metadata, std::string key,
                                               boost::asio::ip::udp::endpoint client) {
@@ -246,19 +237,13 @@ exec::task<void> Socks5UdpListener::run_route(std::shared_ptr<Socks5UdpListener>
         std::lock_guard lock(self->paths_mutex_);
         self->paths_.emplace(key, path);
     }
-    async::spawn_detached([self, path](std::shared_ptr<async::DetachedScope> scope) {
-        return run_response_loop(self, std::move(scope), path);
-    });
+    async::spawn_detached(run_response_loop(self, path));
     for (auto &queued : payloads) {
-        async::spawn_detached(
-            [self, path, queued](std::shared_ptr<async::DetachedScope> scope) mutable {
-                return run_send(self, std::move(scope), path, std::move(queued));
-            });
+        async::spawn_detached(run_send(self, path, std::move(queued)));
     }
 }
 
 exec::task<void> Socks5UdpListener::run_send(std::shared_ptr<Socks5UdpListener> self,
-                                             std::shared_ptr<async::DetachedScope>,
                                              std::shared_ptr<Path> path,
                                              std::shared_ptr<std::vector<std::uint8_t>> payload) {
     try {
@@ -280,7 +265,6 @@ exec::task<void> Socks5UdpListener::run_send(std::shared_ptr<Socks5UdpListener> 
 }
 
 exec::task<void> Socks5UdpListener::run_response_loop(std::shared_ptr<Socks5UdpListener> self,
-                                                      std::shared_ptr<async::DetachedScope> scope,
                                                       std::shared_ptr<Path> path) {
     // Per-path response loop; teardown aborts exit quietly, other failures
     // warn and retire the path.
@@ -312,30 +296,22 @@ exec::task<void> Socks5UdpListener::run_response_loop(std::shared_ptr<Socks5UdpL
             co_return;
         }
         async::spawn_detached(
-            [self, path,
-             packet = build_response_packet(
-                 path, packet.address,
-                 std::span<const std::uint8_t>(path->receive_buffer.data(), packet.size))](
-                std::shared_ptr<async::DetachedScope> scope) mutable {
-                return run_respond(self, std::move(scope), path, std::move(packet));
-            });
+            run_respond(self, path,
+                        build_response_packet(path, packet.address,
+                                              std::span<const std::uint8_t>(
+                                                  path->receive_buffer.data(), packet.size))));
     }
 }
 
 void Socks5UdpListener::send_payload(const std::shared_ptr<Path> &path,
                                      std::shared_ptr<std::vector<std::uint8_t>> payload) {
     auto self = shared_from_this();
-    async::spawn_detached([self, path, payload = std::move(payload)](
-                              std::shared_ptr<async::DetachedScope> scope) mutable {
-        return run_send(self, std::move(scope), path, std::move(payload));
-    });
+    async::spawn_detached(run_send(self, path, std::move(payload)));
 }
 
 void Socks5UdpListener::receive_response(const std::shared_ptr<Path> &path) {
     auto self = shared_from_this();
-    async::spawn_detached([self, path](std::shared_ptr<async::DetachedScope> scope) {
-        return run_response_loop(self, std::move(scope), path);
-    });
+    async::spawn_detached(run_response_loop(self, path));
 }
 
 void Socks5UdpListener::retire_path(std::shared_ptr<Socks5UdpListener> self,
@@ -378,14 +354,10 @@ void Socks5UdpListener::send_response(const std::shared_ptr<Path> &path, io::Dat
         return;
     }
     auto self = shared_from_this();
-    async::spawn_detached([self, path, packet = std::move(packet)](
-                              std::shared_ptr<async::DetachedScope> scope) mutable {
-        return run_respond(self, std::move(scope), path, std::move(packet));
-    });
+    async::spawn_detached(run_respond(self, path, std::move(packet)));
 }
 
 exec::task<void> Socks5UdpListener::run_respond(std::shared_ptr<Socks5UdpListener> self,
-                                                std::shared_ptr<async::DetachedScope>,
                                                 std::shared_ptr<Path> path,
                                                 std::shared_ptr<std::vector<std::uint8_t>> packet) {
     auto socket = self->socket_;

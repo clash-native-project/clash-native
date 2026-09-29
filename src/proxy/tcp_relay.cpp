@@ -67,11 +67,7 @@ void TcpRelay::launch(std::vector<std::uint8_t> initial_left_data) {
     // ProxySession::run_udp_control and Socks5UdpListener::run_response_loop
     // -- heap-use-after-free at async_scope.hpp:162). Detached launch keeps
     // the task's scope on the immortal heap scope instead.
-    async::spawn_detached([self, data = std::move(initial_left_data)](
-                              std::shared_ptr<async::DetachedScope> scope) mutable {
-        (void)scope;
-        return run(std::move(self), std::move(data));
-    });
+    async::spawn_detached(run(std::move(self), std::move(initial_left_data)));
 }
 exec::task<void> TcpRelay::join_pumps(std::shared_ptr<TcpRelay> self,
                                       std::vector<std::uint8_t> initial) {

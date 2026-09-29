@@ -14,9 +14,8 @@
 // Ownership (ASan #194, heap-use-after-free at async_scope.hpp:162):
 // async_scope's __complete touches scope->__active_ as its first access on
 // memory the task frame may already have freed (frame destroy runs inside
-// await_resume's scope_guard, before __complete). Four ASan rounds proved
-// every owner-tied scope variant dies the same way: owner's scope_,
-// frame-held DetachedScope (direct or via wrapper frame), sentinel second
+// await_resume's scope_guard, before __complete). Owner-tied scope variants
+// all die the same way: owner's scope_, frame-held scope, sentinel second
 // spawn (its own __complete races the same teardown).
 //
 // Fix: detached tasks share one process-lifetime heap async_scope that is
@@ -25,42 +24,27 @@
 // __complete always touches live memory: no UAF. Sharing is safe -- spawn
 // only touches the atomic active count plus the never-fired stop source;
 // detached tasks never request_stop and are never drained via on_empty,
-// so no join ordering exists to violate. exec::task drives through
-// async_scope::spawn's internal submit path (tasks are awaitable, not
-// directly connectable -- five rounds of connect/submit/start_detached
-// attempts confirmed no public sender path exists for bare tasks).
+// so no join ordering exists to violate.
+//
+// Why a scope at all (rather than exec::start_detached): exec::task is only
+// a sender where a spawn-like environment is present -- sender_in<root_env>
+// is false for both exec::task and stdexec::task, while true under an env
+// carrying a stop token plus start scheduler. So start_detached rejects bare
+// tasks at compile time ("no matching function ... sender_in<root_env>
+// evaluated to false"), and async_scope::spawn's internal submit path is the
+// only public driver. The shared scope is that driver's minimal vehicle:
+// upstream examples (e.g. server_theme/then_upon.cpp) always join() before
+// destroying the scope, a shape that cannot fit owners which die from inside
+// their own task completions -- hence one immortal scope instead of one per
+// owner.
 
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
 
-#include <concepts>
 #include <exception>
-#include <memory>
-#include <type_traits>
 #include <utility>
 
 namespace clash_native::async {
-
-// Surviving handle for exactly one detached task. Create only via
-// spawn_detached. The int is API ballast (factories take the handle as
-// first coroutine parameter); lifetime comes from the shared_ptr.
-struct DetachedScope {
-    int unused = 0;
-};
-
-template <typename MakeTask>
-    requires std::invocable<MakeTask &, std::shared_ptr<DetachedScope>> &&
-             std::same_as<std::invoke_result_t<MakeTask &, std::shared_ptr<DetachedScope>>,
-                          exec::task<void>>
-exec::task<void> detach_wrap(std::shared_ptr<DetachedScope> scope, MakeTask make_task) {
-    try {
-        co_await std::forward<MakeTask>(make_task)(scope);
-    } catch (...) {
-        // Detached tasks must complete with a value (async_scope spawn
-        // terminates on set_error); swallow like the deadline tasks do.
-    }
-    co_return;
-}
 
 // Process-lifetime scope shared by all detached tasks. Intentionally
 // leaked (one allocation, reclaimed at exit): outlives every owner, so
@@ -70,13 +54,21 @@ inline exec::async_scope &detached_scope() {
     return *scope;
 }
 
-template <typename MakeTask>
-    requires std::invocable<MakeTask &, std::shared_ptr<DetachedScope>> &&
-             std::same_as<std::invoke_result_t<MakeTask &, std::shared_ptr<DetachedScope>>,
-                          exec::task<void>>
-void spawn_detached(MakeTask &&make_task) {
-    auto scope = std::make_shared<DetachedScope>();
-    detached_scope().spawn(detach_wrap(scope, std::forward<MakeTask>(make_task)));
+// Value-only wrapper: async_scope::spawn terminates on set_error, so swallow
+// everything like the deadline tasks always did.
+inline exec::task<void> detach_wrap(exec::task<void> inner) {
+    try {
+        co_await std::move(inner);
+    } catch (...) {
+    }
+    co_return;
+}
+
+// Fire-and-forget for exec::task<void> with no owning scope. The task runs
+// on the shared process-lifetime scope; completion destroys only the heap
+// opstate, never owner memory.
+inline void spawn_detached(exec::task<void> task) {
+    detached_scope().spawn(detach_wrap(std::move(task)));
 }
 
 } // namespace clash_native::async

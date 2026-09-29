@@ -76,9 +76,7 @@ exec::task<void> ProxySession::write_handshake_all(std::shared_ptr<ProxySession>
 // password authentication, request parse. Terminals (target open, UDP
 // association, reply-and-close) stay as methods; every transport failure
 // closes the session, matching the old chain.
-exec::task<void> ProxySession::run_socks5_handshake(std::shared_ptr<ProxySession> self,
-                                                    std::shared_ptr<async::DetachedScope> scope) {
-    (void)scope;
+exec::task<void> ProxySession::run_socks5_handshake(std::shared_ptr<ProxySession> self) {
     try {
         co_await read_handshake_exact(self,
                                       boost::asio::buffer(self->method_header_.data() + 1, 1));
@@ -283,16 +281,12 @@ void ProxySession::open_socks_udp_association() {
 
 void ProxySession::send_socks_udp_associate_reply(const boost::asio::ip::udp::endpoint &endpoint) {
     auto self = shared_from_this();
-    async::spawn_detached([self, endpoint](std::shared_ptr<async::DetachedScope> scope) mutable {
-        return run_socks_udp_associate_reply(self, std::move(scope), endpoint);
-    });
+    async::spawn_detached(run_socks_udp_associate_reply(self, endpoint));
 }
 
 exec::task<void>
 ProxySession::run_socks_udp_associate_reply(std::shared_ptr<ProxySession> self,
-                                            std::shared_ptr<async::DetachedScope> scope,
                                             boost::asio::ip::udp::endpoint endpoint) {
-    (void)scope;
     if (self->closed_.load(std::memory_order_acquire)) {
         co_return;
     }
@@ -327,16 +321,11 @@ ProxySession::run_socks_udp_associate_reply(std::shared_ptr<ProxySession> self,
     // last session reference dropping inside the task cannot free the
     // scope it completes into (ASan heap-use-after-free in #194,
     // async_scope.hpp:162 via run_udp_control destroy).
-    async::spawn_detached([self](std::shared_ptr<async::DetachedScope> scope) {
-        return run_udp_control(self, std::move(scope));
-    });
-    async::spawn_detached([self](std::shared_ptr<async::DetachedScope> scope) {
-        return run_socks_udp_ingress(self, std::move(scope));
-    });
+    async::spawn_detached(run_udp_control(self));
+    async::spawn_detached(run_socks_udp_ingress(self));
 }
 
-exec::task<void> ProxySession::run_udp_control(std::shared_ptr<ProxySession> self,
-                                               std::shared_ptr<async::DetachedScope>) {
+exec::task<void> ProxySession::run_udp_control(std::shared_ptr<ProxySession> self) {
     // Control-connection watchdog: any byte, EOF, or error closes the
     // association. close() aborts the pull via socket cancel.
     while (!self->closed_.load(std::memory_order_acquire)) {
@@ -355,8 +344,7 @@ exec::task<void> ProxySession::run_udp_control(std::shared_ptr<ProxySession> sel
     }
 }
 
-exec::task<void> ProxySession::run_socks_udp_ingress(std::shared_ptr<ProxySession> self,
-                                                     std::shared_ptr<async::DetachedScope>) {
+exec::task<void> ProxySession::run_socks_udp_ingress(std::shared_ptr<ProxySession> self) {
     // Datagram ingress loop: filter by the control peer, route per path.
     // Teardown aborts fail as operation_aborted and exit quietly; other
     // failures close the session.
@@ -458,16 +446,10 @@ void ProxySession::process_socks_udp_packet(std::size_t size) {
         authenticated_user_,
         {}};
     auto self = shared_from_this();
-    async::spawn_detached(
-        [self, snapshot = udp_snapshot_, metadata = std::move(metadata),
-         key = std::move(key)](std::shared_ptr<async::DetachedScope> scope) mutable {
-            return run_udp_route(self, std::move(scope), std::move(snapshot), std::move(metadata),
-                                 std::move(key));
-        });
+    async::spawn_detached(run_udp_route(self, udp_snapshot_, std::move(metadata), std::move(key)));
 }
 
 exec::task<void> ProxySession::run_udp_route(std::shared_ptr<ProxySession> self,
-                                             std::shared_ptr<async::DetachedScope>,
                                              runtime::RuntimeSnapshotPtr snapshot,
                                              core::ConnectionMetadata metadata, std::string key) {
     ProxyServer::RoutedDatagram routed;
@@ -514,19 +496,13 @@ exec::task<void> ProxySession::run_udp_route(std::shared_ptr<ProxySession> self,
         std::lock_guard lock(self->udp_paths_mutex_);
         self->udp_paths_.emplace(key, path);
     }
-    async::spawn_detached([self, path](std::shared_ptr<async::DetachedScope> scope) {
-        return run_udp_response_loop(self, std::move(scope), path);
-    });
+    async::spawn_detached(run_udp_response_loop(self, path));
     for (auto &packet : payloads) {
-        async::spawn_detached(
-            [self, path, packet](std::shared_ptr<async::DetachedScope> scope) mutable {
-                return run_udp_send(self, std::move(scope), path, std::move(packet));
-            });
+        async::spawn_detached(run_udp_send(self, path, std::move(packet)));
     }
 }
 
 exec::task<void> ProxySession::run_udp_send(std::shared_ptr<ProxySession> self,
-                                            std::shared_ptr<async::DetachedScope>,
                                             std::shared_ptr<UdpPath> path,
                                             std::shared_ptr<std::vector<std::uint8_t>> payload) {
     try {
@@ -574,7 +550,6 @@ exec::task<void> ProxySession::run_udp_send(std::shared_ptr<ProxySession> self,
 }
 
 exec::task<void> ProxySession::run_udp_response_loop(std::shared_ptr<ProxySession> self,
-                                                     std::shared_ptr<async::DetachedScope>,
                                                      std::shared_ptr<UdpPath> path) {
     // Per-path response loop: forward each datagram to the client, re-arm
     // as a task loop. Teardown aborts exit quietly; other failures retire
@@ -611,33 +586,22 @@ exec::task<void> ProxySession::run_udp_response_loop(std::shared_ptr<ProxySessio
             }
             co_return;
         }
-        if (self->closed_.load(std::memory_order_acquire)) {
-            co_return;
-        }
-        async::spawn_detached(
-            [self, packet = build_socks_udp_response(
-                       packet.address,
-                       std::span<const std::uint8_t>(path->receive_buffer.data(), packet.size))](
-                std::shared_ptr<async::DetachedScope> scope) mutable {
-                return run_udp_client_send(self, std::move(scope), std::move(packet));
-            });
+        async::spawn_detached(run_udp_client_send(
+            self, build_socks_udp_response(
+                      packet.address,
+                      std::span<const std::uint8_t>(path->receive_buffer.data(), packet.size))));
     }
 }
 
 void ProxySession::send_udp_payload(const std::shared_ptr<UdpPath> &path,
                                     std::shared_ptr<std::vector<std::uint8_t>> payload) {
     auto self = shared_from_this();
-    async::spawn_detached([self, path, payload = std::move(payload)](
-                              std::shared_ptr<async::DetachedScope> scope) mutable {
-        return run_udp_send(self, std::move(scope), path, std::move(payload));
-    });
+    async::spawn_detached(run_udp_send(self, path, std::move(payload)));
 }
 
 void ProxySession::receive_udp_response(const std::shared_ptr<UdpPath> &path) {
     auto self = shared_from_this();
-    async::spawn_detached([self, path](std::shared_ptr<async::DetachedScope> scope) {
-        return run_udp_response_loop(self, std::move(scope), path);
-    });
+    async::spawn_detached(run_udp_response_loop(self, path));
 }
 
 std::shared_ptr<std::vector<std::uint8_t>>
@@ -663,15 +627,11 @@ void ProxySession::send_socks_udp_response(io::DatagramAddress source,
         return;
     }
     auto self = shared_from_this();
-    async::spawn_detached(
-        [self, packet = std::move(packet)](std::shared_ptr<async::DetachedScope> scope) mutable {
-            return run_udp_client_send(self, std::move(scope), std::move(packet));
-        });
+    async::spawn_detached(run_udp_client_send(self, std::move(packet)));
 }
 
 exec::task<void>
 ProxySession::run_udp_client_send(std::shared_ptr<ProxySession> self,
-                                  std::shared_ptr<async::DetachedScope>,
                                   std::shared_ptr<std::vector<std::uint8_t>> packet) {
     if (self->closed_.load(std::memory_order_acquire) || !self->udp_client_endpoint_ ||
         !self->udp_relay_socket_ || !packet) {
@@ -690,16 +650,11 @@ ProxySession::run_udp_client_send(std::shared_ptr<ProxySession> self,
 
 void ProxySession::send_socks_reply(std::uint8_t reply, bool start_relay) {
     auto self = shared_from_this();
-    async::spawn_detached(
-        [self, reply, start_relay](std::shared_ptr<async::DetachedScope> scope) mutable {
-            return run_socks_reply(self, std::move(scope), reply, start_relay);
-        });
+    async::spawn_detached(run_socks_reply(self, reply, start_relay));
 }
 
 exec::task<void> ProxySession::run_socks_reply(std::shared_ptr<ProxySession> self,
-                                               std::shared_ptr<async::DetachedScope> scope,
                                                std::uint8_t reply, bool start_relay) {
-    (void)scope;
     if (self->closed_.load(std::memory_order_acquire)) {
         co_return;
     }
