@@ -695,6 +695,7 @@ TEST(HttpProxyTest, KeepsHttp11ClientConnectionForMultipleRequests) {
     HttpTarget target(runtime);
     clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
     proxy.set_inbound_mode(clash_native::proxy::ProxyInboundMode::http);
+    proxy.set_http_exchange_deadline(std::chrono::seconds(60));
     ASSERT_TRUE(proxy.start());
     runtime.start();
 
@@ -732,6 +733,7 @@ TEST(HttpProxyTest, ForwardsHttp11UpgradeAndRelaysTheUpgradedStream) {
     HttpUpgradeTarget target(runtime);
     clash_native::proxy::ProxyServer proxy(runtime, {boost::asio::ip::address_v4::loopback(), 0});
     proxy.set_inbound_mode(clash_native::proxy::ProxyInboundMode::http);
+    proxy.set_http_exchange_deadline(std::chrono::seconds(60));
     ASSERT_TRUE(proxy.start());
     runtime.start();
 

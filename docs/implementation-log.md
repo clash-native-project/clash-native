@@ -2952,3 +2952,13 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   `grep "new exec::async_scope"` is now clean.
 - Validation: ExchangesOverDoh2 solo 8/8, DNS group 13/13.
   `format-check` + `git diff --check` pass.
+
+### 2026-09-30 - Parameterize HTTP exchange deadline (5min default, 60s in tests)
+
+- `ProxyServer::set_http_exchange_deadline()` (default `minutes(5)`,
+  production behavior unchanged); `run_http_upgrade_exchange` and
+  `run_http_forward_exchange` use `owner_.http_exchange_deadline_`
+  instead of hardcoded `minutes(5)`.
+- The two hanging proxy tests set 60s: keepalive + upgrade teardown now
+  waits out the upstream deadline instead of the full 5 minutes.
+- Validation: both tests pass at ~60s each (was ~300s ctest-killed).

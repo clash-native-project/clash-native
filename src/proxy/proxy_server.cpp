@@ -100,6 +100,13 @@ void ProxyServer::set_inbound_mode(ProxyInboundMode mode) {
     inbound_mode_ = mode;
 }
 
+void ProxyServer::set_http_exchange_deadline(std::chrono::steady_clock::duration deadline) {
+    if (running()) {
+        throw std::logic_error("Cannot change the HTTP exchange deadline on a running proxy");
+    }
+    http_exchange_deadline_ = deadline;
+}
+
 void ProxyServer::set_http_authentication(std::string username, std::string password) {
     if (running()) {
         throw std::logic_error("Cannot change HTTP authentication on a running proxy");

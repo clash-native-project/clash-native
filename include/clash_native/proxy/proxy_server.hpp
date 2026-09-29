@@ -20,6 +20,7 @@
 #include <exec/task.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -59,6 +60,10 @@ class ProxyServer {
 
     void set_endpoint(boost::asio::ip::tcp::endpoint endpoint);
     void set_inbound_mode(ProxyInboundMode mode);
+    // Upstream HTTP exchange deadline for proxy sessions (forward and
+    // upgrade paths). Default 5 minutes; tests shorten it so teardown
+    // does not wait out the full window.
+    void set_http_exchange_deadline(std::chrono::steady_clock::duration deadline);
     void set_http_authentication(std::string username, std::string password);
     void set_socks5_users(std::vector<Socks5User> users);
     void set_socks5_udp_endpoint(boost::asio::ip::udp::endpoint endpoint);
@@ -125,6 +130,8 @@ class ProxyServer {
     boost::asio::ip::tcp::acceptor acceptor_;
     boost::asio::ip::tcp::endpoint endpoint_;
     ProxyInboundMode inbound_mode_ = ProxyInboundMode::mixed;
+    // See set_http_exchange_deadline.
+    std::chrono::steady_clock::duration http_exchange_deadline_ = std::chrono::minutes(5);
     std::string http_username_;
     std::string http_password_;
     std::vector<Socks5User> socks5_users_;

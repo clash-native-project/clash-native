@@ -363,7 +363,7 @@ exec::task<void> ProxySession::run_http_upgrade_exchange(std::shared_ptr<ProxySe
         self->send_http_forward_response(502, "Bad Gateway");
         co_return;
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+    const auto deadline = std::chrono::steady_clock::now() + self->owner_.http_exchange_deadline_;
     auto request = std::move(self->http_upgrade_request_);
     core::Result<io::StreamUpgradeResponse> result =
         core::fail(core::Error{core::ErrorCode::cancelled, "HTTP upgrade tunnel was cancelled"});
@@ -390,7 +390,7 @@ exec::task<void> ProxySession::run_http_forward_exchange(std::shared_ptr<ProxySe
         self->send_http_forward_response(502, "Bad Gateway");
         co_return;
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+    const auto deadline = std::chrono::steady_clock::now() + self->owner_.http_exchange_deadline_;
     auto request = std::move(self->http_forward_request_);
     core::Result<io::StreamingExchangeResponse> result =
         core::fail(core::Error{core::ErrorCode::cancelled, "HTTP forward exchange was cancelled"});
