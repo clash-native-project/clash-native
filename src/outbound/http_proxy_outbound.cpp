@@ -13,6 +13,7 @@
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
+#include <boost/asio/steady_timer.hpp>
 
 #include <exec/asio/use_sender.hpp>
 #include <exec/async_scope.hpp>
@@ -124,10 +125,14 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
         auto self = shared_from_this();
         // Deadline task races the connect chain; teardown stays
         // guard-driven, so no stop is ever requested.
+        // State-owned timer so finish() can wake the loser: otherwise it
+        // sleeps the full window holding state alive after fast success.
+        deadline_timer_ =
+            std::make_shared<boost::asio::steady_timer>(runtime_.serialized_executor());
+        deadline_timer_->expires_at(deadline_);
         scope_.spawn(run(self));
-        scope_.spawn(run_deadline(self));
+        scope_.spawn(run_deadline(self, deadline_timer_));
     }
-
     // Abort for sender-driven cancellation: posted to the strand so it stays
     // ordered with finish(). Marks completion so the chain task bails at its
     // next guard and stops the scope so stop propagates into the awaits;
@@ -326,9 +331,10 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
         co_return;
     }
 
-    static exec::task<void> run_deadline(std::shared_ptr<HttpProxyConnectState> self) {
+    static exec::task<void> run_deadline(std::shared_ptr<HttpProxyConnectState> self,
+                                         std::shared_ptr<boost::asio::steady_timer> timer) {
         try {
-            co_await async::sleep_after(self->runtime_.serialized_executor(), kConnectTimeout);
+            co_await (timer->async_wait(exec::asio::use_sender) | stdexec::then([] {}));
         } catch (...) {
             co_return;
         }
@@ -344,6 +350,12 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
             return;
         }
         completed_ = true;
+        // Wake the deadline loser: it holds state alive and would sleep the
+        // full window after fast success. Cancel is thread-safe; abort
+        // already request_stops the scope, so the sleep unwinds as stopped.
+        if (deadline_timer_) {
+            (void)deadline_timer_->cancel();
+        }
         if (!result.succeeded()) {
             boost::system::error_code ignored;
             if (socket_) {
@@ -372,6 +384,8 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
     exec::async_scope scope_;
     core::StreamOpenHandler handler_;
     std::chrono::steady_clock::time_point deadline_{};
+    // Owned deadline timer so finish() can wake the racing deadline task.
+    std::shared_ptr<boost::asio::steady_timer> deadline_timer_;
     bool completed_ = false;
 };
 

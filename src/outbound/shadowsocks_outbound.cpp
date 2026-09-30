@@ -698,11 +698,14 @@ class ShadowsocksConnectOperation final
             finish(core::StreamOpenResult::failed(validation.error()));
             return;
         }
-        // Deadline is a sleep task racing the chain: whichever finishes
+        // Deadline is a timer wait racing the chain: whichever finishes
         // first wins via the completed_ guard in finish(); the loser
-        // observes completed_ and drops. No steady_timer.async_wait leaf.
-        auto executor = runtime_.serialized_executor();
-        scope_.spawn(run_deadline(shared_from_this(), executor));
+        // observes completed_ and drops. State-owned timer so finish() can
+        // wake the loser instead of sleeping the full window on fast success.
+        deadline_timer_ =
+            std::make_shared<boost::asio::steady_timer>(runtime_.serialized_executor());
+        deadline_timer_->expires_after(kConnectTimeout);
+        scope_.spawn(run_deadline(shared_from_this(), deadline_timer_));
         // The scope owns the chain and deadline tasks; teardown stays
         // guard-driven, so no stop is ever requested.
         scope_.spawn(run(shared_from_this()));
@@ -711,9 +714,9 @@ class ShadowsocksConnectOperation final
     // NOTE: named function per the coroutine creation rules; never an
     // immediately-invoked capturing lambda.
     static exec::task<void> run_deadline(std::shared_ptr<ShadowsocksConnectOperation> self,
-                                         boost::asio::any_io_executor executor) {
+                                         std::shared_ptr<boost::asio::steady_timer> timer) {
         try {
-            co_await async::sleep_after(executor, kConnectTimeout);
+            co_await (timer->async_wait(exec::asio::use_sender) | stdexec::then([] {}));
         } catch (...) {
             co_return;
         }
@@ -1910,6 +1913,11 @@ class ShadowsocksConnectOperation final
             return;
         }
         completed_ = true;
+        // Wake the deadline loser immediately; otherwise it sleeps the full
+        // window holding state alive after fast success.
+        if (deadline_timer_) {
+            (void)deadline_timer_->cancel();
+        }
         if (!result.succeeded()) {
             boost::system::error_code ignored;
             socket_->close(ignored);
@@ -1938,6 +1946,8 @@ class ShadowsocksConnectOperation final
     std::optional<std::vector<std::uint8_t>> plugin_ech_config_;
     core::StreamOpenHandler handler_;
     std::vector<std::uint8_t> write_nonce_;
+    // Owned deadline timer so finish() can wake the racing deadline task.
+    std::shared_ptr<boost::asio::steady_timer> deadline_timer_;
     bool completed_ = false;
     exec::async_scope scope_;
 };

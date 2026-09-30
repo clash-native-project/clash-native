@@ -3068,3 +3068,33 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   arrives) should use a small asio pool per the earlier decision.
 - Validation (Linux ASan): Socks5 5/5, FakeIP/router/policy 9/9, target
   repeat-20 20/20, zero sanitizer reports. Windows RelWithDebInfo passes.
+
+### 2026-09-30 - Cancel outbound deadline losers instead of sleeping them out
+
+- Root cause of the 10s Socks5 stalls: every outbound connect/resolve
+  spawned a chain task plus a `sleep_after` deadline task racing on a
+  `completed_` guard. The loser held the last state reference and slept
+  the full 10s/15s window, keeping the io_context (hence
+  `runtime.stop()`, and the test teardown after it) waiting. Sync tests
+  that looked instant were paying one full deadline sleep per connection.
+- Fix (5 sites): the deadline timer is now state-owned and `finish()` /
+  `abort()` cancels it, waking the loser immediately; the deadline
+  coroutine waits on `timer.async_wait(use_sender)` instead of an
+  uncancellable `sleep_after`:
+  - `DirectConnectState` (detached pair, no member scope per ASan #194)
+  - `HostResolveState` (shared resolve used by all chained dials)
+  - `HttpProxyConnectState`, `ShadowsocksConnectOperation`,
+    `TrojanConnectOperation` (Trojan's dead `timer_` member replaced by
+    the owned deadline timer; absolute `deadline_` kept for TLS/WS
+    sub-operation budgets).
+- Full with_timeout race migration deliberately deferred: it needs the
+  chain bodies rewritten to value-returning tasks, and the current
+  cancel-on-finish fix already removes the entire stall with a fraction
+  of the risk. Revisit if deadline teardown ever needs to differ from
+  finish()'s failure path.
+- Validation (Linux ASan): Socks5 5/5 in 342ms total (was 30s+;
+  ConnectsAndRelaysTcpData 10051ms -> 67ms). Pre-existing failures
+  unrelated to this change, reproduced on the clean tree:
+  `StreamMapAbandonedPullCancelsCleanly` and
+  `ResolverServiceTest.CoalescesEquivalentQueriesAndCachesTheAnswer`
+  (both async_scope UAF shapes). Windows RelWithDebInfo passes.

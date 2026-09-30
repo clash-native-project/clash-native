@@ -9,6 +9,7 @@
 
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
+#include <boost/asio/steady_timer.hpp>
 
 #include <exec/asio/use_sender.hpp>
 #include <exec/task.hpp>
@@ -59,8 +60,13 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
         // completion, which would free a member scope_ before __complete
         // touches scope->__active_ (ASan #194, async_scope.hpp:162 --
         // same shape as ProxySession UDP tasks and Socks5UdpListener).
+        // The timer is state-owned so finish() can cancel it: otherwise the
+        // loser sleeps the full 10s after a fast success and keeps the
+        // io_context (hence runtime.stop()) waiting out the window.
+        deadline_timer_ = std::make_shared<boost::asio::steady_timer>(
+            runtime_.serialized_executor(), std::chrono::seconds(10));
         async::spawn_detached(run_open(self));
-        async::spawn_detached(run_deadline(self));
+        async::spawn_detached(run_deadline(self, deadline_timer_));
     }
 
     // Abort for sender-driven cancellation: idempotent with finish().
@@ -75,6 +81,11 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
                     return;
                 }
                 self->completed_ = true;
+                // Wake the deadline loser as well; otherwise it sleeps the
+                // full window holding state alive after an abort.
+                if (self->deadline_timer_) {
+                    (void)self->deadline_timer_->cancel();
+                }
                 // No request_stop: detached tasks have no shared scope to
                 // stop; closing the socket aborts the open chain, and the
                 // deadline task drops at its completed_ guard.
@@ -172,10 +183,10 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
         }
     }
 
-    static exec::task<void> run_deadline(std::shared_ptr<DirectConnectState> self) {
+    static exec::task<void> run_deadline(std::shared_ptr<DirectConnectState> self,
+                                         std::shared_ptr<boost::asio::steady_timer> timer) {
         try {
-            co_await async::sleep_after(self->runtime_.serialized_executor(),
-                                        std::chrono::seconds(10));
+            co_await (timer->async_wait(exec::asio::use_sender) | stdexec::then([] {}));
         } catch (...) {
             co_return;
         }
@@ -192,6 +203,13 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
             return;
         }
         completed_ = true;
+        // Wake the deadline loser immediately: it holds the last state
+        // reference, and its 10s sleep would otherwise keep the io_context
+        // (hence runtime.stop()) waiting out the window after fast success.
+        // Cancel is thread-safe; the loser drops at its completed_ guard.
+        if (deadline_timer_) {
+            (void)deadline_timer_->cancel();
+        }
         if (!result.succeeded()) {
             boost::system::error_code ignored;
             socket_.close(ignored);
@@ -207,6 +225,9 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
     std::shared_ptr<dns::ResolverService> resolver_;
     boost::asio::ip::tcp::socket socket_;
     core::StreamOpenHandler handler_;
+    // Owned deadline timer so finish() can wake the racing deadline task:
+    // otherwise the loser sleeps the full window holding state alive.
+    std::shared_ptr<boost::asio::steady_timer> deadline_timer_;
     bool completed_ = false;
     // No member scope: open/deadline tasks run detached (immortal heap
     // scope) so the last state reference cannot free their scope (#194).

@@ -2,6 +2,7 @@
 
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/post.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/system/error_code.hpp>
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/timer.hpp>
@@ -10,6 +11,7 @@
 #include <clash_native/dns/resolver_service.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
+#include <exec/asio/use_sender.hpp>
 
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
@@ -64,8 +66,12 @@ class HostResolveState final : public std::enable_shared_from_this<HostResolveSt
         auto self = shared_from_this();
         // Deadline task races the resolve loop; teardown stays guard-driven,
         // so no stop is ever requested.
+        // State-owned timer so finish() can wake the loser: otherwise it
+        // sleeps the full 10s holding state alive after fast success.
+        deadline_timer_ = std::make_shared<boost::asio::steady_timer>(
+            runtime_.serialized_executor(), std::chrono::seconds(10));
         scope_.spawn(run_resolve(self));
-        scope_.spawn(run_deadline(self));
+        scope_.spawn(run_deadline(self, deadline_timer_));
     }
 
     // Abort for sender-driven cancellation: idempotent with finish().
@@ -79,6 +85,9 @@ class HostResolveState final : public std::enable_shared_from_this<HostResolveSt
                     return;
                 }
                 self->completed_ = true;
+                if (self->deadline_timer_) {
+                    (void)self->deadline_timer_->cancel();
+                }
                 if (self->resolver_ && self->request_id_) {
                     self->resolver_->cancel(*self->request_id_);
                     self->request_id_.reset();
@@ -158,10 +167,10 @@ class HostResolveState final : public std::enable_shared_from_this<HostResolveSt
         self->finish(Result{std::move(self->addresses_)});
     }
 
-    static exec::task<void> run_deadline(std::shared_ptr<HostResolveState> self) {
+    static exec::task<void> run_deadline(std::shared_ptr<HostResolveState> self,
+                                         std::shared_ptr<boost::asio::steady_timer> timer) {
         try {
-            co_await async::sleep_after(self->runtime_.serialized_executor(),
-                                        std::chrono::seconds(10));
+            co_await (timer->async_wait(exec::asio::use_sender) | stdexec::then([] {}));
         } catch (...) {
             co_return;
         }
@@ -174,6 +183,11 @@ class HostResolveState final : public std::enable_shared_from_this<HostResolveSt
             return;
         }
         completed_ = true;
+        // Wake the deadline loser immediately; otherwise it sleeps the full
+        // 10s holding state alive after fast success.
+        if (deadline_timer_) {
+            (void)deadline_timer_->cancel();
+        }
         if (resolver_ && request_id_) {
             resolver_->cancel(*request_id_);
             request_id_.reset();
@@ -195,6 +209,8 @@ class HostResolveState final : public std::enable_shared_from_this<HostResolveSt
     std::optional<dns::ResolverService::RequestId> request_id_;
     AddressList addresses_;
     std::optional<core::Error> first_error_;
+    // Owned deadline timer so finish() can wake the racing deadline task.
+    std::shared_ptr<boost::asio::steady_timer> deadline_timer_;
     bool completed_ = false;
 };
 

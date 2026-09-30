@@ -266,7 +266,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
           chain_registry_(std::move(chain_registry)), config_(std::move(config)),
           request_(std::move(request)), command_(command), gun_pool_(std::move(gun_pool)),
           socket_(std::make_shared<boost::asio::ip::tcp::socket>(runtime.serialized_executor())),
-          timer_(runtime.serialized_executor()), handler_(std::move(handler)) {}
+          handler_(std::move(handler)) {}
 
     void start() {
         if (config_.id.empty() || config_.server_host.empty() || config_.server_port == 0 ||
@@ -303,7 +303,14 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
             return;
         }
         deadline_ = std::chrono::steady_clock::now() + kConnectTimeout;
-        scope_.spawn(run_deadline(shared_from_this()));
+        // State-owned timer so finish() can wake the deadline loser: it holds
+        // state alive and would otherwise sleep the full window on success.
+        // deadline_ stays as the absolute end-to-end budget for TLS/WS
+        // sub-operations below.
+        deadline_timer_ =
+            std::make_shared<boost::asio::steady_timer>(runtime_.serialized_executor());
+        deadline_timer_->expires_at(deadline_);
+        scope_.spawn(run_deadline(shared_from_this(), deadline_timer_));
         // Chained dials skip local resolution: the chain resolves the server.
         if (!config_.dialer_proxy.empty()) {
             scope_.spawn(run(shared_from_this(),
@@ -315,9 +322,10 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
 
     // Deadline watchdog: fails the operation if the chain task has not
     // finished first. The sleep sender is aborted when the scope drains.
-    static exec::task<void> run_deadline(std::shared_ptr<TrojanConnectOperation> self) {
+    static exec::task<void> run_deadline(std::shared_ptr<TrojanConnectOperation> self,
+                                         std::shared_ptr<boost::asio::steady_timer> timer) {
         try {
-            co_await async::sleep_until(self->runtime_.serialized_executor(), self->deadline_);
+            co_await (timer->async_wait(exec::asio::use_sender) | stdexec::then([] {}));
         } catch (...) {
         }
         if (self->completed_) {
@@ -802,7 +810,11 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         scope_.spawn(run(shared_from_this(), std::move(endpoints)));
     }
 
-    void cancel_timer() noexcept { timer_.cancel(); }
+    void cancel_timer() noexcept {
+        if (deadline_timer_) {
+            (void)deadline_timer_->cancel();
+        }
+    }
 
   public:
     // Abort for sender-driven cancellation: posted to the strand so it stays
@@ -862,7 +874,8 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     // ready StreamHandle instead of a raw socket.
     std::unique_ptr<io::StreamHandle> chained_transport_;
     std::unique_ptr<io::StreamHandle> transport_stream_;
-    boost::asio::steady_timer timer_;
+    // Owned deadline timer so finish() can wake the racing deadline task.
+    std::shared_ptr<boost::asio::steady_timer> deadline_timer_;
     core::StreamOpenHandler handler_;
     std::chrono::steady_clock::time_point deadline_{};
     // Owns the single connect chain task, which always ends with a value.
