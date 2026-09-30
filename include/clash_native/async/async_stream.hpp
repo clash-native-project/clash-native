@@ -1759,11 +1759,16 @@ template <channel_value T> class StreamMap {
         template <stdexec::receiver Rcvr> struct OpState {
             using operation_state_concept = stdexec::operation_state_tag;
 
+            // Forward declaration: Shared only tracks outstanding losers by
+            // pointer (see pending); ChildOp is defined below.
+            struct ChildOp;
+
             // Per-pull shared state. Owned by reference count: the map
             // operation holds one reference and every outstanding child pull
             // holds one. Children never touch the map operation (it may be
             // destroyed by the downstream right after the winning delivery);
-            // they only touch this state and delete themselves.
+            // they only touch this state, and the decider destroys the losers
+            // directly (see below).
             struct Shared {
                 std::mutex mutex;
                 enum class Outcome : unsigned char { kRacing, kValue, kEnd, kError, kCancelled };
@@ -1775,9 +1780,18 @@ template <channel_value T> class StreamMap {
                 std::optional<Rcvr> receiver;
                 std::size_t total{0};
                 std::size_t finished{0};
-                // Cancels the losing pulls once decided (or abandoned).
-                // Requested only after releasing mutex: callbacks fire inline
-                // and re-enter through this same mutex.
+                // Outstanding child pulls. The decider (winner, abandon, or
+                // outer stop) destroys losers directly instead of waking them
+                // with stop: a stop callback that synchronously deletes its
+                // own operation state use-after-frees inside
+                // inplace_stop_source::request_stop (the source is re-locked
+                // after the callback returns, and nested deliveries re-lock
+                // an inner source owned by the just-deleted child).
+                // Guarded by mutex.
+                std::vector<ChildOp *> pending;
+                // Token source for the child environments below. Never
+                // requested: cancellation flows through direct loser
+                // destruction, so no child stop callback ever fires.
                 stdexec::inplace_stop_source stop;
             };
 
@@ -1821,6 +1835,17 @@ template <channel_value T> class StreamMap {
                     stdexec::start(*op_);
                 }
 
+                void remove_from_pending() noexcept {
+                    // Caller holds shared_->mutex.
+                    auto &pending = shared_->pending;
+                    for (auto it = pending.begin(); it != pending.end(); ++it) {
+                        if (*it == this) {
+                            pending.erase(it);
+                            return;
+                        }
+                    }
+                }
+
                 void on_value(std::optional<T> item) noexcept {
                     // Claiming the single delivery is exclusive: exactly one
                     // path observes kRacing, so moving the receiver out after
@@ -1829,8 +1854,10 @@ template <channel_value T> class StreamMap {
                     // move-assigned (see Shared).
                     bool claimed = false;
                     std::optional<value_type> result;
+                    std::vector<ChildOp *> losers;
                     {
                         std::lock_guard lock(shared_->mutex);
+                        remove_from_pending();
                         if (shared_->outcome == Shared::Outcome::kRacing) {
                             if (!item) {
                                 // One source ended: the map ends only once
@@ -1846,13 +1873,23 @@ template <channel_value T> class StreamMap {
                                 claimed = true;
                             }
                         }
+                        if (claimed) {
+                            losers = std::move(shared_->pending);
+                        }
                     }
                     if (!claimed) {
                         delete this;
                         return;
                     }
+                    // Destroy losers before delivering: their pulls may borrow
+                    // map entries, and the downstream may mutate the map once
+                    // this pull completes. Destroying a parked pull cancels
+                    // its wait without firing a completion (the channel checks
+                    // the wait slot address, which dies with the child).
+                    for (auto *loser : losers) {
+                        delete loser;
+                    }
                     std::optional<Rcvr> receiver(std::move(shared_->receiver));
-                    shared_->stop.request_stop();
                     if (result) {
                         stdexec::set_value(std::move(*receiver), std::move(result));
                     } else {
@@ -1863,27 +1900,38 @@ template <channel_value T> class StreamMap {
 
                 void on_error(std::exception_ptr error) noexcept {
                     bool claimed = false;
+                    std::vector<ChildOp *> losers;
                     {
                         std::lock_guard lock(shared_->mutex);
+                        remove_from_pending();
                         if (shared_->outcome == Shared::Outcome::kRacing) {
                             shared_->outcome = Shared::Outcome::kError;
                             claimed = true;
+                        }
+                        if (claimed) {
+                            losers = std::move(shared_->pending);
                         }
                     }
                     if (!claimed) {
                         delete this;
                         return;
                     }
+                    for (auto *loser : losers) {
+                        delete loser;
+                    }
                     std::optional<Rcvr> receiver(std::move(shared_->receiver));
-                    shared_->stop.request_stop();
                     stdexec::set_error(std::move(*receiver), std::move(error));
                     delete this;
                 }
 
                 void on_stopped() noexcept {
-                    // Shared stop is requested only together with leaving
-                    // kRacing (under the same mutex), so a stopped child is
-                    // always a loser: stay quiet.
+                    // Nobody requests the shared stop anymore (cancellation is
+                    // direct loser destruction), so no child should ever be
+                    // stopped. Detach defensively and stay quiet.
+                    {
+                        std::lock_guard lock(shared_->mutex);
+                        remove_from_pending();
+                    }
                     delete this;
                 }
             };
@@ -1914,20 +1962,22 @@ template <channel_value T> class StreamMap {
             ~OpState() {
                 // Abandoning a racing pull: withdraw the receiver (the
                 // downstream is gone, so nothing may be delivered to it) and
-                // wake the parked children so they self-delete. The shared
-                // state itself dies with the last outstanding child.
+                // destroy the parked losers directly. Destroying a parked
+                // pull cancels its wait without firing a completion. Shared
+                // dies with this last reference unless a nested delivery
+                // still holds one (see below).
                 if (shared_) {
-                    bool cancel = false;
+                    std::vector<ChildOp *> losers;
                     {
                         std::lock_guard lock(shared_->mutex);
                         if (shared_->outcome == Shared::Outcome::kRacing) {
                             shared_->outcome = Shared::Outcome::kCancelled;
                             shared_->receiver.reset();
-                            cancel = true;
                         }
+                        losers = std::move(shared_->pending);
                     }
-                    if (cancel) {
-                        shared_->stop.request_stop();
+                    for (auto *loser : losers) {
+                        delete loser;
                     }
                 }
             }
@@ -1969,6 +2019,10 @@ template <channel_value T> class StreamMap {
                         }
                     }
                     auto *child = new ChildOp{shared, entry.key};
+                    {
+                        std::lock_guard track(shared->mutex);
+                        shared->pending.push_back(child);
+                    }
                     // entry.stream.next() borrows the entry stream; the map
                     // must outlive the pull (single-outstanding-pull
                     // contract).
@@ -1993,11 +2047,11 @@ template <channel_value T> class StreamMap {
                 std::optional<Rcvr> receiver(std::move(shared_->receiver));
                 stdexec::set_value(std::move(*receiver), std::optional<value_type>());
             }
-
             void on_stop() noexcept {
                 if (!shared_) {
                     return;
                 }
+                std::vector<ChildOp *> losers;
                 bool claimed = false;
                 {
                     std::lock_guard lock(shared_->mutex);
@@ -2005,8 +2059,11 @@ template <channel_value T> class StreamMap {
                         shared_->outcome = Shared::Outcome::kCancelled;
                         claimed = true;
                     }
+                    losers = std::move(shared_->pending);
                 }
-                shared_->stop.request_stop();
+                for (auto *loser : losers) {
+                    delete loser;
+                }
                 if (!claimed) {
                     return;
                 }
