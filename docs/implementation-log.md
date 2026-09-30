@@ -3129,3 +3129,25 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   reproduced on the clean tree; `ResolverServiceTest` EDNS-segregation
   sibling crashes in `async_scope.hpp:162` via `DnsUpstream::exchange`,
   a file this change does not touch). Windows RelWithDebInfo passes.
+
+### 2026-09-30 - Fix StreamMap abandoned-pull UAF with direct loser destroy
+
+- Root cause of `StreamMapAbandonedPullCancelsCleanly` ASan
+  heap-use-after-free: the abandon path woke parked children via
+  `shared_->stop.request_stop()`. The first child's channel stop
+  callback synchronously deleted its own operation state; unwinding
+  back through `inplace_stop_source::request_stop` then touched the
+  freed child (re-lock) and sibling deliveries re-entered sibling
+  inner sources owned by already-deleted children.
+- Fix: `Shared` now tracks outstanding children in `pending`
+  (guarded by the existing mutex); the decider (value/end winner,
+  error, outer stop, abandon destroy) takes the loser list out and
+  `delete`s each loser directly before delivering. Destroying a
+  parked pull cancels its channel wait slot without firing a
+  completion. `shared_->stop` is never requested anymore.
+- Validation: `AsyncStreamTest.*` 32/32 green on Linux ASan
+  (previously crashed), full suite 85 passing with the only
+  remaining sanitizer hit the pre-existing
+  `ResolverServiceTest.CoalescesEquivalentQueriesAndCachesTheAnswer`
+  async_scope UAF in `DnsUpstream::exchange` (untouched file).
+  Windows RelWithDebInfo passes.
