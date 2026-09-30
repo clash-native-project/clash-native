@@ -92,6 +92,17 @@ class TrafficRouter {
   public:
     using Snapshot = std::shared_ptr<const TrafficRouter>;
 
+    // Per-rule match cache built once in add_rule so evaluate() (per
+    // connection) performs no parsing or case folding on rule data:
+    // lowered comparison values plus pre-parsed CIDR networks.
+    struct PreparedRule {
+        std::string lowered_value;
+        bool cidr_valid = false;
+        boost::asio::ip::address network;
+        std::vector<std::uint8_t> network_bytes;
+        unsigned prefix = 0;
+    };
+
     explicit TrafficRouter(RouteAction default_action = RouteAction::direct());
 
     void set_default_action(RouteAction action);
@@ -107,6 +118,7 @@ class TrafficRouter {
   private:
     RouteAction default_action_;
     std::vector<TrafficRule> rules_;
+    std::vector<PreparedRule> prepared_;
 };
 
 } // namespace clash_native::router

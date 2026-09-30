@@ -3046,3 +3046,25 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   after stop() returns; now heap-owned via shared_ptr.
 - Validation (Linux ASan): Socks5ProxyTest.* 5/5, target repeat-20 20/20,
   zero UAF/leak reports. Windows RelWithDebInfo build passes.
+
+### 2026-09-30 - Remove per-connection blocking work from runtime threads
+
+- `src/main.cpp`: stdout logger is now `create_async` on a dedicated
+  `init_thread_pool(8192, 1)` backend with RAII `spdlog::shutdown()` on
+  every exit path; console writes (56 call sites, incl. hot warn/debug in
+  session/UDP/DNS paths) no longer block runtime threads.
+- `TrafficRouter`: `add_rule` now builds a `PreparedRule` (lowered domain
+  value, pre-parsed CIDR network/bytes/prefix); `evaluate()` (per
+  connection) lowers the destination domain at most once instead of once
+  per domain rule and never calls `make_address`/`from_chars`.
+- `DnsPolicyRouter::select()` (per query) normalizes only the input name;
+  rule values are normalized once in `add_rule`.
+- `FakeIpStore::purge_expired()`: full-map expiry scan throttled to at
+  most one per second (every store access on the old code scanned the
+  whole map). TTL-0 stores skip the scan; `clear()` resets the throttle.
+- No thread pool added: after the hoisting above, no per-connection path
+  performs blocking I/O or unbounded scans, so a pool would add
+  synchronization for nothing. Genuine blocking filesystem work (if it
+  arrives) should use a small asio pool per the earlier decision.
+- Validation (Linux ASan): Socks5 5/5, FakeIP/router/policy 9/9, target
+  repeat-20 20/20, zero sanitizer reports. Windows RelWithDebInfo passes.

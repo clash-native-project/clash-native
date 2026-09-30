@@ -41,6 +41,9 @@ class DnsPolicyRouter final {
   private:
     std::string default_upstream_;
     std::vector<DnsPolicyRule> rules_;
+    // Lowered rule values built once in add_rule; select() (per query)
+    // normalizes only the input name.
+    std::vector<std::string> normalized_values_;
 };
 
 } // namespace clash_native::dns

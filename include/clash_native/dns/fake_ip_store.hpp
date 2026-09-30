@@ -47,6 +47,9 @@ class FakeIpStore final {
     std::chrono::seconds entry_ttl_{std::chrono::minutes(5)};
     mutable std::unordered_map<std::string, Entry> by_domain_;
     mutable std::unordered_map<std::uint32_t, std::string> by_address_;
+    // Throttles purge_expired(): every store access (per connection/query)
+    // scanned the whole map; now at most one scan per second.
+    mutable std::chrono::steady_clock::time_point last_purge_{};
 };
 
 } // namespace clash_native::dns

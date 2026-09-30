@@ -116,7 +116,14 @@ std::size_t FakeIpStore::size() const noexcept {
 }
 
 void FakeIpStore::purge_expired() const noexcept {
+    if (entry_ttl_.count() == 0) {
+        return;
+    }
     const auto now = std::chrono::steady_clock::now();
+    if (now - last_purge_ < std::chrono::seconds(1)) {
+        return;
+    }
+    last_purge_ = now;
     for (auto it = by_domain_.begin(); it != by_domain_.end();) {
         if (it->second.expires > now) {
             ++it;

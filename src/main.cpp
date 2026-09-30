@@ -9,10 +9,17 @@
 #include <string_view>
 #include <utility>
 
+#include <spdlog/async.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
 namespace {
+
+// Ensures the async logging backend drains before process exit on every
+// return path below.
+struct AsyncLogShutdown {
+    ~AsyncLogShutdown() { spdlog::shutdown(); }
+};
 
 void print_usage(std::string_view program_name) {
     spdlog::info("Usage: {} [--help|--version|--listen <address:port>]", program_name);
@@ -73,11 +80,15 @@ bool parse_endpoint(std::string_view text, boost::asio::ip::tcp::endpoint &endpo
 } // namespace
 
 int main(int argc, char **argv) {
-    auto logger = spdlog::stdout_color_mt("clash-native");
+    // Async backend (single worker, 8k queue): console writes never block
+    // runtime threads; flush_on is asynchronous too.
+    spdlog::init_thread_pool(8192, 1);
+    auto logger = spdlog::create_async<spdlog::sinks::stdout_color_sink_mt>("clash-native");
     logger->set_pattern("%v");
     logger->set_level(spdlog::level::info);
     logger->flush_on(spdlog::level::info);
     spdlog::set_default_logger(std::move(logger));
+    AsyncLogShutdown shutdown_logging;
 
     if (argc > 1) {
         const std::string_view argument{argv[1]};
