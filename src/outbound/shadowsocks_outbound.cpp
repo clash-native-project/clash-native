@@ -31,7 +31,6 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
 
-#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/system/errc.hpp>
 #include <exec/asio/use_sender.hpp>
@@ -698,52 +697,68 @@ class ShadowsocksConnectOperation final
             finish(core::StreamOpenResult::failed(validation.error()));
             return;
         }
-        // Deadline is a timer wait racing the chain: whichever finishes
-        // first wins via the completed_ guard in finish(); the loser
-        // observes completed_ and drops. State-owned timer so finish() can
-        // wake the loser instead of sleeping the full window on fast success.
-        deadline_timer_ =
-            std::make_shared<boost::asio::steady_timer>(runtime_.serialized_executor());
-        deadline_timer_->expires_after(kConnectTimeout);
-        scope_.spawn(run_deadline(shared_from_this(), deadline_timer_));
-        // The scope owns the chain and deadline tasks; teardown stays
-        // guard-driven, so no stop is ever requested.
-        scope_.spawn(run(shared_from_this()));
+        // The scope owns the single guarded connect task, which funnels
+        // its Result through finish(); teardown stays guard-driven, so no
+        // stop is ever requested.
+        scope_.spawn(run_guarded(shared_from_this()));
     }
 
-    // NOTE: named function per the coroutine creation rules; never an
-    // immediately-invoked capturing lambda.
-    static exec::task<void> run_deadline(std::shared_ptr<ShadowsocksConnectOperation> self,
-                                         std::shared_ptr<boost::asio::steady_timer> timer) {
+    // Timeout race driver: the connect chain races a sleep via
+    // with_timeout so a stalled peer cannot park the open. Timeout
+    // surfaces as an in-band Result; machinery set_error crosses as an
+    // exception mapped to a transport_io failure; outer stop cancels both
+    // branches. The former timer task's timeout-side teardown (carrier
+    // close / socket cancel) is subsumed by finish()'s !succeeded close
+    // path. A named function (not an immediately-invoked capturing
+    // lambda) builds the task; see docs/async-pitfalls.md.
+    static exec::task<void> run_guarded(std::shared_ptr<ShadowsocksConnectOperation> self) {
+        core::StreamOpenResult result = core::StreamOpenResult::failed(
+            {core::ErrorCode::cancelled, "Shadowsocks connect stopped"});
         try {
-            co_await (timer->async_wait(exec::asio::use_sender) | stdexec::then([] {}));
+            result = co_await async::with_timeout<core::StreamOpenResult>(
+                self->runtime_.serialized_executor(), kConnectTimeout, run_work(self), [] {
+                    return core::StreamOpenResult::failed(
+                        {core::ErrorCode::timeout, "timed out opening Shadowsocks TCP stream"});
+                });
         } catch (...) {
-            co_return;
+            result = core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "Shadowsocks connect chain failed"});
         }
-        boost::system::error_code ignored;
-        if (self->carrier_) {
-            self->carrier_->close();
-        } else {
-            self->socket_->cancel(ignored);
-        }
-        self->finish(core::StreamOpenResult::failed(
-            {core::ErrorCode::timeout, "timed out opening Shadowsocks TCP stream"}));
+        self->finish(std::move(result));
     }
 
     // Straight-line connect chain: resolve, transport survivor
     // (kcptun / mux pool / TCP plus plugin), cipher handshake. Every
-    // terminal funnels through finish(), so the spawned task always ends
-    // with a value.
-    static exec::task<void> run(std::shared_ptr<ShadowsocksConnectOperation> self) {
+    // terminal returns a Result; run_guarded funnels it through finish(),
+    // so the spawned task always ends with a value unless an outer stop
+    // ends it early.
+    static exec::task<core::StreamOpenResult>
+    run_work(std::shared_ptr<ShadowsocksConnectOperation> self) {
         // Chained dials skip local resolution: the chain resolves the server.
         if (!self->config_.dialer_proxy.empty()) {
-            co_await dial_chained_transport(self);
-            if (self->completed_ || !self->chained_transport_) {
-                co_return;
+            try {
+                co_await dial_chained_transport(self);
+            } catch (const core::Error &failure) {
+                co_return core::StreamOpenResult::failed(failure);
+            } catch (...) {
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "Shadowsocks chained dial failed"});
             }
-            co_await resolve_plugin_ech(self);
+            if (self->completed_ || !self->chained_transport_) {
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
+            }
+            try {
+                co_await resolve_plugin_ech(self);
+            } catch (const core::Error &failure) {
+                co_return core::StreamOpenResult::failed(failure);
+            } catch (...) {
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "Shadowsocks plugin ECH lookup failed"});
+            }
             if (self->completed_) {
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
             }
             // StreamHandle-native plugin carriers consume the chained
             // transport directly; cipher opens use it via the carrier.
@@ -754,36 +769,41 @@ class ShadowsocksConnectOperation final
                 self->carrier_ =
                     std::make_shared<ss::StreamCarrier>(std::move(self->chained_transport_));
             }
-            co_await dispatch_connected(self);
-            co_return;
+            co_return co_await dispatch_connected(self);
         }
         core::Result<detail::AddressList> resolved;
         try {
             resolved = co_await detail::resolve_host_sender(self->runtime_, self->resolver_,
                                                             self->config_.server_host);
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::resolution, "failed to resolve Shadowsocks server"}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::resolution, "failed to resolve Shadowsocks server"});
         }
         if (self->completed_) {
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
         }
         if (!resolved) {
-            self->finish(core::StreamOpenResult::failed(resolved.error()));
-            co_return;
+            co_return core::StreamOpenResult::failed(resolved.error());
         }
-        co_await resolve_plugin_ech(self);
+        try {
+            co_await resolve_plugin_ech(self);
+        } catch (const core::Error &failure) {
+            co_return core::StreamOpenResult::failed(failure);
+        } catch (...) {
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "Shadowsocks plugin ECH lookup failed"});
+        }
         if (self->completed_) {
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
         }
         if (self->kcptun_plugin()) {
             if (resolved.value().empty()) {
-                self->finish(core::StreamOpenResult::failed(
+                co_return core::StreamOpenResult::failed(
                     {core::ErrorCode::resolution,
                      "Shadowsocks kcptun server hostname resolved to no addresses",
-                     {}}));
-                co_return;
+                     {}});
             }
             const auto endpoint =
                 boost::asio::ip::udp::endpoint(resolved.value().front(), self->config_.server_port);
@@ -792,29 +812,25 @@ class ShadowsocksConnectOperation final
                 auto stream =
                     ss::make_kcptun_client_stream(self->runtime_, endpoint, std::move(options));
                 if (!stream) {
-                    self->finish(core::StreamOpenResult::failed(stream.error()));
-                    co_return;
+                    co_return core::StreamOpenResult::failed(stream.error());
                 }
                 self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(stream.value()));
-                co_await send_initial_request(self);
-                co_return;
+                co_return co_await send_initial_request(self);
             }
             try {
                 auto stream = co_await self->kcptun_pool_->open_stream(endpoint);
                 if (self->completed_) {
-                    co_return;
+                    co_return core::StreamOpenResult::failed(
+                        {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
                 }
                 self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(stream));
             } catch (const core::Error &failure) {
-                self->finish(core::StreamOpenResult::failed(failure));
-                co_return;
+                co_return core::StreamOpenResult::failed(failure);
             } catch (...) {
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::transport_io, "kcptun pool open failed", {}}));
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "kcptun pool open failed", {}});
             }
-            co_await send_initial_request(self);
-            co_return;
+            co_return co_await send_initial_request(self);
         }
         auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
         endpoints->reserve(resolved.value().size());
@@ -823,11 +839,10 @@ class ShadowsocksConnectOperation final
         }
         if (self->websocket_plugin() && self->config_.plugin_mux) {
             if (!self->websocket_mux_pool_) {
-                self->finish(core::StreamOpenResult::failed(
+                co_return core::StreamOpenResult::failed(
                     {core::ErrorCode::configuration,
                      "Shadowsocks WebSocket mux pool is not initialized",
-                     {}}));
-                co_return;
+                     {}});
             }
             core::Result<std::unique_ptr<io::StreamHandle>> mux_stream;
             try {
@@ -845,45 +860,40 @@ class ShadowsocksConnectOperation final
                     });
                 mux_stream = co_await std::move(sender);
             } catch (...) {
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::transport_io, "WebSocket mux pool open failed", {}}));
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "WebSocket mux pool open failed", {}});
             }
             if (self->completed_) {
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
             }
             if (!mux_stream) {
-                self->finish(core::StreamOpenResult::failed(mux_stream.error()));
-                co_return;
+                co_return core::StreamOpenResult::failed(mux_stream.error());
             }
             self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(mux_stream.value()));
-            co_await send_initial_request(self);
-            co_return;
+            co_return co_await send_initial_request(self);
         }
-        co_await self->connect_tcp(self, std::move(endpoints));
+        co_return co_await self->connect_tcp(self, std::move(endpoints));
     }
 
-    // TCP connect plus plugin/cipher tail, shared by run(). Throws
-    // core::Error on transport failures; finish() terminals stay inline.
+    // TCP connect plus plugin/cipher tail, shared by run_work().
     // Plugin dispatch shared by the direct and chained transports.
-    static exec::task<void> dispatch_connected(std::shared_ptr<ShadowsocksConnectOperation> self) {
+    static exec::task<core::StreamOpenResult>
+    dispatch_connected(std::shared_ptr<ShadowsocksConnectOperation> self) {
         if (self->shadow_tls_plugin()) {
-            co_await open_shadow_tls(self);
-            co_return;
+            co_return co_await open_shadow_tls(self);
         }
         if (self->restls_plugin()) {
-            co_await open_restls(self);
-            co_return;
+            co_return co_await open_restls(self);
         }
         if (self->jls_plugin()) {
-            co_await open_jls(self);
-            co_return;
+            co_return co_await open_jls(self);
         }
-        co_await send_initial_request(self);
+        co_return co_await send_initial_request(self);
     }
 
-    // ECH config fetch shared by the direct and chained transports. Finishes
-    // the operation on failure; callers check completed_ afterwards.
+    // ECH config fetch shared by the direct and chained transports. Throws
+    // core::Error on failure; callers map it to a failure Result.
     static exec::task<void> resolve_plugin_ech(std::shared_ptr<ShadowsocksConnectOperation> self) {
         if (self->websocket_plugin() && self->config_.plugin_tls &&
             self->config_.plugin_ech_enabled) {
@@ -894,8 +904,7 @@ class ShadowsocksConnectOperation final
                 co_return;
             }
             if (!ech) {
-                self->finish(core::StreamOpenResult::failed(ech.error()));
-                co_return;
+                throw ech.error();
             }
             self->plugin_ech_config_ = std::move(ech.value());
         }
@@ -904,31 +913,26 @@ class ShadowsocksConnectOperation final
 
     // Dials the server through the dialer_proxy chain, delivering a ready
     // StreamHandle. The trace carries our own ID so chain cycles fail fast.
+    // Throws core::Error on failure; callers map it to a failure Result.
     // NOTE: named function per the coroutine creation rules; never an
     // immediately-invoked capturing lambda.
     static exec::task<void>
     dial_chained_transport(std::shared_ptr<ShadowsocksConnectOperation> self) {
-        const auto fail = [self](core::Error error) {
-            self->finish(core::StreamOpenResult::failed(std::move(error)));
-        };
         if (!self->chain_registry_) {
-            fail({core::ErrorCode::configuration,
-                  "Shadowsocks dialer-proxy requires a chain registry",
-                  {}});
-            co_return;
+            throw core::Error{core::ErrorCode::configuration,
+                              "Shadowsocks dialer-proxy requires a chain registry",
+                              {}};
         }
         const auto trace =
             transport::extend_endpoint_trace(self->request_.dial_trace, self->config_.id);
         if (!trace) {
-            fail(trace.error());
-            co_return;
+            throw trace.error();
         }
         const transport::EndpointDialRequirements requirements{true, false};
         const auto plan = transport::EndpointDialPlan::from_registry(
             self->chain_registry_, self->config_.dialer_proxy, requirements);
         if (!plan) {
-            fail(plan.error());
-            co_return;
+            throw plan.error();
         }
         boost::system::error_code ignored;
         const auto numeric = boost::asio::ip::make_address(self->config_.server_host, ignored);
@@ -956,22 +960,20 @@ class ShadowsocksConnectOperation final
                     {core::ErrorCode::endpoint_connection, "Shadowsocks chained dial failed", {}});
             }
         } catch (const core::Error &failure) {
-            opened = core::fail(failure);
+            throw failure;
         } catch (...) {
-            fail({core::ErrorCode::transport_io, "Shadowsocks chained dial failed", {}});
-            co_return;
+            throw core::Error{core::ErrorCode::transport_io, "Shadowsocks chained dial failed", {}};
         }
         if (self->completed_) {
             co_return;
         }
         if (!opened) {
-            fail(opened.error());
-            co_return;
+            throw opened.error();
         }
         self->chained_transport_ = std::move(opened.value());
     }
 
-    static exec::task<void>
+    static exec::task<core::StreamOpenResult>
     connect_tcp(std::shared_ptr<ShadowsocksConnectOperation> self,
                 std::shared_ptr<std::vector<boost::asio::ip::tcp::endpoint>> endpoints) {
         try {
@@ -991,21 +993,20 @@ class ShadowsocksConnectOperation final
                         std::rethrow_exception(std::current_exception());
                     }));
             } catch (const core::Error &failure) {
-                self->finish(core::StreamOpenResult::failed(failure));
-                co_return;
+                co_return core::StreamOpenResult::failed(failure);
             } catch (...) {
-                self->finish(
-                    core::StreamOpenResult::failed({core::ErrorCode::endpoint_connection,
-                                                    "failed to connect to Shadowsocks server"}));
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::endpoint_connection,
+                     "failed to connect to Shadowsocks server"});
             }
             if (self->completed_) {
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
             }
-            co_await dispatch_connected(self);
+            co_return co_await dispatch_connected(self);
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::transport_io, "Shadowsocks connect chain failed"}));
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "Shadowsocks connect chain failed"});
         }
     }
 
@@ -1223,7 +1224,8 @@ class ShadowsocksConnectOperation final
         return options;
     }
 
-    static exec::task<void> open_shadow_tls(std::shared_ptr<ShadowsocksConnectOperation> self) {
+    static exec::task<core::StreamOpenResult>
+    open_shadow_tls(std::shared_ptr<ShadowsocksConnectOperation> self) {
         auto stream =
             std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         transport::proxy::ShadowTlsClientOptions options;
@@ -1257,22 +1259,22 @@ class ShadowsocksConnectOperation final
                 });
             result = co_await std::move(sender);
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::transport_io, "Shadow-TLS open failed", {}}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "Shadow-TLS open failed", {}});
         }
         if (self->completed_) {
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
         }
         if (!result) {
-            self->finish(core::StreamOpenResult::failed(result.error()));
-            co_return;
+            co_return core::StreamOpenResult::failed(result.error());
         }
         self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
-        co_await send_initial_request(self);
+        co_return co_await send_initial_request(self);
     }
 
-    static exec::task<void> open_restls(std::shared_ptr<ShadowsocksConnectOperation> self) {
+    static exec::task<core::StreamOpenResult>
+    open_restls(std::shared_ptr<ShadowsocksConnectOperation> self) {
         auto stream =
             std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         transport::proxy::RestlsClientOptions options;
@@ -1303,22 +1305,22 @@ class ShadowsocksConnectOperation final
                 });
             result = co_await std::move(sender);
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::transport_io, "ResTLS open failed", {}}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "ResTLS open failed", {}});
         }
         if (self->completed_) {
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
         }
         if (!result) {
-            self->finish(core::StreamOpenResult::failed(result.error()));
-            co_return;
+            co_return core::StreamOpenResult::failed(result.error());
         }
         self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
-        co_await send_initial_request(self);
+        co_return co_await send_initial_request(self);
     }
 
-    static exec::task<void> open_jls(std::shared_ptr<ShadowsocksConnectOperation> self) {
+    static exec::task<core::StreamOpenResult>
+    open_jls(std::shared_ptr<ShadowsocksConnectOperation> self) {
         auto stream =
             std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         transport::proxy::JlsClientOptions options;
@@ -1348,33 +1350,30 @@ class ShadowsocksConnectOperation final
                 });
             result = co_await std::move(sender);
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::transport_io, "JLS open failed", {}}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "JLS open failed", {}});
         }
         if (self->completed_) {
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
         }
         if (!result) {
-            self->finish(core::StreamOpenResult::failed(result.error()));
-            co_return;
+            co_return core::StreamOpenResult::failed(result.error());
         }
         self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(result.value()));
-        co_await send_initial_request(self);
+        co_return co_await send_initial_request(self);
     }
 
-    static exec::task<void>
+    static exec::task<core::StreamOpenResult>
     send_initial_request(std::shared_ptr<ShadowsocksConnectOperation> self) {
         const auto method = transport::proxy::cipher_method(self->config_.method);
         if (method.value().shadowsocks_2022) {
             auto address = detail::encode_proxy_address(self->request_.destination);
             if (!address) {
-                self->finish(core::StreamOpenResult::failed(address.error()));
-                co_return;
+                co_return core::StreamOpenResult::failed(address.error());
             }
             if (self->websocket_plugin() && !self->config_.plugin_mux) {
-                co_await open_websocket_2022(self, std::move(address.value()));
-                co_return;
+                co_return co_await open_websocket_2022(self, std::move(address.value()));
             }
             std::optional<core::StreamOpenResult> opened;
             try {
@@ -1412,43 +1411,37 @@ class ShadowsocksConnectOperation final
                     opened = co_await std::move(sender);
                 }
             } catch (...) {
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::transport_io, "Shadowsocks 2022 open failed", {}}));
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "Shadowsocks 2022 open failed", {}});
             }
-            self->finish(std::move(*opened));
-            co_return;
+            co_return std::move(*opened);
         }
         if (method.value().kind == transport::proxy::CipherKind::stream) {
-            co_await send_legacy_initial_request(self, method.value());
-            co_return;
+            co_return co_await send_legacy_initial_request(self, method.value());
         }
         std::vector<std::uint8_t> salt(method.value().key_size);
         if (!transport::proxy::random_bytes(salt)) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::authentication, "failed to generate Shadowsocks salt"}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::authentication, "failed to generate Shadowsocks salt"});
         }
         auto key = transport::proxy::derive_aead_subkey(self->config_.method,
                                                         self->config_.password, salt);
         auto address = detail::encode_proxy_address(self->request_.destination);
         if (!key || !address) {
-            self->finish(core::StreamOpenResult::failed(!key ? key.error() : address.error()));
-            co_return;
+            co_return core::StreamOpenResult::failed(!key ? key.error() : address.error());
         }
         self->write_nonce_.assign(method.value().nonce_size, 0);
         auto record = append_tcp_record(self->config_.method, key.value(), self->write_nonce_,
                                         address.value());
         if (record.empty()) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::authentication, "failed to encrypt Shadowsocks destination"}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::authentication, "failed to encrypt Shadowsocks destination"});
         }
         salt.insert(salt.end(), record.begin(), record.end());
         auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(salt));
         if (self->websocket_plugin() && !self->config_.plugin_mux) {
-            co_await open_websocket_classic(self, std::move(*wire), std::move(key.value()));
-            co_return;
+            co_return co_await open_websocket_classic(self, std::move(*wire),
+                                                      std::move(key.value()));
         }
         if (const auto obfs = self->obfs_options(); obfs) {
             core::Status obfs_result;
@@ -1495,21 +1488,19 @@ class ShadowsocksConnectOperation final
                     obfs_result = co_await std::move(sender);
                 }
             } catch (...) {
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::transport_io, "Shadowsocks obfs request failed", {}}));
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "Shadowsocks obfs request failed", {}});
             }
             if (self->completed_) {
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
             }
             if (!obfs_result) {
-                self->finish(core::StreamOpenResult::failed(obfs_result.error()));
-                co_return;
+                co_return core::StreamOpenResult::failed(obfs_result.error());
             }
-            self->finish(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
+            co_return core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
                 self->socket_, self->config_.method, self->config_.password, std::move(key.value()),
-                self->write_nonce_, std::vector<std::uint8_t>{}, obfs->mode)));
-            co_return;
+                self->write_nonce_, std::vector<std::uint8_t>{}, obfs->mode));
         }
         try {
             if (self->carrier_) {
@@ -1531,29 +1522,27 @@ class ShadowsocksConnectOperation final
                           }));
             }
         } catch (const core::Error &failure) {
-            self->finish(core::StreamOpenResult::failed(
-                {failure.code, "failed to write Shadowsocks TCP request", failure.cause}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {failure.code, "failed to write Shadowsocks TCP request", failure.cause});
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::transport_io, "failed to write Shadowsocks TCP request", {}}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "failed to write Shadowsocks TCP request", {}});
         }
         if (self->completed_) {
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
         }
         if (self->carrier_) {
-            self->finish(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
+            co_return core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
                 self->carrier_, self->config_.method, self->config_.password,
-                std::move(key.value()), self->write_nonce_)));
-        } else {
-            self->finish(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
-                self->socket_, self->config_.method, self->config_.password, std::move(key.value()),
-                self->write_nonce_)));
+                std::move(key.value()), self->write_nonce_));
         }
+        co_return core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
+            self->socket_, self->config_.method, self->config_.password, std::move(key.value()),
+            self->write_nonce_));
     }
 
-    static exec::task<void>
+    static exec::task<core::StreamOpenResult>
     open_websocket_classic(std::shared_ptr<ShadowsocksConnectOperation> self,
                            std::vector<std::uint8_t> wire, std::vector<std::uint8_t> key) {
         auto stream =
@@ -1578,42 +1567,41 @@ class ShadowsocksConnectOperation final
                 });
             plugin = co_await std::move(sender);
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::transport_io, "WebSocket plugin open failed", {}}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "WebSocket plugin open failed", {}});
         }
         if (self->completed_) {
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
         }
         if (!plugin) {
-            self->finish(core::StreamOpenResult::failed(plugin.error()));
-            co_return;
+            co_return core::StreamOpenResult::failed(plugin.error());
         }
         self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(plugin.value()));
         auto shared_wire = std::make_shared<std::vector<std::uint8_t>>(std::move(wire));
         try {
             co_await self->carrier_->async_write(boost::asio::buffer(*shared_wire));
         } catch (const core::Error &failure) {
-            self->finish(core::StreamOpenResult::failed(
-                {failure.code, "failed to write Shadowsocks WebSocket request", failure.cause}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {failure.code, "failed to write Shadowsocks WebSocket request", failure.cause});
         } catch (...) {
-            self->finish(
-                core::StreamOpenResult::failed({core::ErrorCode::transport_io,
-                                                "failed to write Shadowsocks WebSocket request",
-                                                {}}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io,
+                 "failed to write Shadowsocks WebSocket request",
+                 {}});
         }
         if (self->completed_) {
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
         }
-        self->finish(core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
+        co_return core::StreamOpenResult::opened(std::make_unique<ShadowsocksStreamHandle>(
             self->carrier_, self->config_.method, self->config_.password, std::move(key),
-            self->write_nonce_)));
+            self->write_nonce_));
     }
 
-    static exec::task<void> open_websocket_2022(std::shared_ptr<ShadowsocksConnectOperation> self,
-                                                std::vector<std::uint8_t> destination) {
+    static exec::task<core::StreamOpenResult>
+    open_websocket_2022(std::shared_ptr<ShadowsocksConnectOperation> self,
+                        std::vector<std::uint8_t> destination) {
         auto stream =
             std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         core::Result<std::unique_ptr<io::StreamHandle>> plugin;
@@ -1636,16 +1624,15 @@ class ShadowsocksConnectOperation final
                 });
             plugin = co_await std::move(sender);
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::transport_io, "WebSocket plugin open failed", {}}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "WebSocket plugin open failed", {}});
         }
         if (self->completed_) {
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
         }
         if (!plugin) {
-            self->finish(core::StreamOpenResult::failed(plugin.error()));
-            co_return;
+            co_return core::StreamOpenResult::failed(plugin.error());
         }
         self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(plugin.value()));
         core::StreamOpenResult opened;
@@ -1665,45 +1652,40 @@ class ShadowsocksConnectOperation final
                 });
             opened = co_await std::move(sender);
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::transport_io, "Shadowsocks 2022 open failed", {}}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "Shadowsocks 2022 open failed", {}});
         }
-        self->finish(std::move(opened));
+        co_return std::move(opened);
     }
 
-    static exec::task<void>
+    static exec::task<core::StreamOpenResult>
     send_legacy_initial_request(std::shared_ptr<ShadowsocksConnectOperation> self,
                                 const transport::proxy::CipherMethod &method) {
         std::vector<std::uint8_t> iv(method.iv_size);
         if (!transport::proxy::random_bytes(iv)) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::authentication, "failed to generate Shadowsocks legacy IV"}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::authentication, "failed to generate Shadowsocks legacy IV"});
         }
         auto key =
             transport::proxy::derive_legacy_key(self->config_.method, self->config_.password, iv);
         auto address = detail::encode_proxy_address(self->request_.destination);
         if (!key || !address) {
-            self->finish(core::StreamOpenResult::failed(!key ? key.error() : address.error()));
-            co_return;
+            co_return core::StreamOpenResult::failed(!key ? key.error() : address.error());
         }
         auto cipher = transport::proxy::LegacyStreamCipher::create(self->config_.method,
                                                                    key.value(), iv, true);
         if (!cipher) {
-            self->finish(core::StreamOpenResult::failed(cipher.error()));
-            co_return;
+            co_return core::StreamOpenResult::failed(cipher.error());
         }
         auto encrypted_address = std::move(address.value());
         if (const auto result = cipher.value().update(encrypted_address); !result) {
-            self->finish(core::StreamOpenResult::failed(result.error()));
-            co_return;
+            co_return core::StreamOpenResult::failed(result.error());
         }
         iv.insert(iv.end(), encrypted_address.begin(), encrypted_address.end());
         auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(iv));
         if (self->websocket_plugin() && !self->config_.plugin_mux) {
-            co_await open_websocket_legacy(self, std::move(*wire), std::move(cipher.value()));
-            co_return;
+            co_return co_await open_websocket_legacy(self, std::move(*wire),
+                                                     std::move(cipher.value()));
         }
         if (const auto obfs = self->obfs_options(); obfs) {
             auto write_cipher =
@@ -1752,26 +1734,23 @@ class ShadowsocksConnectOperation final
                     obfs_result = co_await std::move(sender);
                 }
             } catch (...) {
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::transport_io, "Shadowsocks obfs request failed", {}}));
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "Shadowsocks obfs request failed", {}});
             }
             if (self->completed_) {
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
             }
             if (!obfs_result) {
-                self->finish(core::StreamOpenResult::failed(obfs_result.error()));
-                co_return;
+                co_return core::StreamOpenResult::failed(obfs_result.error());
             }
             auto stream = ss::make_legacy_stream_handle(self->socket_, self->config_.method,
                                                         self->config_.password,
                                                         std::move(*write_cipher), {}, obfs->mode);
             if (!stream) {
-                self->finish(core::StreamOpenResult::failed(stream.error()));
-                co_return;
+                co_return core::StreamOpenResult::failed(stream.error());
             }
-            self->finish(core::StreamOpenResult::opened(std::move(stream.value())));
-            co_return;
+            co_return core::StreamOpenResult::opened(std::move(stream.value()));
         }
         auto write_cipher =
             std::make_shared<transport::proxy::LegacyStreamCipher>(std::move(cipher.value()));
@@ -1795,16 +1774,15 @@ class ShadowsocksConnectOperation final
                           }));
             }
         } catch (const core::Error &failure) {
-            self->finish(core::StreamOpenResult::failed(
-                {failure.code, "failed to write Shadowsocks legacy request", failure.cause}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {failure.code, "failed to write Shadowsocks legacy request", failure.cause});
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::transport_io, "failed to write Shadowsocks legacy request", {}}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "failed to write Shadowsocks legacy request", {}});
         }
         if (self->completed_) {
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
         }
         auto stream =
             self->carrier_
@@ -1813,13 +1791,12 @@ class ShadowsocksConnectOperation final
                 : ss::make_legacy_stream_handle(self->socket_, self->config_.method,
                                                 self->config_.password, std::move(*write_cipher));
         if (!stream) {
-            self->finish(core::StreamOpenResult::failed(stream.error()));
-            co_return;
+            co_return core::StreamOpenResult::failed(stream.error());
         }
-        self->finish(core::StreamOpenResult::opened(std::move(stream.value())));
+        co_return core::StreamOpenResult::opened(std::move(stream.value()));
     }
 
-    static exec::task<void>
+    static exec::task<core::StreamOpenResult>
     open_websocket_legacy(std::shared_ptr<ShadowsocksConnectOperation> self,
                           std::vector<std::uint8_t> wire,
                           transport::proxy::LegacyStreamCipher write_cipher) {
@@ -1847,49 +1824,47 @@ class ShadowsocksConnectOperation final
                 });
             plugin = co_await std::move(sender);
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::transport_io, "WebSocket plugin open failed", {}}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "WebSocket plugin open failed", {}});
         }
         if (self->completed_) {
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
         }
         if (!plugin) {
-            self->finish(core::StreamOpenResult::failed(plugin.error()));
-            co_return;
+            co_return core::StreamOpenResult::failed(plugin.error());
         }
         self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(plugin.value()));
         auto shared_wire = std::make_shared<std::vector<std::uint8_t>>(std::move(wire));
         try {
             co_await self->carrier_->async_write(boost::asio::buffer(*shared_wire));
         } catch (const core::Error &failure) {
-            self->finish(core::StreamOpenResult::failed(
-                {failure.code, "failed to write Shadowsocks WebSocket request", failure.cause}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {failure.code, "failed to write Shadowsocks WebSocket request", failure.cause});
         } catch (...) {
-            self->finish(
-                core::StreamOpenResult::failed({core::ErrorCode::transport_io,
-                                                "failed to write Shadowsocks WebSocket request",
-                                                {}}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io,
+                 "failed to write Shadowsocks WebSocket request",
+                 {}});
         }
         if (self->completed_) {
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::cancelled, "Shadowsocks connect cancelled"});
         }
         auto stream_handle = ss::make_legacy_stream_handle(
             self->carrier_, self->config_.method, self->config_.password, std::move(*cipher));
         if (!stream_handle) {
-            self->finish(core::StreamOpenResult::failed(stream_handle.error()));
-            co_return;
+            co_return core::StreamOpenResult::failed(stream_handle.error());
         }
-        self->finish(core::StreamOpenResult::opened(std::move(stream_handle.value())));
+        co_return core::StreamOpenResult::opened(std::move(stream_handle.value()));
     }
 
   public:
     // Abort for sender-driven cancellation: posted to the strand so it stays
     // ordered with finish(). The bridge drops the late terminal. The
-    // deadline task observes completed_ and drops; its sleep sender is
-    // aborted when the scope drains (callback_sender aborter cancels it).
+    // timed-out race loser is retired by finish()'s completed_ guard;
+    // with_timeout owns its sleep timer and cancels both branches on
+    // outer stop.
     void abort() noexcept {
         auto self = shared_from_this();
         try {
@@ -1913,11 +1888,6 @@ class ShadowsocksConnectOperation final
             return;
         }
         completed_ = true;
-        // Wake the deadline loser immediately; otherwise it sleeps the full
-        // window holding state alive after fast success.
-        if (deadline_timer_) {
-            (void)deadline_timer_->cancel();
-        }
         if (!result.succeeded()) {
             boost::system::error_code ignored;
             socket_->close(ignored);
@@ -1946,8 +1916,6 @@ class ShadowsocksConnectOperation final
     std::optional<std::vector<std::uint8_t>> plugin_ech_config_;
     core::StreamOpenHandler handler_;
     std::vector<std::uint8_t> write_nonce_;
-    // Owned deadline timer so finish() can wake the racing deadline task.
-    std::shared_ptr<boost::asio::steady_timer> deadline_timer_;
     bool completed_ = false;
     exec::async_scope scope_;
 };

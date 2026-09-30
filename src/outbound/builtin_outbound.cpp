@@ -9,7 +9,6 @@
 
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
 
 #include <exec/asio/use_sender.hpp>
 #include <exec/task.hpp>
@@ -55,18 +54,13 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
 
     void start() {
         auto self = shared_from_this();
-        // Deadline task races the open chain; both run detached (immortal
-        // heap scope): either task holds the last state reference at
-        // completion, which would free a member scope_ before __complete
-        // touches scope->__active_ (ASan #194, async_scope.hpp:162 --
-        // same shape as ProxySession UDP tasks and Socks5UdpListener).
-        // The timer is state-owned so finish() can cancel it: otherwise the
-        // loser sleeps the full 10s after a fast success and keeps the
-        // io_context (hence runtime.stop()) waiting out the window.
-        deadline_timer_ = std::make_shared<boost::asio::steady_timer>(
-            runtime_.serialized_executor(), std::chrono::seconds(10));
-        async::spawn_detached(run_open(self));
-        async::spawn_detached(run_deadline(self, deadline_timer_));
+        // Guarded open races a 10s timeout via with_timeout; runs detached
+        // (immortal heap scope): the finished task holds the last state
+        // reference at completion, which would free a member scope_ before
+        // __complete touches scope->__active_ (ASan #194,
+        // async_scope.hpp:162 -- same shape as ProxySession UDP tasks and
+        // Socks5UdpListener).
+        async::spawn_detached(run_guarded(self));
     }
 
     // Abort for sender-driven cancellation: idempotent with finish().
@@ -81,14 +75,9 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
                     return;
                 }
                 self->completed_ = true;
-                // Wake the deadline loser as well; otherwise it sleeps the
-                // full window holding state alive after an abort.
-                if (self->deadline_timer_) {
-                    (void)self->deadline_timer_->cancel();
-                }
                 // No request_stop: detached tasks have no shared scope to
                 // stop; closing the socket aborts the open chain, and the
-                // deadline task drops at its completed_ guard.
+                // timeout branch drops inside with_timeout.
                 boost::system::error_code ignored;
                 self->socket_.close(ignored);
             });
@@ -97,54 +86,82 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
     }
 
   private:
+    // Timeout race driver: the open chain races a 10s sleep via
+    // with_timeout so a stalled peer cannot park the open. Timeout
+    // surfaces as an in-band Result built from a by-value destination
+    // string (the work sender borrows self); machinery set_error crosses
+    // as an exception mapped to an endpoint_connection failure; outer
+    // stop cancels both branches. The former deadline task's timeout-side
+    // teardown (socket close) is subsumed by finish()'s !succeeded close
+    // path. A named function (not an immediately-invoked capturing
+    // lambda) builds the task; see docs/async-pitfalls.md.
+    static exec::task<void> run_guarded(std::shared_ptr<DirectConnectState> self) {
+        const std::string destination = destination_text(self->request_.destination);
+        core::StreamOpenResult result =
+            core::StreamOpenResult::failed({core::ErrorCode::cancelled, "direct connect stopped"});
+        try {
+            result = co_await async::with_timeout<core::StreamOpenResult>(
+                self->runtime_.serialized_executor(), std::chrono::seconds(10), run_open(self),
+                [destination] {
+                    return core::StreamOpenResult::failed(
+                        {core::ErrorCode::timeout,
+                         fmt::format("timed out connecting direct target {}", destination)});
+                });
+        } catch (...) {
+            result = core::StreamOpenResult::failed(
+                connection_error(core::ErrorCode::endpoint_connection,
+                                 fmt::format("failed to connect direct target {}", destination),
+                                 boost::asio::error::fault));
+        }
+        self->finish(std::move(result));
+    }
+
     // Straight-line open chain: resolve (A/AAAA loop inside the shared
     // sender, kept as in-band Result), then TCP connect. Every terminal
-    // funnels through finish(), so the spawned task always ends with a
-    // value unless an outer stop ends it early.
-    static exec::task<void> run_open(std::shared_ptr<DirectConnectState> self) {
+    // returns a Result; run_guarded funnels it through finish(), so the
+    // spawned task always ends with a value unless an outer stop ends it
+    // early.
+    static exec::task<core::StreamOpenResult> run_open(std::shared_ptr<DirectConnectState> self) {
         if (self->request_.resolved_address) {
-            co_await connect_addresses(
+            co_return co_await connect_addresses(
                 self, std::vector<boost::asio::ip::address>{*self->request_.resolved_address});
-            co_return;
         }
         if (self->request_.destination.is_address()) {
-            co_await connect_addresses(
+            co_return co_await connect_addresses(
                 self, std::vector<boost::asio::ip::address>{self->request_.destination.address()});
-            co_return;
         }
         if (!self->resolver_) {
-            self->finish(core::StreamOpenResult::failed(
+            co_return core::StreamOpenResult::failed(
                 {core::ErrorCode::configuration,
-                 "direct outbound requires a configured DNS resolver"}));
-            co_return;
+                 "direct outbound requires a configured DNS resolver"});
         }
         core::Result<detail::AddressList> resolved;
         try {
             resolved = co_await detail::resolve_host_sender(self->runtime_, self->resolver_,
                                                             self->request_.destination.domain());
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
+            co_return core::StreamOpenResult::failed(
                 {core::ErrorCode::resolution,
                  fmt::format("failed to resolve direct target {}",
-                             destination_text(self->request_.destination))}));
-            co_return;
+                             destination_text(self->request_.destination))});
         }
         if (self->completed_) {
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::cancelled, "direct connect stopped"});
         }
         if (!resolved || resolved.value().empty()) {
-            self->finish(core::StreamOpenResult::failed(
+            co_return core::StreamOpenResult::failed(
                 resolved ? core::Error{core::ErrorCode::resolution,
                                        fmt::format("direct target {} has no resolved addresses",
                                                    destination_text(self->request_.destination))}
-                         : resolved.error()));
-            co_return;
+                         : resolved.error());
         }
-        co_await connect_addresses(self, std::move(resolved.value()));
+        co_return co_await connect_addresses(self, std::move(resolved.value()));
     }
 
-    static exec::task<void> connect_addresses(std::shared_ptr<DirectConnectState> self,
-                                              std::vector<boost::asio::ip::address> addresses) {
+    static exec::task<core::StreamOpenResult>
+    connect_addresses(std::shared_ptr<DirectConnectState> self,
+                      std::vector<boost::asio::ip::address> addresses) {
         auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
         endpoints->reserve(addresses.size());
         for (const auto &address : addresses) {
@@ -167,32 +184,20 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
                     std::rethrow_exception(std::current_exception());
                 }));
         } catch (const core::Error &failure) {
-            self->finish(core::StreamOpenResult::failed(failure));
-            co_return;
+            co_return core::StreamOpenResult::failed(failure);
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
+            co_return core::StreamOpenResult::failed(
                 connection_error(core::ErrorCode::endpoint_connection,
                                  fmt::format("failed to connect direct target {}",
                                              destination_text(self->request_.destination)),
-                                 boost::asio::error::fault)));
-            co_return;
+                                 boost::asio::error::fault));
         }
-        if (!self->completed_) {
-            self->finish(core::StreamOpenResult::opened(
-                std::make_unique<net::TcpStream>(std::move(self->socket_))));
+        if (self->completed_) {
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::cancelled, "direct connect stopped"});
         }
-    }
-
-    static exec::task<void> run_deadline(std::shared_ptr<DirectConnectState> self,
-                                         std::shared_ptr<boost::asio::steady_timer> timer) {
-        try {
-            co_await (timer->async_wait(exec::asio::use_sender) | stdexec::then([] {}));
-        } catch (...) {
-            co_return;
-        }
-        self->finish(core::StreamOpenResult::failed(
-            {core::ErrorCode::timeout, fmt::format("timed out connecting direct target {}",
-                                                   destination_text(self->request_.destination))}));
+        co_return core::StreamOpenResult::opened(
+            std::make_unique<net::TcpStream>(std::move(self->socket_)));
     }
 
     void finish(core::StreamOpenResult result) {
@@ -203,13 +208,6 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
             return;
         }
         completed_ = true;
-        // Wake the deadline loser immediately: it holds the last state
-        // reference, and its 10s sleep would otherwise keep the io_context
-        // (hence runtime.stop()) waiting out the window after fast success.
-        // Cancel is thread-safe; the loser drops at its completed_ guard.
-        if (deadline_timer_) {
-            (void)deadline_timer_->cancel();
-        }
         if (!result.succeeded()) {
             boost::system::error_code ignored;
             socket_.close(ignored);
@@ -225,12 +223,9 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
     std::shared_ptr<dns::ResolverService> resolver_;
     boost::asio::ip::tcp::socket socket_;
     core::StreamOpenHandler handler_;
-    // Owned deadline timer so finish() can wake the racing deadline task:
-    // otherwise the loser sleeps the full window holding state alive.
-    std::shared_ptr<boost::asio::steady_timer> deadline_timer_;
     bool completed_ = false;
-    // No member scope: open/deadline tasks run detached (immortal heap
-    // scope) so the last state reference cannot free their scope (#194).
+    // No member scope: open task runs detached (immortal heap scope) so
+    // the last state reference cannot free its scope (#194).
 };
 
 core::StreamOpenResult rejected_stream() {

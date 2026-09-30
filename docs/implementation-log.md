@@ -3098,3 +3098,34 @@ separate from `docs/architecture.md`, which describes the project blueprint.
   `StreamMapAbandonedPullCancelsCleanly` and
   `ResolverServiceTest.CoalescesEquivalentQueriesAndCachesTheAnswer`
   (both async_scope UAF shapes). Windows RelWithDebInfo passes.
+
+### 2026-09-30 - Migrate outbound deadlines to with_timeout races
+
+- All 5 outbound connect/resolve watchdogs now race via
+  `async::with_timeout`: a single `run_guarded` driver per operation
+  co_awaits `with_timeout<Result>(executor, timeout, run_work, factory)`
+  and funnels the winner through one `finish()` call. Timeout is an
+  in-band `Result`; machinery `set_error` crosses as an exception mapped
+  to a failure `Result`; outer stop cancels both branches.
+- Chain bodies converted to value-returning tasks (`finish(X)` ->
+  `co_return X`; SS/Trojan failure-only helpers throw `core::Error`
+  into the existing catches). Trojan merged `run_resolve` + `resolved()`
+  + `run()` into one task; `deadline_` kept as a pure time_point for the
+  TLS/WS sub-operation absolute budgets. Trojan transport tail split
+  into `open_transport`/`open_grpc_transport`/`open_websocket_transport`/
+  `open_tls_transport` helpers (clang-cl 22 optimizer crash on the
+  monolithic coroutine otherwise).
+- Deleted: all `run_deadline` tasks, `deadline_timer_`/`timer_` members,
+  every manual `cancel()`, steady_timer includes where unused. No
+  `run_deadline`/`deadline_timer_`/`cancel_timer` text remains in
+  `src/outbound/`.
+- New protocols henceforth copy one shape: `run_work` returning a
+  `Result` + `run_guarded` driver + timeout factory; no hand-rolled
+  deadline task, no owned timer, no second `finish()` path.
+- Validation (Linux ASan): Socks5 5/5 + OutboundContract 3/3 + Timer 5/5,
+  zero sanitizer reports, timing unchanged at ~340ms total. Full suite:
+  84 passing; 2 remaining failures are pre-existing async_scope UAFs
+  unrelated to this change (`StreamMapAbandonedPullCancelsCleanly`
+  reproduced on the clean tree; `ResolverServiceTest` EDNS-segregation
+  sibling crashes in `async_scope.hpp:162` via `DnsUpstream::exchange`,
+  a file this change does not touch). Windows RelWithDebInfo passes.

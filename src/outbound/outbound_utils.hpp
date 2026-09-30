@@ -2,7 +2,6 @@
 
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
 #include <boost/system/error_code.hpp>
 #include <clash_native/async/callback_sender.hpp>
 #include <clash_native/async/timer.hpp>
@@ -11,7 +10,6 @@
 #include <clash_native/dns/resolver_service.hpp>
 #include <clash_native/io/sender.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
-#include <exec/asio/use_sender.hpp>
 
 #include <exec/async_scope.hpp>
 #include <exec/task.hpp>
@@ -38,9 +36,9 @@ inline std::error_code to_std_error(const boost::system::error_code &error) {
 
 // Task-driven hostname resolution shared by the outbounds. The A/AAAA loop
 // is a single exec::task co_awaiting one callback_sender leaf per query
-// (registry-pattern resolver stays callback-shaped on purpose); the deadline
-// is a sleep_after task racing it, winner via the completed_ guard. No
-// steady_timer member, no async_wait, no bridge_sender.
+// (registry-pattern resolver stays callback-shaped on purpose); the loop
+// races a 10s timeout via async::with_timeout, timeout surfacing as an
+// in-band Result. No timer member, no async_wait, no bridge_sender.
 class HostResolveState final : public std::enable_shared_from_this<HostResolveState> {
   public:
     using Result = core::Result<AddressList>;
@@ -64,14 +62,9 @@ class HostResolveState final : public std::enable_shared_from_this<HostResolveSt
             return;
         }
         auto self = shared_from_this();
-        // Deadline task races the resolve loop; teardown stays guard-driven,
-        // so no stop is ever requested.
-        // State-owned timer so finish() can wake the loser: otherwise it
-        // sleeps the full 10s holding state alive after fast success.
-        deadline_timer_ = std::make_shared<boost::asio::steady_timer>(
-            runtime_.serialized_executor(), std::chrono::seconds(10));
-        scope_.spawn(run_resolve(self));
-        scope_.spawn(run_deadline(self, deadline_timer_));
+        // Resolve loop races a 10s timeout via with_timeout; teardown stays
+        // guard-driven, so no stop is ever requested.
+        scope_.spawn(run_guarded(self));
     }
 
     // Abort for sender-driven cancellation: idempotent with finish().
@@ -85,9 +78,6 @@ class HostResolveState final : public std::enable_shared_from_this<HostResolveSt
                     return;
                 }
                 self->completed_ = true;
-                if (self->deadline_timer_) {
-                    (void)self->deadline_timer_->cancel();
-                }
                 if (self->resolver_ && self->request_id_) {
                     self->resolver_->cancel(*self->request_id_);
                     self->request_id_.reset();
@@ -129,21 +119,45 @@ class HostResolveState final : public std::enable_shared_from_this<HostResolveSt
             })};
     }
 
-    // The A/AAAA loop as one straight-line task. Every terminal funnels
-    // through finish(), so the spawned task always ends with a value unless
-    // an outer stop ends it early (whose terminal the erasure delivers).
-    static exec::task<void> run_resolve(std::shared_ptr<HostResolveState> self) {
+    // Timeout race driver: the A/AAAA loop races a 10s sleep via
+    // with_timeout so a stalled resolver cannot park the sender. Timeout
+    // surfaces as an in-band Result; machinery set_error crosses as an
+    // exception mapped to a resolution failure; outer stop cancels both
+    // branches. A named function (not an immediately-invoked capturing
+    // lambda) builds the task; see docs/async-pitfalls.md.
+    static exec::task<void> run_guarded(std::shared_ptr<HostResolveState> self) {
+        Result result = Result(
+            core::fail({core::ErrorCode::cancelled, "outbound server hostname resolve stopped"}));
+        try {
+            result = co_await async::with_timeout<Result>(
+                self->runtime_.serialized_executor(), std::chrono::seconds(10), run_resolve(self),
+                [] {
+                    return Result(core::fail({core::ErrorCode::timeout,
+                                              "timed out resolving outbound server hostname"}));
+                });
+        } catch (...) {
+            result = Result(core::fail(
+                {core::ErrorCode::resolution, "failed to resolve outbound server hostname"}));
+        }
+        self->finish(std::move(result));
+    }
+
+    // The A/AAAA loop as one straight-line task. Every terminal returns a
+    // Result; run_guarded funnels it through finish(), so the spawned task
+    // always ends with a value unless an outer stop ends it early (whose
+    // terminal the erasure delivers).
+    static exec::task<Result> run_resolve(std::shared_ptr<HostResolveState> self) {
         for (const auto type : {dns::DnsRecordType::a, dns::DnsRecordType::aaaa}) {
             core::Result<dns::DnsAnswer> answer;
             try {
                 answer = co_await resolve_one(self, type);
             } catch (...) {
-                self->finish(core::fail(
+                co_return Result(core::fail(
                     {core::ErrorCode::resolution, "failed to resolve outbound server hostname"}));
-                co_return;
             }
             if (self->completed_) {
-                co_return;
+                co_return Result(core::fail(
+                    {core::ErrorCode::cancelled, "outbound server hostname resolve stopped"}));
             }
             if (answer) {
                 for (const auto &address : answer.value().addresses) {
@@ -157,25 +171,13 @@ class HostResolveState final : public std::enable_shared_from_this<HostResolveSt
             }
         }
         if (self->addresses_.empty()) {
-            self->finish(self->first_error_
-                             ? Result(core::fail(*self->first_error_))
-                             : Result(core::fail({core::ErrorCode::resolution,
-                                                  "outbound server hostname resolved to no "
-                                                  "addresses"})));
-            co_return;
+            co_return self->first_error_
+                ? Result(core::fail(*self->first_error_))
+                : Result(core::fail({core::ErrorCode::resolution,
+                                     "outbound server hostname resolved to no "
+                                     "addresses"}));
         }
-        self->finish(Result{std::move(self->addresses_)});
-    }
-
-    static exec::task<void> run_deadline(std::shared_ptr<HostResolveState> self,
-                                         std::shared_ptr<boost::asio::steady_timer> timer) {
-        try {
-            co_await (timer->async_wait(exec::asio::use_sender) | stdexec::then([] {}));
-        } catch (...) {
-            co_return;
-        }
-        self->finish(
-            core::fail({core::ErrorCode::timeout, "timed out resolving outbound server hostname"}));
+        co_return Result{std::move(self->addresses_)};
     }
 
     void finish(Result result) {
@@ -183,11 +185,6 @@ class HostResolveState final : public std::enable_shared_from_this<HostResolveSt
             return;
         }
         completed_ = true;
-        // Wake the deadline loser immediately; otherwise it sleeps the full
-        // 10s holding state alive after fast success.
-        if (deadline_timer_) {
-            (void)deadline_timer_->cancel();
-        }
         if (resolver_ && request_id_) {
             resolver_->cancel(*request_id_);
             request_id_.reset();
@@ -203,14 +200,12 @@ class HostResolveState final : public std::enable_shared_from_this<HostResolveSt
     runtime::AsioRuntime &runtime_;
     std::shared_ptr<dns::ResolverService> resolver_;
     std::string host_;
-    // Owns the resolve/deadline chain tasks, which always end with a value.
+    // Owns the single guarded resolve task, which always ends with a value.
     exec::async_scope scope_;
     ResolveHandler handler_;
     std::optional<dns::ResolverService::RequestId> request_id_;
     AddressList addresses_;
     std::optional<core::Error> first_error_;
-    // Owned deadline timer so finish() can wake the racing deadline task.
-    std::shared_ptr<boost::asio::steady_timer> deadline_timer_;
     bool completed_ = false;
 };
 

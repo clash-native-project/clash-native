@@ -13,7 +13,6 @@
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
 
 #include <exec/asio/use_sender.hpp>
 #include <exec/async_scope.hpp>
@@ -123,15 +122,7 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
         }
         deadline_ = std::chrono::steady_clock::now() + kConnectTimeout;
         auto self = shared_from_this();
-        // Deadline task races the connect chain; teardown stays
-        // guard-driven, so no stop is ever requested.
-        // State-owned timer so finish() can wake the loser: otherwise it
-        // sleeps the full window holding state alive after fast success.
-        deadline_timer_ =
-            std::make_shared<boost::asio::steady_timer>(runtime_.serialized_executor());
-        deadline_timer_->expires_at(deadline_);
-        scope_.spawn(run(self));
-        scope_.spawn(run_deadline(self, deadline_timer_));
+        scope_.spawn(run_guarded(self));
     }
     // Abort for sender-driven cancellation: posted to the strand so it stays
     // ordered with finish(). Marks completion so the chain task bails at its
@@ -180,25 +171,25 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
     }
 
     // Straight-line connect chain: resolve, TCP connect, optional TLS
-    // handshake, HTTP session, CONNECT tunnel. Every terminal funnels
-    // through finish(), so the spawned task always ends with a value unless
-    // an outer stop ends it early.
-    static exec::task<void> run(std::shared_ptr<HttpProxyConnectState> self) {
+    // handshake, HTTP session, CONNECT tunnel. Every terminal returns a
+    // Result; run_guarded funnels it through finish(), so the spawned task
+    // always ends with a value unless an outer stop ends it early.
+    static exec::task<core::StreamOpenResult>
+    run_work(std::shared_ptr<HttpProxyConnectState> self) {
         core::Result<detail::AddressList> resolved;
         try {
             resolved = co_await detail::resolve_host_sender(self->runtime_, self->resolver_,
                                                             self->config_.server_host);
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::resolution, "failed to resolve HTTP proxy server"}));
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::resolution, "failed to resolve HTTP proxy server"});
         }
         if (self->completed_) {
-            co_return;
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::cancelled, "HTTP proxy connect cancelled"});
         }
         if (!resolved) {
-            self->finish(core::StreamOpenResult::failed(resolved.error()));
-            co_return;
+            co_return core::StreamOpenResult::failed(resolved.error());
         }
         auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
         endpoints->reserve(resolved.value().size());
@@ -222,15 +213,14 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
                         std::rethrow_exception(std::current_exception());
                     }));
             } catch (const core::Error &failure) {
-                self->finish(core::StreamOpenResult::failed(failure));
-                co_return;
+                co_return core::StreamOpenResult::failed(failure);
             } catch (...) {
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::endpoint_connection, "failed to connect to HTTP proxy"}));
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::endpoint_connection, "failed to connect to HTTP proxy"});
             }
             if (self->completed_) {
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "HTTP proxy connect cancelled"});
             }
             std::unique_ptr<io::StreamHandle> stream =
                 std::make_unique<net::TcpStream>(std::move(*self->socket_));
@@ -249,26 +239,24 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
                     connection = co_await transport::async_tls_client_handshake(std::move(stream),
                                                                                 std::move(options));
                 } catch (const core::Error &failure) {
-                    self->finish(core::StreamOpenResult::failed(failure));
-                    co_return;
+                    co_return core::StreamOpenResult::failed(failure);
                 } catch (...) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::endpoint_connection, "HTTP proxy TLS failed"}));
-                    co_return;
+                    co_return core::StreamOpenResult::failed(
+                        {core::ErrorCode::endpoint_connection, "HTTP proxy TLS failed"});
                 }
                 if (self->completed_) {
                     if (connection.stream) {
                         connection.stream->close();
                     }
-                    co_return;
+                    co_return core::StreamOpenResult::failed(
+                        {core::ErrorCode::cancelled, "HTTP proxy connect cancelled"});
                 }
                 if (!connection.negotiated_alpn.empty() && connection.negotiated_alpn != "h2" &&
                     connection.negotiated_alpn != "http/1.1") {
                     connection.stream->close();
-                    self->finish(core::StreamOpenResult::failed(
+                    co_return core::StreamOpenResult::failed(
                         {core::ErrorCode::unsupported,
-                         "HTTP proxy negotiated an unsupported ALPN protocol"}));
-                    co_return;
+                         "HTTP proxy negotiated an unsupported ALPN protocol"});
                 }
                 alpn = std::move(connection.negotiated_alpn);
                 stream = std::move(connection.stream);
@@ -277,7 +265,8 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
                 if (stream) {
                     stream->close();
                 }
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "HTTP proxy connect cancelled"});
             }
             if (alpn == "h2") {
                 self->session_ = transport::make_http2_exchange_session(std::move(stream));
@@ -285,9 +274,8 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
                 self->session_ = transport::make_http1_exchange_session(std::move(stream));
             }
             if (!self->session_) {
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::transport_io, "failed to create HTTP proxy client session"}));
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::transport_io, "failed to create HTTP proxy client session"});
             }
             io::StreamUpgradeRequest tunnel;
             tunnel.authority = destination_authority(self->request_.destination);
@@ -301,45 +289,53 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
             try {
                 tunneled = co_await self->session_->open_tunnel(std::move(tunnel), self->deadline_);
             } catch (const core::Error &failure) {
-                self->finish(core::StreamOpenResult::failed(failure));
-                co_return;
+                co_return core::StreamOpenResult::failed(failure);
             } catch (...) {
-                self->finish(core::StreamOpenResult::failed(
-                    {core::ErrorCode::endpoint_connection, "HTTP proxy tunnel failed"}));
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::endpoint_connection, "HTTP proxy tunnel failed"});
             }
             if (self->completed_) {
                 if (tunneled.stream) {
                     tunneled.stream->close();
                 }
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "HTTP proxy connect cancelled"});
             }
             if (!tunneled.stream) {
                 const auto status = tunneled.response.status;
-                self->finish(core::StreamOpenResult::failed(
+                co_return core::StreamOpenResult::failed(
                     {core::ErrorCode::rejected,
-                     "HTTP proxy rejected CONNECT with status " + std::to_string(status)}));
-                co_return;
+                     "HTTP proxy rejected CONNECT with status " + std::to_string(status)});
             }
             auto tunnel_stream = std::make_unique<HttpProxyTunnelStream>(std::move(tunneled.stream),
                                                                          std::move(self->session_));
-            self->finish(core::StreamOpenResult::opened(std::move(tunnel_stream)));
+            co_return core::StreamOpenResult::opened(std::move(tunnel_stream));
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::transport_io, "HTTP proxy connect failed"}));
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "HTTP proxy connect failed"});
         }
-        co_return;
     }
 
-    static exec::task<void> run_deadline(std::shared_ptr<HttpProxyConnectState> self,
-                                         std::shared_ptr<boost::asio::steady_timer> timer) {
+    // Timeout race driver: the connect chain races a sleep via with_timeout
+    // so a stalled peer cannot park the open. Timeout surfaces as an
+    // in-band Result; machinery set_error crosses as an exception mapped to
+    // a transport_io failure; outer stop cancels both branches. A named
+    // function (not an immediately-invoked capturing lambda) builds the
+    // task; see docs/async-pitfalls.md.
+    static exec::task<void> run_guarded(std::shared_ptr<HttpProxyConnectState> self) {
+        core::StreamOpenResult result = core::StreamOpenResult::failed(
+            {core::ErrorCode::cancelled, "HTTP proxy connect stopped"});
         try {
-            co_await (timer->async_wait(exec::asio::use_sender) | stdexec::then([] {}));
+            result = co_await async::with_timeout<core::StreamOpenResult>(
+                self->runtime_.serialized_executor(), kConnectTimeout, run_work(self), [] {
+                    return core::StreamOpenResult::failed(
+                        {core::ErrorCode::timeout, "timed out opening HTTP proxy tunnel"});
+                });
         } catch (...) {
-            co_return;
+            result = core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "HTTP proxy connect failed"});
         }
-        self->finish(core::StreamOpenResult::failed(
-            {core::ErrorCode::timeout, "timed out opening HTTP proxy tunnel"}));
+        self->finish(std::move(result));
     }
 
     void finish(core::StreamOpenResult result) {
@@ -350,12 +346,6 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
             return;
         }
         completed_ = true;
-        // Wake the deadline loser: it holds state alive and would sleep the
-        // full window after fast success. Cancel is thread-safe; abort
-        // already request_stops the scope, so the sleep unwinds as stopped.
-        if (deadline_timer_) {
-            (void)deadline_timer_->cancel();
-        }
         if (!result.succeeded()) {
             boost::system::error_code ignored;
             if (socket_) {
@@ -380,12 +370,11 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
     core::StreamRequest request_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
     std::shared_ptr<io::ExchangeSession> session_;
-    // Owns the connect/deadline chain tasks, which always end with a value.
+    // Owns the single guarded connect task, which always ends with a value.
     exec::async_scope scope_;
     core::StreamOpenHandler handler_;
+    // Absolute budget still feeding the TLS and tunnel sub-operations.
     std::chrono::steady_clock::time_point deadline_{};
-    // Owned deadline timer so finish() can wake the racing deadline task.
-    std::shared_ptr<boost::asio::steady_timer> deadline_timer_;
     bool completed_ = false;
 };
 

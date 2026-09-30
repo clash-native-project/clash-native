@@ -20,7 +20,6 @@
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/write.hpp>
 
 #include <exec/async_scope.hpp>
@@ -302,45 +301,30 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                  "Trojan dialer-proxy cannot chain pooled gRPC sessions"}));
             return;
         }
+        // Absolute end-to-end budget for the TLS/WS sub-operations below;
+        // the race itself is bounded by kConnectTimeout in run_guarded.
         deadline_ = std::chrono::steady_clock::now() + kConnectTimeout;
-        // State-owned timer so finish() can wake the deadline loser: it holds
-        // state alive and would otherwise sleep the full window on success.
-        // deadline_ stays as the absolute end-to-end budget for TLS/WS
-        // sub-operations below.
-        deadline_timer_ =
-            std::make_shared<boost::asio::steady_timer>(runtime_.serialized_executor());
-        deadline_timer_->expires_at(deadline_);
-        scope_.spawn(run_deadline(shared_from_this(), deadline_timer_));
-        // Chained dials skip local resolution: the chain resolves the server.
-        if (!config_.dialer_proxy.empty()) {
-            scope_.spawn(run(shared_from_this(),
-                             std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>()));
-            return;
-        }
-        scope_.spawn(run_resolve(shared_from_this()));
+        scope_.spawn(run_guarded(shared_from_this()));
     }
 
-    // Deadline watchdog: fails the operation if the chain task has not
-    // finished first. The sleep sender is aborted when the scope drains.
-    static exec::task<void> run_deadline(std::shared_ptr<TrojanConnectOperation> self,
-                                         std::shared_ptr<boost::asio::steady_timer> timer) {
+    // Drives run_work under a with_timeout race so a stalled chain cannot
+    // park the bridge terminal: work and the sleep race, the winner's
+    // StreamOpenResult is finished in band, and machinery set_error crosses
+    // as an exception. Outer stop cancels both branches.
+    static exec::task<void> run_guarded(std::shared_ptr<TrojanConnectOperation> self) {
+        core::StreamOpenResult result = core::StreamOpenResult::failed(
+            {core::ErrorCode::cancelled, "Trojan connect was cancelled"});
         try {
-            co_await (timer->async_wait(exec::asio::use_sender) | stdexec::then([] {}));
+            result = co_await async::with_timeout<core::StreamOpenResult>(
+                self->runtime_.serialized_executor(), kConnectTimeout, run_work(self), [] {
+                    return core::StreamOpenResult::failed(
+                        {core::ErrorCode::timeout, "timed out opening Trojan stream"});
+                });
         } catch (...) {
+            result = core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "Trojan connect failed"});
         }
-        if (self->completed_) {
-            co_return;
-        }
-        self->finish(core::StreamOpenResult::failed(
-            {core::ErrorCode::timeout, "timed out opening Trojan stream"}));
-    }
-
-    // Hostname resolution as a task: co_awaits the sender-native resolve,
-    // then spawns the connect chain. Replaces the callback resolve_host.
-    static exec::task<void> run_resolve(std::shared_ptr<TrojanConnectOperation> self) {
-        auto result = co_await detail::resolve_host_sender(self->runtime_, self->resolver_,
-                                                           self->config_.server_host);
-        self->resolved(std::move(result));
+        self->finish(std::move(result));
     }
 
   private:
@@ -436,27 +420,21 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     // NOTE: named function per the coroutine creation rules; never an
     // immediately-invoked capturing lambda.
     static exec::task<void> dial_chained_transport(std::shared_ptr<TrojanConnectOperation> self) {
-        const auto fail = [self](core::Error error) {
-            self->finish(core::StreamOpenResult::failed(std::move(error)));
-        };
         if (!self->chain_registry_) {
-            fail({core::ErrorCode::configuration,
-                  "Trojan dialer-proxy requires a chain registry",
-                  {}});
-            co_return;
+            throw core::Error{core::ErrorCode::configuration,
+                              "Trojan dialer-proxy requires a chain registry",
+                              {}};
         }
         const auto trace =
             transport::extend_endpoint_trace(self->request_.dial_trace, self->config_.id);
         if (!trace) {
-            fail(trace.error());
-            co_return;
+            throw trace.error();
         }
         const transport::EndpointDialRequirements requirements{true, false};
         const auto plan = transport::EndpointDialPlan::from_registry(
             self->chain_registry_, self->config_.dialer_proxy, requirements);
         if (!plan) {
-            fail(plan.error());
-            co_return;
+            throw plan.error();
         }
         boost::system::error_code ignored;
         const auto numeric = boost::asio::ip::make_address(self->config_.server_host, ignored);
@@ -478,35 +456,290 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                                                transport::ChainedStreamReceiver{std::move(done)});
                     return async::CallbackAbortFn{[self] { self->abort(); }};
                 });
+        } catch (const core::Error &) {
+            throw;
         } catch (...) {
-            fail({core::ErrorCode::transport_io, "Trojan chained dial failed", {}});
-            co_return;
+            throw core::Error{core::ErrorCode::transport_io, "Trojan chained dial failed", {}};
         }
         if (self->completed_) {
-            co_return;
+            throw core::Error{core::ErrorCode::cancelled, "Trojan connect was cancelled", {}};
         }
         if (!opened) {
-            fail(opened.error());
-            co_return;
+            throw opened.error();
         }
         self->chained_transport_ = std::move(opened.value());
     }
 
-    // Straight-line connect chain: TCP connect, TLS or WebSocket transport,
-    // Trojan request write. Every terminal funnels through finish(), so the
-    // spawned task always ends with a value.
-    static exec::task<void>
-    run(std::shared_ptr<TrojanConnectOperation> self,
-        std::shared_ptr<std::vector<boost::asio::ip::tcp::endpoint>> endpoints) {
+    // Transport selection: gRPC pooled session, WebSocket handshake, or
+    // plain TLS handshake. Each helper returns whether the Trojan request
+    // header was already sent (WS early data) so run_work can skip the
+    // post-write; failures return in band for run_guarded to finish once.
+    static exec::task<core::Result<bool>>
+    open_transport(std::shared_ptr<TrojanConnectOperation> self) {
+        if (self->config_.network == "grpc") {
+            co_return co_await open_grpc_transport(self);
+        }
+        if (self->config_.network == "ws" || self->config_.network == "wss") {
+            co_return co_await open_websocket_transport(self);
+        }
+        co_return co_await open_tls_transport(self);
+    }
+
+    // gRPC transport: dials a pooled session into transport_stream_.
+    static exec::task<core::Result<bool>>
+    open_grpc_transport(std::shared_ptr<TrojanConnectOperation> self) {
+        const auto gun_pool = self->gun_pool_;
+        if (!gun_pool) {
+            co_return core::fail(
+                {core::ErrorCode::configuration, "Trojan gRPC pool is not initialized"});
+        }
+        std::unique_ptr<io::StreamHandle> gun_stream;
+        try {
+            gun_stream = co_await gun_pool->dial();
+        } catch (const core::Error &failure) {
+            co_return core::fail(failure);
+        } catch (...) {
+            co_return core::fail({core::ErrorCode::transport_io, "Trojan gRPC dial failed"});
+        }
+        if (self->completed_) {
+            gun_stream->close();
+            co_return core::fail({core::ErrorCode::cancelled, "Trojan connect was cancelled"});
+        }
+        self->transport_stream_ = std::move(gun_stream);
+        co_return core::Result<bool>{false};
+    }
+
+    // WebSocket transport, with an optional security overlay underneath.
+    static exec::task<core::Result<bool>>
+    open_websocket_transport(std::shared_ptr<TrojanConnectOperation> self) {
+        bool header_sent = false;
+        transport::WebSocketClientOptions ws_options;
+        ws_options.host = self->config_.websocket_host.empty()
+                              ? (self->config_.server_name.empty() ? self->config_.server_host
+                                                                   : self->config_.server_name)
+                              : self->config_.websocket_host;
+        ws_options.target = self->config_.websocket_path;
+        ws_options.headers = self->config_.websocket_headers;
+        // With a security overlay the camouflage replaces the
+        // WS-underlying TLS (matching Mihomo); otherwise the ws
+        // client owns its TLS handshake.
+        const bool overlayed = !self->config_.security_mode.empty();
+        ws_options.tls =
+            !overlayed && (self->config_.network == "wss" || self->config_.websocket_tls);
+        ws_options.tls_server_name = self->config_.server_name.empty() ? self->config_.server_host
+                                                                       : self->config_.server_name;
+        if (self->config_.ech_enabled) {
+            auto ech = co_await fetch_trojan_ech_config(self->resolver_, self->config_,
+                                                        ws_options.tls_server_name);
+            if (!ech) {
+                co_return core::fail(ech.error());
+            }
+            ws_options.tls_ech_config_list = std::move(ech.value());
+        }
+        ws_options.tls_verify_peer = self->config_.verify_peer;
+        ws_options.tls_trusted_ca_pem = self->config_.trusted_ca_pem;
+        ws_options.tls_verify_hostname = self->config_.name_cert_verify;
+        ws_options.tls_client_certificate_pem = self->config_.certificate;
+        ws_options.tls_client_private_key_pem = self->config_.private_key;
+        ws_options.tls_alpn_protocols = self->config_.alpn_protocols.empty()
+                                            ? std::vector<std::string>{"http/1.1"}
+                                            : self->config_.alpn_protocols;
+        ws_options.tls_fingerprint = self->config_.client_fingerprint;
+        ws_options.tls_certificate_pin = self->config_.fingerprint;
+        if (!self->config_.reality_public_key.empty()) {
+            ws_options.tls_reality = transport::TlsRealityOptions{self->config_.reality_public_key,
+                                                                  self->config_.reality_short_id};
+        }
+        ws_options.max_early_data = self->config_.websocket_max_early_data;
+        ws_options.early_data_header_name = self->config_.websocket_early_data_header;
+        ws_options.v2ray_http_upgrade = self->config_.websocket_v2ray_http_upgrade;
+        ws_options.v2ray_http_upgrade_fast_open =
+            self->config_.websocket_v2ray_http_upgrade_fast_open;
+        ws_options.deadline = self->deadline_;
+        if (!self->config_.ss_enabled) {
+            auto header =
+                build_request_header(self->config_, self->request_.destination, self->command_);
+            if (!header) {
+                co_return core::fail(header.error());
+            }
+            ws_options.initial_payload = std::move(header.value());
+            header_sent = true;
+        }
+        std::unique_ptr<io::StreamHandle> ws_base = self->take_connected_stream();
+        self->socket_.reset();
+        if (overlayed) {
+            auto overlay = co_await open_security_overlay(self, std::move(ws_base));
+            if (!overlay) {
+                co_return core::fail(overlay.error());
+            }
+            if (self->completed_) {
+                overlay.value()->close();
+                co_return core::fail({core::ErrorCode::cancelled, "Trojan connect was cancelled"});
+            }
+            ws_base = std::move(overlay.value());
+        }
+        auto plain_stream = std::move(ws_base);
+        // Shared ownership of the pre-handshake stream so the
+        // aborter can close it after the initiation moved it into
+        // the handshake operation. Closing aborts the in-flight
+        // handshake; the late terminal is dropped by the sender.
+        auto plain = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(plain_stream));
+        using WsSigs = stdexec::completion_signatures<
+            stdexec::set_value_t(core::Result<std::unique_ptr<io::StreamHandle>>),
+            stdexec::set_error_t(std::exception_ptr), stdexec::set_stopped_t()>;
+        core::Result<std::unique_ptr<io::StreamHandle>> ws_result;
+        try {
+            ws_result = co_await async::callback_sender<WsSigs>(
+                [plain, ws_options = std::move(ws_options)](auto terminal) mutable {
+                    auto *slot = plain.get();
+                    auto handshake = transport::async_websocket_client_handshake(
+                        std::move(*slot), std::move(ws_options), std::move(terminal));
+                    return async::CallbackAbortFn{[plain, handshake] {
+                        if (handshake) {
+                            handshake->cancel();
+                        } else if (plain && *plain) {
+                            (*plain)->close();
+                        }
+                    }};
+                },
+                [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> result) {
+                    stdexec::set_value(std::move(receiver), std::move(result));
+                });
+        } catch (const core::Error &failure) {
+            co_return core::fail(failure);
+        } catch (...) {
+            co_return core::fail({core::ErrorCode::endpoint_connection, "Trojan WebSocket failed"});
+        }
+        if (self->completed_) {
+            if (ws_result && ws_result.value()) {
+                ws_result.value()->close();
+            }
+            co_return core::fail({core::ErrorCode::cancelled, "Trojan connect was cancelled"});
+        }
+        if (!ws_result) {
+            co_return core::fail(ws_result.error());
+        }
+        self->transport_stream_ = std::move(ws_result.value());
+        co_return core::Result<bool>{header_sent};
+    }
+
+    // Plain TLS transport (a security overlay replaces TLS when set).
+    static exec::task<core::Result<bool>>
+    open_tls_transport(std::shared_ptr<TrojanConnectOperation> self) {
+        transport::TlsClientOptions tls_options;
+        tls_options.server_name = self->config_.server_name.empty() ? self->config_.server_host
+                                                                    : self->config_.server_name;
+        tls_options.verify_peer = self->config_.verify_peer;
+        tls_options.trusted_ca_pem = self->config_.trusted_ca_pem;
+        tls_options.verify_hostname = self->config_.name_cert_verify;
+        tls_options.client_certificate_pem = self->config_.certificate;
+        tls_options.client_private_key_pem = self->config_.private_key;
+        tls_options.alpn_protocols = self->config_.alpn_protocols.empty()
+                                         ? std::vector<std::string>{"h2", "http/1.1"}
+                                         : self->config_.alpn_protocols;
+        tls_options.certificate_pin = self->config_.fingerprint;
+        tls_options.fingerprint = self->config_.client_fingerprint;
+        if (!self->config_.reality_public_key.empty()) {
+            tls_options.reality = transport::TlsRealityOptions{self->config_.reality_public_key,
+                                                               self->config_.reality_short_id};
+        }
+        if (self->config_.ech_enabled) {
+            auto ech = co_await fetch_trojan_ech_config(self->resolver_, self->config_,
+                                                        tls_options.server_name);
+            if (!ech) {
+                co_return core::fail(ech.error());
+            }
+            tls_options.ech_config_list = std::move(ech.value());
+        }
+        tls_options.deadline = self->deadline_;
+        auto plain_stream = self->take_connected_stream();
+        self->socket_.reset();
+        std::unique_ptr<io::StreamHandle> camouflaged = std::move(plain_stream);
+        // The camouflage layers carry their own TLS handshake and
+        // replace the Trojan TLS step (matching Mihomo's
+        // StreamTLSConn); without them the plain stream goes
+        // through the shared TLS client below.
+        if (!self->config_.security_mode.empty()) {
+            auto overlay = co_await open_security_overlay(self, std::move(camouflaged));
+            if (!overlay) {
+                co_return core::fail(overlay.error());
+            }
+            if (self->completed_) {
+                overlay.value()->close();
+                co_return core::fail({core::ErrorCode::cancelled, "Trojan connect was cancelled"});
+            }
+            self->transport_stream_ = std::move(overlay.value());
+        } else {
+            transport::TlsClientConnection connection;
+            try {
+                connection = co_await transport::async_tls_client_handshake(std::move(camouflaged),
+                                                                            std::move(tls_options));
+            } catch (const core::Error &failure) {
+                co_return core::fail(failure);
+            } catch (...) {
+                co_return core::fail({core::ErrorCode::endpoint_connection, "Trojan TLS failed"});
+            }
+            if (self->completed_) {
+                if (connection.stream) {
+                    connection.stream->close();
+                }
+                co_return core::fail({core::ErrorCode::cancelled, "Trojan connect was cancelled"});
+            }
+            self->transport_stream_ = std::move(connection.stream);
+        }
+        co_return core::Result<bool>{false};
+    }
+
+    // Straight-line connect chain: resolve (skipped for dialer_proxy
+    // chains), TCP connect, TLS or WebSocket transport, Trojan request
+    // write. Value-returning: every terminal co_returns a StreamOpenResult
+    // for run_guarded to finish with; intra-chain completed_ bails stay so
+    // abort() wins every race.
+    static exec::task<core::StreamOpenResult>
+    run_work(std::shared_ptr<TrojanConnectOperation> self) {
         // gRPC dials its own pooled sessions; the direct TCP connect below
         // only serves the tcp/ws/wss transports.
         const bool direct_connect = self->config_.network != "grpc";
         const bool chained = !self->config_.dialer_proxy.empty();
+        // Chained dials skip local resolution: the chain resolves the server.
+        auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
+        if (!chained) {
+            core::Result<detail::AddressList> resolved;
+            try {
+                resolved = co_await detail::resolve_host_sender(self->runtime_, self->resolver_,
+                                                                self->config_.server_host);
+            } catch (...) {
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::resolution, "failed to resolve Trojan server"});
+            }
+            if (self->completed_) {
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "Trojan connect was cancelled"});
+            }
+            if (!resolved || resolved.value().empty()) {
+                co_return core::StreamOpenResult::failed(
+                    !resolved ? resolved.error()
+                              : core::Error{core::ErrorCode::resolution,
+                                            "Trojan server hostname resolved to no addresses"});
+            }
+            endpoints->reserve(resolved.value().size());
+            for (const auto &address : resolved.value()) {
+                endpoints->emplace_back(address, self->config_.server_port);
+            }
+        }
         try {
             if (chained) {
-                co_await dial_chained_transport(self);
+                try {
+                    co_await dial_chained_transport(self);
+                } catch (const core::Error &failure) {
+                    co_return core::StreamOpenResult::failed(failure);
+                } catch (...) {
+                    co_return core::StreamOpenResult::failed(
+                        {core::ErrorCode::transport_io, "Trojan chained dial failed"});
+                }
                 if (self->completed_ || !self->chained_transport_) {
-                    co_return;
+                    co_return core::StreamOpenResult::failed(
+                        {core::ErrorCode::cancelled, "Trojan connect was cancelled"});
                 }
             } else if (direct_connect) {
                 try {
@@ -525,240 +758,33 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                                   std::rethrow_exception(std::current_exception());
                               }));
                 } catch (const core::Error &failure) {
-                    self->finish(core::StreamOpenResult::failed(failure));
-                    co_return;
+                    co_return core::StreamOpenResult::failed(failure);
                 } catch (...) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::endpoint_connection, "failed to connect to Trojan "
-                                                               "server"}));
-                    co_return;
+                    co_return core::StreamOpenResult::failed({core::ErrorCode::endpoint_connection,
+                                                              "failed to connect to Trojan "
+                                                              "server"});
                 }
             }
             if (self->completed_) {
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "Trojan connect was cancelled"});
             }
             // Without the ss layer the WS handshake carries the request
             // header (early data or first message) and no post-write is
             // needed below.
             bool header_sent = false;
-            if (self->config_.network == "grpc") {
-                const auto gun_pool = self->gun_pool_;
-                if (!gun_pool) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::configuration, "Trojan gRPC pool is not initialized"}));
-                    co_return;
-                }
-                std::unique_ptr<io::StreamHandle> gun_stream;
-                try {
-                    gun_stream = co_await gun_pool->dial();
-                } catch (const core::Error &failure) {
-                    self->finish(core::StreamOpenResult::failed(failure));
-                    co_return;
-                } catch (...) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::transport_io, "Trojan gRPC dial failed"}));
-                    co_return;
-                }
-                if (self->completed_) {
-                    gun_stream->close();
-                    co_return;
-                }
-                self->transport_stream_ = std::move(gun_stream);
-            } else if (self->config_.network == "ws" || self->config_.network == "wss") {
-                transport::WebSocketClientOptions ws_options;
-                ws_options.host =
-                    self->config_.websocket_host.empty()
-                        ? (self->config_.server_name.empty() ? self->config_.server_host
-                                                             : self->config_.server_name)
-                        : self->config_.websocket_host;
-                ws_options.target = self->config_.websocket_path;
-                ws_options.headers = self->config_.websocket_headers;
-                // With a security overlay the camouflage replaces the
-                // WS-underlying TLS (matching Mihomo); otherwise the ws
-                // client owns its TLS handshake.
-                const bool overlayed = !self->config_.security_mode.empty();
-                ws_options.tls =
-                    !overlayed && (self->config_.network == "wss" || self->config_.websocket_tls);
-                ws_options.tls_server_name = self->config_.server_name.empty()
-                                                 ? self->config_.server_host
-                                                 : self->config_.server_name;
-                if (self->config_.ech_enabled) {
-                    auto ech = co_await fetch_trojan_ech_config(self->resolver_, self->config_,
-                                                                ws_options.tls_server_name);
-                    if (!ech) {
-                        self->finish(core::StreamOpenResult::failed(ech.error()));
-                        co_return;
-                    }
-                    ws_options.tls_ech_config_list = std::move(ech.value());
-                }
-                ws_options.tls_verify_peer = self->config_.verify_peer;
-                ws_options.tls_trusted_ca_pem = self->config_.trusted_ca_pem;
-                ws_options.tls_verify_hostname = self->config_.name_cert_verify;
-                ws_options.tls_client_certificate_pem = self->config_.certificate;
-                ws_options.tls_client_private_key_pem = self->config_.private_key;
-                ws_options.tls_alpn_protocols = self->config_.alpn_protocols.empty()
-                                                    ? std::vector<std::string>{"http/1.1"}
-                                                    : self->config_.alpn_protocols;
-                ws_options.tls_fingerprint = self->config_.client_fingerprint;
-                ws_options.tls_certificate_pin = self->config_.fingerprint;
-                if (!self->config_.reality_public_key.empty()) {
-                    ws_options.tls_reality = transport::TlsRealityOptions{
-                        self->config_.reality_public_key, self->config_.reality_short_id};
-                }
-                ws_options.max_early_data = self->config_.websocket_max_early_data;
-                ws_options.early_data_header_name = self->config_.websocket_early_data_header;
-                ws_options.v2ray_http_upgrade = self->config_.websocket_v2ray_http_upgrade;
-                ws_options.v2ray_http_upgrade_fast_open =
-                    self->config_.websocket_v2ray_http_upgrade_fast_open;
-                ws_options.deadline = self->deadline_;
-                if (!self->config_.ss_enabled) {
-                    auto header = build_request_header(self->config_, self->request_.destination,
-                                                       self->command_);
-                    if (!header) {
-                        self->finish(core::StreamOpenResult::failed(header.error()));
-                        co_return;
-                    }
-                    ws_options.initial_payload = std::move(header.value());
-                    header_sent = true;
-                }
-                std::unique_ptr<io::StreamHandle> ws_base = self->take_connected_stream();
-                self->socket_.reset();
-                if (overlayed) {
-                    auto overlay = co_await open_security_overlay(self, std::move(ws_base));
-                    if (!overlay) {
-                        self->finish(core::StreamOpenResult::failed(overlay.error()));
-                        co_return;
-                    }
-                    if (self->completed_) {
-                        overlay.value()->close();
-                        co_return;
-                    }
-                    ws_base = std::move(overlay.value());
-                }
-                auto plain_stream = std::move(ws_base);
-                // Shared ownership of the pre-handshake stream so the
-                // aborter can close it after the initiation moved it into
-                // the handshake operation. Closing aborts the in-flight
-                // handshake; the late terminal is dropped by the sender.
-                auto plain =
-                    std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(plain_stream));
-                using WsSigs = stdexec::completion_signatures<
-                    stdexec::set_value_t(core::Result<std::unique_ptr<io::StreamHandle>>),
-                    stdexec::set_error_t(std::exception_ptr), stdexec::set_stopped_t()>;
-                core::Result<std::unique_ptr<io::StreamHandle>> ws_result;
-                try {
-                    ws_result = co_await async::callback_sender<WsSigs>(
-                        [plain, ws_options = std::move(ws_options)](auto terminal) mutable {
-                            auto *slot = plain.get();
-                            auto handshake = transport::async_websocket_client_handshake(
-                                std::move(*slot), std::move(ws_options), std::move(terminal));
-                            return async::CallbackAbortFn{[plain, handshake] {
-                                if (handshake) {
-                                    handshake->cancel();
-                                } else if (plain && *plain) {
-                                    (*plain)->close();
-                                }
-                            }};
-                        },
-                        [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> result) {
-                            stdexec::set_value(std::move(receiver), std::move(result));
-                        });
-                } catch (const core::Error &failure) {
-                    self->finish(core::StreamOpenResult::failed(failure));
-                    co_return;
-                } catch (...) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::endpoint_connection, "Trojan WebSocket failed"}));
-                    co_return;
-                }
-                if (self->completed_) {
-                    if (ws_result && ws_result.value()) {
-                        ws_result.value()->close();
-                    }
-                    co_return;
-                }
-                if (!ws_result) {
-                    self->finish(core::StreamOpenResult::failed(ws_result.error()));
-                    co_return;
-                }
-                self->transport_stream_ = std::move(ws_result.value());
-            } else {
-                transport::TlsClientOptions tls_options;
-                tls_options.server_name = self->config_.server_name.empty()
-                                              ? self->config_.server_host
-                                              : self->config_.server_name;
-                tls_options.verify_peer = self->config_.verify_peer;
-                tls_options.trusted_ca_pem = self->config_.trusted_ca_pem;
-                tls_options.verify_hostname = self->config_.name_cert_verify;
-                tls_options.client_certificate_pem = self->config_.certificate;
-                tls_options.client_private_key_pem = self->config_.private_key;
-                tls_options.alpn_protocols = self->config_.alpn_protocols.empty()
-                                                 ? std::vector<std::string>{"h2", "http/1.1"}
-                                                 : self->config_.alpn_protocols;
-                tls_options.certificate_pin = self->config_.fingerprint;
-                tls_options.fingerprint = self->config_.client_fingerprint;
-                if (!self->config_.reality_public_key.empty()) {
-                    tls_options.reality = transport::TlsRealityOptions{
-                        self->config_.reality_public_key, self->config_.reality_short_id};
-                }
-                if (self->config_.ech_enabled) {
-                    auto ech = co_await fetch_trojan_ech_config(self->resolver_, self->config_,
-                                                                tls_options.server_name);
-                    if (!ech) {
-                        self->finish(core::StreamOpenResult::failed(ech.error()));
-                        co_return;
-                    }
-                    tls_options.ech_config_list = std::move(ech.value());
-                }
-                tls_options.deadline = self->deadline_;
-                auto plain_stream = self->take_connected_stream();
-                self->socket_.reset();
-                std::unique_ptr<io::StreamHandle> camouflaged = std::move(plain_stream);
-                // The camouflage layers carry their own TLS handshake and
-                // replace the Trojan TLS step (matching Mihomo's
-                // StreamTLSConn); without them the plain stream goes
-                // through the shared TLS client below.
-                if (!self->config_.security_mode.empty()) {
-                    auto overlay = co_await open_security_overlay(self, std::move(camouflaged));
-                    if (!overlay) {
-                        self->finish(core::StreamOpenResult::failed(overlay.error()));
-                        co_return;
-                    }
-                    if (self->completed_) {
-                        overlay.value()->close();
-                        co_return;
-                    }
-                    self->transport_stream_ = std::move(overlay.value());
-                } else {
-                    transport::TlsClientConnection connection;
-                    try {
-                        connection = co_await transport::async_tls_client_handshake(
-                            std::move(camouflaged), std::move(tls_options));
-                    } catch (const core::Error &failure) {
-                        self->finish(core::StreamOpenResult::failed(failure));
-                        co_return;
-                    } catch (...) {
-                        self->finish(core::StreamOpenResult::failed(
-                            {core::ErrorCode::endpoint_connection, "Trojan TLS failed"}));
-                        co_return;
-                    }
-                    if (self->completed_) {
-                        if (connection.stream) {
-                            connection.stream->close();
-                        }
-                        co_return;
-                    }
-                    self->transport_stream_ = std::move(connection.stream);
-                }
+            auto transport = co_await open_transport(self);
+            if (!transport) {
+                co_return core::StreamOpenResult::failed(transport.error());
             }
+            header_sent = transport.value();
             if (self->config_.ss_enabled) {
                 const auto method =
                     self->config_.ss_method.empty() ? "AES-128-GCM" : self->config_.ss_method;
                 auto ss_stream = transport::trojan::make_trojan_ss_stream_handle(
                     std::move(self->transport_stream_), method, self->config_.ss_password);
                 if (!ss_stream) {
-                    self->finish(core::StreamOpenResult::failed(ss_stream.error()));
-                    co_return;
+                    co_return core::StreamOpenResult::failed(ss_stream.error());
                 }
                 self->transport_stream_ = std::move(ss_stream.value());
             }
@@ -766,53 +792,28 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 const auto header =
                     build_request_header(self->config_, self->request_.destination, self->command_);
                 if (!header) {
-                    self->finish(core::StreamOpenResult::failed(header.error()));
-                    co_return;
+                    co_return core::StreamOpenResult::failed(header.error());
                 }
                 auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(header.value()));
                 try {
                     co_await self->transport_stream_->async_write(boost::asio::buffer(*wire));
                 } catch (const core::Error &failure) {
-                    self->finish(core::StreamOpenResult::failed(failure));
-                    co_return;
+                    co_return core::StreamOpenResult::failed(failure);
                 } catch (...) {
-                    self->finish(core::StreamOpenResult::failed(
-                        {core::ErrorCode::transport_io, "failed to write Trojan request"}));
-                    co_return;
+                    co_return core::StreamOpenResult::failed(
+                        {core::ErrorCode::transport_io, "failed to write Trojan request"});
                 }
             }
             if (self->completed_) {
-                co_return;
+                co_return core::StreamOpenResult::failed(
+                    {core::ErrorCode::cancelled, "Trojan connect was cancelled"});
             }
-            self->finish(core::StreamOpenResult::opened(std::move(self->transport_stream_)));
+            co_return core::StreamOpenResult::opened(std::move(self->transport_stream_));
+        } catch (const core::Error &failure) {
+            co_return core::StreamOpenResult::failed(failure);
         } catch (...) {
-            self->finish(core::StreamOpenResult::failed(
-                {core::ErrorCode::transport_io, "Trojan connect failed"}));
-        }
-        co_return;
-    }
-
-    void resolved(core::Result<detail::AddressList> result) {
-        if (completed_) {
-            return;
-        }
-        if (!result) {
-            finish(core::StreamOpenResult::failed(result.error()));
-            return;
-        }
-        auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();
-        endpoints->reserve(result.value().size());
-        for (const auto &address : result.value()) {
-            endpoints->emplace_back(address, config_.server_port);
-        }
-        // The scope only owns this chain task (merge-shaped usage);
-        // teardown stays guard-driven, so no stop is ever requested.
-        scope_.spawn(run(shared_from_this(), std::move(endpoints)));
-    }
-
-    void cancel_timer() noexcept {
-        if (deadline_timer_) {
-            (void)deadline_timer_->cancel();
+            co_return core::StreamOpenResult::failed(
+                {core::ErrorCode::transport_io, "Trojan connect failed"});
         }
     }
 
@@ -831,7 +832,6 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 }
                 self->completed_ = true;
                 boost::system::error_code ignored;
-                self->cancel_timer();
                 if (self->socket_) {
                     self->socket_->cancel(ignored);
                     self->socket_->close(ignored);
@@ -847,7 +847,6 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
             return;
         }
         completed_ = true;
-        cancel_timer();
         if (!result.succeeded()) {
             boost::system::error_code ignored;
             if (socket_) {
@@ -874,11 +873,9 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     // ready StreamHandle instead of a raw socket.
     std::unique_ptr<io::StreamHandle> chained_transport_;
     std::unique_ptr<io::StreamHandle> transport_stream_;
-    // Owned deadline timer so finish() can wake the racing deadline task.
-    std::shared_ptr<boost::asio::steady_timer> deadline_timer_;
     core::StreamOpenHandler handler_;
     std::chrono::steady_clock::time_point deadline_{};
-    // Owns the single connect chain task, which always ends with a value.
+    // Owns the single guarded connect task (run_guarded -> run_work).
     exec::async_scope scope_;
     bool completed_ = false;
 };
