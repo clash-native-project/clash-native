@@ -83,8 +83,8 @@ stdexec::task<void> GunClient::run_open(std::shared_ptr<GunClient> client,
             }
             entry->session = std::move(opened);
         }
-        auto stream = co_await async::callback_sender<async::BridgeSignatures<OpenResult>>(
-            [entry, options](OpenHandler open) mutable {
+        auto stream =
+            co_await async::bridge_sender<OpenResult>([entry, options](OpenHandler open) mutable {
                 std::shared_ptr<gun::GunStreamOpenAborter> handle;
                 gun::async_open_gun_stream_abortable(
                     entry->session, options,
@@ -96,8 +96,7 @@ stdexec::task<void> GunClient::run_open(std::shared_ptr<GunClient> client,
                         handle->abort();
                     }
                 }};
-            },
-            async::BridgeTranslate<OpenResult>{});
+            });
         if (stream) {
             guard->armed = false;
             result = OpenResult{std::unique_ptr<io::StreamHandle>(
@@ -140,16 +139,14 @@ io::AnySender<std::unique_ptr<io::StreamHandle>> GunClient::dial() {
     // awaits settle promptly; the late terminal then drops at the first-wins
     // guard. The scope dies with the starter captures (never a member), so
     // no #194 shape.
-    auto bridged = async::callback_sender<
-        async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>>(
+    auto bridged = async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
         [shared, self, entry, maker = std::move(maker), options = std::move(options), guard](
             async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>> done) mutable {
             shared->scope.spawn(run_open(self, entry, std::move(maker), std::move(options),
                                          std::move(guard), std::move(done)));
             using AbortFn = async::CallbackAbortFn;
             return AbortFn{[shared] { shared->scope.request_stop(); }};
-        },
-        async::BridgeTranslate<core::Result<std::unique_ptr<io::StreamHandle>>>{});
+        });
     auto sender = std::move(bridged) |
                   stdexec::then([](core::Result<std::unique_ptr<io::StreamHandle>> result) {
                       if (!result) {

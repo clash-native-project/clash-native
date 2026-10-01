@@ -261,12 +261,14 @@ if(WIN32)
     target_compile_definitions(clash-native-core PUBLIC _HAS_ITERATOR_DEBUGGING=0)
     target_link_libraries(clash-native-core PUBLIC ws2_32 mswsock synchronization)
     # Known clang-cl 22 optimizer crash (jump-threading, 0xC0000005) when
-    # compiling src/outbound/trojan_outbound.cpp at /O2 with its split
+    # compiling src/outbound/trojan_outbound.cpp with its split
     # open_transport/open_grpc_transport/open_websocket_transport/open_tls_transport
     # coroutine helpers. Reproduces on the clean tree, so it is a toolchain
-    # bug, not a source regression. Compile that TU alone at /O1 until the
-    # toolchain is fixed or the helpers are split further.
-    set_source_files_properties(src/outbound/trojan_outbound.cpp PROPERTIES COMPILE_OPTIONS "/O1;/Ob1")
+    # bug, not a source regression. /O1 still runs jump-threading and crashed
+    # again after the bridge_sender migration reshaped the open helpers, so
+    # compile that TU alone at /Od until the toolchain is fixed or the
+    # helpers are split further.
+    set_source_files_properties(src/outbound/trojan_outbound.cpp PROPERTIES COMPILE_OPTIONS "/Od")
 endif()
 target_compile_definitions(clash-native-core
     PUBLIC

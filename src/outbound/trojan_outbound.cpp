@@ -243,14 +243,13 @@ open_grpc_session(runtime::AsioRuntime &runtime, std::shared_ptr<dns::ResolverSe
         exec::async_scope scope;
     };
     auto shared = std::make_shared<Shared>();
-    auto bridged = async::callback_sender<async::BridgeSignatures<SessionResult>>(
+    auto bridged = async::bridge_sender<SessionResult>(
         [shared, &runtime, resolver = std::move(resolver),
          config = std::move(config)](SessionHandler done) mutable {
             shared->scope.spawn(GrpcSessionOpen::run(&runtime, std::move(resolver),
                                                      std::move(config), std::move(done)));
             return async::CallbackAbortFn{[shared] { shared->scope.request_stop(); }};
-        },
-        async::BridgeTranslate<SessionResult>{});
+        });
     auto sender = std::move(bridged) | stdexec::then([](SessionResult result) {
                       if (!result) {
                           throw result.error();
@@ -349,7 +348,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         try {
             if (mode == "shadow-tls") {
                 auto boxed = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(stream));
-                co_return co_await async::callback_sender<async::BridgeSignatures<Opened>>(
+                co_return co_await async::bridge_sender<Opened>(
                     [self, boxed](async::BridgeHandler<Opened> done) mutable {
                         // Mihomo forwards the proxy-level fingerprint (pin)
                         // and client-fingerprint (hello) into the overlay;
@@ -370,12 +369,11 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                                 handle->abort();
                             }
                         }};
-                    },
-                    async::BridgeTranslate<Opened>{});
+                    });
             }
             if (mode == "restls") {
                 auto boxed = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(stream));
-                co_return co_await async::callback_sender<async::BridgeSignatures<Opened>>(
+                co_return co_await async::bridge_sender<Opened>(
                     [self, boxed](async::BridgeHandler<Opened> done) mutable {
                         auto options = self->config_.restls_options;
                         if (options.certificate_pin.empty()) {
@@ -390,12 +388,11 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                                 handle->abort();
                             }
                         }};
-                    },
-                    async::BridgeTranslate<Opened>{});
+                    });
             }
             if (mode == "jls") {
                 auto boxed = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(stream));
-                co_return co_await async::callback_sender<async::BridgeSignatures<Opened>>(
+                co_return co_await async::bridge_sender<Opened>(
                     [self, boxed](async::BridgeHandler<Opened> done) mutable {
                         auto handle = transport::proxy::async_open_jls_abortable(
                             std::move(*boxed), self->config_.jls_options,
@@ -406,8 +403,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                                 handle->abort();
                             }
                         }};
-                    },
-                    async::BridgeTranslate<Opened>{});
+                    });
             }
             co_return core::fail({core::ErrorCode::configuration,
                                   "Trojan security mode must be shadow-tls, restls, or jls"});
@@ -601,27 +597,22 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         // the handshake operation. Closing aborts the in-flight
         // handshake; the late terminal is dropped by the sender.
         auto plain = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(plain_stream));
-        using WsSigs = stdexec::completion_signatures<
-            stdexec::set_value_t(core::Result<std::unique_ptr<io::StreamHandle>>),
-            stdexec::set_error_t(std::exception_ptr), stdexec::set_stopped_t()>;
         core::Result<std::unique_ptr<io::StreamHandle>> ws_result;
         try {
-            ws_result = co_await async::callback_sender<WsSigs>(
-                [plain, ws_options = std::move(ws_options)](auto terminal) mutable {
-                    auto *slot = plain.get();
-                    auto handshake = transport::async_websocket_client_handshake(
-                        std::move(*slot), std::move(ws_options), std::move(terminal));
-                    return async::CallbackAbortFn{[plain, handshake] {
-                        if (handshake) {
-                            handshake->cancel();
-                        } else if (plain && *plain) {
-                            (*plain)->close();
-                        }
-                    }};
-                },
-                [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> result) {
-                    stdexec::set_value(std::move(receiver), std::move(result));
-                });
+            ws_result =
+                co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
+                    [plain, ws_options = std::move(ws_options)](auto terminal) mutable {
+                        auto *slot = plain.get();
+                        auto handshake = transport::async_websocket_client_handshake(
+                            std::move(*slot), std::move(ws_options), std::move(terminal));
+                        return async::CallbackAbortFn{[plain, handshake] {
+                            if (handshake) {
+                                handshake->cancel();
+                            } else if (plain && *plain) {
+                                (*plain)->close();
+                            }
+                        }};
+                    });
         } catch (const core::Error &failure) {
             co_return core::fail(failure);
         } catch (...) {
@@ -976,7 +967,7 @@ io::AnySender<core::StreamOpenResult> TrojanOutbound::connect_stream(core::Strea
     auto chain_registry = chain_registry_;
     auto config = config_;
     auto gun_pool = gun_pool_;
-    return async::callback_sender<async::BridgeSignatures<core::StreamOpenResult>>(
+    return async::bridge_sender<core::StreamOpenResult>(
         [&runtime, resolver = std::move(resolver), chain_registry = std::move(chain_registry),
          config = std::move(config), gun_pool = std::move(gun_pool), request = std::move(request)](
             async::BridgeHandler<core::StreamOpenResult> terminal) mutable {
@@ -985,8 +976,7 @@ io::AnySender<core::StreamOpenResult> TrojanOutbound::connect_stream(core::Strea
                 std::move(request), std::move(terminal), 0x01, std::move(gun_pool));
             operation->start();
             return async::CallbackAbortFn{[operation] { operation->abort(); }};
-        },
-        async::BridgeTranslate<core::StreamOpenResult>{});
+        });
 }
 
 io::AnySender<core::DatagramOpenResult>
@@ -1001,7 +991,7 @@ TrojanOutbound::open_datagram(core::DatagramRequest request) {
     auto chain_registry = chain_registry_;
     auto config = config_;
     auto gun_pool = gun_pool_;
-    return async::callback_sender<async::BridgeSignatures<core::DatagramOpenResult>>(
+    return async::bridge_sender<core::DatagramOpenResult>(
         [&runtime, resolver = std::move(resolver), chain_registry = std::move(chain_registry),
          config = std::move(config), gun_pool = std::move(gun_pool), request = std::move(request)](
             async::BridgeHandler<core::DatagramOpenResult> terminal) mutable {
@@ -1039,8 +1029,7 @@ TrojanOutbound::open_datagram(core::DatagramRequest request) {
                 transport::trojan::kCommandUdp, std::move(gun_pool));
             operation->start();
             return async::CallbackAbortFn{[operation] { operation->abort(); }};
-        },
-        async::BridgeTranslate<core::DatagramOpenResult>{});
+        });
 }
 
 } // namespace clash_native::outbound

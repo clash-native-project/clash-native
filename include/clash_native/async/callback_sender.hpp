@@ -240,13 +240,14 @@ CallbackSender<Sigs, Initiate, Translate> callback_sender(Initiate &&initiate,
         std::forward<Initiate>(initiate), std::forward<Translate>(translate));
 }
 
-// Bridge vocabulary: callback_sender subsumes the old bridge_sender. A
-// bridge starter launches handler-style work returning an aborter, and the
-// native result always completes set_value(result) (tri-state results stay
-// in band; set_error is reserved for sender-machinery failures). Handler is
-// std::function so registry-style internals can store it; the translate
-// below closes a late delivered handle (StreamOpenResult/DatagramOpenResult
-// shape) instead of leaking it.
+// Bridge vocabulary: the unary bridge_sender factory below builds the
+// callback_sender subsuming the old bridge_sender. A bridge starter launches
+// handler-style work returning an aborter, and the native result always
+// completes set_value(result) (tri-state results stay in band; set_error is
+// reserved for sender-machinery failures). Handler is std::function so
+// registry-style internals can store it; the translate below closes a late
+// delivered handle (StreamOpenResult/DatagramOpenResult shape) instead of
+// leaking it.
 template <typename Result> using BridgeHandler = std::function<void(Result)>;
 
 template <typename Result> struct BridgeTranslate {
@@ -264,5 +265,14 @@ template <typename Result>
 using BridgeSignatures = stdexec::completion_signatures<stdexec::set_value_t(Result),
                                                         stdexec::set_error_t(std::exception_ptr),
                                                         stdexec::set_stopped_t()>;
+
+// Unary bridge factory: handler-style work whose native completion is
+// already the final Result. Same CallbackSender type (Sigs/Translate built
+// in); the initiation takes a BridgeHandler<Result> and returns the aborter.
+template <typename Result, typename Initiate> auto bridge_sender(Initiate &&initiate) {
+    return CallbackSender<BridgeSignatures<Result>, std::decay_t<Initiate>,
+                          BridgeTranslate<Result>>(std::forward<Initiate>(initiate),
+                                                   BridgeTranslate<Result>{});
+}
 
 } // namespace clash_native::async

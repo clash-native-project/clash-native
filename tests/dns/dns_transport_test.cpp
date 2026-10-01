@@ -129,8 +129,8 @@ class FakeDnsTransport final : public clash_native::dns::DnsTransport,
         auto self = shared_from_this();
         auto box = std::make_shared<std::optional<clash_native::dns::DnsExchangeRequest>>(
             std::move(request));
-        return clash_native::async::callback_sender<clash_native::async::BridgeSignatures<
-            clash_native::core::Result<clash_native::dns::DnsPacket>>>(
+        return clash_native::async::bridge_sender<
+            clash_native::core::Result<clash_native::dns::DnsPacket>>(
             [self, box](clash_native::async::BridgeHandler<
                         clash_native::core::Result<clash_native::dns::DnsPacket>>
                             done) mutable {
@@ -144,9 +144,7 @@ class FakeDnsTransport final : public clash_native::dns::DnsTransport,
                 self->open_exchange(std::move(**box), std::move(done));
                 box->reset();
                 return clash_native::async::CallbackAbortFn{[self] { self->cancel_exchange(); }};
-            },
-            clash_native::async::BridgeTranslate<
-                clash_native::core::Result<clash_native::dns::DnsPacket>>{});
+            });
     }
 
     void open_exchange(
@@ -2690,8 +2688,8 @@ TEST(ResolverServiceTransportTest, CancellingOneQueryLeavesSiblingFlowing) {
             auto self = shared_from_this();
             auto box = std::make_shared<std::optional<clash_native::dns::DnsExchangeRequest>>(
                 std::move(request));
-            return clash_native::async::callback_sender<clash_native::async::BridgeSignatures<
-                clash_native::core::Result<clash_native::dns::DnsPacket>>>(
+            return clash_native::async::bridge_sender<
+                clash_native::core::Result<clash_native::dns::DnsPacket>>(
                 [self, box](clash_native::async::BridgeHandler<
                             clash_native::core::Result<clash_native::dns::DnsPacket>>
                                 done) mutable {
@@ -2707,9 +2705,7 @@ TEST(ResolverServiceTransportTest, CancellingOneQueryLeavesSiblingFlowing) {
                     box->reset();
                     return clash_native::async::CallbackAbortFn{
                         [self, id] { self->cancel_exchange(id); }};
-                },
-                clash_native::async::BridgeTranslate<
-                    clash_native::core::Result<clash_native::dns::DnsPacket>>{});
+                });
         }
         void answer(clash_native::dns::DnsExchangeId id) {
             auto found = pending.find(id);

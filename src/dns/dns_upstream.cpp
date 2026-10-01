@@ -90,11 +90,10 @@ DnsUpstream::exchange(DnsPacket query, std::chrono::steady_clock::time_point dea
     if (!transport_) {
         return io::AnySender<DnsExchangeResult>{stdexec::just(core::fail(configuration_error()))};
     }
-    using Signatures = async::BridgeSignatures<DnsExchangeResult>;
     auto shared = std::make_shared<DriveShared>();
     shared->runtime = &runtime_;
     shared->sender = transport_->exchange({std::move(query), deadline});
-    return async::callback_sender<Signatures>(
+    return async::bridge_sender<DnsExchangeResult>(
         [shared](auto terminal) mutable -> async::CallbackAbortFn {
             shared->done = [terminal = std::move(terminal)](DnsExchangeResult result) mutable {
                 terminal(std::move(result));
@@ -108,8 +107,7 @@ DnsUpstream::exchange(DnsPacket query, std::chrono::steady_clock::time_point dea
                     }
                 }
             }};
-        },
-        async::BridgeTranslate<DnsExchangeResult>{});
+        });
 }
 
 void DnsUpstream::stop() noexcept {
@@ -432,8 +430,7 @@ void DnsUpstreamGroup::record_success(std::size_t member_index) noexcept {
 io::AnySender<DnsExchangeResult>
 DnsUpstreamGroup::exchange(DnsPacket query, std::chrono::steady_clock::time_point deadline) {
     auto self = shared_from_this();
-    using Signatures = async::BridgeSignatures<DnsExchangeResult>;
-    return async::callback_sender<Signatures>(
+    return async::bridge_sender<DnsExchangeResult>(
         [self, query = std::move(query),
          deadline](auto terminal) mutable -> async::CallbackAbortFn {
             auto done = std::make_shared<async::BridgeHandler<DnsExchangeResult>>(
@@ -453,8 +450,7 @@ DnsUpstreamGroup::exchange(DnsPacket query, std::chrono::steady_clock::time_poin
                 self->operations_.erase(operation);
                 operation->cancel();
             }};
-        },
-        async::BridgeTranslate<DnsExchangeResult>{});
+        });
 }
 
 void DnsUpstreamGroup::forget(Operation *operation) noexcept {

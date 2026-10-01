@@ -543,18 +543,18 @@ DnsQueryService::RequestId DnsQueryService::query(DnsPacket packet, Handler hand
 io::AnySender<core::Result<DnsPacket>> DnsQueryService::query_sender(DnsPacket packet) {
     struct Shared {
         DnsQueryService *service = nullptr;
-        // Set once query() returns; the aborter spins until then because
-        // the request id is the only cancel handle and stop may race start.
+        // Set once query() returns; the aborter never blocks waiting for
+        // it. The id is published before the aborter exists, so the start()
+        // orphan tail still cancels when stop wins the race, and strand
+        // ordering of the query/cancel posts prevents leaks.
         std::atomic<RequestId> id{0};
-        std::atomic_bool started{false};
     };
-    using Signatures = async::BridgeSignatures<core::Result<DnsPacket>>;
     auto shared = std::make_shared<Shared>();
     shared->service = this;
     // NOTE: query() posts to the owner strand; the starter must stay
     // copyable, so the packet lives in a shared box for re-invocation.
     auto box = std::make_shared<std::optional<DnsPacket>>(std::move(packet));
-    return async::callback_sender<Signatures>(
+    return async::bridge_sender<core::Result<DnsPacket>>(
         [shared, box](auto terminal) mutable -> async::CallbackAbortFn {
             if (!box || !*box) {
                 terminal(core::fail(cancelled_error()));
@@ -570,20 +570,13 @@ io::AnySender<core::Result<DnsPacket>> DnsQueryService::query_sender(DnsPacket p
             // Publish before the owner strand runs: query_on_owner may
             // complete inline on a direct call, and cancel() needs the id.
             shared->id.store(id, std::memory_order_release);
-            shared->started.store(true, std::memory_order_release);
             box->reset();
             return async::CallbackAbortFn{[shared] {
-                // Wait for the id: query() only posts; without this the
-                // aborter could run before the request exists and leak it.
-                for (int spins = 0;
-                     !shared->started.load(std::memory_order_acquire) && spins < 10000; ++spins) {
-                }
                 if (const auto id = shared->id.load(std::memory_order_acquire)) {
                     shared->service->cancel(id);
                 }
             }};
-        },
-        async::BridgeTranslate<core::Result<DnsPacket>>{});
+        });
 }
 
 void DnsQueryService::query_on_owner(RequestId request_id, DnsPacket packet, Handler handler,

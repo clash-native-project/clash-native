@@ -157,7 +157,11 @@ class ProxyServer {
     std::shared_ptr<dns::FakeIpStore> fake_ip_store_;
     std::function<bool(std::string_view)> fake_ip_filter_;
     std::shared_ptr<std::atomic_bool> callback_gate_;
-    std::unordered_set<dns::ResolverService::RequestId> resolver_requests_;
+    struct ResolverRequests {
+        std::mutex mutex;
+        std::unordered_set<dns::ResolverService::RequestId> ids;
+    };
+    std::shared_ptr<ResolverRequests> resolver_requests_;
     exec::async_scope accept_scope_;
 };
 

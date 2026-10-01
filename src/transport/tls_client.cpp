@@ -1343,22 +1343,20 @@ async_tls_client_handshake(std::unique_ptr<io::StreamHandle> stream, TlsClientOp
     // a second start after the move fails fast instead of hanging.
     auto state = std::make_shared<std::pair<std::unique_ptr<io::StreamHandle>, TlsClientOptions>>(
         std::move(stream), std::move(options));
-    auto bridged =
-        async::callback_sender<async::BridgeSignatures<core::Result<TlsClientConnection>>>(
-            [state](async::BridgeHandler<core::Result<TlsClientConnection>> terminal) mutable {
-                if (!state->first) {
-                    terminal(core::fail(
-                        configuration_error("TLS client handshake stream was already consumed")));
-                    // Inline completion: nothing to abort.
-                    return async::CallbackAbortFn{};
-                }
-                auto operation = std::make_shared<detail::TlsClientHandshakeOperationImpl>(
-                    std::move(state->first), std::move(state->second), std::move(terminal));
-                operation->start();
-                using AbortFn = async::CallbackAbortFn;
-                return AbortFn{[operation] { operation->cancel(); }};
-            },
-            async::BridgeTranslate<core::Result<TlsClientConnection>>{});
+    auto bridged = async::bridge_sender<core::Result<TlsClientConnection>>(
+        [state](async::BridgeHandler<core::Result<TlsClientConnection>> terminal) mutable {
+            if (!state->first) {
+                terminal(core::fail(
+                    configuration_error("TLS client handshake stream was already consumed")));
+                // Inline completion: nothing to abort.
+                return async::CallbackAbortFn{};
+            }
+            auto operation = std::make_shared<detail::TlsClientHandshakeOperationImpl>(
+                std::move(state->first), std::move(state->second), std::move(terminal));
+            operation->start();
+            using AbortFn = async::CallbackAbortFn;
+            return AbortFn{[operation] { operation->cancel(); }};
+        });
     auto sender = std::move(bridged) | stdexec::then([](core::Result<TlsClientConnection> result) {
                       if (!result) {
                           throw result.error();

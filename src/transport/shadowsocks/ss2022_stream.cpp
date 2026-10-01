@@ -774,38 +774,30 @@ class Shadowsocks2022OpenOperation final
             core::Status obfs_result;
             try {
                 if (self->obfs_options_->mode == ObfsMode::http) {
-                    obfs_result =
-                        co_await async::callback_sender<async::BridgeSignatures<core::Status>>(
-                            [self, wire](async::BridgeHandler<core::Status> done) mutable {
-                                auto handle = async_write_http_obfs_request_abortable(
-                                    self->socket_, std::move(*wire),
-                                    {self->obfs_options_->host, self->obfs_options_->port},
-                                    [done](core::Status result) mutable {
-                                        done(std::move(result));
-                                    });
-                                return async::CallbackAbortFn{[handle] {
-                                    if (handle) {
-                                        handle->abort();
-                                    }
-                                }};
-                            },
-                            async::BridgeTranslate<core::Status>{});
+                    obfs_result = co_await async::bridge_sender<core::Status>(
+                        [self, wire](async::BridgeHandler<core::Status> done) mutable {
+                            auto handle = async_write_http_obfs_request_abortable(
+                                self->socket_, std::move(*wire),
+                                {self->obfs_options_->host, self->obfs_options_->port},
+                                [done](core::Status result) mutable { done(std::move(result)); });
+                            return async::CallbackAbortFn{[handle] {
+                                if (handle) {
+                                    handle->abort();
+                                }
+                            }};
+                        });
                 } else {
-                    obfs_result =
-                        co_await async::callback_sender<async::BridgeSignatures<core::Status>>(
-                            [self, wire](async::BridgeHandler<core::Status> done) mutable {
-                                auto handle = async_write_tls_obfs_request_abortable(
-                                    self->socket_, std::move(*wire), self->obfs_options_->host,
-                                    [done](core::Status result) mutable {
-                                        done(std::move(result));
-                                    });
-                                return async::CallbackAbortFn{[handle] {
-                                    if (handle) {
-                                        handle->abort();
-                                    }
-                                }};
-                            },
-                            async::BridgeTranslate<core::Status>{});
+                    obfs_result = co_await async::bridge_sender<core::Status>(
+                        [self, wire](async::BridgeHandler<core::Status> done) mutable {
+                            auto handle = async_write_tls_obfs_request_abortable(
+                                self->socket_, std::move(*wire), self->obfs_options_->host,
+                                [done](core::Status result) mutable { done(std::move(result)); });
+                            return async::CallbackAbortFn{[handle] {
+                                if (handle) {
+                                    handle->abort();
+                                }
+                            }};
+                        });
                 }
             } catch (...) {
                 self->complete(core::StreamOpenResult::failed(

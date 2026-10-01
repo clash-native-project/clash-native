@@ -79,8 +79,7 @@ class WebSocketPluginOperation final
         }
         core::Result<std::unique_ptr<io::StreamHandle>> result;
         try {
-            result = co_await async::callback_sender<
-                async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>>(
+            result = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                 [self](async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
                            done) mutable {
                     WebSocketClientOptions options;
@@ -110,8 +109,7 @@ class WebSocketPluginOperation final
                             self->websocket_->cancel();
                         }
                     }};
-                },
-                async::BridgeTranslate<core::Result<std::unique_ptr<io::StreamHandle>>>{});
+                });
         } catch (...) {
             self->finish(core::fail(core::Error{
                 core::ErrorCode::endpoint_connection, "WebSocket plugin handshake failed", {}}));
@@ -204,31 +202,30 @@ class WebSocketPluginMuxOperation final
         }
         core::Result<std::unique_ptr<io::StreamHandle>> ws_result;
         try {
-            ws_result = co_await async::callback_sender<
-                async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>>(
-                [self](async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
-                           done) mutable {
-                    WebSocketClientOptions websocket_options;
-                    websocket_options.host = self->options_.host;
-                    websocket_options.target = self->options_.path;
-                    websocket_options.tls = self->options_.tls;
-                    websocket_options.tls_server_name = self->options_.host;
-                    websocket_options.tls_verify_peer = !self->options_.skip_cert_verify;
-                    websocket_options.tls_alpn_protocols = {"http/1.1"};
-                    self->websocket_ = async_websocket_client_handshake(
-                        std::move(self->stream_), std::move(websocket_options),
-                        [self,
-                         done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
-                            self->websocket_.reset();
-                            done(std::move(opened));
-                        });
-                    return async::CallbackAbortFn{[self] {
-                        if (self->websocket_) {
-                            self->websocket_->cancel();
-                        }
-                    }};
-                },
-                async::BridgeTranslate<core::Result<std::unique_ptr<io::StreamHandle>>>{});
+            ws_result =
+                co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
+                    [self](async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
+                               done) mutable {
+                        WebSocketClientOptions websocket_options;
+                        websocket_options.host = self->options_.host;
+                        websocket_options.target = self->options_.path;
+                        websocket_options.tls = self->options_.tls;
+                        websocket_options.tls_server_name = self->options_.host;
+                        websocket_options.tls_verify_peer = !self->options_.skip_cert_verify;
+                        websocket_options.tls_alpn_protocols = {"http/1.1"};
+                        self->websocket_ = async_websocket_client_handshake(
+                            std::move(self->stream_), std::move(websocket_options),
+                            [self,
+                             done](core::Result<std::unique_ptr<io::StreamHandle>> opened) mutable {
+                                self->websocket_.reset();
+                                done(std::move(opened));
+                            });
+                        return async::CallbackAbortFn{[self] {
+                            if (self->websocket_) {
+                                self->websocket_->cancel();
+                            }
+                        }};
+                    });
         } catch (...) {
             self->finish(core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>(
                 core::fail(core::Error{core::ErrorCode::endpoint_connection,
@@ -249,8 +246,8 @@ class WebSocketPluginMuxOperation final
         mux_options.smux_version = self->options_.smux_version;
         core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>> mux_result;
         try {
-            mux_result = co_await async::callback_sender<async::BridgeSignatures<
-                core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>>>(
+            mux_result = co_await async::bridge_sender<
+                core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>>(
                 [self, mux_options,
                  stream = std::make_shared<std::unique_ptr<io::StreamHandle>>(
                      std::move(ws_result.value()))](
@@ -270,9 +267,7 @@ class WebSocketPluginMuxOperation final
                             self->mux_->cancel();
                         }
                     }};
-                },
-                async::BridgeTranslate<
-                    core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>>{});
+                });
         } catch (...) {
             self->finish(
                 core::Result<std::shared_ptr<clash_native::io::MultiplexedSession>>(core::fail(

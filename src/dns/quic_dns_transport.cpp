@@ -435,8 +435,7 @@ void QuicDnsTransport::Operation::fail_session(core::Error error) {
 io::AnySender<DnsExchangeResult> QuicDnsTransport::exchange(DnsExchangeRequest request) {
     auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
     auto self = shared_from_this();
-    using Signatures = async::BridgeSignatures<DnsExchangeResult>;
-    return async::callback_sender<Signatures>(
+    return async::bridge_sender<DnsExchangeResult>(
         [self, box](auto terminal) mutable -> async::CallbackAbortFn {
             if (!box || !*box) {
                 terminal(core::fail(cancelled_error()));
@@ -454,8 +453,7 @@ io::AnySender<DnsExchangeResult> QuicDnsTransport::exchange(DnsExchangeRequest r
                 });
             box->reset();
             return async::CallbackAbortFn{[self, id] { self->cancel_exchange(id); }};
-        },
-        async::BridgeTranslate<DnsExchangeResult>{});
+        });
 }
 
 DnsExchangeId QuicDnsTransport::open_exchange(DnsExchangeRequest request,

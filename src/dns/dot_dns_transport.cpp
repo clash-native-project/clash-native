@@ -91,8 +91,7 @@ class DotDnsTransport::Session final
         auto state = std::make_shared<
             std::tuple<std::vector<std::uint8_t>, std::chrono::steady_clock::time_point, bool>>(
             std::move(query), deadline, true);
-        return async::callback_sender<
-            async::BridgeSignatures<core::Result<std::vector<std::uint8_t>>>>(
+        return async::bridge_sender<core::Result<std::vector<std::uint8_t>>>(
             [self, query_id, state](auto terminal) mutable -> async::CallbackAbortFn {
                 if (!std::get<2>(*state)) {
                     terminal(core::fail(cancelled_error()));
@@ -132,8 +131,7 @@ class DotDnsTransport::Session final
                 async::spawn_detached(run_deadline(self, query_id, deadline));
                 return async::CallbackAbortFn{
                     [self, query_id] { self->fail_request(query_id, cancelled_error()); }};
-            },
-            async::BridgeTranslate<core::Result<std::vector<std::uint8_t>>>{});
+            });
     }
 
     void cancel(std::uint16_t query_id) noexcept { fail_request(query_id, cancelled_error()); }
@@ -668,7 +666,7 @@ std::shared_ptr<DotDnsTransport::Session> DotDnsTransport::session() {
 io::AnySender<DnsExchangeResult> DotDnsTransport::exchange(DnsExchangeRequest request) {
     auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
     auto self = shared_from_this();
-    return async::callback_sender<async::BridgeSignatures<DnsExchangeResult>>(
+    return async::bridge_sender<DnsExchangeResult>(
         [self, box](auto done) mutable -> async::CallbackAbortFn {
             if (!box || !*box) {
                 done(core::fail(cancelled_error()));
@@ -678,8 +676,7 @@ io::AnySender<DnsExchangeResult> DotDnsTransport::exchange(DnsExchangeRequest re
             box->reset();
             return async::CallbackAbortFn{
                 [self, exchange_id] { self->cancel_exchange(exchange_id); }};
-        },
-        async::BridgeTranslate<DnsExchangeResult>{});
+        });
 }
 
 DnsExchangeId DotDnsTransport::open_exchange(DnsExchangeRequest request, OpenHandler handler) {

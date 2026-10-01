@@ -338,7 +338,7 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
 io::AnySender<DnsExchangeResult> Doh1DnsTransport::exchange(DnsExchangeRequest request) {
     auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
     auto self = shared_from_this();
-    return async::callback_sender<async::BridgeSignatures<DnsExchangeResult>>(
+    return async::bridge_sender<DnsExchangeResult>(
         [self, box](auto done) mutable -> async::CallbackAbortFn {
             if (!box || !*box) {
                 done(core::fail(cancelled_error()));
@@ -348,8 +348,7 @@ io::AnySender<DnsExchangeResult> Doh1DnsTransport::exchange(DnsExchangeRequest r
             box->reset();
             return async::CallbackAbortFn{
                 [self, exchange_id] { self->cancel_exchange(exchange_id); }};
-        },
-        async::BridgeTranslate<DnsExchangeResult>{});
+        });
 }
 
 DnsExchangeId Doh1DnsTransport::open_exchange(DnsExchangeRequest request, OpenHandler handler) {

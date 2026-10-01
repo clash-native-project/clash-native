@@ -1,10 +1,10 @@
 #include <clash_native/dns/ech_resolver.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/detached.hpp>
 #include <clash_native/core/error.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 
+#include <exec/async_scope.hpp>
 #include <stdexec/execution.hpp>
 
 #include <algorithm>
@@ -31,10 +31,10 @@ struct EchLookup : public std::enable_shared_from_this<EchLookup> {
     DnsQueryService *service = nullptr;
     std::string original;
 
-    // ECH follow-up chain as one detached task: co_await each query_sender
+    // ECH follow-up chain as one scope-owned task: co_await each query_sender
     // and scan for the ech SvcParam inline. The task always ends with a
     // value (finish drops late terminals on settled); abort marks settled
-    // and the late finish drops.
+    // and requests stop, and the late finish drops.
     static stdexec::task<void>
     run(std::shared_ptr<EchLookup> self,
         async::BridgeHandler<core::Result<std::vector<std::uint8_t>>> terminal) {
@@ -143,6 +143,7 @@ struct EchLookup : public std::enable_shared_from_this<EchLookup> {
         finish(core::fail(not_found_error(self->original)));
         co_return;
     }
+    exec::async_scope scope;
 
     std::atomic_bool settled{false};
 };
@@ -150,21 +151,25 @@ struct EchLookup : public std::enable_shared_from_this<EchLookup> {
 io::AnySender<core::Result<std::vector<std::uint8_t>>>
 async_query_ech_config(DnsQueryService &query_service, std::string name,
                        std::optional<std::string> query_server_name) {
-    using Signatures = async::BridgeSignatures<core::Result<std::vector<std::uint8_t>>>;
     auto lookup = std::make_shared<EchLookup>();
     lookup->service = &query_service;
     lookup->original = std::move(query_server_name).value_or(std::move(name));
-    return async::callback_sender<Signatures>(
+    return async::bridge_sender<core::Result<std::vector<std::uint8_t>>>(
         [lookup](auto terminal) mutable -> async::CallbackAbortFn {
-            async::spawn_detached(
+            lookup->scope.spawn(
                 EchLookup::run(lookup, [terminal = std::move(terminal)](
                                            core::Result<std::vector<std::uint8_t>> result) mutable {
                     terminal(std::move(result));
                 }));
-            return async::CallbackAbortFn{
-                [lookup] { lookup->settled.store(true, std::memory_order_release); }};
-        },
-        async::BridgeTranslate<core::Result<std::vector<std::uint8_t>>>{});
+            return async::CallbackAbortFn{[lookup] {
+                if (!lookup->settled.exchange(true, std::memory_order_acq_rel)) {
+                    try {
+                        lookup->scope.request_stop();
+                    } catch (...) {
+                    }
+                }
+            }};
+        });
 }
 
 } // namespace clash_native::dns

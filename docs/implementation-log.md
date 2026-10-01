@@ -1,5 +1,27 @@
 # Implementation Log
 
+### 2026-10-02 — Unary bridge_sender factory, cancel hardening
+
+- Added unary `async::bridge_sender<Result>(initiate)` in
+  `callback_sender.hpp` (same `CallbackSender` type, Sigs/Translate built
+  in); migrated all ~45 `callback_sender<BridgeSignatures<X>>` +
+  `BridgeTranslate<X>{}` pairs (DNS transports/upstream/query/ECH,
+  shadowsocks/trojan opens, TLS/gun/ss2022/plugin bridges, proxy resolve
+  leaf, test fakes). `BridgeHandler` storage vocabulary kept; five
+  hand-written non-Bridge translates (ss mux/ss2022/trojan-ws) now reuse the
+  factory too. Net -80 lines across 18 files.
+- Cancel fixes: `query_sender` aborter no longer spin-waits the request id
+  (never blocks on the stop path; strand ordering of query/cancel posts
+  covers the race); `proxy_server` resolver set moved to a shared
+  mutex-protected struct (aborter owns everything, callable from any
+  thread); ECH lookup runs on a member `async_scope` with
+  `settled`+`request_stop()` abort instead of settled-flag abandon.
+- Toolchain: `trojan_outbound.cpp` workaround strengthened `/O1` -> `/Od`
+  (bridge migration reshaped the open helpers; jump-threading crashed again).
+- Validation: Windows Release build clean, `clash-native-tests.exe`
+  313/313 passed, `clang-format` clean on all touched files.
+***
+
 ### 2026-10-01 — Migrate exec::task to stdexec::task, delete bridge_sender shim
 
 - Mechanical rename only: every `exec::task<T>` coroutine (~175-190 unique

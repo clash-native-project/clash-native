@@ -856,17 +856,12 @@ class ShadowsocksConnectOperation final
             }
             core::Result<std::unique_ptr<io::StreamHandle>> mux_stream;
             try {
-                using Sigs =
-                    async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>;
                 // NOTE: name the sender first; argument order is unspecified.
-                auto sender = async::callback_sender<Sigs>(
+                auto sender = async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                     [self, endpoints](auto terminal) mutable -> async::CallbackAbortFn {
                         self->websocket_mux_pool_->async_open_stream(
                             std::move(*endpoints), self->websocket_options(), std::move(terminal));
                         return async::CallbackAbortFn{[self] { self->abort(); }};
-                    },
-                    [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> stream) {
-                        stdexec::set_value(std::move(receiver), std::move(stream));
                     });
                 mux_stream = co_await std::move(sender);
             } catch (...) {
@@ -1251,9 +1246,8 @@ class ShadowsocksConnectOperation final
         }
         core::Result<std::unique_ptr<io::StreamHandle>> result;
         try {
-            using Sigs = async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>;
             // NOTE: name the sender first; argument order is unspecified.
-            auto sender = async::callback_sender<Sigs>(
+            auto sender = async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                 [self, stream,
                  options = std::move(options)](auto terminal) mutable -> async::CallbackAbortFn {
                     auto handle = transport::proxy::async_open_shadow_tls_abortable(
@@ -1264,9 +1258,6 @@ class ShadowsocksConnectOperation final
                             handle->abort();
                         }
                     }};
-                },
-                [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> opened) {
-                    stdexec::set_value(std::move(receiver), std::move(opened));
                 });
             result = co_await std::move(sender);
         } catch (...) {
@@ -1297,9 +1288,8 @@ class ShadowsocksConnectOperation final
         options.certificate_pin = self->config_.plugin_fingerprint;
         core::Result<std::unique_ptr<io::StreamHandle>> result;
         try {
-            using Sigs = async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>;
             // NOTE: name the sender first; argument order is unspecified.
-            auto sender = async::callback_sender<Sigs>(
+            auto sender = async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                 [self, stream,
                  options = std::move(options)](auto terminal) mutable -> async::CallbackAbortFn {
                     auto handle = transport::proxy::async_open_restls_abortable(
@@ -1310,9 +1300,6 @@ class ShadowsocksConnectOperation final
                             handle->abort();
                         }
                     }};
-                },
-                [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> opened) {
-                    stdexec::set_value(std::move(receiver), std::move(opened));
                 });
             result = co_await std::move(sender);
         } catch (...) {
@@ -1342,9 +1329,8 @@ class ShadowsocksConnectOperation final
         options.skip_cert_verify = self->config_.plugin_skip_cert_verify;
         core::Result<std::unique_ptr<io::StreamHandle>> result;
         try {
-            using Sigs = async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>;
             // NOTE: name the sender first; argument order is unspecified.
-            auto sender = async::callback_sender<Sigs>(
+            auto sender = async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                 [self, stream,
                  options = std::move(options)](auto terminal) mutable -> async::CallbackAbortFn {
                     auto handle = transport::proxy::async_open_jls_abortable(
@@ -1355,9 +1341,6 @@ class ShadowsocksConnectOperation final
                             handle->abort();
                         }
                     }};
-                },
-                [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> opened) {
-                    stdexec::set_value(std::move(receiver), std::move(opened));
                 });
             result = co_await std::move(sender);
         } catch (...) {
@@ -1389,25 +1372,20 @@ class ShadowsocksConnectOperation final
             std::optional<core::StreamOpenResult> opened;
             try {
                 if (self->carrier_) {
-                    using Sigs = async::BridgeSignatures<core::StreamOpenResult>;
                     // NOTE: name the sender first; argument order is unspecified.
-                    auto sender = async::callback_sender<Sigs>(
+                    auto sender = async::bridge_sender<core::StreamOpenResult>(
                         [self, dest = std::move(address.value())](
                             auto terminal) mutable -> async::CallbackAbortFn {
                             ss::async_open_shadowsocks_2022_stream(
                                 self->runtime_, self->carrier_, self->config_.method,
                                 self->config_.password, std::move(dest), std::move(terminal));
                             return async::CallbackAbortFn{[self] { self->abort(); }};
-                        },
-                        [](auto receiver, core::StreamOpenResult result) {
-                            stdexec::set_value(std::move(receiver), std::move(result));
                         });
                     opened = co_await std::move(sender);
                 } else {
-                    using Sigs = async::BridgeSignatures<core::StreamOpenResult>;
                     auto obfs = self->obfs_options();
                     // NOTE: name the sender first; argument order is unspecified.
-                    auto sender = async::callback_sender<Sigs>(
+                    auto sender = async::bridge_sender<core::StreamOpenResult>(
                         [self, dest = std::move(address.value()),
                          obfs = std::move(obfs)](auto terminal) mutable -> async::CallbackAbortFn {
                             ss::async_open_shadowsocks_2022_stream(
@@ -1415,9 +1393,6 @@ class ShadowsocksConnectOperation final
                                 self->config_.password, std::move(dest), std::move(obfs),
                                 std::move(terminal));
                             return async::CallbackAbortFn{[self] { self->abort(); }};
-                        },
-                        [](auto receiver, core::StreamOpenResult result) {
-                            stdexec::set_value(std::move(receiver), std::move(result));
                         });
                     opened = co_await std::move(sender);
                 }
@@ -1458,9 +1433,8 @@ class ShadowsocksConnectOperation final
             core::Status obfs_result;
             try {
                 if (obfs->mode == ss::ObfsMode::http) {
-                    using Sigs = async::BridgeSignatures<core::Status>;
                     // NOTE: name the sender first; argument order is unspecified.
-                    auto sender = async::callback_sender<Sigs>(
+                    auto sender = async::bridge_sender<core::Status>(
                         [self, wire](auto terminal) mutable -> async::CallbackAbortFn {
                             const auto options = self->obfs_options();
                             auto handle = ss::async_write_http_obfs_request_abortable(
@@ -1472,15 +1446,11 @@ class ShadowsocksConnectOperation final
                                     handle->abort();
                                 }
                             }};
-                        },
-                        [](auto receiver, core::Status result) {
-                            stdexec::set_value(std::move(receiver), std::move(result));
                         });
                     obfs_result = co_await std::move(sender);
                 } else {
-                    using Sigs = async::BridgeSignatures<core::Status>;
                     // NOTE: name the sender first; argument order is unspecified.
-                    auto sender = async::callback_sender<Sigs>(
+                    auto sender = async::bridge_sender<core::Status>(
                         [self, wire](auto terminal) mutable -> async::CallbackAbortFn {
                             const auto options = self->obfs_options();
                             auto handle = ss::async_write_tls_obfs_request_abortable(
@@ -1492,9 +1462,6 @@ class ShadowsocksConnectOperation final
                                     handle->abort();
                                 }
                             }};
-                        },
-                        [](auto receiver, core::Status result) {
-                            stdexec::set_value(std::move(receiver), std::move(result));
                         });
                     obfs_result = co_await std::move(sender);
                 }
@@ -1560,9 +1527,8 @@ class ShadowsocksConnectOperation final
             std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         core::Result<std::unique_ptr<io::StreamHandle>> plugin;
         try {
-            using Sigs = async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>;
             // NOTE: name the sender first; argument order is unspecified.
-            auto sender = async::callback_sender<Sigs>(
+            auto sender = async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                 [self, stream](auto terminal) mutable -> async::CallbackAbortFn {
                     auto handle = ss::async_open_websocket_plugin(
                         std::move(*stream), self->websocket_options(), std::move(terminal));
@@ -1572,9 +1538,6 @@ class ShadowsocksConnectOperation final
                             handle->cancel();
                         }
                     }};
-                },
-                [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> opened) {
-                    stdexec::set_value(std::move(receiver), std::move(opened));
                 });
             plugin = co_await std::move(sender);
         } catch (...) {
@@ -1617,9 +1580,8 @@ class ShadowsocksConnectOperation final
             std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         core::Result<std::unique_ptr<io::StreamHandle>> plugin;
         try {
-            using Sigs = async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>;
             // NOTE: name the sender first; argument order is unspecified.
-            auto sender = async::callback_sender<Sigs>(
+            auto sender = async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                 [self, stream](auto terminal) mutable -> async::CallbackAbortFn {
                     auto handle = ss::async_open_websocket_plugin(
                         std::move(*stream), self->websocket_options(), std::move(terminal));
@@ -1629,9 +1591,6 @@ class ShadowsocksConnectOperation final
                             handle->cancel();
                         }
                     }};
-                },
-                [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> opened) {
-                    stdexec::set_value(std::move(receiver), std::move(opened));
                 });
             plugin = co_await std::move(sender);
         } catch (...) {
@@ -1648,18 +1607,14 @@ class ShadowsocksConnectOperation final
         self->carrier_ = std::make_shared<ss::StreamCarrier>(std::move(plugin.value()));
         core::StreamOpenResult opened;
         try {
-            using Sigs = async::BridgeSignatures<core::StreamOpenResult>;
             // NOTE: name the sender first; argument order is unspecified.
-            auto sender = async::callback_sender<Sigs>(
+            auto sender = async::bridge_sender<core::StreamOpenResult>(
                 [self, destination = std::move(destination)](
                     auto terminal) mutable -> async::CallbackAbortFn {
                     ss::async_open_shadowsocks_2022_stream(
                         self->runtime_, self->carrier_, self->config_.method,
                         self->config_.password, std::move(destination), std::move(terminal));
                     return async::CallbackAbortFn{[self] { self->abort(); }};
-                },
-                [](auto receiver, core::StreamOpenResult result) {
-                    stdexec::set_value(std::move(receiver), std::move(result));
                 });
             opened = co_await std::move(sender);
         } catch (...) {
@@ -1704,9 +1659,8 @@ class ShadowsocksConnectOperation final
             core::Status obfs_result;
             try {
                 if (obfs->mode == ss::ObfsMode::http) {
-                    using Sigs = async::BridgeSignatures<core::Status>;
                     // NOTE: name the sender first; argument order is unspecified.
-                    auto sender = async::callback_sender<Sigs>(
+                    auto sender = async::bridge_sender<core::Status>(
                         [self, wire](auto terminal) mutable -> async::CallbackAbortFn {
                             const auto options = self->obfs_options();
                             auto handle = ss::async_write_http_obfs_request_abortable(
@@ -1718,15 +1672,11 @@ class ShadowsocksConnectOperation final
                                     handle->abort();
                                 }
                             }};
-                        },
-                        [](auto receiver, core::Status result) {
-                            stdexec::set_value(std::move(receiver), std::move(result));
                         });
                     obfs_result = co_await std::move(sender);
                 } else {
-                    using Sigs = async::BridgeSignatures<core::Status>;
                     // NOTE: name the sender first; argument order is unspecified.
-                    auto sender = async::callback_sender<Sigs>(
+                    auto sender = async::bridge_sender<core::Status>(
                         [self, wire](auto terminal) mutable -> async::CallbackAbortFn {
                             const auto options = self->obfs_options();
                             auto handle = ss::async_write_tls_obfs_request_abortable(
@@ -1738,9 +1688,6 @@ class ShadowsocksConnectOperation final
                                     handle->abort();
                                 }
                             }};
-                        },
-                        [](auto receiver, core::Status result) {
-                            stdexec::set_value(std::move(receiver), std::move(result));
                         });
                     obfs_result = co_await std::move(sender);
                 }
@@ -1817,9 +1764,8 @@ class ShadowsocksConnectOperation final
             std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
         core::Result<std::unique_ptr<io::StreamHandle>> plugin;
         try {
-            using Sigs = async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>;
             // NOTE: name the sender first; argument order is unspecified.
-            auto sender = async::callback_sender<Sigs>(
+            auto sender = async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
                 [self, stream](auto terminal) mutable -> async::CallbackAbortFn {
                     auto handle = ss::async_open_websocket_plugin(
                         std::move(*stream), self->websocket_options(), std::move(terminal));
@@ -1829,9 +1775,6 @@ class ShadowsocksConnectOperation final
                             handle->cancel();
                         }
                     }};
-                },
-                [](auto receiver, core::Result<std::unique_ptr<io::StreamHandle>> opened) {
-                    stdexec::set_value(std::move(receiver), std::move(opened));
                 });
             plugin = co_await std::move(sender);
         } catch (...) {
@@ -2480,7 +2423,7 @@ ShadowsocksOutbound::connect_stream(core::StreamRequest request) {
     auto kcptun_pool = kcptun_pool_;
     auto websocket_mux_pool = websocket_mux_pool_;
     auto config = config_;
-    return async::callback_sender<async::BridgeSignatures<core::StreamOpenResult>>(
+    return async::bridge_sender<core::StreamOpenResult>(
         [&runtime, resolver = std::move(resolver), chain_registry = std::move(chain_registry),
          kcptun_pool = std::move(kcptun_pool), websocket_mux_pool = std::move(websocket_mux_pool),
          config = std::move(config), request = std::move(request)](
@@ -2491,8 +2434,7 @@ ShadowsocksOutbound::connect_stream(core::StreamRequest request) {
                 std::move(terminal));
             operation->start();
             return async::CallbackAbortFn{[operation] { operation->abort(); }};
-        },
-        async::BridgeTranslate<core::StreamOpenResult>{});
+        });
 }
 
 // Chained native-UDP open as one task: co_await the chained datagram
@@ -2632,9 +2574,8 @@ stdexec::task<core::DatagramOpenResult> open_uot_datagram_task(
                                        std::nullopt, request.dial_trace};
     core::StreamOpenResult stream_result;
     try {
-        using Sigs = async::BridgeSignatures<core::StreamOpenResult>;
         // NOTE: name the sender first; argument order is unspecified.
-        auto sender = async::callback_sender<Sigs>(
+        auto sender = async::bridge_sender<core::StreamOpenResult>(
             [&runtime, resolver, chain_registry, kcptun_pool, websocket_mux_pool, config,
              stream_request =
                  std::move(stream_request)](auto terminal) mutable -> async::CallbackAbortFn {
@@ -2644,9 +2585,6 @@ stdexec::task<core::DatagramOpenResult> open_uot_datagram_task(
                     std::move(terminal));
                 operation->start();
                 return async::CallbackAbortFn{[operation] { operation->abort(); }};
-            },
-            [](auto receiver, core::StreamOpenResult result) {
-                stdexec::set_value(std::move(receiver), std::move(result));
             });
         stream_result = co_await std::move(sender);
     } catch (...) {
@@ -2758,7 +2696,7 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
             exec::async_scope scope;
         };
         auto shared = std::make_shared<Shared>();
-        return async::callback_sender<async::BridgeSignatures<core::DatagramOpenResult>>(
+        return async::bridge_sender<core::DatagramOpenResult>(
             [&runtime, shared, resolver = std::move(resolver),
              chain_registry = std::move(chain_registry), config = std::move(config),
              request = std::move(chained_request)](
@@ -2768,8 +2706,7 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
                                           std::move(config), std::move(request)),
                     std::move(terminal)));
                 return async::CallbackAbortFn{[shared] { shared->scope.request_stop(); }};
-            },
-            async::BridgeTranslate<core::DatagramOpenResult>{});
+            });
     }
     auto &runtime = runtime_;
     auto resolver = resolver_;
@@ -2785,7 +2722,7 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
         exec::async_scope scope;
     };
     auto shared = std::make_shared<Shared>();
-    return async::callback_sender<async::BridgeSignatures<core::DatagramOpenResult>>(
+    return async::bridge_sender<core::DatagramOpenResult>(
         [&runtime, shared, resolver = std::move(resolver),
          chain_registry = std::move(chain_registry), kcptun_pool = std::move(kcptun_pool),
          websocket_mux_pool = std::move(websocket_mux_pool), config = std::move(config),
@@ -2800,8 +2737,7 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
                     : open_native_datagram_task(runtime, std::move(resolver), std::move(config));
             shared->scope.spawn(run_datagram_task(std::move(task), std::move(terminal)));
             return async::CallbackAbortFn{[shared] { shared->scope.request_stop(); }};
-        },
-        async::BridgeTranslate<core::DatagramOpenResult>{});
+        });
 }
 
 } // namespace clash_native::outbound

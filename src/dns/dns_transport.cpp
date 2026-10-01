@@ -907,7 +907,7 @@ std::shared_ptr<AsioDnsTransport::TcpSession> AsioDnsTransport::tcp_session() {
 io::AnySender<DnsExchangeResult> AsioDnsTransport::exchange(DnsExchangeRequest request) {
     auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
     auto self = shared_from_this();
-    return async::callback_sender<async::BridgeSignatures<DnsExchangeResult>>(
+    return async::bridge_sender<DnsExchangeResult>(
         [self, box](auto done) mutable -> async::CallbackAbortFn {
             if (!box || !*box) {
                 done(core::fail(cancelled_error()));
@@ -918,8 +918,7 @@ io::AnySender<DnsExchangeResult> AsioDnsTransport::exchange(DnsExchangeRequest r
             box->reset();
             return async::CallbackAbortFn{
                 [self, exchange_id] { self->cancel_exchange(exchange_id); }};
-        },
-        async::BridgeTranslate<DnsExchangeResult>{});
+        });
 }
 
 DnsExchangeId AsioDnsTransport::open_exchange(DnsExchangeRequest request,

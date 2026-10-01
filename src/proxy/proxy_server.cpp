@@ -81,7 +81,8 @@ ProxyServer::ProxyServer(runtime::AsioRuntime &runtime, boost::asio::ip::tcp::en
       outbound_registry_(std::make_shared<outbound::OutboundRegistry>()),
       connection_registry_(std::make_shared<observability::ConnectionRegistry>()),
       snapshot_store_(std::make_shared<runtime::RuntimeSnapshotStore>()),
-      callback_gate_(std::make_shared<std::atomic_bool>(false)) {
+      callback_gate_(std::make_shared<std::atomic_bool>(false)),
+      resolver_requests_(std::make_shared<ResolverRequests>()) {
     if (!outbound_registry_->add_outbound("direct", direct_outbound_) ||
         !outbound_registry_->add_outbound("reject", reject_outbound_)) {
         throw std::logic_error("failed to initialize proxy built-in outbounds");
@@ -386,11 +387,19 @@ void ProxyServer::stop_on_owner() noexcept {
     } catch (...) {
     }
     if (resolver_) {
-        for (const auto request_id : resolver_requests_) {
+        std::vector<dns::ResolverService::RequestId> pending;
+        {
+            std::lock_guard lock(resolver_requests_->mutex);
+            pending.assign(resolver_requests_->ids.begin(), resolver_requests_->ids.end());
+            resolver_requests_->ids.clear();
+        }
+        for (const auto request_id : pending) {
             resolver_->cancel(request_id);
         }
+    } else {
+        std::lock_guard lock(resolver_requests_->mutex);
+        resolver_requests_->ids.clear();
     }
-    resolver_requests_.clear();
 
     if (socks5_udp_listener_) {
         socks5_udp_listener_->stop();
@@ -535,36 +544,43 @@ stdexec::task<core::StreamOpenResult> ProxyServer::route_stream(
         return !server.callback_gate_->load(std::memory_order_acquire);
     };
     // Resolve leaf: registers the registry request for server stop and
-    // unregisters on terminal; the aborter cancels late. callback_sender
-    // (bridge_sender removed; unified spelling) because the result must
-    // cross as an in-band value while stop maps to set_stopped.
-    const auto resolve_addresses = [&server, snapshot](std::string host, dns::DnsRecordType type)
-        -> stdexec::task<core::Result<dns::DnsAnswer>> {
+    // unregisters on terminal; the aborter cancels late. Unary bridge_sender
+    // factory because the result must cross as an in-band value while stop
+    // maps to set_stopped.
+    const auto resolve_addresses =
+        [scheduler = server.runtime_.scheduler(), snapshot, requests = server.resolver_requests_](
+            std::string host,
+            dns::DnsRecordType type) -> stdexec::task<core::Result<dns::DnsAnswer>> {
         core::Result<dns::DnsAnswer> answer;
         try {
-            answer = co_await async::callback_sender<
-                async::BridgeSignatures<core::Result<dns::DnsAnswer>>>(
-                [&server, snapshot, host = std::move(host),
+            answer = co_await async::bridge_sender<core::Result<dns::DnsAnswer>>(
+                [scheduler, snapshot, requests, host = std::move(host),
                  type](auto terminal) mutable -> async::CallbackAbortFn {
                     auto resolver = snapshot->resolver;
                     auto id = std::make_shared<dns::ResolverService::RequestId>();
                     *id = resolver->resolve(
                         {std::move(host), type, 1},
-                        [&server, id, terminal = std::move(terminal)](
+                        [requests, id, terminal = std::move(terminal)](
                             core::Result<dns::DnsAnswer> result) mutable {
-                            server.resolver_requests_.erase(*id);
+                            {
+                                std::lock_guard lock(requests->mutex);
+                                requests->ids.erase(*id);
+                            }
                             terminal(std::move(result));
                         },
-                        server.runtime_.scheduler());
-                    server.resolver_requests_.insert(*id);
-                    return async::CallbackAbortFn{[&server, snapshot, id] {
+                        scheduler);
+                    {
+                        std::lock_guard lock(requests->mutex);
+                        requests->ids.insert(*id);
+                    }
+                    return async::CallbackAbortFn{[snapshot, id, requests] {
                         if (snapshot->resolver) {
                             snapshot->resolver->cancel(*id);
                         }
-                        server.resolver_requests_.erase(*id);
+                        std::lock_guard lock(requests->mutex);
+                        requests->ids.erase(*id);
                     }};
-                },
-                async::BridgeTranslate<core::Result<dns::DnsAnswer>>{});
+                });
         } catch (...) {
             co_return core::fail(
                 core::Error{core::ErrorCode::resolution, "proxy route DNS enrichment failed", {}});

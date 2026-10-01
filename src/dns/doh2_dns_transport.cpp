@@ -181,7 +181,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         auto state = std::make_shared<
             std::tuple<io::ExchangeRequest, std::chrono::steady_clock::time_point, bool>>(
             std::move(request), deadline, true);
-        return async::callback_sender<async::BridgeSignatures<core::Result<io::ExchangeResponse>>>(
+        return async::bridge_sender<core::Result<io::ExchangeResponse>>(
             [self, query_id, state](auto terminal) mutable -> async::CallbackAbortFn {
                 if (!std::get<2>(*state)) {
                     terminal(core::fail(cancelled_error()));
@@ -222,8 +222,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
                         session->fail_pending(query_id, cancelled_error());
                     });
                 }};
-            },
-            async::BridgeTranslate<core::Result<io::ExchangeResponse>>{});
+            });
     }
 
     void cancel(std::uint16_t query_id) noexcept {
@@ -780,7 +779,7 @@ std::shared_ptr<Doh2DnsTransport::Session> Doh2DnsTransport::session() {
 io::AnySender<DnsExchangeResult> Doh2DnsTransport::exchange(DnsExchangeRequest request) {
     auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
     auto self = shared_from_this();
-    return async::callback_sender<async::BridgeSignatures<DnsExchangeResult>>(
+    return async::bridge_sender<DnsExchangeResult>(
         [self, box](auto done) mutable -> async::CallbackAbortFn {
             if (!box || !*box) {
                 done(core::fail(cancelled_error()));
@@ -790,8 +789,7 @@ io::AnySender<DnsExchangeResult> Doh2DnsTransport::exchange(DnsExchangeRequest r
             box->reset();
             return async::CallbackAbortFn{
                 [self, exchange_id] { self->cancel_exchange(exchange_id); }};
-        },
-        async::BridgeTranslate<DnsExchangeResult>{});
+        });
 }
 
 DnsExchangeId Doh2DnsTransport::open_exchange(DnsExchangeRequest request, OpenHandler handler) {
