@@ -11,7 +11,6 @@
 #include <boost/asio/ip/address.hpp>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
 
 #include <stdexec/execution.hpp>
 
@@ -235,7 +234,7 @@ TEST(UdpStreamTest, ReceivesDatagramsAwaitedInsideATask) {
     exec::async_scope scope;
     std::optional<clash_native::io::DatagramPacket> got;
     std::array<char, 32> incoming_buffer{};
-    scope.spawn([&]() -> exec::task<void> {
+    scope.spawn([&]() -> stdexec::task<void> {
         auto packet = co_await stream->async_receive_from(boost::asio::buffer(incoming_buffer));
         got = std::move(packet);
         co_return;
@@ -275,7 +274,7 @@ TEST(UdpStreamTest, AbortedReceiveFailsTheAwaitingTask) {
         ~Guard() { *settled = true; }
     };
     std::array<char, 32> incoming_buffer{};
-    scope.spawn([&]() -> exec::task<void> {
+    scope.spawn([&]() -> stdexec::task<void> {
         Guard guard{&settled};
         try {
             auto packet = co_await stream->async_receive_from(boost::asio::buffer(incoming_buffer));

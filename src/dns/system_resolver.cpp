@@ -1,8 +1,8 @@
+#include <clash_native/async/detached.hpp>
 #include <clash_native/dns/system_resolver.hpp>
 
 #include <exec/asio/use_sender.hpp>
-#include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
 #include <memory>
@@ -34,7 +34,6 @@ struct Request {
 struct SystemResolverState {
     std::unordered_map<RequestId, std::shared_ptr<Request>> requests;
     RequestId next_request_id = 1;
-    exec::async_scope scope;
 };
 
 SystemResolver::SystemResolver(boost::asio::io_context &context)
@@ -44,9 +43,9 @@ SystemResolver::SystemResolver(boost::asio::io_context &context)
 // lookup in complete(). cancel() aborts the in-flight use_sender await
 // (operation_aborted -> set_stopped), so the task ends promptly and its late
 // terminal drops the same way. The task always ends with a value.
-exec::task<void> run_system_lookup(std::shared_ptr<SystemResolverState> state,
-                                   boost::asio::ip::tcp::resolver *resolver, RequestId request_id,
-                                   std::string name) {
+stdexec::task<void> run_system_lookup(std::shared_ptr<SystemResolverState> state,
+                                      boost::asio::ip::tcp::resolver *resolver,
+                                      RequestId request_id, std::string name) {
     try {
         auto results = co_await resolver->async_resolve(name, "0", exec::asio::use_sender);
         std::vector<boost::asio::ip::address> addresses;
@@ -88,9 +87,9 @@ void SystemResolver::resolve(std::string name, Handler handler) {
     auto request = std::make_shared<Request>();
     request->handler = std::move(handler);
     state_->requests.emplace(request_id, std::move(request));
-    // The scope only owns lookup tasks; teardown stays guard-driven
-    // (cancel aborts the resolver), so no stop is ever requested.
-    state_->scope.spawn(run_system_lookup(state_, &resolver_, request_id, std::move(name)));
+    // Detached lookup task; teardown stays guard-driven (cancel aborts the
+    // resolver), so no stop is ever requested.
+    async::spawn_detached(run_system_lookup(state_, &resolver_, request_id, std::move(name)));
 }
 
 void SystemResolver::cancel() noexcept {

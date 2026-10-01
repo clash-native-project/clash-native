@@ -6,7 +6,6 @@
 
 #include <exec/any_sender_of.hpp>
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
 
 #include <chrono>
 #include <concepts>
@@ -1214,7 +1213,7 @@ template <channel_value T> struct MergeShared {
 // delivers exactly one sentinel and the merge accounting stays exact.
 template <channel_value T, async_stream S>
     requires std::same_as<stream_value_t<S>, T>
-exec::task<void> merge_driver_task(S source, std::shared_ptr<MergeShared<T>> shared) {
+stdexec::task<void> merge_driver_task(S source, std::shared_ptr<MergeShared<T>> shared) {
     using Item = std::optional<T>;
     try {
         while (true) {
@@ -1407,7 +1406,7 @@ inline constexpr AsyncMergeFn merge_concurrent{};
 
 namespace detail {
 
-template <async_stream S, class F> exec::task<void> for_each_task(S stream, F func) {
+template <async_stream S, class F> stdexec::task<void> for_each_task(S stream, F func) {
     while (auto item = co_await next(stream)) {
         std::invoke(func, std::move(*item));
     }
@@ -1435,7 +1434,7 @@ struct AsyncForEachFn {
 inline constexpr AsyncForEachFn async_for_each{};
 
 template <async_stream S, class Acc, class F>
-exec::task<Acc> async_fold(S stream, Acc init, F func) {
+stdexec::task<Acc> async_fold(S stream, Acc init, F func) {
     Acc acc = std::move(init);
     while (auto item = co_await next(stream)) {
         acc = std::invoke(func, std::move(acc), std::move(*item));
@@ -1443,7 +1442,7 @@ exec::task<Acc> async_fold(S stream, Acc init, F func) {
     co_return acc;
 }
 
-template <async_stream S> exec::task<std::vector<stream_value_t<S>>> collect(S stream) {
+template <async_stream S> stdexec::task<std::vector<stream_value_t<S>>> collect(S stream) {
     std::vector<stream_value_t<S>> out;
     while (auto item = co_await next(stream)) {
         out.push_back(std::move(*item));
@@ -1451,7 +1450,7 @@ template <async_stream S> exec::task<std::vector<stream_value_t<S>>> collect(S s
     co_return out;
 }
 
-template <async_stream S> exec::task<std::size_t> count(S stream) {
+template <async_stream S> stdexec::task<std::size_t> count(S stream) {
     std::size_t total = 0;
     while (auto item = co_await next(stream)) {
         (void)item;
@@ -1460,7 +1459,7 @@ template <async_stream S> exec::task<std::size_t> count(S stream) {
     co_return total;
 }
 
-template <async_stream S> exec::task<std::optional<stream_value_t<S>>> first(S stream) {
+template <async_stream S> stdexec::task<std::optional<stream_value_t<S>>> first(S stream) {
     co_return co_await next(stream);
 }
 
@@ -1494,8 +1493,8 @@ struct SubscribeNoop {
 };
 
 template <async_stream S, class OnNext, class OnDone, class OnError>
-exec::task<void> subscribe_loop(S stream, std::shared_ptr<SubscribeShared> alive, OnNext on_next,
-                                OnDone on_done, OnError on_error) {
+stdexec::task<void> subscribe_loop(S stream, std::shared_ptr<SubscribeShared> alive, OnNext on_next,
+                                   OnDone on_done, OnError on_error) {
     // Route a failure either to the explicit handler or, for the default
     // policy, to the join point. Never throws: the spawned task must complete
     // with a value (see SubscribeShared).
@@ -1621,7 +1620,7 @@ namespace detail {
 
 // Type-erased pull sender: completes with an item, end-of-stream, an error,
 // or stopped, like every stream pull. A coroutine task cannot serve here:
-// this stdexec version's exec::task has no connect() member and only links
+// this stdexec version's task type has no connect() member and only links
 // through coroutine await machinery, so fan-in children could never connect
 // it to their custom receivers. The type-erased sender connects directly to
 // any receiver instead. The stop-token query is declared so cancellation

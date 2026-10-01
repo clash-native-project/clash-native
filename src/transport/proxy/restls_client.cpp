@@ -8,7 +8,7 @@
 #include <clash_native/transport/proxy/restls.hpp>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <botan/asn1_obj.h>
 #include <botan/auto_rng.h>
@@ -1118,7 +1118,7 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
     }
 
   private:
-    static exec::task<void> run_open(std::shared_ptr<RestlsOpenOperation> self) {
+    static stdexec::task<void> run_open(std::shared_ptr<RestlsOpenOperation> self) {
         if (auto error = co_await run_flush_writes(self); error) {
             self->finish(core::fail(std::move(*error)));
             co_return;
@@ -1160,7 +1160,7 @@ class RestlsOpenOperation final : public std::enable_shared_from_this<RestlsOpen
         }
     }
 
-    static exec::task<std::optional<core::Error>>
+    static stdexec::task<std::optional<core::Error>>
     run_flush_writes(std::shared_ptr<RestlsOpenOperation> self) {
         while (!self->completed_ && !self->tls_write_queue_.empty()) {
             auto chunk = std::move(self->tls_write_queue_.front());

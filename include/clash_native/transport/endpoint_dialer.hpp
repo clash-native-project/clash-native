@@ -56,68 +56,6 @@ core::Result<std::shared_ptr<const core::EndpointDialTrace>>
 extend_endpoint_trace(const std::shared_ptr<const core::EndpointDialTrace> &trace,
                       std::string_view outbound_id);
 
-// Drives a chained stream open into a bridge handler, unwrapping the
-// StreamOpenResult into the transported handle.
-struct ChainedStreamReceiver {
-    using receiver_concept = stdexec::receiver_tag;
-    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>> handler;
-    void set_value(core::StreamOpenResult result) && noexcept {
-        auto done = std::move(handler);
-        if (result.status == core::OpenStatus::opened && result.handle) {
-            done(core::Result<std::unique_ptr<io::StreamHandle>>{std::move(result.handle)});
-            return;
-        }
-        if (result.error) {
-            done(core::fail(result.error.value()));
-            return;
-        }
-        done(core::fail(
-            core::Error{core::ErrorCode::endpoint_connection, "chained outbound dial failed", {}}));
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto done = std::move(handler);
-        try {
-            std::rethrow_exception(std::move(error));
-        } catch (const core::Error &failure) {
-            done(core::fail(failure));
-        } catch (...) {
-            done(core::fail(core::Error{
-                core::ErrorCode::endpoint_connection, "chained outbound dial failed", {}}));
-        }
-    }
-    void set_stopped() && noexcept {
-        auto done = std::move(handler);
-        done(core::fail(
-            core::Error{core::ErrorCode::cancelled, "chained outbound dial was cancelled", {}}));
-    }
-};
-
-// Drives a chained datagram open into a bridge handler.
-struct ChainedDatagramReceiver {
-    using receiver_concept = stdexec::receiver_tag;
-    async::BridgeHandler<core::DatagramOpenResult> handler;
-    void set_value(core::DatagramOpenResult result) && noexcept {
-        auto done = std::move(handler);
-        done(std::move(result));
-    }
-    void set_error(std::exception_ptr error) && noexcept {
-        auto done = std::move(handler);
-        try {
-            std::rethrow_exception(std::move(error));
-        } catch (const core::Error &failure) {
-            done(core::DatagramOpenResult::failed(failure));
-        } catch (...) {
-            done(core::DatagramOpenResult::failed(
-                {core::ErrorCode::endpoint_connection, "chained datagram open failed", {}}));
-        }
-    }
-    void set_stopped() && noexcept {
-        auto done = std::move(handler);
-        done(core::DatagramOpenResult::failed(
-            {core::ErrorCode::cancelled, "chained datagram open was cancelled", {}}));
-    }
-};
-
 // Executes a prebound endpoint plan. Each request can carry a trace through
 // nested outbound calls so accidental recursive chains fail before dialing.
 class EndpointDialer final {

@@ -8,7 +8,6 @@
 #include <ikcp.h>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
 
 #include <stdexec/execution.hpp>
 
@@ -223,7 +222,7 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
   private:
     // UDP receive loop: data moves into ikcp inside the loop body; C-library
     // boundary is ikcp_input/ikcp_flush below (thin, no sender wrapping).
-    static exec::task<void> run_receive_loop(std::shared_ptr<KcpStreamState> self) {
+    static stdexec::task<void> run_receive_loop(std::shared_ptr<KcpStreamState> self) {
         while (!self->closed_) {
             io::DatagramPacket packet{0, {}};
             std::exception_ptr failure;
@@ -273,7 +272,7 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
 
     // ikcp update loop: sleep races close via scope stop/drop; interval is a
     // sender (async::sleep_after), not a steady_timer.async_wait leaf.
-    static exec::task<void> run_update_loop(std::shared_ptr<KcpStreamState> self) {
+    static stdexec::task<void> run_update_loop(std::shared_ptr<KcpStreamState> self) {
         while (!self->closed_) {
             try {
                 co_await async::sleep_after(self->executor_,
@@ -328,7 +327,7 @@ class KcpStreamState final : public std::enable_shared_from_this<KcpStreamState>
         scope_.spawn(run_send_chain(shared_from_this()));
     }
 
-    static exec::task<void> run_send_chain(std::shared_ptr<KcpStreamState> self) {
+    static stdexec::task<void> run_send_chain(std::shared_ptr<KcpStreamState> self) {
         while (!self->closed_ && !self->send_queue_.empty()) {
             auto packet = self->send_queue_.front();
             if (self->options_.rate_limit > 0) {

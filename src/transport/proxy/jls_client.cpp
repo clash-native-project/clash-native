@@ -6,7 +6,7 @@
 #include <clash_native/transport/proxy/jls.hpp>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <botan/auto_rng.h>
 #include <botan/credentials_manager.h>
@@ -737,7 +737,7 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
     }
 
   private:
-    static exec::task<void> run_open(std::shared_ptr<JlsOpenOperation> self) {
+    static stdexec::task<void> run_open(std::shared_ptr<JlsOpenOperation> self) {
         if (auto error = co_await run_flush_writes(self); error) {
             self->finish(core::fail(std::move(*error)));
             co_return;
@@ -787,7 +787,7 @@ class JlsOpenOperation final : public std::enable_shared_from_this<JlsOpenOperat
         }
     }
 
-    static exec::task<std::optional<core::Error>>
+    static stdexec::task<std::optional<core::Error>>
     run_flush_writes(std::shared_ptr<JlsOpenOperation> self) {
         while (!self->completed_ && !self->tls_write_queue_.empty()) {
             auto chunk = std::move(self->tls_write_queue_.front());

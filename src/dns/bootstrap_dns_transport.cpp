@@ -1,10 +1,8 @@
+#include <clash_native/async/detached.hpp>
 #include <clash_native/async/oneshot.hpp>
 #include <clash_native/dns/bootstrap_resolver.hpp>
 #include <clash_native/dns/dns_transport.hpp>
 #include <clash_native/io/sender.hpp>
-
-#include <exec/async_scope.hpp>
-#include <exec/task.hpp>
 
 #include <stdexec/execution.hpp>
 
@@ -83,26 +81,18 @@ class BootstrapDnsTransport::Operation final
     ~Operation() {
         // Best effort: an abandoned operation (receiver destroyed without
         // stop) still aborts its bootstrap resolve and wakes its awaits.
+        // Detached task: no stop to request; the late terminal drops on
+        // the completed_ guard.
         cancel_bootstrap();
-        try {
-            scope_.request_stop();
-        } catch (...) {
-        }
     }
 
-    void start() { scope_.spawn(run(shared_from_this())); }
+    void start() { async::spawn_detached(run(shared_from_this())); }
 
     void cancel() {
         if (completed_.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
         cancel_bootstrap();
-        try {
-            // Aborts the in-flight inner sender await (stop-mapped below)
-            // and detaches any parked oneshot wait.
-            scope_.request_stop();
-        } catch (...) {
-        }
         terminal_.send(DriveTerminal{core::fail(cancelled_error())});
     }
 
@@ -110,7 +100,7 @@ class BootstrapDnsTransport::Operation final
     // Straight-line chain: bootstrap resolve, address select, inner exchange.
     // Every terminal funnels through finish(), so the spawned task always
     // ends with a value.
-    static exec::task<void> run(std::shared_ptr<Operation> self) {
+    static stdexec::task<void> run(std::shared_ptr<Operation> self) {
         auto channel = async::oneshot::channel<AddressResult>();
         auto sender =
             std::make_shared<async::oneshot::Sender<AddressResult>>(std::move(channel.sender));
@@ -202,8 +192,7 @@ class BootstrapDnsTransport::Operation final
     async::oneshot::Sender<DriveTerminal> terminal_;
     std::atomic_bool completed_{false};
     std::atomic<BootstrapResolver::RequestId> bootstrap_id_{0};
-    // Owns the resolve/exchange chain task, which always ends with a value.
-    exec::async_scope scope_;
+    // Detached resolve/exchange chain task, which always ends with a value.
 };
 
 BootstrapDnsTransport::BootstrapDnsTransport(runtime::AsioRuntime &runtime,

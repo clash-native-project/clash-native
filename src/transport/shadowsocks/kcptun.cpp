@@ -1,7 +1,6 @@
 #include <clash_native/transport/shadowsocks/kcptun.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/async/timer.hpp>
 #include <clash_native/io/stream_handle.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
@@ -15,6 +14,8 @@
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
+#include <clash_native/async/detached.hpp>
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
 #include <array>
@@ -452,29 +453,40 @@ class SmuxStreamState final : public std::enable_shared_from_this<SmuxStreamStat
         }
     }
 
+    // Keepalive as a named-function task loop: sleep via the timer sender,
+    // then send NOP and re-arm. No receiver scaffolding; the loop exits on
+    // close (checked after each sleep, like the old SleepReceiver guard).
+    static stdexec::task<void> run_keepalive(std::weak_ptr<SmuxStreamState> weak) {
+        auto self = weak.lock();
+        if (!self || self->closed_ || self->options_.keepalive_seconds <= 0) {
+            co_return;
+        }
+        auto executor = self->transport_->executor();
+        auto interval = std::chrono::seconds(self->options_.keepalive_seconds);
+        self.reset();
+        while (true) {
+            try {
+                co_await async::sleep_after(executor, interval);
+            } catch (...) {
+                co_return;
+            }
+            auto locked = weak.lock();
+            if (!locked || locked->closed_) {
+                co_return;
+            }
+            locked->enqueue_packet(locked->make_frame(kSmuxNop, {}), {});
+            locked->pump_write();
+        }
+    }
+
     void schedule_keepalive() {
         if (closed_ || options_.keepalive_seconds <= 0) {
             return;
         }
-        struct SleepReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::weak_ptr<SmuxStreamState> self;
-            void set_value() && noexcept {
-                auto locked = self.lock();
-                if (!locked || locked->closed_) {
-                    return;
-                }
-                locked->enqueue_packet(locked->make_frame(kSmuxNop, {}), {});
-                locked->pump_write();
-                locked->schedule_keepalive();
-            }
-            void set_error(std::exception_ptr) && noexcept {}
-            void set_stopped() && noexcept {}
-        };
-        // NOTE: name the sender first; argument order is unspecified.
-        auto sender = async::sleep_after(transport_->executor(),
-                                         std::chrono::seconds(options_.keepalive_seconds));
-        async::start_with_receiver(std::move(sender), SleepReceiver{weak_from_this()});
+        // Detached loop on the process-lifetime scope (never stopped or
+        // joined); each wake re-locks and exits on close, so teardown is
+        // a flag check rather than a scope join.
+        async::spawn_detached(run_keepalive(weak_from_this()));
     }
 
     void close_with_error(const boost::system::error_code &error) {

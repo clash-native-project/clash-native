@@ -1,4 +1,5 @@
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/detached.hpp>
 #include <clash_native/async/oneshot.hpp>
 #include <clash_native/async/timer.hpp>
 #include <clash_native/dns/dns_codec.hpp>
@@ -10,8 +11,7 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
 
-#include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
 #include <array>
@@ -289,9 +289,9 @@ class AsioDnsTransport::TcpSession final
         write_queue_.push_back(query_id);
         connect_if_needed();
         flush_writes();
-        // The scope only owns chain tasks (merge-shaped usage); teardown
-        // stays guard-driven, so no stop is ever requested.
-        scope_.spawn(run_deadline(shared_from_this(), query_id, deadline));
+        // Detached chain task; teardown stays guard-driven (map/generation
+        // guards drop late terminals), so no stop is ever requested.
+        async::spawn_detached(run_deadline(shared_from_this(), query_id, deadline));
     }
 
     void cancel(std::uint16_t query_id) noexcept { fail_request(query_id, cancelled_error()); }
@@ -314,8 +314,9 @@ class AsioDnsTransport::TcpSession final
     // Per-request deadline task: fires once at the deadline; the map lookup
     // in fail_request drops it when the response already won. Bounded by the
     // deadline, so no stop is ever requested.
-    static exec::task<void> run_deadline(std::shared_ptr<TcpSession> self, std::uint16_t query_id,
-                                         std::chrono::steady_clock::time_point deadline) {
+    static stdexec::task<void> run_deadline(std::shared_ptr<TcpSession> self,
+                                            std::uint16_t query_id,
+                                            std::chrono::steady_clock::time_point deadline) {
         try {
             co_await async::sleep_until(self->runtime_.serialized_executor(), deadline);
         } catch (...) {
@@ -341,8 +342,8 @@ class AsioDnsTransport::TcpSession final
     // pump and flush queued writes. Every terminal funnels through
     // connection_failed() or the pump starters, so the spawned task always
     // ends with a value.
-    static exec::task<void> run_connect(std::shared_ptr<TcpSession> self,
-                                        std::uint64_t generation) {
+    static stdexec::task<void> run_connect(std::shared_ptr<TcpSession> self,
+                                           std::uint64_t generation) {
         if (!self->dialer_) {
             self->connection_failed(
                 {core::ErrorCode::configuration, "DNS upstream stream dialer is not configured"},
@@ -387,9 +388,9 @@ class AsioDnsTransport::TcpSession final
         connecting_ = true;
         const auto generation = connection_generation_;
         auto self = shared_from_this();
-        // The scope only owns chain tasks (merge-shaped usage); teardown
-        // stays guard-driven, so no stop is ever requested.
-        scope_.spawn(run_connect(self, generation));
+        // Detached chain task; abort = close_connection/fail via generation
+        // guards, so no stop is ever requested.
+        async::spawn_detached(run_connect(self, generation));
     }
 
     void on_connected(std::uint64_t generation) {
@@ -591,8 +592,9 @@ class AsioDnsTransport::TcpSession final
     boost::asio::ip::tcp::endpoint endpoint_;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
     std::unique_ptr<io::StreamHandle> stream_;
-    // Owns the connect/deadline chain tasks, which always end with a value.
-    exec::async_scope scope_;
+    // Connect/deadline chain tasks run detached (immortal heap scope);
+    // abort = fail_request/close_connection via map/generation guards, so
+    // no stop is ever requested and no scope is owned here.
     std::unordered_map<std::uint16_t, PendingPtr> pending_;
     std::deque<std::uint16_t> write_queue_;
     std::uint64_t connection_generation_ = 0;
@@ -627,12 +629,14 @@ class AsioDnsTransport::Operation final
         }
         query_ = encoded.value();
         auto self = shared_from_this();
-        // The scope only owns this exchange task (merge-shaped usage);
-        // teardown is guard-driven, so no stop is ever requested: the
-        // request deadline bounds any orphaned chain, and the map lookup in
-        // complete() drops late terminals.
-        scope_.spawn(run(shared_from_this()));
-        scope_.spawn(run_deadline(self, request_.deadline));
+        // Detached exchange/deadline tasks; teardown is guard-driven, so no
+        // stop is ever requested: the request deadline bounds any orphaned
+        // chain, and the map lookup in complete() drops late terminals.
+        // Detached (not scope-owned): a scope-owned sleeper self-deletes
+        // inside __complete while holding the scope mutex, so destroying the
+        // scope during teardown races its completion (async_scope.hpp:162 UAF).
+        async::spawn_detached(run(shared_from_this()));
+        async::spawn_detached(run_deadline(self, request_.deadline));
     }
 
     void cancel() {
@@ -651,7 +655,7 @@ class AsioDnsTransport::Operation final
     // Straight-line exchange chain: datagram (or TCP) send/receive, then
     // decode. Every terminal funnels through finish(), so the spawned task
     // always ends with a value.
-    static exec::task<void> run(std::shared_ptr<Operation> self) {
+    static stdexec::task<void> run(std::shared_ptr<Operation> self) {
         if (std::chrono::steady_clock::now() >= self->request_.deadline) {
             self->finish(core::fail(timeout_error()));
             co_return;
@@ -699,8 +703,8 @@ class AsioDnsTransport::Operation final
     // Deadline task: fires once at the deadline; the completed_ guard in
     // finish() drops it when the exchange already won. Bounded by the
     // deadline, so no stop is ever requested.
-    static exec::task<void> run_deadline(std::shared_ptr<Operation> self,
-                                         std::chrono::steady_clock::time_point deadline) {
+    static stdexec::task<void> run_deadline(std::shared_ptr<Operation> self,
+                                            std::chrono::steady_clock::time_point deadline) {
         try {
             co_await async::sleep_until(self->owner_.runtime_.serialized_executor(), deadline);
         } catch (...) {
@@ -712,7 +716,7 @@ class AsioDnsTransport::Operation final
 
     // UDP send/receive loop in one task: mismatched packets re-arm the
     // receive await; truncation falls through to the TCP task.
-    static exec::task<void> run_udp(std::shared_ptr<Operation> self) {
+    static stdexec::task<void> run_udp(std::shared_ptr<Operation> self) {
         try {
             co_await self->datagram_->async_send_to(
                 boost::asio::buffer(self->query_),
@@ -775,7 +779,7 @@ class AsioDnsTransport::Operation final
     // TCP fallback: register on the shared session with a oneshot terminal,
     // then await it. cancel() (or the deadline) aborts the session entry so
     // a late response drops by map lookup.
-    static exec::task<void> run_tcp(std::shared_ptr<Operation> self) {
+    static stdexec::task<void> run_tcp(std::shared_ptr<Operation> self) {
         if (self->completed_) {
             co_return;
         }
@@ -872,8 +876,7 @@ class AsioDnsTransport::Operation final
     std::shared_ptr<AsioDnsTransport::TcpSession> tcp_session_;
     std::uint16_t query_id_ = 0;
     bool completed_ = false;
-    // Owns the exchange/deadline chain tasks, which always end with a value.
-    exec::async_scope scope_;
+    // Exchange/deadline tasks are detached (see start()); no scope owned here.
 };
 
 std::optional<std::uint16_t> AsioDnsTransport::next_query_id() noexcept {
@@ -904,17 +907,19 @@ std::shared_ptr<AsioDnsTransport::TcpSession> AsioDnsTransport::tcp_session() {
 io::AnySender<DnsExchangeResult> AsioDnsTransport::exchange(DnsExchangeRequest request) {
     auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
     auto self = shared_from_this();
-    return async::bridge_sender<DnsExchangeResult>(
-        [self, box](async::BridgeHandler<DnsExchangeResult> done) mutable {
+    return async::callback_sender<async::BridgeSignatures<DnsExchangeResult>>(
+        [self, box](auto done) mutable -> async::CallbackAbortFn {
             if (!box || !*box) {
                 done(core::fail(cancelled_error()));
+                // Inline failure: nothing to abort.
                 return async::CallbackAbortFn{};
             }
             const auto exchange_id = self->open_exchange(std::move(**box), std::move(done));
             box->reset();
             return async::CallbackAbortFn{
                 [self, exchange_id] { self->cancel_exchange(exchange_id); }};
-        });
+        },
+        async::BridgeTranslate<DnsExchangeResult>{});
 }
 
 DnsExchangeId AsioDnsTransport::open_exchange(DnsExchangeRequest request,

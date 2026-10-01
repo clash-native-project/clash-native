@@ -6,8 +6,8 @@
 #include <clash_native/dns/dns_query_service.hpp>
 #include <clash_native/io/sender.hpp>
 
-#include <exec/task.hpp>
 #include <spdlog/spdlog.h>
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -143,7 +143,7 @@ class DnsQueryService::Operation final
     // maps to a cancelled value inline (not a rethrow): request_stop
     // unwinds the await as stopped, and the coroutine must deliver the
     // waiter terminal itself since nobody else will.
-    static exec::task<void> run(std::shared_ptr<Operation> self) {
+    static stdexec::task<void> run(std::shared_ptr<Operation> self) {
         DnsExchangeResult result = core::fail(cancelled_error());
         try {
             const auto deadline = std::chrono::steady_clock::now() + self->upstream_->timeout();

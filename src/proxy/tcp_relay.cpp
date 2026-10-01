@@ -69,16 +69,16 @@ void TcpRelay::launch(std::vector<std::uint8_t> initial_left_data) {
     // the task's scope on the immortal heap scope instead.
     async::spawn_detached(run(std::move(self), std::move(initial_left_data)));
 }
-exec::task<void> TcpRelay::join_pumps(std::shared_ptr<TcpRelay> self,
-                                      std::vector<std::uint8_t> initial) {
+stdexec::task<void> TcpRelay::join_pumps(std::shared_ptr<TcpRelay> self,
+                                         std::vector<std::uint8_t> initial) {
     auto peer = self;
     co_await stdexec::when_all(pump(std::move(self), true, std::move(initial)),
                                pump(std::move(peer), false, {}));
     co_return;
 }
 
-exec::task<void> TcpRelay::run(std::shared_ptr<TcpRelay> self,
-                               std::vector<std::uint8_t> initial_left_data) {
+stdexec::task<void> TcpRelay::run(std::shared_ptr<TcpRelay> self,
+                                  std::vector<std::uint8_t> initial_left_data) {
     try {
         co_await exec::when_any(join_pumps(self, std::move(initial_left_data)) |
                                     stdexec::then([] { return 0; }),
@@ -93,8 +93,8 @@ exec::task<void> TcpRelay::run(std::shared_ptr<TcpRelay> self,
     co_return;
 }
 
-exec::task<void> TcpRelay::pump(std::shared_ptr<TcpRelay> self, bool left_to_right,
-                                std::vector<std::uint8_t> first_payload) {
+stdexec::task<void> TcpRelay::pump(std::shared_ptr<TcpRelay> self, bool left_to_right,
+                                   std::vector<std::uint8_t> first_payload) {
     io::StreamHandle *from = left_to_right ? self->left_.get() : self->right_.get();
     io::StreamHandle *to = left_to_right ? self->right_.get() : self->left_.get();
     std::uint64_t *counter =
@@ -133,7 +133,7 @@ exec::task<void> TcpRelay::pump(std::shared_ptr<TcpRelay> self, bool left_to_rig
     co_return;
 }
 
-exec::task<void> TcpRelay::idle_watchdog(std::shared_ptr<TcpRelay> self) {
+stdexec::task<void> TcpRelay::idle_watchdog(std::shared_ptr<TcpRelay> self) {
     auto executor = self->left_->executor();
     while (true) {
         std::chrono::steady_clock::time_point last;

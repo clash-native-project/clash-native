@@ -1,11 +1,10 @@
 #include <clash_native/dns/ech_resolver.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/detached.hpp>
 #include <clash_native/core/error.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 
-#include <exec/async_scope.hpp>
-#include <exec/task.hpp>
 #include <stdexec/execution.hpp>
 
 #include <algorithm>
@@ -31,13 +30,12 @@ core::Error not_found_error(const std::string &name) {
 struct EchLookup : public std::enable_shared_from_this<EchLookup> {
     DnsQueryService *service = nullptr;
     std::string original;
-    exec::async_scope scope;
 
-    // ECH follow-up chain as one task: co_await each query_sender and
-    // scan for the ech SvcParam inline. The task always ends with a value
-    // (finish drops late terminals on settled); abort cancels the
-    // in-flight query await through scope stop plus query cancel.
-    static exec::task<void>
+    // ECH follow-up chain as one detached task: co_await each query_sender
+    // and scan for the ech SvcParam inline. The task always ends with a
+    // value (finish drops late terminals on settled); abort marks settled
+    // and the late finish drops.
+    static stdexec::task<void>
     run(std::shared_ptr<EchLookup> self,
         async::BridgeHandler<core::Result<std::vector<std::uint8_t>>> terminal) {
         auto finish = [self, terminal = std::move(terminal)](
@@ -158,18 +156,13 @@ async_query_ech_config(DnsQueryService &query_service, std::string name,
     lookup->original = std::move(query_server_name).value_or(std::move(name));
     return async::callback_sender<Signatures>(
         [lookup](auto terminal) mutable -> async::CallbackAbortFn {
-            lookup->scope.spawn(
+            async::spawn_detached(
                 EchLookup::run(lookup, [terminal = std::move(terminal)](
                                            core::Result<std::vector<std::uint8_t>> result) mutable {
                     terminal(std::move(result));
                 }));
-            return async::CallbackAbortFn{[lookup] {
-                lookup->settled.store(true, std::memory_order_release);
-                try {
-                    lookup->scope.request_stop();
-                } catch (...) {
-                }
-            }};
+            return async::CallbackAbortFn{
+                [lookup] { lookup->settled.store(true, std::memory_order_release); }};
         },
         async::BridgeTranslate<core::Result<std::vector<std::uint8_t>>>{});
 }

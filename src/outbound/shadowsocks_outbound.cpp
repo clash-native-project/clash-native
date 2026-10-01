@@ -1,6 +1,7 @@
 #include <clash_native/outbound/shadowsocks_outbound.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/detached.hpp>
 #include <clash_native/async/timer.hpp>
 #include <clash_native/core/base64.hpp>
 #include <clash_native/dns/ech_resolver.hpp>
@@ -35,10 +36,10 @@
 #include <boost/system/errc.hpp>
 #include <exec/asio/use_sender.hpp>
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
-#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -103,7 +104,7 @@ std::vector<std::uint8_t> append_tcp_record(std::string_view method,
 // with an optional query-server-name override. DNS failure fails closed.
 // NOTE: named function per the coroutine creation rules; never an
 // immediately-invoked capturing lambda.
-exec::task<core::Result<std::vector<std::uint8_t>>>
+stdexec::task<core::Result<std::vector<std::uint8_t>>>
 fetch_ss_plugin_ech_config(std::shared_ptr<dns::ResolverService> resolver,
                            const ShadowsocksOutboundConfig &config,
                            const std::string &server_name) {
@@ -183,9 +184,10 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
         // directly instead of bridging it back into a handler.
         // NOTE: named function per the coroutine creation rules; never an
         // immediately-invoked capturing lambda.
-        static exec::task<void> run_carrier_write(std::shared_ptr<State> self,
-                                                  std::shared_ptr<std::vector<std::uint8_t>> wire,
-                                                  std::size_t size, WriteTerminal done) {
+        static stdexec::task<void>
+        run_carrier_write(std::shared_ptr<State> self,
+                          std::shared_ptr<std::vector<std::uint8_t>> wire, std::size_t size,
+                          WriteTerminal done) {
             try {
                 // NOTE: name the sender first; argument order is unspecified.
                 auto sender = self->carrier->async_write(boost::asio::buffer(*wire));
@@ -235,9 +237,11 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
             auto wire = std::make_shared<std::vector<std::uint8_t>>(std::move(encoded));
             auto self = shared_from_this();
             // Single carrier write as one task co_awaiting the carrier
-            // sender directly; teardown stays guard-driven via abort().
+            // sender directly; runs detached (immortal heap scope) so the
+            // last State reference cannot free a member scope_ (#194).
+            // Teardown stays guard-driven via abort().
             WriteTerminal done{std::move(write_handler)};
-            scope_.spawn(run_carrier_write(self, wire, size, std::move(done)));
+            async::spawn_detached(run_carrier_write(self, wire, size, std::move(done)));
         }
 
         void read(boost::asio::mutable_buffer buffer, StreamReadHandler handler) {
@@ -503,9 +507,9 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
         // directly instead of re-arming through a bridge receiver.
         // NOTE: named function per the coroutine creation rules; never an
         // immediately-invoked capturing lambda.
-        static exec::task<void> run_read_exact_carrier(std::shared_ptr<State> self,
-                                                       boost::asio::mutable_buffer buffer,
-                                                       ExactReadHandler handler) {
+        static stdexec::task<void> run_read_exact_carrier(std::shared_ptr<State> self,
+                                                          boost::asio::mutable_buffer buffer,
+                                                          ExactReadHandler handler) {
             std::size_t done = 0;
             while (done < buffer.size()) {
                 auto rest = boost::asio::mutable_buffer(
@@ -533,7 +537,10 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
         }
 
         void read_exact_carrier(boost::asio::mutable_buffer buffer, ExactReadHandler handler) {
-            scope_.spawn(run_read_exact_carrier(shared_from_this(), buffer, std::move(handler)));
+            // Detached (immortal heap scope): the last State reference cannot
+            // free a member scope_ (#194). Teardown stays guard-driven.
+            async::spawn_detached(
+                run_read_exact_carrier(shared_from_this(), buffer, std::move(handler)));
         }
 
         void finish_write(const boost::system::error_code &error, std::size_t size) {
@@ -580,8 +587,9 @@ class ShadowsocksStreamHandle final : public io::StreamHandle {
         bool obfs_response_ready = true;
         bool read_in_progress = false;
         bool write_in_progress = false;
-        // Owns the read/write chain tasks, which always end with a value.
-        exec::async_scope scope_;
+        // No member scope: carrier read/write chain tasks run detached
+        // (immortal heap scope) so the last State reference cannot free its
+        // scope (#194). Teardown stays guard-driven via cancel_read/write.
     };
 
   public:
@@ -697,10 +705,12 @@ class ShadowsocksConnectOperation final
             finish(core::StreamOpenResult::failed(validation.error()));
             return;
         }
-        // The scope owns the single guarded connect task, which funnels
-        // its Result through finish(); teardown stays guard-driven, so no
-        // stop is ever requested.
-        scope_.spawn(run_guarded(shared_from_this()));
+        // Guarded connect runs detached (immortal heap scope): the finished
+        // task holds the last operation reference at completion, which would
+        // free a member scope_ before __complete touches scope->__active_
+        // (ASan #194). Teardown stays guard-driven via abort(); no stop is
+        // ever requested.
+        async::spawn_detached(run_guarded(shared_from_this()));
     }
 
     // Timeout race driver: the connect chain races a sleep via
@@ -711,7 +721,7 @@ class ShadowsocksConnectOperation final
     // close / socket cancel) is subsumed by finish()'s !succeeded close
     // path. A named function (not an immediately-invoked capturing
     // lambda) builds the task; see docs/async-pitfalls.md.
-    static exec::task<void> run_guarded(std::shared_ptr<ShadowsocksConnectOperation> self) {
+    static stdexec::task<void> run_guarded(std::shared_ptr<ShadowsocksConnectOperation> self) {
         core::StreamOpenResult result = core::StreamOpenResult::failed(
             {core::ErrorCode::cancelled, "Shadowsocks connect stopped"});
         try {
@@ -732,7 +742,7 @@ class ShadowsocksConnectOperation final
     // terminal returns a Result; run_guarded funnels it through finish(),
     // so the spawned task always ends with a value unless an outer stop
     // ends it early.
-    static exec::task<core::StreamOpenResult>
+    static stdexec::task<core::StreamOpenResult>
     run_work(std::shared_ptr<ShadowsocksConnectOperation> self) {
         // Chained dials skip local resolution: the chain resolves the server.
         if (!self->config_.dialer_proxy.empty()) {
@@ -878,7 +888,7 @@ class ShadowsocksConnectOperation final
 
     // TCP connect plus plugin/cipher tail, shared by run_work().
     // Plugin dispatch shared by the direct and chained transports.
-    static exec::task<core::StreamOpenResult>
+    static stdexec::task<core::StreamOpenResult>
     dispatch_connected(std::shared_ptr<ShadowsocksConnectOperation> self) {
         if (self->shadow_tls_plugin()) {
             co_return co_await open_shadow_tls(self);
@@ -894,7 +904,8 @@ class ShadowsocksConnectOperation final
 
     // ECH config fetch shared by the direct and chained transports. Throws
     // core::Error on failure; callers map it to a failure Result.
-    static exec::task<void> resolve_plugin_ech(std::shared_ptr<ShadowsocksConnectOperation> self) {
+    static stdexec::task<void>
+    resolve_plugin_ech(std::shared_ptr<ShadowsocksConnectOperation> self) {
         if (self->websocket_plugin() && self->config_.plugin_tls &&
             self->config_.plugin_ech_enabled) {
             auto ech = co_await fetch_ss_plugin_ech_config(
@@ -916,7 +927,7 @@ class ShadowsocksConnectOperation final
     // Throws core::Error on failure; callers map it to a failure Result.
     // NOTE: named function per the coroutine creation rules; never an
     // immediately-invoked capturing lambda.
-    static exec::task<void>
+    static stdexec::task<void>
     dial_chained_transport(std::shared_ptr<ShadowsocksConnectOperation> self) {
         if (!self->chain_registry_) {
             throw core::Error{core::ErrorCode::configuration,
@@ -973,7 +984,7 @@ class ShadowsocksConnectOperation final
         self->chained_transport_ = std::move(opened.value());
     }
 
-    static exec::task<core::StreamOpenResult>
+    static stdexec::task<core::StreamOpenResult>
     connect_tcp(std::shared_ptr<ShadowsocksConnectOperation> self,
                 std::shared_ptr<std::vector<boost::asio::ip::tcp::endpoint>> endpoints) {
         try {
@@ -1224,7 +1235,7 @@ class ShadowsocksConnectOperation final
         return options;
     }
 
-    static exec::task<core::StreamOpenResult>
+    static stdexec::task<core::StreamOpenResult>
     open_shadow_tls(std::shared_ptr<ShadowsocksConnectOperation> self) {
         auto stream =
             std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
@@ -1273,7 +1284,7 @@ class ShadowsocksConnectOperation final
         co_return co_await send_initial_request(self);
     }
 
-    static exec::task<core::StreamOpenResult>
+    static stdexec::task<core::StreamOpenResult>
     open_restls(std::shared_ptr<ShadowsocksConnectOperation> self) {
         auto stream =
             std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
@@ -1319,7 +1330,7 @@ class ShadowsocksConnectOperation final
         co_return co_await send_initial_request(self);
     }
 
-    static exec::task<core::StreamOpenResult>
+    static stdexec::task<core::StreamOpenResult>
     open_jls(std::shared_ptr<ShadowsocksConnectOperation> self) {
         auto stream =
             std::make_shared<std::unique_ptr<io::StreamHandle>>(self->take_connected_stream());
@@ -1364,7 +1375,7 @@ class ShadowsocksConnectOperation final
         co_return co_await send_initial_request(self);
     }
 
-    static exec::task<core::StreamOpenResult>
+    static stdexec::task<core::StreamOpenResult>
     send_initial_request(std::shared_ptr<ShadowsocksConnectOperation> self) {
         const auto method = transport::proxy::cipher_method(self->config_.method);
         if (method.value().shadowsocks_2022) {
@@ -1542,7 +1553,7 @@ class ShadowsocksConnectOperation final
             self->write_nonce_));
     }
 
-    static exec::task<core::StreamOpenResult>
+    static stdexec::task<core::StreamOpenResult>
     open_websocket_classic(std::shared_ptr<ShadowsocksConnectOperation> self,
                            std::vector<std::uint8_t> wire, std::vector<std::uint8_t> key) {
         auto stream =
@@ -1599,7 +1610,7 @@ class ShadowsocksConnectOperation final
             self->write_nonce_));
     }
 
-    static exec::task<core::StreamOpenResult>
+    static stdexec::task<core::StreamOpenResult>
     open_websocket_2022(std::shared_ptr<ShadowsocksConnectOperation> self,
                         std::vector<std::uint8_t> destination) {
         auto stream =
@@ -1658,7 +1669,7 @@ class ShadowsocksConnectOperation final
         co_return std::move(opened);
     }
 
-    static exec::task<core::StreamOpenResult>
+    static stdexec::task<core::StreamOpenResult>
     send_legacy_initial_request(std::shared_ptr<ShadowsocksConnectOperation> self,
                                 const transport::proxy::CipherMethod &method) {
         std::vector<std::uint8_t> iv(method.iv_size);
@@ -1796,7 +1807,7 @@ class ShadowsocksConnectOperation final
         co_return core::StreamOpenResult::opened(std::move(stream.value()));
     }
 
-    static exec::task<core::StreamOpenResult>
+    static stdexec::task<core::StreamOpenResult>
     open_websocket_legacy(std::shared_ptr<ShadowsocksConnectOperation> self,
                           std::vector<std::uint8_t> wire,
                           transport::proxy::LegacyStreamCipher write_cipher) {
@@ -1917,7 +1928,8 @@ class ShadowsocksConnectOperation final
     core::StreamOpenHandler handler_;
     std::vector<std::uint8_t> write_nonce_;
     bool completed_ = false;
-    exec::async_scope scope_;
+    // No member scope: guarded connect task runs detached (immortal heap
+    // scope) so the last operation reference cannot free its scope (#194).
 };
 
 class ShadowsocksDatagramHandle final : public io::DatagramHandle {
@@ -1933,9 +1945,9 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
         // sender directly; teardown stays guard-driven via abort.
         // NOTE: named function per the coroutine creation rules; never an
         // immediately-invoked capturing lambda.
-        static exec::task<void> run_send(std::shared_ptr<State> self,
-                                         std::shared_ptr<std::vector<std::uint8_t>> packet,
-                                         std::size_t plaintext_size, WriteTerminal done) {
+        static stdexec::task<void> run_send(std::shared_ptr<State> self,
+                                            std::shared_ptr<std::vector<std::uint8_t>> packet,
+                                            std::size_t plaintext_size, WriteTerminal done) {
             try {
                 // NOTE: name the sender first; argument order is unspecified.
                 auto sender = self->transport_->async_send_to(
@@ -1995,7 +2007,9 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
                 self->send_in_progress = true;
                 self->send_handler = std::move(handler);
                 WriteTerminal done{std::move(self->send_handler)};
-                scope_.spawn(run_send(self, packet, payload_size, std::move(done)));
+                // Detached (immortal heap scope): the last State reference
+                // cannot free a member scope_ (#194).
+                async::spawn_detached(run_send(self, packet, payload_size, std::move(done)));
                 return;
             }
             std::vector<std::uint8_t> plaintext = std::move(address.value());
@@ -2012,7 +2026,9 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
             self->send_in_progress = true;
             self->send_handler = std::move(handler);
             WriteTerminal done{std::move(self->send_handler)};
-            scope_.spawn(run_send(self, wire, payload_size, std::move(done)));
+            // Detached (immortal heap scope): the last State reference
+            // cannot free a member scope_ (#194).
+            async::spawn_detached(run_send(self, wire, payload_size, std::move(done)));
         }
 
         void receive(boost::asio::mutable_buffer buffer, ReadHandler handler) {
@@ -2034,7 +2050,7 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
         // sender directly instead of bridging back into a handler.
         // NOTE: named function per the coroutine creation rules; never an
         // immediately-invoked capturing lambda.
-        static exec::task<void> run_receive(std::shared_ptr<State> self, ReadTerminal done) {
+        static stdexec::task<void> run_receive(std::shared_ptr<State> self, ReadTerminal done) {
             for (;;) {
                 io::DatagramPacket raw;
                 try {
@@ -2062,7 +2078,9 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
 
         void receive_next() {
             ReadTerminal done{std::move(receive_handler)};
-            scope_.spawn(run_receive(shared_from_this(), std::move(done)));
+            // Detached (immortal heap scope): the last State reference
+            // cannot free a member scope_ (#194).
+            async::spawn_detached(run_receive(shared_from_this(), std::move(done)));
         }
 
         void decode_response(std::size_t size) {
@@ -2220,13 +2238,13 @@ class ShadowsocksDatagramHandle final : public io::DatagramHandle {
         WriteHandler send_handler;
         bool receive_in_progress = false;
         bool send_in_progress = false;
-        // Owns the send/receive chain tasks, which always end with a value.
-        exec::async_scope scope_;
+        // No member scope: send/receive chain tasks run detached (immortal
+        // heap scope) so the last State reference cannot free its scope
+        // (#194). Teardown stays guard-driven via cancel_send/receive.
     };
 
   public:
     explicit ShadowsocksDatagramHandle(std::shared_ptr<State> state) : state_(std::move(state)) {}
-
     io::AnySender<std::size_t> async_send_to(boost::asio::const_buffer buffer,
                                              io::DatagramAddress destination) override {
         using Signatures = stdexec::completion_signatures<stdexec::set_value_t(std::size_t),
@@ -2462,7 +2480,7 @@ ShadowsocksOutbound::connect_stream(core::StreamRequest request) {
     auto kcptun_pool = kcptun_pool_;
     auto websocket_mux_pool = websocket_mux_pool_;
     auto config = config_;
-    return async::bridge_sender<core::StreamOpenResult>(
+    return async::callback_sender<async::BridgeSignatures<core::StreamOpenResult>>(
         [&runtime, resolver = std::move(resolver), chain_registry = std::move(chain_registry),
          kcptun_pool = std::move(kcptun_pool), websocket_mux_pool = std::move(websocket_mux_pool),
          config = std::move(config), request = std::move(request)](
@@ -2473,7 +2491,8 @@ ShadowsocksOutbound::connect_stream(core::StreamRequest request) {
                 std::move(terminal));
             operation->start();
             return async::CallbackAbortFn{[operation] { operation->abort(); }};
-        });
+        },
+        async::BridgeTranslate<core::StreamOpenResult>{});
 }
 
 // Chained native-UDP open as one task: co_await the chained datagram
@@ -2481,7 +2500,7 @@ ShadowsocksOutbound::connect_stream(core::StreamRequest request) {
 // Stream-kind (legacy) ciphers stay socket-bound and cannot chain.
 // NOTE: named function per the coroutine creation rules; never an
 // immediately-invoked capturing lambda.
-exec::task<core::DatagramOpenResult>
+stdexec::task<core::DatagramOpenResult>
 open_chained_datagram_task(runtime::AsioRuntime &runtime, transport::EndpointDialPlan plan,
                            ShadowsocksOutboundConfig config,
                            std::shared_ptr<const core::EndpointDialTrace> trace,
@@ -2523,7 +2542,7 @@ open_chained_datagram_task(runtime::AsioRuntime &runtime, transport::EndpointDia
 // Opens native UDP through the dialer_proxy chain: the chain delivers a
 // DatagramHandle relaying the server, wrapped in the usual cipher session.
 // Stream-kind (legacy) ciphers stay socket-bound and cannot chain.
-exec::task<core::DatagramOpenResult>
+stdexec::task<core::DatagramOpenResult>
 open_chained_datagram(runtime::AsioRuntime &runtime, std::shared_ptr<dns::ResolverService> resolver,
                       OutboundRegistry::Snapshot registry, ShadowsocksOutboundConfig config,
                       core::DatagramRequest request) {
@@ -2585,8 +2604,8 @@ open_chained_datagram(runtime::AsioRuntime &runtime, std::shared_ptr<dns::Resolv
 // funnels through done, so the spawned task always ends with a value.
 // NOTE: named function per the coroutine creation rules; never an
 // immediately-invoked capturing lambda.
-exec::task<void> run_datagram_task(exec::task<core::DatagramOpenResult> task,
-                                   async::BridgeHandler<core::DatagramOpenResult> done) {
+stdexec::task<void> run_datagram_task(stdexec::task<core::DatagramOpenResult> task,
+                                      async::BridgeHandler<core::DatagramOpenResult> done) {
     try {
         done(co_await std::move(task));
     } catch (const core::Error &failure) {
@@ -2602,7 +2621,7 @@ exec::task<void> run_datagram_task(exec::task<core::DatagramOpenResult> task,
 // datagram handle. Stop aborts via the operation abort.
 // NOTE: named function per the coroutine creation rules; never an
 // immediately-invoked capturing lambda.
-exec::task<core::DatagramOpenResult> open_uot_datagram_task(
+stdexec::task<core::DatagramOpenResult> open_uot_datagram_task(
     runtime::AsioRuntime &runtime, std::shared_ptr<dns::ResolverService> resolver,
     OutboundRegistry::Snapshot chain_registry, std::shared_ptr<ss::KcptunClientPool> kcptun_pool,
     std::shared_ptr<ss::WebSocketPluginMuxPool> websocket_mux_pool,
@@ -2654,7 +2673,7 @@ exec::task<core::DatagramOpenResult> open_uot_datagram_task(
 // then build the cipher session synchronously on a bound socket.
 // NOTE: named function per the coroutine creation rules; never an
 // immediately-invoked capturing lambda.
-exec::task<core::DatagramOpenResult>
+stdexec::task<core::DatagramOpenResult>
 open_native_datagram_task(runtime::AsioRuntime &runtime,
                           std::shared_ptr<dns::ResolverService> resolver,
                           ShadowsocksOutboundConfig config) {
@@ -2731,11 +2750,15 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
         auto chain_registry = chain_registry_;
         auto config = config_;
         auto chained_request = request;
+        // Heap scope owned by the starter (not the outbound): run_datagram_task
+        // funnels every terminal through done, so the task always ends with a
+        // value. The aborter stops the scope so the open awaits settle
+        // promptly; the late terminal then drops at the first-wins guard.
         struct Shared {
             exec::async_scope scope;
         };
         auto shared = std::make_shared<Shared>();
-        return async::bridge_sender<core::DatagramOpenResult>(
+        return async::callback_sender<async::BridgeSignatures<core::DatagramOpenResult>>(
             [&runtime, shared, resolver = std::move(resolver),
              chain_registry = std::move(chain_registry), config = std::move(config),
              request = std::move(chained_request)](
@@ -2745,7 +2768,8 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
                                           std::move(config), std::move(request)),
                     std::move(terminal)));
                 return async::CallbackAbortFn{[shared] { shared->scope.request_stop(); }};
-            });
+            },
+            async::BridgeTranslate<core::DatagramOpenResult>{});
     }
     auto &runtime = runtime_;
     auto resolver = resolver_;
@@ -2753,17 +2777,21 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
     auto kcptun_pool = kcptun_pool_;
     auto websocket_mux_pool = websocket_mux_pool_;
     auto config = config_;
+    // Heap scope owned by the starter (not the outbound): the open task
+    // funnels every terminal through done, so the task always ends with a
+    // value. The aborter stops the scope so the open awaits settle promptly;
+    // the late terminal then drops at the first-wins guard.
     struct Shared {
         exec::async_scope scope;
     };
     auto shared = std::make_shared<Shared>();
-    return async::bridge_sender<core::DatagramOpenResult>(
+    return async::callback_sender<async::BridgeSignatures<core::DatagramOpenResult>>(
         [&runtime, shared, resolver = std::move(resolver),
          chain_registry = std::move(chain_registry), kcptun_pool = std::move(kcptun_pool),
          websocket_mux_pool = std::move(websocket_mux_pool), config = std::move(config),
          request =
              std::move(request)](async::BridgeHandler<core::DatagramOpenResult> terminal) mutable {
-            exec::task<core::DatagramOpenResult> task =
+            stdexec::task<core::DatagramOpenResult> task =
                 (config.udp_over_tcp || config.plugin == "kcptun")
                     ? open_uot_datagram_task(runtime, std::move(resolver),
                                              std::move(chain_registry), std::move(kcptun_pool),
@@ -2772,7 +2800,8 @@ ShadowsocksOutbound::open_datagram(core::DatagramRequest request) {
                     : open_native_datagram_task(runtime, std::move(resolver), std::move(config));
             shared->scope.spawn(run_datagram_task(std::move(task), std::move(terminal)));
             return async::CallbackAbortFn{[shared] { shared->scope.request_stop(); }};
-        });
+        },
+        async::BridgeTranslate<core::DatagramOpenResult>{});
 }
 
 } // namespace clash_native::outbound

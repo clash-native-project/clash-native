@@ -6,7 +6,6 @@
 #include <boost/asio/write.hpp>
 
 #include <exec/asio/use_sender.hpp>
-#include <exec/task.hpp>
 
 #include <stdexec/execution.hpp>
 
@@ -43,7 +42,7 @@ std::optional<std::size_t> null_position(const std::vector<std::uint8_t> &payloa
 
 } // namespace
 
-exec::task<void> ProxySession::run_socks4_request(std::shared_ptr<ProxySession> self) {
+stdexec::task<void> ProxySession::run_socks4_request(std::shared_ptr<ProxySession> self) {
     try {
         co_await read_handshake_exact(self, boost::asio::buffer(self->socks4_request_.data() + 1,
                                                                 self->socks4_request_.size() - 1));
@@ -101,7 +100,7 @@ exec::task<void> ProxySession::run_socks4_request(std::shared_ptr<ProxySession> 
     self->open_socks4_target();
 }
 
-exec::task<std::vector<std::uint8_t>>
+stdexec::task<std::vector<std::uint8_t>>
 ProxySession::read_socks4_cstring(std::shared_ptr<ProxySession> self) {
     self->socks4_payload_.clear();
     std::array<std::uint8_t, 1024> chunk{};
@@ -151,8 +150,8 @@ void ProxySession::send_socks4_reply(std::uint8_t status, bool start_relay) {
     async::spawn_detached(run_socks4_reply(self, status, start_relay));
 }
 
-exec::task<void> ProxySession::run_socks4_reply(std::shared_ptr<ProxySession> self,
-                                                std::uint8_t status, bool start_relay) {
+stdexec::task<void> ProxySession::run_socks4_reply(std::shared_ptr<ProxySession> self,
+                                                   std::uint8_t status, bool start_relay) {
     if (self->closed_.load(std::memory_order_acquire)) {
         co_return;
     }

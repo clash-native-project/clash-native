@@ -1,5 +1,5 @@
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/detached.hpp>
 #include <clash_native/async/timer.hpp>
 
 #include <clash_native/core/base64.hpp>
@@ -23,12 +23,13 @@
 #include <boost/asio/write.hpp>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <openssl/evp.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <exception>
 #include <memory>
@@ -49,7 +50,7 @@ constexpr auto kConnectTimeout = std::chrono::seconds(15);
 // ECH would leak the SNI the user asked to encrypt.
 // NOTE: named function per the coroutine creation rules; never an
 // immediately-invoked capturing lambda.
-exec::task<core::Result<std::vector<std::uint8_t>>>
+stdexec::task<core::Result<std::vector<std::uint8_t>>>
 fetch_trojan_ech_config(std::shared_ptr<dns::ResolverService> resolver,
                         const TrojanOutboundConfig &config, const std::string &server_name) {
     if (!config.ech_config.empty()) {
@@ -129,9 +130,9 @@ core::Result<std::vector<std::uint8_t>> build_request_header(const TrojanOutboun
 struct GrpcSessionOpen {
     using SessionResult = core::Result<std::shared_ptr<io::ExchangeSession>>;
     using SessionHandler = async::BridgeHandler<SessionResult>;
-    static exec::task<void> run(runtime::AsioRuntime *runtime,
-                                std::shared_ptr<dns::ResolverService> resolver,
-                                TrojanOutboundConfig config, SessionHandler done) {
+    static stdexec::task<void> run(runtime::AsioRuntime *runtime,
+                                   std::shared_ptr<dns::ResolverService> resolver,
+                                   TrojanOutboundConfig config, SessionHandler done) {
         const auto deadline = std::chrono::steady_clock::now() + kConnectTimeout;
         auto socket =
             std::make_shared<boost::asio::ip::tcp::socket>(runtime->serialized_executor());
@@ -233,17 +234,23 @@ open_grpc_session(runtime::AsioRuntime &runtime, std::shared_ptr<dns::ResolverSe
                   TrojanOutboundConfig config) {
     using SessionResult = GrpcSessionOpen::SessionResult;
     using SessionHandler = GrpcSessionOpen::SessionHandler;
+    // Heap scope owned by the starter (not the operation): GrpcSessionOpen::run
+    // funnels every terminal through done, so the task always ends with a
+    // value. The aborter stops the scope so the run awaits settle promptly;
+    // the late terminal then drops at the first-wins guard. The scope dies
+    // with the starter captures (never a member), so no #194 shape.
     struct Shared {
         exec::async_scope scope;
     };
     auto shared = std::make_shared<Shared>();
-    auto bridged = async::bridge_sender<SessionResult>(
+    auto bridged = async::callback_sender<async::BridgeSignatures<SessionResult>>(
         [shared, &runtime, resolver = std::move(resolver),
          config = std::move(config)](SessionHandler done) mutable {
             shared->scope.spawn(GrpcSessionOpen::run(&runtime, std::move(resolver),
                                                      std::move(config), std::move(done)));
             return async::CallbackAbortFn{[shared] { shared->scope.request_stop(); }};
-        });
+        },
+        async::BridgeTranslate<SessionResult>{});
     auto sender = std::move(bridged) | stdexec::then([](SessionResult result) {
                       if (!result) {
                           throw result.error();
@@ -303,15 +310,18 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         }
         // Absolute end-to-end budget for the TLS/WS sub-operations below;
         // the race itself is bounded by kConnectTimeout in run_guarded.
+        // Guarded connect runs detached (immortal heap scope): the finished
+        // task holds the last operation reference at completion, which would
+        // free a member scope_ before __complete touches scope->__active_
+        // (ASan #194). Teardown stays guard-driven via abort().
         deadline_ = std::chrono::steady_clock::now() + kConnectTimeout;
-        scope_.spawn(run_guarded(shared_from_this()));
+        async::spawn_detached(run_guarded(shared_from_this()));
     }
-
     // Drives run_work under a with_timeout race so a stalled chain cannot
     // park the bridge terminal: work and the sleep race, the winner's
     // StreamOpenResult is finished in band, and machinery set_error crosses
     // as an exception. Outer stop cancels both branches.
-    static exec::task<void> run_guarded(std::shared_ptr<TrojanConnectOperation> self) {
+    static stdexec::task<void> run_guarded(std::shared_ptr<TrojanConnectOperation> self) {
         core::StreamOpenResult result = core::StreamOpenResult::failed(
             {core::ErrorCode::cancelled, "Trojan connect was cancelled"});
         try {
@@ -331,7 +341,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     // TLS-underlay camouflage over an established TCP stream. Each
     // proxy::async_open_* is bridged into the chain task; aborting the
     // operation cancels the late terminal like the SS plugin opens.
-    static exec::task<core::Result<std::unique_ptr<io::StreamHandle>>>
+    static stdexec::task<core::Result<std::unique_ptr<io::StreamHandle>>>
     open_security_overlay(std::shared_ptr<TrojanConnectOperation> self,
                           std::unique_ptr<io::StreamHandle> stream) {
         const auto &mode = self->config_.security_mode;
@@ -339,7 +349,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
         try {
             if (mode == "shadow-tls") {
                 auto boxed = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(stream));
-                co_return co_await async::bridge_sender<Opened>(
+                co_return co_await async::callback_sender<async::BridgeSignatures<Opened>>(
                     [self, boxed](async::BridgeHandler<Opened> done) mutable {
                         // Mihomo forwards the proxy-level fingerprint (pin)
                         // and client-fingerprint (hello) into the overlay;
@@ -360,11 +370,12 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                                 handle->abort();
                             }
                         }};
-                    });
+                    },
+                    async::BridgeTranslate<Opened>{});
             }
             if (mode == "restls") {
                 auto boxed = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(stream));
-                co_return co_await async::bridge_sender<Opened>(
+                co_return co_await async::callback_sender<async::BridgeSignatures<Opened>>(
                     [self, boxed](async::BridgeHandler<Opened> done) mutable {
                         auto options = self->config_.restls_options;
                         if (options.certificate_pin.empty()) {
@@ -379,11 +390,12 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                                 handle->abort();
                             }
                         }};
-                    });
+                    },
+                    async::BridgeTranslate<Opened>{});
             }
             if (mode == "jls") {
                 auto boxed = std::make_shared<std::unique_ptr<io::StreamHandle>>(std::move(stream));
-                co_return co_await async::bridge_sender<Opened>(
+                co_return co_await async::callback_sender<async::BridgeSignatures<Opened>>(
                     [self, boxed](async::BridgeHandler<Opened> done) mutable {
                         auto handle = transport::proxy::async_open_jls_abortable(
                             std::move(*boxed), self->config_.jls_options,
@@ -394,7 +406,8 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                                 handle->abort();
                             }
                         }};
-                    });
+                    },
+                    async::BridgeTranslate<Opened>{});
             }
             co_return core::fail({core::ErrorCode::configuration,
                                   "Trojan security mode must be shadow-tls, restls, or jls"});
@@ -419,7 +432,8 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     // StreamHandle. The trace carries our own ID so chain cycles fail fast.
     // NOTE: named function per the coroutine creation rules; never an
     // immediately-invoked capturing lambda.
-    static exec::task<void> dial_chained_transport(std::shared_ptr<TrojanConnectOperation> self) {
+    static stdexec::task<void>
+    dial_chained_transport(std::shared_ptr<TrojanConnectOperation> self) {
         if (!self->chain_registry_) {
             throw core::Error{core::ErrorCode::configuration,
                               "Trojan dialer-proxy requires a chain registry",
@@ -443,23 +457,26 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
                 ? core::Destination::domain(self->config_.server_host, self->config_.server_port)
                 : core::Destination::address(numeric, self->config_.server_port);
         core::StreamRequest chained_request{std::move(destination), std::nullopt, trace.value()};
-        core::Result<std::unique_ptr<io::StreamHandle>> opened;
+        core::StreamOpenResult chained;
         try {
-            opened = co_await async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
-                [self, plan = std::move(plan.value()),
-                 chained_request = std::move(chained_request)](
-                    async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>>
-                        done) mutable {
-                    transport::EndpointDialer dialer(self->runtime_.serialized_executor(),
-                                                     std::move(plan));
-                    async::start_with_receiver(dialer.connect_stream(std::move(chained_request)),
-                                               transport::ChainedStreamReceiver{std::move(done)});
-                    return async::CallbackAbortFn{[self] { self->abort(); }};
-                });
+            transport::EndpointDialer dialer(self->runtime_.serialized_executor(),
+                                             std::move(plan.value()));
+            // NOTE: name the sender first; argument order is unspecified.
+            auto sender = dialer.connect_stream(std::move(chained_request));
+            chained = co_await std::move(sender);
         } catch (const core::Error &) {
             throw;
         } catch (...) {
             throw core::Error{core::ErrorCode::transport_io, "Trojan chained dial failed", {}};
+        }
+        core::Result<std::unique_ptr<io::StreamHandle>> opened;
+        if (chained.status == core::OpenStatus::opened && chained.handle) {
+            opened = core::Result<std::unique_ptr<io::StreamHandle>>{std::move(chained.handle)};
+        } else if (chained.error) {
+            opened = core::fail(chained.error.value());
+        } else {
+            opened = core::fail(core::Error{
+                core::ErrorCode::endpoint_connection, "chained outbound dial failed", {}});
         }
         if (self->completed_) {
             throw core::Error{core::ErrorCode::cancelled, "Trojan connect was cancelled", {}};
@@ -474,7 +491,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     // plain TLS handshake. Each helper returns whether the Trojan request
     // header was already sent (WS early data) so run_work can skip the
     // post-write; failures return in band for run_guarded to finish once.
-    static exec::task<core::Result<bool>>
+    static stdexec::task<core::Result<bool>>
     open_transport(std::shared_ptr<TrojanConnectOperation> self) {
         if (self->config_.network == "grpc") {
             co_return co_await open_grpc_transport(self);
@@ -486,7 +503,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     }
 
     // gRPC transport: dials a pooled session into transport_stream_.
-    static exec::task<core::Result<bool>>
+    static stdexec::task<core::Result<bool>>
     open_grpc_transport(std::shared_ptr<TrojanConnectOperation> self) {
         const auto gun_pool = self->gun_pool_;
         if (!gun_pool) {
@@ -510,7 +527,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     }
 
     // WebSocket transport, with an optional security overlay underneath.
-    static exec::task<core::Result<bool>>
+    static stdexec::task<core::Result<bool>>
     open_websocket_transport(std::shared_ptr<TrojanConnectOperation> self) {
         bool header_sent = false;
         transport::WebSocketClientOptions ws_options;
@@ -624,7 +641,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     }
 
     // Plain TLS transport (a security overlay replaces TLS when set).
-    static exec::task<core::Result<bool>>
+    static stdexec::task<core::Result<bool>>
     open_tls_transport(std::shared_ptr<TrojanConnectOperation> self) {
         transport::TlsClientOptions tls_options;
         tls_options.server_name = self->config_.server_name.empty() ? self->config_.server_host
@@ -695,7 +712,7 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     // write. Value-returning: every terminal co_returns a StreamOpenResult
     // for run_guarded to finish with; intra-chain completed_ bails stay so
     // abort() wins every race.
-    static exec::task<core::StreamOpenResult>
+    static stdexec::task<core::StreamOpenResult>
     run_work(std::shared_ptr<TrojanConnectOperation> self) {
         // gRPC dials its own pooled sessions; the direct TCP connect below
         // only serves the tcp/ws/wss transports.
@@ -875,8 +892,8 @@ class TrojanConnectOperation final : public std::enable_shared_from_this<TrojanC
     std::unique_ptr<io::StreamHandle> transport_stream_;
     core::StreamOpenHandler handler_;
     std::chrono::steady_clock::time_point deadline_{};
-    // Owns the single guarded connect task (run_guarded -> run_work).
-    exec::async_scope scope_;
+    // No member scope: guarded connect task runs detached (immortal heap
+    // scope) so the last operation reference cannot free its scope (#194).
     bool completed_ = false;
 };
 
@@ -959,7 +976,7 @@ io::AnySender<core::StreamOpenResult> TrojanOutbound::connect_stream(core::Strea
     auto chain_registry = chain_registry_;
     auto config = config_;
     auto gun_pool = gun_pool_;
-    return async::bridge_sender<core::StreamOpenResult>(
+    return async::callback_sender<async::BridgeSignatures<core::StreamOpenResult>>(
         [&runtime, resolver = std::move(resolver), chain_registry = std::move(chain_registry),
          config = std::move(config), gun_pool = std::move(gun_pool), request = std::move(request)](
             async::BridgeHandler<core::StreamOpenResult> terminal) mutable {
@@ -968,7 +985,8 @@ io::AnySender<core::StreamOpenResult> TrojanOutbound::connect_stream(core::Strea
                 std::move(request), std::move(terminal), 0x01, std::move(gun_pool));
             operation->start();
             return async::CallbackAbortFn{[operation] { operation->abort(); }};
-        });
+        },
+        async::BridgeTranslate<core::StreamOpenResult>{});
 }
 
 io::AnySender<core::DatagramOpenResult>
@@ -983,7 +1001,7 @@ TrojanOutbound::open_datagram(core::DatagramRequest request) {
     auto chain_registry = chain_registry_;
     auto config = config_;
     auto gun_pool = gun_pool_;
-    return async::bridge_sender<core::DatagramOpenResult>(
+    return async::callback_sender<async::BridgeSignatures<core::DatagramOpenResult>>(
         [&runtime, resolver = std::move(resolver), chain_registry = std::move(chain_registry),
          config = std::move(config), gun_pool = std::move(gun_pool), request = std::move(request)](
             async::BridgeHandler<core::DatagramOpenResult> terminal) mutable {
@@ -992,6 +1010,7 @@ TrojanOutbound::open_datagram(core::DatagramRequest request) {
                 handler(core::DatagramOpenResult::failed(
                     {core::ErrorCode::configuration,
                      "Trojan UDP association requires an initial destination"}));
+                // Inline completion: nothing to abort.
                 return async::CallbackAbortFn{};
             }
             core::StreamRequest stream_request{*request.initial_destination, std::nullopt,
@@ -1020,7 +1039,8 @@ TrojanOutbound::open_datagram(core::DatagramRequest request) {
                 transport::trojan::kCommandUdp, std::move(gun_pool));
             operation->start();
             return async::CallbackAbortFn{[operation] { operation->abort(); }};
-        });
+        },
+        async::BridgeTranslate<core::DatagramOpenResult>{});
 }
 
 } // namespace clash_native::outbound

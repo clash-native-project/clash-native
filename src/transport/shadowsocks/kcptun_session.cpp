@@ -1,10 +1,12 @@
 #include <clash_native/transport/shadowsocks/kcptun_session.hpp>
 
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
 #include <clash_native/async/timer.hpp>
 #include <clash_native/io/stream_handle.hpp>
 #include <clash_native/net/stream_handle_adapter.hpp>
+
+#include <clash_native/async/detached.hpp>
+#include <stdexec/execution.hpp>
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/dispatch.hpp>
@@ -158,6 +160,7 @@ class KcptunMuxSession final : public std::enable_shared_from_this<KcptunMuxSess
     void read_exact(boost::asio::mutable_buffer buffer, ReadExactHandler handler,
                     std::size_t offset = 0);
     void schedule_keepalive();
+    static stdexec::task<void> run_keepalive(std::weak_ptr<KcptunMuxSession> weak);
 
     std::unique_ptr<io::StreamHandle> carrier_;
     KcptunClientOptions options_;
@@ -738,28 +741,36 @@ void KcptunMuxSession::read_exact(boost::asio::mutable_buffer buffer, ReadExactH
     });
 }
 
+// Keepalive as a named-function task loop: sleep via the timer sender, then
+// send NOP. No receiver scaffolding; exits on close like the old guard.
+stdexec::task<void> KcptunMuxSession::run_keepalive(std::weak_ptr<KcptunMuxSession> weak) {
+    auto self = weak.lock();
+    if (!self || self->closed_ || self->options_.keepalive_seconds <= 0) {
+        co_return;
+    }
+    auto executor = self->carrier_->executor();
+    auto interval = std::chrono::seconds(self->options_.keepalive_seconds);
+    self.reset();
+    while (true) {
+        try {
+            co_await async::sleep_after(executor, interval);
+        } catch (...) {
+            co_return;
+        }
+        auto locked = weak.lock();
+        if (!locked || locked->closed_) {
+            co_return;
+        }
+        locked->enqueue_frame(kNop, 0, {});
+    }
+}
 void KcptunMuxSession::schedule_keepalive() {
     if (closed_ || options_.keepalive_seconds <= 0) {
         return;
     }
-    struct SleepReceiver {
-        using receiver_concept = stdexec::receiver_tag;
-        std::weak_ptr<KcptunMuxSession> self;
-        void set_value() && noexcept {
-            auto locked = self.lock();
-            if (!locked || locked->closed_) {
-                return;
-            }
-            locked->enqueue_frame(kNop, 0, {});
-            locked->schedule_keepalive();
-        }
-        void set_error(std::exception_ptr) && noexcept {}
-        void set_stopped() && noexcept {}
-    };
-    // NOTE: name the sender first; argument order is unspecified.
-    auto sender =
-        async::sleep_after(carrier_->executor(), std::chrono::seconds(options_.keepalive_seconds));
-    async::start_with_receiver(std::move(sender), SleepReceiver{weak_from_this()});
+    // Detached loop on the process-lifetime scope (never stopped or
+    // joined); each wake re-locks and exits on close.
+    async::spawn_detached(run_keepalive(weak_from_this()));
 }
 
 boost::system::error_code unpack_transport_error(std::exception_ptr error) noexcept {
@@ -892,38 +903,48 @@ struct KcptunClientPool::Impl final : public std::enable_shared_from_this<Kcptun
         }
     }
 
+    // Scavenge as a named-function task loop: sleep via the timer sender,
+    // then reap closed/expired sessions. No receiver scaffolding; exits on
+    // close like the old guard.
+    static stdexec::task<void> run_scavenge(std::weak_ptr<Impl> weak) {
+        auto self = weak.lock();
+        if (!self || self->closed) {
+            co_return;
+        }
+        auto executor = self->scavenger.get_executor();
+        self.reset();
+        while (true) {
+            try {
+                co_await async::sleep_after(executor, kScavengePeriod);
+            } catch (...) {
+                co_return;
+            }
+            auto locked = weak.lock();
+            if (!locked || locked->closed) {
+                co_return;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            for (auto &slot : locked->slots) {
+                if (slot.session && slot.session->closed()) {
+                    slot.session.reset();
+                } else if (slot.session && locked->options.auto_expire_seconds > 0 &&
+                           now - slot.created >=
+                               std::chrono::seconds(locked->options.auto_expire_seconds +
+                                                    locked->options.scavenge_ttl_seconds)) {
+                    slot.session->close();
+                    slot.session.reset();
+                }
+            }
+        }
+    }
+
     void schedule_scavenge() {
         if (closed) {
             return;
         }
-        struct ScavengeReceiver {
-            using receiver_concept = stdexec::receiver_tag;
-            std::weak_ptr<Impl> self;
-            void set_value() && noexcept {
-                auto locked = self.lock();
-                if (!locked || locked->closed) {
-                    return;
-                }
-                const auto now = std::chrono::steady_clock::now();
-                for (auto &slot : locked->slots) {
-                    if (slot.session && slot.session->closed()) {
-                        slot.session.reset();
-                    } else if (slot.session && locked->options.auto_expire_seconds > 0 &&
-                               now - slot.created >=
-                                   std::chrono::seconds(locked->options.auto_expire_seconds +
-                                                        locked->options.scavenge_ttl_seconds)) {
-                        slot.session->close();
-                        slot.session.reset();
-                    }
-                }
-                locked->schedule_scavenge();
-            }
-            void set_error(std::exception_ptr) && noexcept {}
-            void set_stopped() && noexcept {}
-        };
-        // NOTE: name the sender first; argument order is unspecified.
-        auto sender = async::sleep_after(scavenger.get_executor(), kScavengePeriod);
-        async::start_with_receiver(std::move(sender), ScavengeReceiver{weak_from_this()});
+        // Detached loop on the process-lifetime scope (never stopped or
+        // joined); each wake re-locks and exits on close.
+        async::spawn_detached(run_scavenge(weak_from_this()));
     }
 
     runtime::AsioRuntime &runtime;

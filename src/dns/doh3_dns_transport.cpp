@@ -1,10 +1,9 @@
 #include "quic_dns_transport_internal.hpp"
-
-#include <clash_native/io/exchange_session.hpp>
-#include <clash_native/transport/http_sessions.hpp>
-
 #include <algorithm>
 #include <cctype>
+#include <clash_native/async/detached.hpp>
+#include <clash_native/io/exchange_session.hpp>
+#include <clash_native/transport/http_sessions.hpp>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -83,15 +82,18 @@ void QuicDnsTransport::Operation::submit_http3_exchange(const std::shared_ptr<Ex
     request.response_body_limit = 0xffff;
 
     exchange->http_exchange_started = true;
-    // Guarded emission pump: one exchange task per request, co_awaiting
-    // the io:: sender. The task always ends with a value; on_http3_result
-    // drops late terminals when the exchange is already gone. Cancelled
-    // via the session (close path shuts the stream down).
-    scope_.spawn(run_http3_exchange(shared_from_this(), exchange->id, std::move(request),
-                                    exchange->request.deadline));
+    // Guarded emission pump: one detached exchange task per request,
+    // co_awaiting the io:: sender. The task always ends with a value;
+    // on_http3_result drops late terminals when the exchange is already
+    // gone. Cancelled via the session (close path shuts the stream down).
+    // Detached: the task outlives the exchange it races, and a scope-owned
+    // task self-deletes inside __complete while holding the scope mutex
+    // (async_scope.hpp:162 UAF).
+    async::spawn_detached(run_http3_exchange(shared_from_this(), exchange->id, std::move(request),
+                                             exchange->request.deadline));
 }
 
-exec::task<void>
+stdexec::task<void>
 QuicDnsTransport::Operation::run_http3_exchange(std::shared_ptr<Operation> self, DnsExchangeId id,
                                                 io::ExchangeRequest request,
                                                 std::chrono::steady_clock::time_point deadline) {

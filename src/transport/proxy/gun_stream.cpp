@@ -2,7 +2,6 @@
 
 #include <clash_native/async/callback_sender.hpp>
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
 #include <stdexec/execution.hpp>
 
 #include <boost/asio/buffer.hpp>
@@ -278,8 +277,8 @@ class GunStreamState final : public std::enable_shared_from_this<GunStreamState>
     // and stop settlement poisons so parked reads fail fast either way.
     // Scope-owned (not detached): the state's scope joins the head task so
     // close/abort waits out the exchange instead of leaking it.
-    static exec::task<void> run_resolve_head(std::shared_ptr<GunStreamState> self,
-                                             io::AnySender<io::StreamingExchangeResponse> head) {
+    static stdexec::task<void> run_resolve_head(std::shared_ptr<GunStreamState> self,
+                                                io::AnySender<io::StreamingExchangeResponse> head) {
         try {
             auto response = co_await std::move(head);
             if (response.response.status != 200) {
@@ -480,7 +479,7 @@ class GunStreamState final : public std::enable_shared_from_this<GunStreamState>
     // response body sender (cancellable via stop/abort). Late completions
     // after cancel_receive still drop at the receive_handler_ guard in the
     // caller chain.
-    static exec::task<boost::system::error_code>
+    static stdexec::task<boost::system::error_code>
     read_exact_task(std::shared_ptr<GunStreamState> self,
                     std::shared_ptr<std::vector<std::uint8_t>> buffer, std::size_t offset) {
         while (offset < buffer->size()) {
@@ -514,7 +513,7 @@ class GunStreamState final : public std::enable_shared_from_this<GunStreamState>
             run_read_exact(std::move(self), std::move(buffer), offset, std::move(completion)));
     }
 
-    static exec::task<void>
+    static stdexec::task<void>
     run_read_exact(std::shared_ptr<GunStreamState> self,
                    std::shared_ptr<std::vector<std::uint8_t>> buffer, std::size_t offset,
                    std::function<void(const boost::system::error_code &)> completion) {

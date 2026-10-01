@@ -11,8 +11,7 @@
 #include <clash_native/io/sender.hpp>
 #include <clash_native/runtime/asio_runtime.hpp>
 
-#include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <clash_native/async/detached.hpp>
 
 #include <stdexec/execution.hpp>
 
@@ -35,7 +34,7 @@ inline std::error_code to_std_error(const boost::system::error_code &error) {
 }
 
 // Task-driven hostname resolution shared by the outbounds. The A/AAAA loop
-// is a single exec::task co_awaiting one callback_sender leaf per query
+// is a single stdexec::task co_awaiting one callback_sender leaf per query
 // (registry-pattern resolver stays callback-shaped on purpose); the loop
 // races a 10s timeout via async::with_timeout, timeout surfacing as an
 // in-band Result. No timer member, no async_wait, no bridge_sender.
@@ -62,9 +61,12 @@ class HostResolveState final : public std::enable_shared_from_this<HostResolveSt
             return;
         }
         auto self = shared_from_this();
-        // Resolve loop races a 10s timeout via with_timeout; teardown stays
+        // Resolve loop races a 10s timeout via with_timeout; runs detached
+        // (immortal heap scope): the finished task holds the last state
+        // reference at completion, which would free a member scope_ before
+        // __complete touches scope->__active_ (ASan #194). Teardown stays
         // guard-driven, so no stop is ever requested.
-        scope_.spawn(run_guarded(self));
+        async::spawn_detached(run_guarded(self));
     }
 
     // Abort for sender-driven cancellation: idempotent with finish().
@@ -125,7 +127,7 @@ class HostResolveState final : public std::enable_shared_from_this<HostResolveSt
     // exception mapped to a resolution failure; outer stop cancels both
     // branches. A named function (not an immediately-invoked capturing
     // lambda) builds the task; see docs/async-pitfalls.md.
-    static exec::task<void> run_guarded(std::shared_ptr<HostResolveState> self) {
+    static stdexec::task<void> run_guarded(std::shared_ptr<HostResolveState> self) {
         Result result = Result(
             core::fail({core::ErrorCode::cancelled, "outbound server hostname resolve stopped"}));
         try {
@@ -146,7 +148,7 @@ class HostResolveState final : public std::enable_shared_from_this<HostResolveSt
     // Result; run_guarded funnels it through finish(), so the spawned task
     // always ends with a value unless an outer stop ends it early (whose
     // terminal the erasure delivers).
-    static exec::task<Result> run_resolve(std::shared_ptr<HostResolveState> self) {
+    static stdexec::task<Result> run_resolve(std::shared_ptr<HostResolveState> self) {
         for (const auto type : {dns::DnsRecordType::a, dns::DnsRecordType::aaaa}) {
             core::Result<dns::DnsAnswer> answer;
             try {
@@ -200,8 +202,8 @@ class HostResolveState final : public std::enable_shared_from_this<HostResolveSt
     runtime::AsioRuntime &runtime_;
     std::shared_ptr<dns::ResolverService> resolver_;
     std::string host_;
-    // Owns the single guarded resolve task, which always ends with a value.
-    exec::async_scope scope_;
+    // No member scope: resolve task runs detached (immortal heap scope) so
+    // the last state reference cannot free its scope (#194).
     ResolveHandler handler_;
     std::optional<dns::ResolverService::RequestId> request_id_;
     AddressList addresses_;

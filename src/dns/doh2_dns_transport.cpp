@@ -15,10 +15,9 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
-#include <exec/async_scope.hpp>
-#include <exec/task.hpp>
 #include <memory>
 #include <optional>
+#include <stdexec/execution.hpp>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -130,8 +129,6 @@ class Doh2DnsTransport final : public DnsTransport,
     std::unordered_map<DnsExchangeId, std::shared_ptr<Operation>> operations_;
     std::shared_ptr<Session> session_;
     std::unordered_set<std::uint16_t> active_query_ids_;
-    // Owns per-exchange run() tasks, which always end with a value.
-    exec::async_scope run_scope_;
     DnsExchangeId next_exchange_id_ = 1;
     std::uint16_t next_query_id_ = 1;
     bool stopped_ = false;
@@ -166,7 +163,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     ~Session() {
         // Must not touch strand state here: a posted lambda may still hold
         // `self` (keeping the Session alive past the last owner), and
-        // handlers/anchors are drained on the strand. If this destructor
+        // handlers are drained on the strand. If this destructor
         // runs, no posted lambda is outstanding... except the runtime may
         // already be stopped, in which case posted work never runs and the
         // Session must still release its handlers inline. Guard each.
@@ -184,8 +181,8 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         auto state = std::make_shared<
             std::tuple<io::ExchangeRequest, std::chrono::steady_clock::time_point, bool>>(
             std::move(request), deadline, true);
-        return async::bridge_sender<core::Result<io::ExchangeResponse>>(
-            [self, query_id, state](Handler terminal) mutable {
+        return async::callback_sender<async::BridgeSignatures<core::Result<io::ExchangeResponse>>>(
+            [self, query_id, state](auto terminal) mutable -> async::CallbackAbortFn {
                 if (!std::get<2>(*state)) {
                     terminal(core::fail(cancelled_error()));
                     return async::CallbackAbortFn{};
@@ -225,7 +222,8 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
                         session->fail_pending(query_id, cancelled_error());
                     });
                 }};
-            });
+            },
+            async::BridgeTranslate<core::Result<io::ExchangeResponse>>{});
     }
 
     void cancel(std::uint16_t query_id) noexcept {
@@ -240,8 +238,8 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         post_state([](const std::shared_ptr<Session> &session) {
             // Stop the HTTP/2 session inline (not posted): its read/write
             // pumps run on the stream executor, not this strand, and its
-            // scope_ must not outlive runtime.stop()'s join. fail_all is
-            // strand-side below.
+            // detached tasks must not outlive runtime.stop()'s join. fail_all
+            // is strand-side below.
             if (session->http_session_) {
                 auto http = std::move(session->http_session_);
                 http->stop();
@@ -291,8 +289,7 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         // Per-request deadline task: fires once at the deadline;
         // the map lookup drops it when the exchange already won.
         // Bounded by the deadline, so no stop is ever requested.
-        // Detached (not on scope_): see spawn_detached_deadline.
-        scope_anchor_ = shared_from_this();
+        // Detached: the task holds shared_ptr self.
         spawn_detached_deadline(shared_from_this(), query_id, owned_deadline);
     }
 
@@ -305,10 +302,10 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     }
 
     // Per-request deadline: fires once at the deadline; the map lookup
-    // drops it when the exchange already won. Runs detached (not on
-    // scope_).
-    static exec::task<void> run_deadline(std::shared_ptr<Session> self, std::uint16_t query_id,
-                                         std::chrono::steady_clock::time_point deadline) {
+    // drops it when the exchange already won. Runs detached, holding
+    // shared_ptr self.
+    static stdexec::task<void> run_deadline(std::shared_ptr<Session> self, std::uint16_t query_id,
+                                            std::chrono::steady_clock::time_point deadline) {
         try {
             co_await async::sleep_until(self->runtime_.serialized_executor(), deadline);
         } catch (...) {
@@ -324,8 +321,8 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     }
 
     // Strand-side connect step: runs on the strand; decides the next move
-    // from a snapshot taken on the IO thread. Spawning here keeps scope_
-    // ownership on the strand while the dial/TLS awaits run free.
+    // from a snapshot taken on the IO thread. Spawned detached here; the
+    // task holds shared_ptr self while the dial/TLS awaits run free.
     void on_connect_progress(std::uint64_t generation, ConnectEvent event) {
         if (generation != connection_generation_ || stopped_) {
             if (event.handle) {
@@ -354,7 +351,8 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     // Straight-line connect chain: dial, TLS handshake on IO threads, then
     // hop to the strand for every state decision. The task always ends
     // with a value.
-    static exec::task<void> run_connect(std::shared_ptr<Session> self, std::uint64_t generation) {
+    static stdexec::task<void> run_connect(std::shared_ptr<Session> self,
+                                           std::uint64_t generation) {
         ConnectEvent event;
         try {
             auto opened = co_await self->dialer_->connect_stream(
@@ -415,10 +413,10 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     // One multiplexed exchange: the deadline task may erase the pending
     // first, in which case finish_pending() drops the late terminal. The
     // HTTP await runs on IO threads; the terminal hops to the strand.
-    static exec::task<void> run_exchange(std::shared_ptr<Session> self, std::uint16_t query_id,
-                                         std::shared_ptr<io::ExchangeSession> http_session,
-                                         io::ExchangeRequest request,
-                                         std::chrono::steady_clock::time_point deadline) {
+    static stdexec::task<void> run_exchange(std::shared_ptr<Session> self, std::uint16_t query_id,
+                                            std::shared_ptr<io::ExchangeSession> http_session,
+                                            io::ExchangeRequest request,
+                                            std::chrono::steady_clock::time_point deadline) {
         core::Result<io::ExchangeResponse> result = core::fail(cancelled_error());
         try {
             result = co_await http_session->exchange(std::move(request), deadline);
@@ -442,9 +440,9 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         connecting_ = true;
         const auto generation = connection_generation_;
         const auto self = shared_from_this();
-        // The scope only owns chain tasks (merge-shaped usage); teardown stays
-        // guard-driven, so no stop is ever requested.
-        scope_.spawn(run_connect(self, generation));
+        // Detached: teardown stays guard-driven (generation/stopped_ checks
+        // plus pending-map lookups), so no stop is ever requested.
+        async::spawn_detached(run_connect(self, generation));
     }
 
     void submit_waiting() {
@@ -479,7 +477,8 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
             request = std::move(pending->request);
             deadline = pending->deadline;
         }
-        scope_.spawn(run_exchange(self, query_id, http_session_, std::move(request), deadline));
+        async::spawn_detached(
+            run_exchange(self, query_id, http_session_, std::move(request), deadline));
     }
 
     // Detached deadline via async::spawn_detached.
@@ -500,9 +499,6 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
         // exchange still terminates on its own deadline and its late
         // terminal finds no pending and is dropped.
         auto handler = std::move(pending->handler);
-        if (pending_.empty()) {
-            scope_anchor_.reset();
-        }
         if (handler) {
             handler(core::fail(std::move(error)));
         }
@@ -520,9 +516,6 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
             retired_ = true;
         }
         auto handler = std::move(pending->handler);
-        if (pending_.empty()) {
-            scope_anchor_.reset();
-        }
         if (handler) {
             handler(std::move(result));
         }
@@ -574,15 +567,9 @@ class Doh2DnsTransport::Session final : public std::enable_shared_from_this<Sess
     bool verify_peer_;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
     std::shared_ptr<io::ExchangeSession> http_session_;
-    // Lifetime anchor: tasks spawned on scope_ hold only `self`; finish
-    // paths run continuations inline, which may drop the last owner while
-    // a task still unwinds through __complete. The anchor is released on
-    // the strand after the terminal is delivered. The destructor must not
-    // touch it: a posted lambda may still hold `self` when the last owner
-    // drops, and the lambda runs next on the strand.
-    std::shared_ptr<void> scope_anchor_;
-    // Owns the connect/exchange chain tasks, which always end with a value.
-    exec::async_scope scope_;
+    // Detached tasks (connect/exchange/deadline) hold shared_ptr self and
+    // always end with a value; teardown stays guard-driven via the pending
+    // map and generation checks, so no scope is owned here.
     std::unordered_map<std::uint16_t, std::shared_ptr<Pending>> pending_;
     std::uint64_t connection_generation_ = 0;
     bool connecting_ = false;
@@ -598,12 +585,14 @@ class Doh2DnsTransport::Operation final
         : owner_(owner), exchange_id_(exchange_id), request_(std::move(request)),
           handler_(std::move(handler)) {}
 
-    void start() { owner_.run_scope_.spawn(run(shared_from_this())); }
+    // Detached: the task holds shared_ptr self and always ends with a
+    // value; cancel() stays guard-driven, so no stop is ever requested.
+    void start() { async::spawn_detached(run(shared_from_this())); }
 
     // One multiplexed exchange: build the request, co_await the session
     // sender (deadline enforced inside), validate, and finish exactly
     // once. Always ends with a value; finish() drops late terminals.
-    static exec::task<void> run(std::shared_ptr<Operation> self) {
+    static stdexec::task<void> run(std::shared_ptr<Operation> self) {
         try {
             if (std::chrono::steady_clock::now() >= self->request_.deadline) {
                 self->finish(core::fail(timeout_error()));
@@ -755,9 +744,8 @@ class Doh2DnsTransport::Operation final
 };
 
 std::optional<std::uint16_t> Doh2DnsTransport::next_query_id() noexcept {
-    // Called only from Operation::run's synchronous prefix, which itself
-    // runs on run_scope_'s spawn thread; single exchange per test keeps
-    // this uncontended, but route through the strand for safety.
+    // Called only from Operation::run's synchronous prefix; single exchange
+    // per test keeps this uncontended.
     for (std::size_t attempt = 0; attempt < 0xffff; ++attempt) {
         const auto query_id = next_query_id_++;
         if (next_query_id_ == 0) {
@@ -792,8 +780,8 @@ std::shared_ptr<Doh2DnsTransport::Session> Doh2DnsTransport::session() {
 io::AnySender<DnsExchangeResult> Doh2DnsTransport::exchange(DnsExchangeRequest request) {
     auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
     auto self = shared_from_this();
-    return async::bridge_sender<DnsExchangeResult>(
-        [self, box](async::BridgeHandler<DnsExchangeResult> done) mutable {
+    return async::callback_sender<async::BridgeSignatures<DnsExchangeResult>>(
+        [self, box](auto done) mutable -> async::CallbackAbortFn {
             if (!box || !*box) {
                 done(core::fail(cancelled_error()));
                 return async::CallbackAbortFn{};
@@ -802,7 +790,8 @@ io::AnySender<DnsExchangeResult> Doh2DnsTransport::exchange(DnsExchangeRequest r
             box->reset();
             return async::CallbackAbortFn{
                 [self, exchange_id] { self->cancel_exchange(exchange_id); }};
-        });
+        },
+        async::BridgeTranslate<DnsExchangeResult>{});
 }
 
 DnsExchangeId Doh2DnsTransport::open_exchange(DnsExchangeRequest request, OpenHandler handler) {
@@ -835,8 +824,8 @@ void Doh2DnsTransport::stop() noexcept {
         session->stop();
         // Release the transport's ownership on the strand, after the
         // posted drain runs: dropping it here could destroy the Session
-        // (and its scope_) while a posted lambda still references it.
-        // The lambda holds `self`, so destruction happens after it runs.
+        // while a posted lambda still references it. The lambda holds
+        // `self`, so destruction happens after it runs.
         auto strand = runtime_.serialized_executor();
         boost::asio::post(strand, [session]() mutable { session.reset(); });
         session_.reset();

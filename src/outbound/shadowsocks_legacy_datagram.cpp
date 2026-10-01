@@ -9,8 +9,7 @@
 #include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/shadowsocks/legacy_packet.hpp>
 
-#include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <clash_native/async/detached.hpp>
 
 #include <stdexec/execution.hpp>
 
@@ -78,12 +77,14 @@ class LegacyDatagramState final : public std::enable_shared_from_this<LegacyData
         send_in_progress_ = true;
         return io::AnySender<std::size_t>{async::callback_sender<Signatures>(
             [self, packet, plaintext_size](auto terminal) mutable -> async::CallbackAbortFn {
-                // Single send chain as one task co_awaiting the socket sender;
-                // teardown stays guard-driven, so no stop is ever requested.
+                // Single send chain as one task co_awaiting the socket
+                // sender; runs detached (immortal heap scope) so the last
+                // state reference cannot free a member scope_ (#194).
+                // Teardown stays guard-driven, so no stop is ever requested.
                 // The terminal drops late completions once stop/destroy claims
                 // the callback_sender settlement.
                 SendTerminal done{std::move(terminal)};
-                self->scope_.spawn(
+                async::spawn_detached(
                     run_send(self, std::move(packet), plaintext_size, std::move(done)));
                 return async::CallbackAbortFn{[self] { self->abort(); }};
             },
@@ -117,9 +118,11 @@ class LegacyDatagramState final : public std::enable_shared_from_this<LegacyData
             [self, buffer](auto terminal) mutable -> async::CallbackAbortFn {
                 // Single-pull receive loop as one task: keep pulling from the
                 // socket (dropping off-server packets) until a decodable
-                // datagram lands in the caller's buffer.
+                // datagram lands in the caller's buffer. Runs detached
+                // (immortal heap scope) so the last state reference cannot
+                // free a member scope_ (#194); no stop is ever requested.
                 ReceiveTerminal done{std::move(terminal)};
-                self->scope_.spawn(run_receive(self, buffer, std::move(done)));
+                async::spawn_detached(run_receive(self, buffer, std::move(done)));
                 return async::CallbackAbortFn{[self] { self->abort(); }};
             },
             [](auto receiver, const boost::system::error_code &error, std::size_t size,
@@ -172,9 +175,9 @@ class LegacyDatagramState final : public std::enable_shared_from_this<LegacyData
     }
 
   private:
-    static exec::task<void> run_send(std::shared_ptr<LegacyDatagramState> self,
-                                     std::shared_ptr<std::vector<std::uint8_t>> packet,
-                                     std::size_t plaintext_size, SendTerminal done) {
+    static stdexec::task<void> run_send(std::shared_ptr<LegacyDatagramState> self,
+                                        std::shared_ptr<std::vector<std::uint8_t>> packet,
+                                        std::size_t plaintext_size, SendTerminal done) {
         try {
             // NOTE: name the sender first; argument order is unspecified.
             auto sender = self->socket_->async_send_to(
@@ -192,8 +195,9 @@ class LegacyDatagramState final : public std::enable_shared_from_this<LegacyData
         done({}, plaintext_size);
     }
 
-    static exec::task<void> run_receive(std::shared_ptr<LegacyDatagramState> self,
-                                        boost::asio::mutable_buffer output, ReceiveTerminal done) {
+    static stdexec::task<void> run_receive(std::shared_ptr<LegacyDatagramState> self,
+                                           boost::asio::mutable_buffer output,
+                                           ReceiveTerminal done) {
         for (;;) {
             std::size_t size = 0;
             io::DatagramAddress sender;
@@ -260,8 +264,8 @@ class LegacyDatagramState final : public std::enable_shared_from_this<LegacyData
     std::string method_;
     std::string password_;
     std::array<std::uint8_t, kMaxUdpWireSize> receive_buffer_{};
-    // Owns the single send/receive chain tasks, which always end with a value.
-    exec::async_scope scope_;
+    // No member scope: send/receive chain tasks run detached (immortal heap
+    // scope) so the last state reference cannot free its scope (#194).
     // Single-outstanding guards so concurrent callers fail fast instead of
     // interleaving on the shared codec buffer.
     bool receive_in_progress_ = false;

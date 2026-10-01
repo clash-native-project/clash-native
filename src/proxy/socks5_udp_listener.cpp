@@ -83,7 +83,7 @@ std::optional<boost::asio::ip::udp::endpoint> Socks5UdpListener::endpoint() cons
     return endpoint_;
 }
 
-exec::task<void> Socks5UdpListener::run_receive(std::shared_ptr<Socks5UdpListener> self) {
+stdexec::task<void> Socks5UdpListener::run_receive(std::shared_ptr<Socks5UdpListener> self) {
     // Ingress loop: each datagram routes per path inline; teardown aborts
     // exit quietly while other failures only warn and continue.
     while (!self->stopped_) {
@@ -188,10 +188,10 @@ void Socks5UdpListener::process(std::size_t size, boost::asio::ip::udp::endpoint
     async::spawn_detached(run_route(self, snapshot_, std::move(metadata), std::move(key), client));
 }
 
-exec::task<void> Socks5UdpListener::run_route(std::shared_ptr<Socks5UdpListener> self,
-                                              runtime::RuntimeSnapshotPtr snapshot,
-                                              core::ConnectionMetadata metadata, std::string key,
-                                              boost::asio::ip::udp::endpoint client) {
+stdexec::task<void> Socks5UdpListener::run_route(std::shared_ptr<Socks5UdpListener> self,
+                                                 runtime::RuntimeSnapshotPtr snapshot,
+                                                 core::ConnectionMetadata metadata, std::string key,
+                                                 boost::asio::ip::udp::endpoint client) {
     ProxyServer::RoutedDatagram routed;
     try {
         routed = co_await self->owner_.open_datagram(std::move(snapshot), std::move(metadata));
@@ -243,9 +243,9 @@ exec::task<void> Socks5UdpListener::run_route(std::shared_ptr<Socks5UdpListener>
     }
 }
 
-exec::task<void> Socks5UdpListener::run_send(std::shared_ptr<Socks5UdpListener> self,
-                                             std::shared_ptr<Path> path,
-                                             std::shared_ptr<std::vector<std::uint8_t>> payload) {
+stdexec::task<void>
+Socks5UdpListener::run_send(std::shared_ptr<Socks5UdpListener> self, std::shared_ptr<Path> path,
+                            std::shared_ptr<std::vector<std::uint8_t>> payload) {
     try {
         co_await path->handle->async_send_to(boost::asio::buffer(*payload),
                                              io::DatagramAddress::from_endpoint(path->target));
@@ -264,8 +264,8 @@ exec::task<void> Socks5UdpListener::run_send(std::shared_ptr<Socks5UdpListener> 
     }
 }
 
-exec::task<void> Socks5UdpListener::run_response_loop(std::shared_ptr<Socks5UdpListener> self,
-                                                      std::shared_ptr<Path> path) {
+stdexec::task<void> Socks5UdpListener::run_response_loop(std::shared_ptr<Socks5UdpListener> self,
+                                                         std::shared_ptr<Path> path) {
     // Per-path response loop; teardown aborts exit quietly, other failures
     // warn and retire the path.
     while (!self->stopped_) {
@@ -357,9 +357,9 @@ void Socks5UdpListener::send_response(const std::shared_ptr<Path> &path, io::Dat
     async::spawn_detached(run_respond(self, path, std::move(packet)));
 }
 
-exec::task<void> Socks5UdpListener::run_respond(std::shared_ptr<Socks5UdpListener> self,
-                                                std::shared_ptr<Path> path,
-                                                std::shared_ptr<std::vector<std::uint8_t>> packet) {
+stdexec::task<void>
+Socks5UdpListener::run_respond(std::shared_ptr<Socks5UdpListener> self, std::shared_ptr<Path> path,
+                               std::shared_ptr<std::vector<std::uint8_t>> packet) {
     auto socket = self->socket_;
     if (self->stopped_ || !socket || !packet) {
         co_return;

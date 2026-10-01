@@ -8,7 +8,7 @@
 #include <clash_native/transport/proxy/crypto.hpp>
 #include <clash_native/transport/tls_client.hpp>
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/dispatch.hpp>
@@ -524,7 +524,7 @@ class ShadowTlsOpenOperation final : public std::enable_shared_from_this<ShadowT
 
     void start() { scope_.spawn(run_open(shared_from_this())); }
 
-    static exec::task<void> run_open(std::shared_ptr<ShadowTlsOpenOperation> self) {
+    static stdexec::task<void> run_open(std::shared_ptr<ShadowTlsOpenOperation> self) {
         if (self->options_.version < 1 || self->options_.version > 3) {
             self->finish(core::fail(configuration_error("Shadow-TLS version must be 1, 2, or 3")));
             co_return;

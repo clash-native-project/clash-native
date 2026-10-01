@@ -7,7 +7,7 @@
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
 
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -489,9 +489,9 @@ void GrpcClientCall::start() {
 // tasks over the io:: senders (composable with stop/when_any/timeout);
 // the thin terminal below only maps the native completion back into the
 // legacy on_response callback for the frame pump.
-exec::task<void> GrpcClientCall::run_open(std::shared_ptr<GrpcClientCall> self,
-                                          io::StreamingExchangeRequest request,
-                                          std::chrono::steady_clock::time_point deadline) {
+stdexec::task<void> GrpcClientCall::run_open(std::shared_ptr<GrpcClientCall> self,
+                                             io::StreamingExchangeRequest request,
+                                             std::chrono::steady_clock::time_point deadline) {
     try {
         auto response = co_await self->session_->exchange_streaming(std::move(request), deadline);
         self->on_response(std::move(response));
@@ -703,7 +703,7 @@ void GrpcClientCall::read_response() {
     scope_.spawn(run_body_read(shared_from_this()));
 }
 
-exec::task<void> GrpcClientCall::run_body_read(std::shared_ptr<GrpcClientCall> self) {
+stdexec::task<void> GrpcClientCall::run_body_read(std::shared_ptr<GrpcClientCall> self) {
     try {
         auto pulled =
             co_await self->response_body_->async_read_some(boost::asio::buffer(self->read_buffer_));

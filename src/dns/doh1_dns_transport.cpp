@@ -1,4 +1,5 @@
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/detached.hpp>
 #include <clash_native/async/timer.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
@@ -7,8 +8,7 @@
 #include <clash_native/transport/http_sessions.hpp>
 #include <clash_native/transport/tls_client.hpp>
 
-#include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -153,13 +153,12 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
         }
 
         // Per-request deadline task: fires once at the deadline; finish()
-        // drops it when the exchange already completed. Bounded by the
-        // deadline, so no stop is ever requested.
-        scope_.spawn(run_deadline(shared_from_this(), request_.deadline));
-        // The scope only owns this exchange task (merge-shaped usage);
-        // teardown is guard-driven, so no stop is ever requested: the
-        // request deadline bounds any orphaned chain.
-        scope_.spawn(run(shared_from_this()));
+        // drops it when the exchange already completed. Detached (immortal
+        // heap scope): bounded by the deadline, so no stop is ever requested.
+        async::spawn_detached(run_deadline(shared_from_this(), request_.deadline));
+        // The exchange chain runs detached; teardown is guard-driven, so no
+        // stop is ever requested: the request deadline bounds any orphaned chain.
+        async::spawn_detached(run(shared_from_this()));
     }
 
     void cancel() {
@@ -171,8 +170,8 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     OpenHandler take_handler() { return std::move(handler_); }
 
   private:
-    static exec::task<void> run_deadline(std::shared_ptr<Operation> self,
-                                         std::chrono::steady_clock::time_point deadline) {
+    static stdexec::task<void> run_deadline(std::shared_ptr<Operation> self,
+                                            std::chrono::steady_clock::time_point deadline) {
         try {
             co_await async::sleep_until(self->owner_.runtime_.serialized_executor(), deadline);
         } catch (...) {
@@ -184,7 +183,7 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     // Straight-line exchange chain: dial, TLS handshake, HTTP exchange,
     // response validation. Every terminal funnels through finish(), so the
     // spawned task always ends with a value.
-    static exec::task<void> run(std::shared_ptr<Operation> self) {
+    static stdexec::task<void> run(std::shared_ptr<Operation> self) {
         try {
             const auto endpoint = self->owner_.config_.tcp_endpoint.value_or(
                 boost::asio::ip::tcp::endpoint(self->owner_.config_.endpoint.address(),
@@ -331,16 +330,16 @@ class Doh1DnsTransport::Operation final : public std::enable_shared_from_this<Op
     OpenHandler handler_;
     std::shared_ptr<io::ExchangeSession> http_session_;
     std::string authority_;
-    // Owns the single exchange chain task, which always ends with a value.
-    exec::async_scope scope_;
+    // Detached exchange/deadline chain tasks (immortal heap scope); teardown
+    // is guard-driven via completed_/finish, so no scope is owned here.
     bool completed_ = false;
 };
 
 io::AnySender<DnsExchangeResult> Doh1DnsTransport::exchange(DnsExchangeRequest request) {
     auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
     auto self = shared_from_this();
-    return async::bridge_sender<DnsExchangeResult>(
-        [self, box](async::BridgeHandler<DnsExchangeResult> done) mutable {
+    return async::callback_sender<async::BridgeSignatures<DnsExchangeResult>>(
+        [self, box](auto done) mutable -> async::CallbackAbortFn {
             if (!box || !*box) {
                 done(core::fail(cancelled_error()));
                 return async::CallbackAbortFn{};
@@ -349,7 +348,8 @@ io::AnySender<DnsExchangeResult> Doh1DnsTransport::exchange(DnsExchangeRequest r
             box->reset();
             return async::CallbackAbortFn{
                 [self, exchange_id] { self->cancel_exchange(exchange_id); }};
-        });
+        },
+        async::BridgeTranslate<DnsExchangeResult>{});
 }
 
 DnsExchangeId Doh1DnsTransport::open_exchange(DnsExchangeRequest request, OpenHandler handler) {

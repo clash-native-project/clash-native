@@ -54,10 +54,10 @@ std::shared_ptr<GunClient::TransportEntry> GunClient::pick_transport() {
     return lightest;
 }
 
-exec::task<void> GunClient::run_open(std::shared_ptr<GunClient> client,
-                                     std::shared_ptr<TransportEntry> entry, SessionMaker maker,
-                                     gun::GunStreamOptions options,
-                                     std::shared_ptr<DialGuard> guard, OpenHandler done) {
+stdexec::task<void> GunClient::run_open(std::shared_ptr<GunClient> client,
+                                        std::shared_ptr<TransportEntry> entry, SessionMaker maker,
+                                        gun::GunStreamOptions options,
+                                        std::shared_ptr<DialGuard> guard, OpenHandler done) {
     OpenResult result = core::fail({core::ErrorCode::transport_io, "gun dial failed"});
     try {
         if (!entry->session) {
@@ -83,8 +83,8 @@ exec::task<void> GunClient::run_open(std::shared_ptr<GunClient> client,
             }
             entry->session = std::move(opened);
         }
-        auto stream =
-            co_await async::bridge_sender<OpenResult>([entry, options](OpenHandler open) mutable {
+        auto stream = co_await async::callback_sender<async::BridgeSignatures<OpenResult>>(
+            [entry, options](OpenHandler open) mutable {
                 std::shared_ptr<gun::GunStreamOpenAborter> handle;
                 gun::async_open_gun_stream_abortable(
                     entry->session, options,
@@ -96,7 +96,8 @@ exec::task<void> GunClient::run_open(std::shared_ptr<GunClient> client,
                         handle->abort();
                     }
                 }};
-            });
+            },
+            async::BridgeTranslate<OpenResult>{});
         if (stream) {
             guard->armed = false;
             result = OpenResult{std::unique_ptr<io::StreamHandle>(
@@ -132,20 +133,23 @@ io::AnySender<std::unique_ptr<io::StreamHandle>> GunClient::dial() {
         exec::async_scope scope;
     };
     auto shared = std::make_shared<Shared>();
-    // Linear open chain as a named-function task spawned directly into
-    // the shared scope (the run() shape): ensure the Transport session,
-    // then the Tun stream, and deliver the in-band result through done
-    // exactly once. Failures stay values. The aborter stops the scope so
-    // the run_open awaits settle promptly; the late terminal then drops
-    // at the bridge's first-wins guard.
-    auto bridged = async::bridge_sender<core::Result<std::unique_ptr<io::StreamHandle>>>(
+    // Linear open chain as a named-function task spawned into the shared
+    // scope (the run() shape): ensure the Transport session, then the Tun
+    // stream, and deliver the in-band result through done exactly once.
+    // Failures stay values. The aborter stops the scope so the run_open
+    // awaits settle promptly; the late terminal then drops at the first-wins
+    // guard. The scope dies with the starter captures (never a member), so
+    // no #194 shape.
+    auto bridged = async::callback_sender<
+        async::BridgeSignatures<core::Result<std::unique_ptr<io::StreamHandle>>>>(
         [shared, self, entry, maker = std::move(maker), options = std::move(options), guard](
             async::BridgeHandler<core::Result<std::unique_ptr<io::StreamHandle>>> done) mutable {
             shared->scope.spawn(run_open(self, entry, std::move(maker), std::move(options),
                                          std::move(guard), std::move(done)));
             using AbortFn = async::CallbackAbortFn;
             return AbortFn{[shared] { shared->scope.request_stop(); }};
-        });
+        },
+        async::BridgeTranslate<core::Result<std::unique_ptr<io::StreamHandle>>>{});
     auto sender = std::move(bridged) |
                   stdexec::then([](core::Result<std::unique_ptr<io::StreamHandle>> result) {
                       if (!result) {

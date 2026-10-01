@@ -8,7 +8,6 @@
 #include "transport/builtin_ca_bundle.hpp"
 #include <exec/asio/use_sender.hpp>
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
 
 #include <stdexec/execution.hpp>
 
@@ -1079,7 +1078,8 @@ class TlsClientHandshakeOperationImpl final
         boost::asio::post(executor_, [self, fn = std::forward<Fn>(fn)]() mutable { fn(self); });
     }
 
-    static exec::task<void> run_handshake(std::shared_ptr<TlsClientHandshakeOperationImpl> self) {
+    static stdexec::task<void>
+    run_handshake(std::shared_ptr<TlsClientHandshakeOperationImpl> self) {
         const auto configured = self->configure();
         if (!configured) {
             self->post_state([error = configured.error()](
@@ -1110,9 +1110,9 @@ class TlsClientHandshakeOperationImpl final
         co_await do_handshake(self);
     }
 
-    static exec::task<void> run_deadline(std::shared_ptr<TlsClientHandshakeOperationImpl> self,
-                                         boost::asio::any_io_executor executor,
-                                         std::chrono::steady_clock::time_point deadline) {
+    static stdexec::task<void> run_deadline(std::shared_ptr<TlsClientHandshakeOperationImpl> self,
+                                            boost::asio::any_io_executor executor,
+                                            std::chrono::steady_clock::time_point deadline) {
         try {
             co_await async::sleep_until(executor, deadline);
         } catch (...) {
@@ -1123,7 +1123,7 @@ class TlsClientHandshakeOperationImpl final
         });
     }
 
-    static exec::task<void> do_handshake(std::shared_ptr<TlsClientHandshakeOperationImpl> self) {
+    static stdexec::task<void> do_handshake(std::shared_ptr<TlsClientHandshakeOperationImpl> self) {
         core::Result<TlsClientConnection> result =
             core::fail(handshake_error(boost::asio::error::operation_aborted));
         try {
@@ -1343,19 +1343,22 @@ async_tls_client_handshake(std::unique_ptr<io::StreamHandle> stream, TlsClientOp
     // a second start after the move fails fast instead of hanging.
     auto state = std::make_shared<std::pair<std::unique_ptr<io::StreamHandle>, TlsClientOptions>>(
         std::move(stream), std::move(options));
-    auto bridged = async::bridge_sender<core::Result<TlsClientConnection>>(
-        [state](async::BridgeHandler<core::Result<TlsClientConnection>> terminal) mutable {
-            if (!state->first) {
-                terminal(core::fail(
-                    configuration_error("TLS client handshake stream was already consumed")));
-                return async::CallbackAbortFn{};
-            }
-            auto operation = std::make_shared<detail::TlsClientHandshakeOperationImpl>(
-                std::move(state->first), std::move(state->second), std::move(terminal));
-            operation->start();
-            using AbortFn = async::CallbackAbortFn;
-            return AbortFn{[operation] { operation->cancel(); }};
-        });
+    auto bridged =
+        async::callback_sender<async::BridgeSignatures<core::Result<TlsClientConnection>>>(
+            [state](async::BridgeHandler<core::Result<TlsClientConnection>> terminal) mutable {
+                if (!state->first) {
+                    terminal(core::fail(
+                        configuration_error("TLS client handshake stream was already consumed")));
+                    // Inline completion: nothing to abort.
+                    return async::CallbackAbortFn{};
+                }
+                auto operation = std::make_shared<detail::TlsClientHandshakeOperationImpl>(
+                    std::move(state->first), std::move(state->second), std::move(terminal));
+                operation->start();
+                using AbortFn = async::CallbackAbortFn;
+                return AbortFn{[operation] { operation->cancel(); }};
+            },
+            async::BridgeTranslate<core::Result<TlsClientConnection>>{});
     auto sender = std::move(bridged) | stdexec::then([](core::Result<TlsClientConnection> result) {
                       if (!result) {
                           throw result.error();

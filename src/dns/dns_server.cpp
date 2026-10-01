@@ -1,10 +1,10 @@
-#include <clash_native/dns/dns_codec.hpp>
-#include <clash_native/dns/dns_server.hpp>
-
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
+#include <clash_native/async/detached.hpp>
+#include <clash_native/dns/dns_codec.hpp>
+#include <clash_native/dns/dns_server.hpp>
 
 #include <exec/asio/use_sender.hpp>
 #include <spdlog/spdlog.h>
@@ -195,9 +195,10 @@ void DnsServer::set_fake_ip_store(std::shared_ptr<FakeIpStore> store,
 
 void DnsServer::stop_on_owner() noexcept {
     // Stop the UDP and accept loops first: the in-flight receive/accept
-    // completes stopped and the loops exit without re-arming. In-flight
-    // UDP resolves abort through query_sender stop; socket close below is
-    // retained as the I/O-level abort.
+    // completes stopped and the loops exit without re-arming. Per-query
+    // resolve/send tasks are detached (abort = socket close below, the
+    // I/O-level abort); a resolve that outlives stop runs to completion
+    // and its send drops on the closed socket.
     try {
         udp_scope_.request_stop();
     } catch (...) {
@@ -241,7 +242,7 @@ void DnsServer::receive_udp() {
     udp_scope_.spawn(run_udp_loop(this));
 }
 
-exec::task<void> DnsServer::run_udp_loop(DnsServer *server) {
+stdexec::task<void> DnsServer::run_udp_loop(DnsServer *server) {
     while (server->running_.load(std::memory_order_acquire)) {
         io::DatagramPacket received;
         try {
@@ -264,16 +265,18 @@ exec::task<void> DnsServer::run_udp_loop(DnsServer *server) {
         if (!query) {
             continue;
         }
+        // Detached per-query resolve: abort is the socket close in
+        // stop_on_owner (the send drops on the closed socket); a resolve
+        // that outlives stop runs to completion and drops the same way.
         const auto sender_endpoint =
             boost::asio::ip::udp::endpoint(received.address.address(), received.address.port());
-        server->udp_scope_.spawn(
-            run_udp_resolve(server, std::move(query.value()), sender_endpoint));
+        async::spawn_detached(run_udp_resolve(server, std::move(query.value()), sender_endpoint));
     }
     co_return;
 }
 
-exec::task<void> DnsServer::run_udp_resolve(DnsServer *server, DnsPacket query,
-                                            boost::asio::ip::udp::endpoint sender) {
+stdexec::task<void> DnsServer::run_udp_resolve(DnsServer *server, DnsPacket query,
+                                               boost::asio::ip::udp::endpoint sender) {
     const auto snapshot = server->current_snapshot();
     const auto &fake_store = snapshot ? snapshot->fake_ip_store : server->fake_ip_store_;
     const auto &fake_filter = snapshot ? snapshot->fake_ip_filter : server->fake_ip_filter_;
@@ -306,8 +309,9 @@ exec::task<void> DnsServer::run_udp_resolve(DnsServer *server, DnsPacket query,
     };
     core::Result<DnsPacket> answered = error_response();
     try {
-        // Composable wait: server stop aborts the query await through the
-        // scope, so the task never leaks until the upstream answers.
+        // Upstream await: abort is the socket close in stop_on_owner (see
+        // stop_on_owner); a resolve that outlives stop runs to completion
+        // and its send drops on the closed socket.
         // NOTE: query_sender takes the packet by value; the limit/encode
         // below still need the original, so move a copy.
         answered = co_await query_service->query_sender(query);
@@ -329,14 +333,17 @@ exec::task<void> DnsServer::run_udp_resolve(DnsServer *server, DnsPacket query,
 
 void DnsServer::send_udp_response(boost::asio::ip::udp::endpoint recipient,
                                   std::shared_ptr<std::vector<std::uint8_t>> payload) {
-    // Fire-and-forget send task: completion (sent, failed, stopped) is
-    // terminal by itself, so the task always ends with a value.
-    udp_scope_.spawn(run_udp_send(this, recipient, std::move(payload)));
+    // Fire-and-forget detached send: completion (sent, failed, stopped)
+    // is terminal by itself, so the task always ends with a value. Abort
+    // is the socket close in stop_on_owner; a late send drops on the
+    // closed socket. Detached (not scope-owned): per-query tasks outlive
+    // the loop scope they fan out from (async_scope.hpp:162 UAF).
+    async::spawn_detached(run_udp_send(this, recipient, std::move(payload)));
 }
 
-exec::task<void> DnsServer::run_udp_send(DnsServer *server,
-                                         boost::asio::ip::udp::endpoint recipient,
-                                         std::shared_ptr<std::vector<std::uint8_t>> payload) {
+stdexec::task<void> DnsServer::run_udp_send(DnsServer *server,
+                                            boost::asio::ip::udp::endpoint recipient,
+                                            std::shared_ptr<std::vector<std::uint8_t>> payload) {
     try {
         auto sender = server->udp_socket_.async_send_to(
             boost::asio::buffer(*payload), io::DatagramAddress::from_endpoint(recipient));
@@ -354,7 +361,7 @@ void DnsServer::accept_tcp() {
     accept_scope_.spawn(run_accept_loop(this));
 }
 
-exec::task<void> DnsServer::run_accept_loop(DnsServer *server) {
+stdexec::task<void> DnsServer::run_accept_loop(DnsServer *server) {
     while (server->running_.load(std::memory_order_acquire)) {
         auto socket =
             std::make_shared<boost::asio::ip::tcp::socket>(server->runtime_.serialized_executor());
@@ -379,7 +386,13 @@ DnsServer::TcpConnection::TcpConnection(DnsServer &server,
                                         std::shared_ptr<boost::asio::ip::tcp::socket> socket)
     : server(server), socket(std::move(socket)) {}
 
-void DnsServer::TcpConnection::start() { scope.spawn(run(shared_from_this())); }
+void DnsServer::TcpConnection::start() {
+    // Detached query loop: abort is the socket close in abort()/close()
+    // (the in-flight read/write completes aborted) and late terminals
+    // drop at completed_. Detached (not scope-owned): the connection
+    // outlives the accept scope that created it (async_scope.hpp:162 UAF).
+    async::spawn_detached(run(shared_from_this()));
+}
 
 void DnsServer::TcpConnection::abort() noexcept {
     // Idempotent with close(): mark completed so the loop task bails at
@@ -403,12 +416,11 @@ void DnsServer::TcpConnection::close() noexcept {
     server.tcp_connections_.erase(shared_from_this());
 }
 
-exec::task<void> DnsServer::TcpConnection::run(std::shared_ptr<TcpConnection> self) {
-    // Query loop: length, body, resolve, write back, repeat. Reads and
-    // writes are use_sender awaits composed with the query_sender await:
-    // connection stop (socket close) aborts the wire wait, and query stop
-    // aborts the upstream wait. Every terminal funnels to close(), so the
-    // task always ends with a value and the scope never fails.
+stdexec::task<void> DnsServer::TcpConnection::run(std::shared_ptr<TcpConnection> self) {
+    // Query loop: length, body, resolve, write back, repeat. Connection
+    // stop (socket close) aborts the wire wait; the loop bails at
+    // completed_. Every terminal funnels to close(), so the detached task
+    // always ends with a value.
     try {
         while (!self->completed_) {
             std::array<std::uint8_t, 2> length{};
@@ -471,7 +483,7 @@ exec::task<void> DnsServer::TcpConnection::run(std::shared_ptr<TcpConnection> se
     co_return;
 }
 
-exec::task<core::Result<std::vector<std::uint8_t>>>
+stdexec::task<core::Result<std::vector<std::uint8_t>>>
 DnsServer::TcpConnection::resolve(std::shared_ptr<TcpConnection> self, DnsPacket query) {
     auto &server = self->server;
     const auto snapshot = server.current_snapshot();
@@ -488,8 +500,8 @@ DnsServer::TcpConnection::resolve(std::shared_ptr<TcpConnection> self, DnsPacket
     }
     core::Result<DnsPacket> answered;
     try {
-        // Composable wait: connection stop aborts the socket, query stop
-        // aborts this await; either way the loop bails at completed_.
+        // Upstream await: connection stop closes the socket and the loop
+        // bails at completed_.
         answered = co_await query_service->query_sender(std::move(query));
     } catch (const core::Error &failure) {
         co_return core::Result<std::vector<std::uint8_t>>(core::fail(failure));

@@ -17,7 +17,6 @@
 #include <boost/system/error_code.hpp>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
 #include <stdexec/execution.hpp>
 
 #include <algorithm>
@@ -58,14 +57,18 @@ struct HttpOpResult {
 using HttpOpSigs = stdexec::completion_signatures<stdexec::set_value_t(HttpOpResult),
                                                   stdexec::set_error_t(std::exception_ptr),
                                                   stdexec::set_stopped_t()>;
+// The Beast initiations below stay on callback_sender: their Asio handlers
+// are void-signature/in-band-error (error_code, size) completions that
+// exec::asio::use_sender cannot express, and HttpOpResult must cross in
+// band per docs/async-pitfalls.md:92-95.
 
 // Adapter drive tasks: Beast needs an Asio-style (error, size) handler while
 // the bytes ride sender terminals. Each drive task co_awaits the StreamHandle
 // op (so stop composes) and translates the terminal into the handler in band
 // as an error_code; the spawned task therefore always ends with a value.
 template <typename Handler>
-exec::task<void> run_adapter_read(std::shared_ptr<io::StreamHandle> handle,
-                                  boost::asio::mutable_buffer buffer, Handler handler) {
+stdexec::task<void> run_adapter_read(std::shared_ptr<io::StreamHandle> handle,
+                                     boost::asio::mutable_buffer buffer, Handler handler) {
     try {
         auto count = co_await handle->async_read_some(buffer);
         if (count) {
@@ -80,9 +83,9 @@ exec::task<void> run_adapter_read(std::shared_ptr<io::StreamHandle> handle,
 }
 
 template <typename Handler>
-exec::task<void> run_adapter_write(std::shared_ptr<io::StreamHandle> handle,
-                                   std::shared_ptr<std::vector<std::uint8_t>> bytes,
-                                   Handler handler) {
+stdexec::task<void> run_adapter_write(std::shared_ptr<io::StreamHandle> handle,
+                                      std::shared_ptr<std::vector<std::uint8_t>> bytes,
+                                      Handler handler) {
     try {
         const auto count = co_await handle->async_write(boost::asio::buffer(*bytes));
         (void)bytes;
@@ -910,8 +913,8 @@ class Http1ClientSession final : public io::ExchangeSession,
     // fail_streaming_response; header failures reuse fail_active. The
     // download parks on the pending space signal when the receive queue
     // is full instead of direct repump calls.
-    exec::task<void> run_streaming(std::shared_ptr<Http1ClientSession> self, ExchangeId exchange_id,
-                                   std::shared_ptr<Pending> pending) {
+    stdexec::task<void> run_streaming(std::shared_ptr<Http1ClientSession> self,
+                                      ExchangeId exchange_id, std::shared_ptr<Pending> pending) {
         auto fail_upload = [&](core::Error error) {
             if (self->active_id_ != exchange_id) {
                 return;
@@ -1344,8 +1347,8 @@ class Http1ClientSession final : public io::ExchangeSession,
     // Tunnel handshake as a straight-line coroutine: write the request,
     // skip interim responses, then hand the stream over or deliver the
     // rejection. Same in-band-error discipline as run_buffered.
-    exec::task<void> run_tunnel(std::shared_ptr<Http1ClientSession> self, ExchangeId exchange_id,
-                                std::shared_ptr<Pending> pending) {
+    stdexec::task<void> run_tunnel(std::shared_ptr<Http1ClientSession> self, ExchangeId exchange_id,
+                                   std::shared_ptr<Pending> pending) {
         try {
             const auto *message = std::get_if<HttpTunnelMessage>(&pending->message);
             if (message == nullptr) {
@@ -1484,8 +1487,8 @@ class Http1ClientSession final : public io::ExchangeSession,
     // connection, so no per-exchange stop wiring is needed: the in-flight
     // Beast op aborts on close and the task lands in retire_all, which is
     // idempotent against the maps.
-    exec::task<void> run_buffered(std::shared_ptr<Http1ClientSession> self, ExchangeId exchange_id,
-                                  std::shared_ptr<Pending> pending) {
+    stdexec::task<void> run_buffered(std::shared_ptr<Http1ClientSession> self,
+                                     ExchangeId exchange_id, std::shared_ptr<Pending> pending) {
         try {
             const auto *message = std::get_if<HttpMessage>(&pending->message);
             if (message == nullptr) {
@@ -1551,9 +1554,10 @@ class Http1ClientSession final : public io::ExchangeSession,
     // Per-exchange deadline task: fires once at the deadline; the map
     // lookup + timer_done guard drop it when the exchange already won.
     // Bounded by the deadline, so no stop is ever requested.
-    static exec::task<void> run_deadline(std::shared_ptr<Http1ClientSession> self,
-                                         ExchangeId exchange_id, std::shared_ptr<Pending> pending,
-                                         std::chrono::steady_clock::time_point deadline) {
+    static stdexec::task<void> run_deadline(std::shared_ptr<Http1ClientSession> self,
+                                            ExchangeId exchange_id,
+                                            std::shared_ptr<Pending> pending,
+                                            std::chrono::steady_clock::time_point deadline) {
         auto executor = self->executor_;
         try {
             co_await async::sleep_until(executor, deadline);

@@ -2,7 +2,6 @@
 
 #include <clash_native/async/callback_sender.hpp>
 
-#include <exec/task.hpp>
 #include <exec/when_any.hpp>
 
 #include <boost/asio/any_io_executor.hpp>
@@ -94,9 +93,9 @@ inline auto sleep_until(boost::asio::any_io_executor executor,
 // race as shared_ptr<Result> built inside each winning branch only.
 template <typename Result, stdexec::sender Work, typename TimeoutFactory>
     requires std::is_invocable_r_v<Result, TimeoutFactory &>
-exec::task<Result> with_timeout(boost::asio::any_io_executor executor,
-                                std::chrono::steady_clock::duration timeout, Work work,
-                                TimeoutFactory timeout_factory) {
+stdexec::task<Result> with_timeout(boost::asio::any_io_executor executor,
+                                   std::chrono::steady_clock::duration timeout, Work work,
+                                   TimeoutFactory timeout_factory) {
     auto pointer_race =
         exec::when_any(std::move(work) | stdexec::then([](Result result) {
                            return std::make_shared<Result>(std::move(result));

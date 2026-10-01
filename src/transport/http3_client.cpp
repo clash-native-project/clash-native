@@ -14,7 +14,7 @@
 #include <boost/asio/post.hpp>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <nghttp3/nghttp3.h>
 
@@ -418,9 +418,9 @@ class Http3ClientSession final : public io::ExchangeSession,
         scope_.spawn(run_deadline(shared_from_this(), exchange_id, pending, deadline));
     }
 
-    static exec::task<void> run_deadline(std::shared_ptr<Http3ClientSession> self,
-                                         ExchangeId exchange_id, PendingPtr pending,
-                                         std::chrono::steady_clock::time_point deadline) {
+    static stdexec::task<void> run_deadline(std::shared_ptr<Http3ClientSession> self,
+                                            ExchangeId exchange_id, PendingPtr pending,
+                                            std::chrono::steady_clock::time_point deadline) {
         auto executor = self->executor_;
         try {
             co_await async::sleep_until(executor, deadline);
@@ -629,8 +629,8 @@ class Http3ClientSession final : public io::ExchangeSession,
         scope_.spawn(run_request_body_read(shared_from_this(), pending, stream_id));
     }
 
-    static exec::task<void> run_request_body_read(std::shared_ptr<Http3ClientSession> self,
-                                                  PendingPtr pending, std::int64_t stream_id) {
+    static stdexec::task<void> run_request_body_read(std::shared_ptr<Http3ClientSession> self,
+                                                     PendingPtr pending, std::int64_t stream_id) {
         boost::system::error_code terminal = {};
         std::size_t size = 0;
         try {

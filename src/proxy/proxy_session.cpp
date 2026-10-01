@@ -32,7 +32,7 @@ void ProxySession::start() {
     async::spawn_detached(run_handshake(self));
 }
 
-exec::task<void> ProxySession::run_handshake(std::shared_ptr<ProxySession> self) {
+stdexec::task<void> ProxySession::run_handshake(std::shared_ptr<ProxySession> self) {
     const auto executor = self->client_.get_executor();
     try {
         // Tri-state race: true = handshake done, false = timeout; a
@@ -144,7 +144,7 @@ void ProxySession::open_target(core::Destination destination) {
     async::spawn_detached(run_open_target(self, std::move(metadata), std::move(connection_id)));
 }
 
-exec::task<void> ProxySession::run_open_target(
+stdexec::task<void> ProxySession::run_open_target(
     std::shared_ptr<ProxySession> self, core::ConnectionMetadata metadata,
     std::optional<observability::ConnectionRegistry::ConnectionId> connection_id) {
     core::StreamOpenResult result;

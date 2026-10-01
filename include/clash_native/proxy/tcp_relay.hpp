@@ -11,7 +11,7 @@
 #include <mutex>
 #include <vector>
 
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 namespace clash_native::proxy {
 
@@ -41,22 +41,22 @@ class TcpRelay final : public std::enable_shared_from_this<TcpRelay> {
     // which stays a plain value callback (not a pump). Always terminates
     // with a value so the scope spawn is safe; pump failures surface as
     // early termination and still deliver stats below.
-    static exec::task<void> run(std::shared_ptr<TcpRelay> self,
-                                std::vector<std::uint8_t> initial_left_data);
-    static exec::task<void> join_pumps(std::shared_ptr<TcpRelay> self,
-                                       std::vector<std::uint8_t> initial_left_data);
+    static stdexec::task<void> run(std::shared_ptr<TcpRelay> self,
+                                   std::vector<std::uint8_t> initial_left_data);
+    static stdexec::task<void> join_pumps(std::shared_ptr<TcpRelay> self,
+                                          std::vector<std::uint8_t> initial_left_data);
     // One direction of the relay. Always terminates with a value: clean EOF
     // shuts down the peer send side and returns (the sibling keeps going
     // until its own EOF), failures close the relay to abort the peer
     // promptly and return. Never lets failures escape: an error-terminated
     // branch would unwind the whole race. Cancellation unwinds past the
     // catch and completes stopped.
-    static exec::task<void> pump(std::shared_ptr<TcpRelay> self, bool left_to_right,
-                                 std::vector<std::uint8_t> first_payload);
+    static stdexec::task<void> pump(std::shared_ptr<TcpRelay> self, bool left_to_right,
+                                    std::vector<std::uint8_t> first_payload);
     // Completes once no bytes have flowed for the idle timeout. Recomputes
     // the deadline from the pumps' activity stamps instead of re-arming a
     // callback timer, so the whole relay composes with stop/when_any.
-    static exec::task<void> idle_watchdog(std::shared_ptr<TcpRelay> self);
+    static stdexec::task<void> idle_watchdog(std::shared_ptr<TcpRelay> self);
     void touch();
     void finish() noexcept;
 

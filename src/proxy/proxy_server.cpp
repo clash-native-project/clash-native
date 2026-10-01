@@ -1,5 +1,5 @@
 #include <clash_native/async/callback_sender.hpp>
-#include <clash_native/async/start_with_receiver.hpp>
+#include <clash_native/async/detached.hpp>
 #include <clash_native/net/udp_stream.hpp>
 #include <clash_native/proxy/proxy_server.hpp>
 #include <clash_native/proxy/tcp_relay.hpp>
@@ -56,24 +56,24 @@ core::Error listener_error(std::string_view operation, const boost::system::erro
             std::error_code(error.value(), std::system_category())};
 }
 
-// Detached drain receiver: releases the stop semaphore; errors are
-// impossible here (on_empty only fails on misuse, and the loop swallows
-// its own failures), so terminate rather than hang the stop path. Owns the
-// semaphore: the drain completion can post to the owner strand after
-// stop()'s stack frame is gone (ASan stack-use-after-return), so the
-// semaphore must outlive the call, not borrow it.
-struct DetachedRelease {
-    using receiver_concept = stdexec::receiver_tag;
-    std::shared_ptr<std::binary_semaphore> completed;
-    // NOLINTNEXTLINE(google-explicit-constructor): implicit for start API.
-    DetachedRelease(std::shared_ptr<std::binary_semaphore> done) : completed(std::move(done)) {}
-    void set_value() && noexcept { completed->release(); }
-    void set_error(std::exception_ptr) && noexcept { std::terminate(); }
-    void set_stopped() && noexcept { completed->release(); }
-};
-
+// Drain task: releases the stop semaphore once the accept scope empties.
+// Spawned detached (immortal heap scope): the drain completion can post to
+// the owner strand after stop()'s stack frame is gone (ASan
+// stack-use-after-return), so the semaphore must outlive the call, not
+// borrow it. Never request_stop a detached scope; the accept scope's own
+// stop (from stop_on_owner) ends the loop, this task only observes it.
 } // namespace
 
+stdexec::task<void> ProxyServer::run_drain(ProxyServer *server,
+                                           std::shared_ptr<std::binary_semaphore> completed) {
+    try {
+        co_await server->accept_scope_.on_empty();
+    } catch (...) {
+        // on_empty only fails on misuse and the loop swallows its own
+        // failures; release anyway so stop() cannot hang.
+    }
+    completed->release();
+}
 ProxyServer::ProxyServer(runtime::AsioRuntime &runtime, boost::asio::ip::tcp::endpoint endpoint)
     : runtime_(runtime), acceptor_(runtime.serialized_executor()), endpoint_(endpoint), router_(),
       direct_outbound_(std::make_shared<outbound::DirectOutbound>(runtime)),
@@ -362,14 +362,12 @@ void ProxyServer::stop() noexcept {
     boost::asio::dispatch(runtime_.serialized_executor(), [this, completed] {
         stop_on_owner();
         // The accept loop only exits after its in-flight accept completes
-        // stopped; draining the scope here keeps the spawn's __active_
-        // count alive until the task (and its use_sender op) is destroyed,
-        // instead of racing the ProxyServer destructor at teardown. The
-        // drain runs on the owner strand, and the accept completion posts
-        // back here, so stop only returns once the loop is gone.
-        auto drained =
-            accept_scope_.on_empty() | stdexec::then([completed] { completed->release(); });
-        async::start_with_receiver(std::move(drained), DetachedRelease{completed});
+        // stopped; drain the scope in a detached run_drain task (immortal
+        // heap scope, owns the semaphore) instead of racing the ProxyServer
+        // destructor at teardown. The drain runs on the owner strand, and
+        // the accept completion posts back here, so stop only returns once
+        // the loop is gone.
+        async::spawn_detached(run_drain(this, completed));
     });
     completed->acquire();
 }
@@ -467,7 +465,7 @@ void ProxyServer::accept() {
     accept_scope_.spawn(run_accept_loop(this));
 }
 
-exec::task<void> ProxyServer::run_accept_loop(ProxyServer *server) {
+stdexec::task<void> ProxyServer::run_accept_loop(ProxyServer *server) {
     while (server->running_.load()) {
         auto client =
             std::make_shared<boost::asio::ip::tcp::socket>(server->runtime_.serialized_executor());
@@ -504,7 +502,7 @@ exec::task<void> ProxyServer::run_accept_loop(ProxyServer *server) {
     }
 }
 
-exec::task<core::StreamOpenResult> ProxyServer::open_stream(
+stdexec::task<core::StreamOpenResult> ProxyServer::open_stream(
     core::ConnectionMetadata metadata,
     std::optional<observability::ConnectionRegistry::ConnectionId> connection_id) {
     const auto snapshot = snapshot_store_->load();
@@ -522,7 +520,7 @@ exec::task<core::StreamOpenResult> ProxyServer::open_stream(
     co_return co_await route_stream(*this, snapshot, std::move(metadata), {}, 0, connection_id);
 }
 
-exec::task<core::StreamOpenResult> ProxyServer::route_stream(
+stdexec::task<core::StreamOpenResult> ProxyServer::route_stream(
     ProxyServer &server, runtime::RuntimeSnapshotPtr snapshot, core::ConnectionMetadata metadata,
     router::RoutingContext context, std::size_t start,
     std::optional<observability::ConnectionRegistry::ConnectionId> connection_id) {
@@ -538,11 +536,10 @@ exec::task<core::StreamOpenResult> ProxyServer::route_stream(
     };
     // Resolve leaf: registers the registry request for server stop and
     // unregisters on terminal; the aborter cancels late. callback_sender
-    // (not bridge_sender) because the result must cross as an in-band
-    // value while stop maps to set_stopped.
-    const auto resolve_addresses =
-        [&server, snapshot](std::string host,
-                            dns::DnsRecordType type) -> exec::task<core::Result<dns::DnsAnswer>> {
+    // (bridge_sender removed; unified spelling) because the result must
+    // cross as an in-band value while stop maps to set_stopped.
+    const auto resolve_addresses = [&server, snapshot](std::string host, dns::DnsRecordType type)
+        -> stdexec::task<core::Result<dns::DnsAnswer>> {
         core::Result<dns::DnsAnswer> answer;
         try {
             answer = co_await async::callback_sender<
@@ -613,7 +610,7 @@ exec::task<core::StreamOpenResult> ProxyServer::route_stream(
         }
         const auto dial =
             [&server](std::shared_ptr<core::Outbound> outbound,
-                      core::StreamRequest request) -> exec::task<core::StreamOpenResult> {
+                      core::StreamRequest request) -> stdexec::task<core::StreamOpenResult> {
             try {
                 co_return co_await outbound->connect_stream(std::move(request));
             } catch (const core::Error &failure) {
@@ -681,7 +678,7 @@ exec::task<core::StreamOpenResult> ProxyServer::route_stream(
         }
     }
 }
-exec::task<ProxyServer::RoutedDatagram>
+stdexec::task<ProxyServer::RoutedDatagram>
 ProxyServer::open_datagram(runtime::RuntimeSnapshotPtr snapshot,
                            core::ConnectionMetadata metadata) {
     if (!snapshot) {
@@ -708,7 +705,7 @@ ProxyServer::open_datagram(runtime::RuntimeSnapshotPtr snapshot,
     co_return co_await open_datagram_resolved(*this, std::move(snapshot), std::move(metadata));
 }
 
-exec::task<ProxyServer::RoutedDatagram>
+stdexec::task<ProxyServer::RoutedDatagram>
 ProxyServer::open_datagram_resolved(ProxyServer &server, runtime::RuntimeSnapshotPtr snapshot,
                                     core::ConnectionMetadata metadata) {
     const auto domain = metadata.destination.domain();
@@ -742,7 +739,7 @@ ProxyServer::open_datagram_resolved(ProxyServer &server, runtime::RuntimeSnapsho
                                       std::move(context));
 }
 
-exec::task<ProxyServer::RoutedDatagram>
+stdexec::task<ProxyServer::RoutedDatagram>
 ProxyServer::route_datagram(ProxyServer &server, runtime::RuntimeSnapshotPtr snapshot,
                             core::ConnectionMetadata metadata, router::RoutingContext context) {
     const auto failed = [](core::Error error, boost::asio::ip::udp::endpoint target) {

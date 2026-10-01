@@ -15,9 +15,9 @@
 #include <atomic>
 #include <cstdint>
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
 #include <functional>
 #include <memory>
+#include <stdexec/execution.hpp>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -54,41 +54,40 @@ class DnsServer final {
     boost::asio::ip::tcp::endpoint tcp_endpoint() const noexcept;
 
   private:
-    // One executor-driven TCP connection: owns its socket, query-loop
-    // task, and in-flight query drives. abort() closes the socket (the
-    // in-flight read/write completes aborted) and drops query drives;
-    // close() additionally erases from the server set. Late completions
-    // drop at completed_, never at the server gate.
+    // One executor-driven TCP connection: owns its socket and query-loop
+    // task. abort() closes the socket (the in-flight read/write completes
+    // aborted) and funnels the detached loop task to close(); close()
+    // additionally erases from the server set. Late completions drop at
+    // completed_, never at the server gate.
     struct TcpConnection : public std::enable_shared_from_this<TcpConnection> {
         TcpConnection(DnsServer &server, std::shared_ptr<boost::asio::ip::tcp::socket> socket);
         void start();
         void abort() noexcept;
         void close() noexcept;
         // Query loop: read length, read body, resolve, write back, repeat.
-        // Every terminal funnels through close(), so the task always ends
-        // with a value and the scope never fails.
-        static exec::task<void> run(std::shared_ptr<TcpConnection> self);
-        // Resolve one query through query_sender: stop composes with the
-        // read/write awaits instead of leaking until the upstream answers.
-        static exec::task<core::Result<std::vector<std::uint8_t>>>
+        // Every terminal funnels through close(), so the detached task
+        // always ends with a value.
+        static stdexec::task<void> run(std::shared_ptr<TcpConnection> self);
+        // Resolve one query through query_sender: connection stop aborts
+        // the socket, and the loop bails at completed_.
+        static stdexec::task<core::Result<std::vector<std::uint8_t>>>
         resolve(std::shared_ptr<TcpConnection> self, DnsPacket query);
         DnsServer &server;
         std::shared_ptr<boost::asio::ip::tcp::socket> socket;
-        exec::async_scope scope;
         bool completed_ = false;
     };
 
     void receive_udp();
-    static exec::task<void> run_udp_loop(DnsServer *server);
-    static exec::task<void> run_udp_resolve(DnsServer *server, DnsPacket query,
-                                            boost::asio::ip::udp::endpoint sender);
+    static stdexec::task<void> run_udp_loop(DnsServer *server);
+    static stdexec::task<void> run_udp_resolve(DnsServer *server, DnsPacket query,
+                                               boost::asio::ip::udp::endpoint sender);
     void send_udp_response(boost::asio::ip::udp::endpoint recipient,
                            std::shared_ptr<std::vector<std::uint8_t>> payload);
-    static exec::task<void> run_udp_send(DnsServer *server,
-                                         boost::asio::ip::udp::endpoint recipient,
-                                         std::shared_ptr<std::vector<std::uint8_t>> payload);
+    static stdexec::task<void> run_udp_send(DnsServer *server,
+                                            boost::asio::ip::udp::endpoint recipient,
+                                            std::shared_ptr<std::vector<std::uint8_t>> payload);
     void accept_tcp();
-    static exec::task<void> run_accept_loop(DnsServer *server);
+    static stdexec::task<void> run_accept_loop(DnsServer *server);
     runtime::RuntimeSnapshotPtr current_snapshot() const noexcept;
     void stop_on_owner() noexcept;
 
@@ -103,9 +102,10 @@ class DnsServer final {
     std::array<std::uint8_t, 65535> udp_buffer_{};
     std::atomic_bool running_{false};
     std::unordered_set<std::shared_ptr<TcpConnection>> tcp_connections_;
-    // Owns the UDP pump plus per-query resolve/send tasks. Stop closes the
-    // socket: the in-flight receive completes stopped and the loop exits
-    // without re-arming; in-flight resolves abort through query_sender.
+    // Owns the UDP pump loop task only; per-query resolve/send tasks are
+    // detached (abort = socket close; late sends drop on the closed
+    // socket). Stop requests stop so the in-flight receive completes
+    // stopped and the loop exits without re-arming.
     exec::async_scope udp_scope_;
     // Owns the accept-loop task; stop requests stop so the in-flight accept
     // completes stopped and the loop exits without re-arming.

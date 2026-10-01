@@ -1,4 +1,5 @@
 #include <clash_native/async/callback_sender.hpp>
+#include <clash_native/async/detached.hpp>
 #include <clash_native/async/timer.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/dns/dns_transport.hpp>
@@ -7,8 +8,7 @@
 
 #include <boost/asio/buffer.hpp>
 
-#include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
 #include <array>
@@ -64,8 +64,6 @@ class DotDnsTransport final : public DnsTransport,
     std::unordered_map<DnsExchangeId, std::shared_ptr<Operation>> operations_;
     std::shared_ptr<Session> session_;
     std::unordered_set<std::uint16_t> active_query_ids_;
-    // Owns per-exchange run() tasks, which always end with a value.
-    exec::async_scope run_scope_;
     DnsExchangeId next_exchange_id_ = 1;
     std::uint16_t next_query_id_ = 1;
     bool stopped_ = false;
@@ -93,8 +91,9 @@ class DotDnsTransport::Session final
         auto state = std::make_shared<
             std::tuple<std::vector<std::uint8_t>, std::chrono::steady_clock::time_point, bool>>(
             std::move(query), deadline, true);
-        return async::bridge_sender<core::Result<std::vector<std::uint8_t>>>(
-            [self, query_id, state](Session::Handler terminal) mutable {
+        return async::callback_sender<
+            async::BridgeSignatures<core::Result<std::vector<std::uint8_t>>>>(
+            [self, query_id, state](auto terminal) mutable -> async::CallbackAbortFn {
                 if (!std::get<2>(*state)) {
                     terminal(core::fail(cancelled_error()));
                     return async::CallbackAbortFn{};
@@ -128,11 +127,13 @@ class DotDnsTransport::Session final
                 self->ensure_write_loop();
                 // Per-request deadline task: fires once at the deadline;
                 // the map lookup drops it when the response already won.
-                // Bounded by the deadline, so no stop is ever requested.
-                self->scope_.spawn(run_deadline(self, query_id, deadline));
+                // Detached (immortal heap scope, matching Doh2): bounded by
+                // the deadline, so no stop is ever requested.
+                async::spawn_detached(run_deadline(self, query_id, deadline));
                 return async::CallbackAbortFn{
                     [self, query_id] { self->fail_request(query_id, cancelled_error()); }};
-            });
+            },
+            async::BridgeTranslate<core::Result<std::vector<std::uint8_t>>>{});
     }
 
     void cancel(std::uint16_t query_id) noexcept { fail_request(query_id, cancelled_error()); }
@@ -159,8 +160,8 @@ class DotDnsTransport::Session final
     // Per-request deadline task: fires once at the deadline; the map
     // lookup drops it when the response already won. Bounded by the
     // deadline, so no stop is ever requested.
-    static exec::task<void> run_deadline(std::shared_ptr<Session> self, std::uint16_t query_id,
-                                         std::chrono::steady_clock::time_point deadline) {
+    static stdexec::task<void> run_deadline(std::shared_ptr<Session> self, std::uint16_t query_id,
+                                            std::chrono::steady_clock::time_point deadline) {
         try {
             co_await async::sleep_until(self->runtime_.serialized_executor(), deadline);
         } catch (...) {
@@ -174,7 +175,8 @@ class DotDnsTransport::Session final
     // Straight-line connect chain: dial, TLS handshake, then frame pumps.
     // Every terminal funnels through connection_failed() or the pump
     // starters, so the spawned task always ends with a value.
-    static exec::task<void> run_connect(std::shared_ptr<Session> self, std::uint64_t generation) {
+    static stdexec::task<void> run_connect(std::shared_ptr<Session> self,
+                                           std::uint64_t generation) {
         try {
             auto opened = co_await self->dialer_->connect_stream(
                 {core::Destination::address(self->endpoint_.address(), self->endpoint_.port()),
@@ -219,9 +221,9 @@ class DotDnsTransport::Session final
             self->tls_stream_ = std::move(tls.stream);
             self->connecting_ = false;
             self->connected_ = true;
-            // The scope only owns chain tasks (merge-shaped usage); teardown
-            // stays guard-driven, so no stop is ever requested.
-            self->scope_.spawn(run_read_loop(self, generation));
+            // Detached: teardown stays guard-driven (generation/stopped_
+            // checks plus pending-map lookups), so no stop is ever requested.
+            async::spawn_detached(run_read_loop(self, generation));
             self->ensure_write_loop(generation);
         } catch (...) {
             if (generation == self->connection_generation_ && !self->stopped_) {
@@ -241,9 +243,9 @@ class DotDnsTransport::Session final
         connecting_ = true;
         const auto generation = connection_generation_;
         auto self = shared_from_this();
-        // The scope only owns chain tasks (merge-shaped usage); teardown stays
-        // guard-driven, so no stop is ever requested.
-        scope_.spawn(run_connect(self, generation));
+        // Detached: teardown stays guard-driven (generation/stopped_ checks
+        // plus pending-map lookups), so no stop is ever requested.
+        async::spawn_detached(run_connect(self, generation));
     }
 
     void ensure_write_loop(std::uint64_t generation = 0) {
@@ -255,14 +257,14 @@ class DotDnsTransport::Session final
             return;
         }
         write_in_progress_ = true;
-        scope_.spawn(run_write_loop(shared_from_this(), generation));
+        async::spawn_detached(run_write_loop(shared_from_this(), generation));
     }
 
     // Sequential write pump: drains the queue frame by frame with co_await
     // on the io:: write sender. Ends with a value on every path: normal
     // drain, stale generation, or connection failure.
-    static exec::task<void> run_write_loop(std::shared_ptr<Session> self,
-                                           std::uint64_t generation) {
+    static stdexec::task<void> run_write_loop(std::shared_ptr<Session> self,
+                                              std::uint64_t generation) {
         try {
             while (!self->stopped_ && !self->retired_ &&
                    generation == self->connection_generation_ && self->connected_) {
@@ -314,7 +316,8 @@ class DotDnsTransport::Session final
     // Sequential read pump: length prefix then body with co_await on the
     // io:: read sender, dispatching complete frames in order. Ends with a
     // value on every path; the connection failure path retires the session.
-    static exec::task<void> run_read_loop(std::shared_ptr<Session> self, std::uint64_t generation) {
+    static stdexec::task<void> run_read_loop(std::shared_ptr<Session> self,
+                                             std::uint64_t generation) {
         try {
             while (!self->stopped_ && !self->retired_ &&
                    generation == self->connection_generation_ && self->connected_) {
@@ -372,8 +375,8 @@ class DotDnsTransport::Session final
     // throwing core::Error on EOF or wire failure. Array/vector overloads
     // share one path for the prefix and the body.
     template <typename Buffer>
-    static exec::task<void> read_exact_task(std::shared_ptr<Session> self, std::uint64_t generation,
-                                            Buffer &buffer) {
+    static stdexec::task<void> read_exact_task(std::shared_ptr<Session> self,
+                                               std::uint64_t generation, Buffer &buffer) {
         std::size_t offset = 0;
         const auto total = std::size(buffer);
         auto *data = std::data(buffer);
@@ -487,8 +490,9 @@ class DotDnsTransport::Session final
     bool verify_peer_;
     std::shared_ptr<DnsUpstreamDialer> dialer_;
     std::unique_ptr<io::StreamHandle> tls_stream_;
-    // Owns the connect chain task, which always ends with a value.
-    exec::async_scope scope_;
+    // Connect/read/write tasks run detached, holding shared_ptr self and
+    // always ending with a value; teardown stays guard-driven via the
+    // pending map and generation checks, so no scope is owned here.
     std::unordered_map<std::uint16_t, PendingPtr> pending_;
     std::deque<std::uint16_t> write_queue_;
     std::uint64_t connection_generation_ = 0;
@@ -507,12 +511,14 @@ class DotDnsTransport::Operation final
         : owner_(owner), exchange_id_(exchange_id), request_(std::move(request)),
           handler_(std::move(handler)) {}
 
-    void start() { owner_.run_scope_.spawn(run(shared_from_this())); }
+    // Detached: the task holds shared_ptr self and always ends with a
+    // value; cancel() stays guard-driven, so no stop is ever requested.
+    void start() { async::spawn_detached(run(shared_from_this())); }
 
     // One multiplexed exchange: build the query, co_await the session
     // sender (deadline enforced inside), validate, and finish exactly
     // once. Always ends with a value; finish() drops late terminals.
-    static exec::task<void> run(std::shared_ptr<Operation> self) {
+    static stdexec::task<void> run(std::shared_ptr<Operation> self) {
         try {
             if (std::chrono::steady_clock::now() >= self->request_.deadline) {
                 self->finish(core::fail(timeout_error()));
@@ -662,8 +668,8 @@ std::shared_ptr<DotDnsTransport::Session> DotDnsTransport::session() {
 io::AnySender<DnsExchangeResult> DotDnsTransport::exchange(DnsExchangeRequest request) {
     auto box = std::make_shared<std::optional<DnsExchangeRequest>>(std::move(request));
     auto self = shared_from_this();
-    return async::bridge_sender<DnsExchangeResult>(
-        [self, box](async::BridgeHandler<DnsExchangeResult> done) mutable {
+    return async::callback_sender<async::BridgeSignatures<DnsExchangeResult>>(
+        [self, box](auto done) mutable -> async::CallbackAbortFn {
             if (!box || !*box) {
                 done(core::fail(cancelled_error()));
                 return async::CallbackAbortFn{};
@@ -672,7 +678,8 @@ io::AnySender<DnsExchangeResult> DotDnsTransport::exchange(DnsExchangeRequest re
             box->reset();
             return async::CallbackAbortFn{
                 [self, exchange_id] { self->cancel_exchange(exchange_id); }};
-        });
+        },
+        async::BridgeTranslate<DnsExchangeResult>{});
 }
 
 DnsExchangeId DotDnsTransport::open_exchange(DnsExchangeRequest request, OpenHandler handler) {

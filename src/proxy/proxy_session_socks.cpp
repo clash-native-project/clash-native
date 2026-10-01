@@ -14,7 +14,7 @@
 #include <exec/asio/use_sender.hpp>
 #include <spdlog/spdlog.h>
 
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
 #include <span>
@@ -42,8 +42,8 @@ std::uint8_t socks_error_code(const std::optional<core::Error> &error) {
 // Handshake transport: exact read / full write over the client stream.
 // Transport failures throw; the handshake task maps every failure to
 // close(), matching the old per-step error branches.
-exec::task<void> ProxySession::read_handshake_exact(std::shared_ptr<ProxySession> self,
-                                                    boost::asio::mutable_buffer buffer) {
+stdexec::task<void> ProxySession::read_handshake_exact(std::shared_ptr<ProxySession> self,
+                                                       boost::asio::mutable_buffer buffer) {
     co_await (boost::asio::async_read(self->client_, buffer, exec::asio::use_sender) |
               stdexec::then([](std::size_t) {}) | stdexec::let_error([](std::exception_ptr error) {
                   try {
@@ -57,8 +57,8 @@ exec::task<void> ProxySession::read_handshake_exact(std::shared_ptr<ProxySession
               }));
 }
 
-exec::task<void> ProxySession::write_handshake_all(std::shared_ptr<ProxySession> self,
-                                                   boost::asio::const_buffer buffer) {
+stdexec::task<void> ProxySession::write_handshake_all(std::shared_ptr<ProxySession> self,
+                                                      boost::asio::const_buffer buffer) {
     co_await (boost::asio::async_write(self->client_, buffer, exec::asio::use_sender) |
               stdexec::then([](std::size_t) {}) | stdexec::let_error([](std::exception_ptr error) {
                   try {
@@ -76,7 +76,7 @@ exec::task<void> ProxySession::write_handshake_all(std::shared_ptr<ProxySession>
 // password authentication, request parse. Terminals (target open, UDP
 // association, reply-and-close) stay as methods; every transport failure
 // closes the session, matching the old chain.
-exec::task<void> ProxySession::run_socks5_handshake(std::shared_ptr<ProxySession> self) {
+stdexec::task<void> ProxySession::run_socks5_handshake(std::shared_ptr<ProxySession> self) {
     try {
         co_await read_handshake_exact(self,
                                       boost::asio::buffer(self->method_header_.data() + 1, 1));
@@ -284,7 +284,7 @@ void ProxySession::send_socks_udp_associate_reply(const boost::asio::ip::udp::en
     async::spawn_detached(run_socks_udp_associate_reply(self, endpoint));
 }
 
-exec::task<void>
+stdexec::task<void>
 ProxySession::run_socks_udp_associate_reply(std::shared_ptr<ProxySession> self,
                                             boost::asio::ip::udp::endpoint endpoint) {
     if (self->closed_.load(std::memory_order_acquire)) {
@@ -325,7 +325,7 @@ ProxySession::run_socks_udp_associate_reply(std::shared_ptr<ProxySession> self,
     async::spawn_detached(run_socks_udp_ingress(self));
 }
 
-exec::task<void> ProxySession::run_udp_control(std::shared_ptr<ProxySession> self) {
+stdexec::task<void> ProxySession::run_udp_control(std::shared_ptr<ProxySession> self) {
     // Control-connection watchdog: any byte, EOF, or error closes the
     // association. close() aborts the pull via socket cancel.
     while (!self->closed_.load(std::memory_order_acquire)) {
@@ -344,7 +344,7 @@ exec::task<void> ProxySession::run_udp_control(std::shared_ptr<ProxySession> sel
     }
 }
 
-exec::task<void> ProxySession::run_socks_udp_ingress(std::shared_ptr<ProxySession> self) {
+stdexec::task<void> ProxySession::run_socks_udp_ingress(std::shared_ptr<ProxySession> self) {
     // Datagram ingress loop: filter by the control peer, route per path.
     // Teardown aborts fail as operation_aborted and exit quietly; other
     // failures close the session.
@@ -449,9 +449,10 @@ void ProxySession::process_socks_udp_packet(std::size_t size) {
     async::spawn_detached(run_udp_route(self, udp_snapshot_, std::move(metadata), std::move(key)));
 }
 
-exec::task<void> ProxySession::run_udp_route(std::shared_ptr<ProxySession> self,
-                                             runtime::RuntimeSnapshotPtr snapshot,
-                                             core::ConnectionMetadata metadata, std::string key) {
+stdexec::task<void> ProxySession::run_udp_route(std::shared_ptr<ProxySession> self,
+                                                runtime::RuntimeSnapshotPtr snapshot,
+                                                core::ConnectionMetadata metadata,
+                                                std::string key) {
     ProxyServer::RoutedDatagram routed;
     try {
         routed = co_await self->owner_.open_datagram(std::move(snapshot), std::move(metadata));
@@ -502,9 +503,9 @@ exec::task<void> ProxySession::run_udp_route(std::shared_ptr<ProxySession> self,
     }
 }
 
-exec::task<void> ProxySession::run_udp_send(std::shared_ptr<ProxySession> self,
-                                            std::shared_ptr<UdpPath> path,
-                                            std::shared_ptr<std::vector<std::uint8_t>> payload) {
+stdexec::task<void> ProxySession::run_udp_send(std::shared_ptr<ProxySession> self,
+                                               std::shared_ptr<UdpPath> path,
+                                               std::shared_ptr<std::vector<std::uint8_t>> payload) {
     try {
         co_await path->handle->async_send_to(boost::asio::buffer(*payload),
                                              io::DatagramAddress::from_endpoint(path->target));
@@ -549,8 +550,8 @@ exec::task<void> ProxySession::run_udp_send(std::shared_ptr<ProxySession> self,
     }
 }
 
-exec::task<void> ProxySession::run_udp_response_loop(std::shared_ptr<ProxySession> self,
-                                                     std::shared_ptr<UdpPath> path) {
+stdexec::task<void> ProxySession::run_udp_response_loop(std::shared_ptr<ProxySession> self,
+                                                        std::shared_ptr<UdpPath> path) {
     // Per-path response loop: forward each datagram to the client, re-arm
     // as a task loop. Teardown aborts exit quietly; other failures retire
     // the path.
@@ -630,7 +631,7 @@ void ProxySession::send_socks_udp_response(io::DatagramAddress source,
     async::spawn_detached(run_udp_client_send(self, std::move(packet)));
 }
 
-exec::task<void>
+stdexec::task<void>
 ProxySession::run_udp_client_send(std::shared_ptr<ProxySession> self,
                                   std::shared_ptr<std::vector<std::uint8_t>> packet) {
     if (self->closed_.load(std::memory_order_acquire) || !self->udp_client_endpoint_ ||
@@ -653,8 +654,8 @@ void ProxySession::send_socks_reply(std::uint8_t reply, bool start_relay) {
     async::spawn_detached(run_socks_reply(self, reply, start_relay));
 }
 
-exec::task<void> ProxySession::run_socks_reply(std::shared_ptr<ProxySession> self,
-                                               std::uint8_t reply, bool start_relay) {
+stdexec::task<void> ProxySession::run_socks_reply(std::shared_ptr<ProxySession> self,
+                                                  std::uint8_t reply, bool start_relay) {
     if (self->closed_.load(std::memory_order_acquire)) {
         co_return;
     }

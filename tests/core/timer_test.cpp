@@ -14,7 +14,7 @@
 #include <boost/asio/io_context.hpp>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include "async_test_helpers.hpp"
 

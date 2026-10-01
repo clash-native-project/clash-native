@@ -42,13 +42,13 @@ void ProxySession::read_http_headers() {
     async::spawn_detached(run_http_headers(self));
 }
 
-exec::task<void> ProxySession::run_http_headers(std::shared_ptr<ProxySession> self) {
+stdexec::task<void> ProxySession::run_http_headers(std::shared_ptr<ProxySession> self) {
     self->http_request_parser_ = std::make_shared<ProxyRequestBodyStream::Parser>();
     self->http_request_parser_->header_limit(64 * 1024);
     self->http_request_parser_->body_limit((std::numeric_limits<std::uint64_t>::max)());
     self->http_request_parser_->merge_all_trailers(true);
-    // Beast header read is a handler-shaped initiation by design; the leaf
-    // stays a callback_sender while this task drives the chain inline.
+    // Beast header leaf stays callback_sender: HttpOpResult carries the error in-band, which
+    // use_sender cannot express (docs/async-pitfalls.md:92-95).
     HttpOpResult header{};
     try {
         header = co_await async::callback_sender<HttpOpSignatures>(
@@ -156,8 +156,8 @@ void ProxySession::send_http_auth_response(bool missing, bool keep_alive) {
     async::spawn_detached(run_http_auth_response(self, missing, keep_alive));
 }
 
-exec::task<void> ProxySession::run_http_auth_response(std::shared_ptr<ProxySession> self,
-                                                      bool missing, bool keep_alive) {
+stdexec::task<void> ProxySession::run_http_auth_response(std::shared_ptr<ProxySession> self,
+                                                         bool missing, bool keep_alive) {
     if (self->closed_.load(std::memory_order_acquire)) {
         co_return;
     }
@@ -358,7 +358,7 @@ void ProxySession::start_http_upgrade_exchange() {
     async::spawn_detached(run_http_upgrade_exchange(self));
 }
 
-exec::task<void> ProxySession::run_http_upgrade_exchange(std::shared_ptr<ProxySession> self) {
+stdexec::task<void> ProxySession::run_http_upgrade_exchange(std::shared_ptr<ProxySession> self) {
     self->http_tunnel_session_ = transport::make_http1_exchange_session(std::move(self->remote_));
     if (!self->http_tunnel_session_) {
         self->send_http_forward_response(502, "Bad Gateway");
@@ -385,7 +385,7 @@ void ProxySession::start_http_forward_exchange() {
     async::spawn_detached(run_http_forward_exchange(self));
 }
 
-exec::task<void> ProxySession::run_http_forward_exchange(std::shared_ptr<ProxySession> self) {
+stdexec::task<void> ProxySession::run_http_forward_exchange(std::shared_ptr<ProxySession> self) {
     self->http_session_ = transport::make_http1_exchange_session(std::move(self->remote_));
     if (!self->http_session_) {
         self->send_http_forward_response(502, "Bad Gateway");
@@ -407,9 +407,9 @@ exec::task<void> ProxySession::run_http_forward_exchange(std::shared_ptr<ProxySe
     async::spawn_detached(run_http_forward_response(self, std::move(result)));
 }
 
-exec::task<void> ProxySession::run_client_write_then_open(std::shared_ptr<ProxySession> self,
-                                                          std::string payload,
-                                                          core::Destination destination) {
+stdexec::task<void> ProxySession::run_client_write_then_open(std::shared_ptr<ProxySession> self,
+                                                             std::string payload,
+                                                             core::Destination destination) {
     try {
         co_await write_handshake_all(self, boost::asio::buffer(payload));
     } catch (...) {
@@ -418,7 +418,7 @@ exec::task<void> ProxySession::run_client_write_then_open(std::shared_ptr<ProxyS
     }
     self->open_http_forward_target(std::move(destination));
 }
-exec::task<void>
+stdexec::task<void>
 ProxySession::run_http_upgrade_response(std::shared_ptr<ProxySession> self,
                                         core::Result<io::StreamUpgradeResponse> result) {
     if (self->closed_.load(std::memory_order_acquire)) {
@@ -457,7 +457,7 @@ ProxySession::run_http_upgrade_response(std::shared_ptr<ProxySession> self,
     self->start_relay();
 }
 
-exec::task<void>
+stdexec::task<void>
 ProxySession::run_http_forward_response(std::shared_ptr<ProxySession> self,
                                         core::Result<io::StreamingExchangeResponse> result) {
     if (self->closed_.load(std::memory_order_acquire)) {
@@ -572,7 +572,7 @@ std::string ProxySession::build_http_forward_response_headers(const io::Exchange
     return output;
 }
 
-exec::task<void> ProxySession::run_http_forward_body(std::shared_ptr<ProxySession> self) {
+stdexec::task<void> ProxySession::run_http_forward_body(std::shared_ptr<ProxySession> self) {
     // Chunked download loop: pull from the upstream body, frame as chunk,
     // write to the client, all inline. EOF writes trailers; stop aborts
     // both pulls via close() and exits.
@@ -638,7 +638,7 @@ exec::task<void> ProxySession::run_http_forward_body(std::shared_ptr<ProxySessio
     }
 }
 
-exec::task<void> ProxySession::write_http_forward_trailers(std::shared_ptr<ProxySession> self) {
+stdexec::task<void> ProxySession::write_http_forward_trailers(std::shared_ptr<ProxySession> self) {
     if (self->closed_.load(std::memory_order_acquire)) {
         co_return;
     }
@@ -732,10 +732,10 @@ void ProxySession::send_http_forward_response(int status, std::string_view reaso
                                                          std::string(extra_headers), keep_alive));
 }
 
-exec::task<void> ProxySession::run_http_forward_response_send(std::shared_ptr<ProxySession> self,
-                                                              int status, std::string reason,
-                                                              std::string extra_headers,
-                                                              bool keep_alive) {
+stdexec::task<void> ProxySession::run_http_forward_response_send(std::shared_ptr<ProxySession> self,
+                                                                 int status, std::string reason,
+                                                                 std::string extra_headers,
+                                                                 bool keep_alive) {
     if (self->closed_.load(std::memory_order_acquire)) {
         co_return;
     }
@@ -764,8 +764,8 @@ void ProxySession::send_http_response(int status, std::string_view reason, bool 
     async::spawn_detached(run_http_response(self, status, std::string(reason), start_relay));
 }
 
-exec::task<void> ProxySession::run_http_response(std::shared_ptr<ProxySession> self, int status,
-                                                 std::string reason, bool start_relay) {
+stdexec::task<void> ProxySession::run_http_response(std::shared_ptr<ProxySession> self, int status,
+                                                    std::string reason, bool start_relay) {
     if (self->closed_.load(std::memory_order_acquire)) {
         co_return;
     }

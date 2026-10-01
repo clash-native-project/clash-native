@@ -2,7 +2,7 @@
 
 #include <clash_native/dns/dns_codec.hpp>
 
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
 #include <limits>
@@ -70,7 +70,7 @@ class AddressResolver::Operation final
     // CNAME chain as one task: co_await each query_sender in turn and
     // follow CNAME targets inline. The task always ends with a value and
     // finish() drops late terminals on the completed_ guard.
-    static exec::task<void> run(std::shared_ptr<Operation> self) {
+    static stdexec::task<void> run(std::shared_ptr<Operation> self) {
         while (!self->completed_ && !self->cancel_requested_.load(std::memory_order_acquire)) {
             DnsPacket packet = make_query_packet(self->current_question_);
             core::Result<DnsPacket> result = core::fail(cancelled_error());

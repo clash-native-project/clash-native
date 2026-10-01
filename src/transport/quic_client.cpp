@@ -7,7 +7,6 @@
 #include <clash_native/net/stream_handle_adapter.hpp>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
 
 #include "transport/builtin_ca_bundle.hpp"
 
@@ -802,7 +801,7 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
     // UDP receive loop as a task: each pull is co_awaited directly on the
     // datagram sender (cancellable on retire/fail); thin ngtcp2 boundary is
     // process_datagram below (no sender wrapping of the C engine).
-    static exec::task<void> run_receive_loop(std::shared_ptr<Impl> self) {
+    static stdexec::task<void> run_receive_loop(std::shared_ptr<Impl> self) {
         auto buffer = std::make_shared<ReceiveBuffer>();
         while (!self->retired_) {
             io::DatagramPacket packet{0, {}};
@@ -1105,7 +1104,7 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
 
     // UDP send loop as a task: each send is co_awaited directly on the
     // datagram sender (cancellable on retire/fail via datagram cancel).
-    static exec::task<void> run_send_loop(std::shared_ptr<Impl> self) {
+    static stdexec::task<void> run_send_loop(std::shared_ptr<Impl> self) {
         while (!self->retired_) {
             if (self->outgoing_.empty() || !self->datagram_) {
                 try {
@@ -1163,7 +1162,7 @@ class QuicClientConnection::Impl final : public std::enable_shared_from_this<Imp
 
     // ngtcp2 expiry loop: the wait is sleep_after (sender), not a
     // steady_timer.async_wait leaf; handle_expiry stays a thin C call.
-    static exec::task<void> run_expiry_loop(std::shared_ptr<Impl> self) {
+    static stdexec::task<void> run_expiry_loop(std::shared_ptr<Impl> self) {
         while (!self->retired_ && self->connection_ != nullptr) {
             const auto expiry = ngtcp2_conn_get_expiry2(self->connection_);
             if (expiry == std::numeric_limits<ngtcp2_tstamp>::max()) {

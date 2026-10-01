@@ -17,7 +17,7 @@
 #include <boost/asio/ssl/context.hpp>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -27,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <semaphore>
 #include <set>
 #include <string>
 #include <string_view>
@@ -104,25 +105,27 @@ class ProxyServer {
     };
 
     void accept();
-    static exec::task<void> run_accept_loop(ProxyServer *server);
+    static stdexec::task<void> run_accept_loop(ProxyServer *server);
+    static stdexec::task<void> run_drain(ProxyServer *server,
+                                         std::shared_ptr<std::binary_semaphore> completed);
     core::Status start_socks5_udp_listener();
-    exec::task<core::StreamOpenResult>
+    stdexec::task<core::StreamOpenResult>
     open_stream(core::ConnectionMetadata metadata,
                 std::optional<observability::ConnectionRegistry::ConnectionId> connection_id);
-    static exec::task<core::StreamOpenResult>
+    static stdexec::task<core::StreamOpenResult>
     route_stream(ProxyServer &server, runtime::RuntimeSnapshotPtr snapshot,
                  core::ConnectionMetadata metadata, router::RoutingContext context,
                  std::size_t start,
                  std::optional<observability::ConnectionRegistry::ConnectionId> connection_id);
-    exec::task<RoutedDatagram> open_datagram(runtime::RuntimeSnapshotPtr snapshot,
-                                             core::ConnectionMetadata metadata);
-    static exec::task<RoutedDatagram> open_datagram_resolved(ProxyServer &server,
-                                                             runtime::RuntimeSnapshotPtr snapshot,
-                                                             core::ConnectionMetadata metadata);
-    static exec::task<RoutedDatagram> route_datagram(ProxyServer &server,
-                                                     runtime::RuntimeSnapshotPtr snapshot,
-                                                     core::ConnectionMetadata metadata,
-                                                     router::RoutingContext context);
+    stdexec::task<RoutedDatagram> open_datagram(runtime::RuntimeSnapshotPtr snapshot,
+                                                core::ConnectionMetadata metadata);
+    static stdexec::task<RoutedDatagram>
+    open_datagram_resolved(ProxyServer &server, runtime::RuntimeSnapshotPtr snapshot,
+                           core::ConnectionMetadata metadata);
+    static stdexec::task<RoutedDatagram> route_datagram(ProxyServer &server,
+                                                        runtime::RuntimeSnapshotPtr snapshot,
+                                                        core::ConnectionMetadata metadata,
+                                                        router::RoutingContext context);
     void stop_on_owner() noexcept;
     void remove_session(const SessionPtr &session) noexcept;
 

@@ -9,7 +9,7 @@
 #include <clash_native/io/sender.hpp>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <atomic>
 #include <chrono>

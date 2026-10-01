@@ -15,7 +15,7 @@
 #include <boost/asio/write.hpp>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <nghttp2/nghttp2.h>
 
@@ -181,8 +181,8 @@ class Http2ClientSession final : public io::ExchangeSession,
         scope_.spawn(run_ping(shared_from_this(), ping_generation_));
     }
 
-    static exec::task<void> run_ping(std::shared_ptr<Http2ClientSession> self,
-                                     std::uint64_t generation) {
+    static stdexec::task<void> run_ping(std::shared_ptr<Http2ClientSession> self,
+                                        std::uint64_t generation) {
         auto executor = self->executor_;
         auto interval = self->ping_interval_;
         try {
@@ -233,9 +233,9 @@ class Http2ClientSession final : public io::ExchangeSession,
         async::spawn_detached(run_deadline(shared_from_this(), exchange_id, pending, deadline));
     }
 
-    static exec::task<void> run_deadline(std::shared_ptr<Http2ClientSession> self,
-                                         ExchangeId exchange_id, PendingPtr pending,
-                                         std::chrono::steady_clock::time_point deadline) {
+    static stdexec::task<void> run_deadline(std::shared_ptr<Http2ClientSession> self,
+                                            ExchangeId exchange_id, PendingPtr pending,
+                                            std::chrono::steady_clock::time_point deadline) {
         auto executor = self->executor_;
         try {
             co_await async::sleep_until(executor, deadline);
@@ -783,8 +783,8 @@ class Http2ClientSession final : public io::ExchangeSession,
         return std::nullopt;
     }
 
-    static exec::task<void> run_request_body_read(std::shared_ptr<Http2ClientSession> self,
-                                                  PendingPtr pending, std::int32_t stream_id) {
+    static stdexec::task<void> run_request_body_read(std::shared_ptr<Http2ClientSession> self,
+                                                     PendingPtr pending, std::int32_t stream_id) {
         boost::system::error_code terminal = {};
         std::size_t size = 0;
         try {

@@ -8,7 +8,7 @@
 #include <clash_native/async/callback_sender.hpp>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -99,10 +99,10 @@ class GunClient final : public std::enable_shared_from_this<GunClient> {
     using OpenResult = core::Result<std::unique_ptr<io::StreamHandle>>;
     using OpenHandler = async::BridgeHandler<OpenResult>;
 
-    static exec::task<void> run_open(std::shared_ptr<GunClient> client,
-                                     std::shared_ptr<TransportEntry> entry, SessionMaker maker,
-                                     gun::GunStreamOptions options,
-                                     std::shared_ptr<DialGuard> guard, OpenHandler done);
+    static stdexec::task<void> run_open(std::shared_ptr<GunClient> client,
+                                        std::shared_ptr<TransportEntry> entry, SessionMaker maker,
+                                        gun::GunStreamOptions options,
+                                        std::shared_ptr<DialGuard> guard, OpenHandler done);
 
     GunClientOptions options_;
     SessionMaker maker_;

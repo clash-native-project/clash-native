@@ -14,9 +14,8 @@
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
 
+#include <clash_native/async/detached.hpp>
 #include <exec/asio/use_sender.hpp>
-#include <exec/async_scope.hpp>
-#include <exec/task.hpp>
 
 #include <stdexec/execution.hpp>
 
@@ -122,12 +121,18 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
         }
         deadline_ = std::chrono::steady_clock::now() + kConnectTimeout;
         auto self = shared_from_this();
-        scope_.spawn(run_guarded(self));
+        // Guarded open races a 15s timeout via with_timeout; runs detached
+        // (immortal heap scope): the finished task holds the last state
+        // reference at completion, which would free a member scope_ before
+        // __complete touches scope->__active_ (ASan #194). Teardown stays
+        // guard-driven plus socket/session abort; no request_stop on a
+        // detached scope.
+        async::spawn_detached(run_guarded(self));
     }
     // Abort for sender-driven cancellation: posted to the strand so it stays
     // ordered with finish(). Marks completion so the chain task bails at its
-    // next guard and stops the scope so stop propagates into the awaits;
-    // the callback_sender settlement drops the late terminal.
+    // next guard; abort closes the socket/session (no request_stop: the task
+    // runs detached); the callback_sender settlement drops the late terminal.
     void abort() noexcept {
         auto self = shared_from_this();
         try {
@@ -138,7 +143,9 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
                     return;
                 }
                 self->completed_ = true;
-                self->scope_.request_stop();
+                // No request_stop: detached tasks have no shared scope to
+                // stop; closing the socket/session aborts the open chain, and
+                // the timeout branch drops inside with_timeout.
                 boost::system::error_code ignored;
                 if (self->socket_) {
                     self->socket_->cancel(ignored);
@@ -174,7 +181,7 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
     // handshake, HTTP session, CONNECT tunnel. Every terminal returns a
     // Result; run_guarded funnels it through finish(), so the spawned task
     // always ends with a value unless an outer stop ends it early.
-    static exec::task<core::StreamOpenResult>
+    static stdexec::task<core::StreamOpenResult>
     run_work(std::shared_ptr<HttpProxyConnectState> self) {
         core::Result<detail::AddressList> resolved;
         try {
@@ -322,7 +329,7 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
     // a transport_io failure; outer stop cancels both branches. A named
     // function (not an immediately-invoked capturing lambda) builds the
     // task; see docs/async-pitfalls.md.
-    static exec::task<void> run_guarded(std::shared_ptr<HttpProxyConnectState> self) {
+    static stdexec::task<void> run_guarded(std::shared_ptr<HttpProxyConnectState> self) {
         core::StreamOpenResult result = core::StreamOpenResult::failed(
             {core::ErrorCode::cancelled, "HTTP proxy connect stopped"});
         try {
@@ -370,8 +377,8 @@ class HttpProxyConnectState final : public std::enable_shared_from_this<HttpProx
     core::StreamRequest request_;
     std::shared_ptr<boost::asio::ip::tcp::socket> socket_;
     std::shared_ptr<io::ExchangeSession> session_;
-    // Owns the single guarded connect task, which always ends with a value.
-    exec::async_scope scope_;
+    // No member scope: connect task runs detached (immortal heap scope) so
+    // the last state reference cannot free its scope (#194).
     core::StreamOpenHandler handler_;
     // Absolute budget still feeding the TLS and tunnel sub-operations.
     std::chrono::steady_clock::time_point deadline_{};

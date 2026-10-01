@@ -1,11 +1,10 @@
+#include <clash_native/async/detached.hpp>
 #include <clash_native/async/oneshot.hpp>
 #include <clash_native/async/timer.hpp>
 #include <clash_native/dns/bootstrap_resolver.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 
 #include <exec/asio/use_sender.hpp>
-#include <exec/async_scope.hpp>
-#include <exec/task.hpp>
 
 #include <stdexec/execution.hpp>
 
@@ -64,8 +63,8 @@ class SystemBootstrapResolver final : public BootstrapResolver,
             return request_id;
         }
         auto self = shared_from_this();
-        scope_.spawn(run(self, request_id));
-        scope_.spawn(run_deadline(self, request_id, deadline));
+        async::spawn_detached(run(self, request_id));
+        async::spawn_detached(run_deadline(self, request_id, deadline));
         return request_id;
     }
 
@@ -99,8 +98,8 @@ class SystemBootstrapResolver final : public BootstrapResolver,
     // Straight-line resolve chain. Always ends with a value: every terminal
     // funnels through complete(), and a stop-cancelled await ends the task
     // silently after stop() already delivered the terminal.
-    static exec::task<void> run(std::shared_ptr<SystemBootstrapResolver> self,
-                                RequestId request_id) {
+    static stdexec::task<void> run(std::shared_ptr<SystemBootstrapResolver> self,
+                                   RequestId request_id) {
         std::string hostname;
         {
             const auto found = self->requests_.find(request_id);
@@ -138,9 +137,9 @@ class SystemBootstrapResolver final : public BootstrapResolver,
     // Deadline task: fires once at the deadline; the map lookup drops it
     // when the resolve already won. Bounded by the deadline, so no stop is
     // ever requested.
-    static exec::task<void> run_deadline(std::shared_ptr<SystemBootstrapResolver> self,
-                                         RequestId request_id,
-                                         std::chrono::steady_clock::time_point deadline) {
+    static stdexec::task<void> run_deadline(std::shared_ptr<SystemBootstrapResolver> self,
+                                            RequestId request_id,
+                                            std::chrono::steady_clock::time_point deadline) {
         try {
             co_await async::sleep_until(self->runtime_.serialized_executor(), deadline);
         } catch (...) {
@@ -168,7 +167,6 @@ class SystemBootstrapResolver final : public BootstrapResolver,
 
     runtime::AsioRuntime &runtime_;
     boost::asio::ip::tcp::resolver resolver_;
-    exec::async_scope scope_;
     std::unordered_map<RequestId, std::shared_ptr<Request>> requests_;
     RequestId next_request_id_ = 1;
     bool stopped_ = false;
@@ -232,8 +230,8 @@ class DnsBootstrapResolver final : public BootstrapResolver,
         request->servers = merge_servers(configured_servers_);
         requests_.emplace(request_id, request);
         auto self = shared_from_this();
-        scope_.spawn(run(self, request_id));
-        scope_.spawn(run_deadline(self, request_id, request));
+        async::spawn_detached(run(self, request_id));
+        async::spawn_detached(run_deadline(self, request_id, request));
         return request_id;
     }
 
@@ -304,7 +302,8 @@ class DnsBootstrapResolver final : public BootstrapResolver,
     // Driver task: UDP servers in order, then the system fallback. Progression
     // stays in this one task; the deadline tasks only set flags and close the
     // socket to wake it. Always ends with a value.
-    static exec::task<void> run(std::shared_ptr<DnsBootstrapResolver> self, RequestId request_id) {
+    static stdexec::task<void> run(std::shared_ptr<DnsBootstrapResolver> self,
+                                   RequestId request_id) {
         const auto found = self->requests_.find(request_id);
         if (found == self->requests_.end()) {
             co_return;
@@ -339,9 +338,10 @@ class DnsBootstrapResolver final : public BootstrapResolver,
 
     // One server: A then AAAA, accumulating addresses. Any failure or expiry
     // moves to the next server; a completed request (or stop) ends the drive.
-    static exec::task<ServerStep> run_server(std::shared_ptr<DnsBootstrapResolver> self,
-                                             RequestId request_id, std::shared_ptr<Request> request,
-                                             DnsServerEndpoint endpoint) {
+    static stdexec::task<ServerStep> run_server(std::shared_ptr<DnsBootstrapResolver> self,
+                                                RequestId request_id,
+                                                std::shared_ptr<Request> request,
+                                                DnsServerEndpoint endpoint) {
         auto socket =
             std::make_shared<boost::asio::ip::udp::socket>(self->runtime_.serialized_executor());
         boost::system::error_code error;
@@ -365,7 +365,7 @@ class DnsBootstrapResolver final : public BootstrapResolver,
             (request->deadline - now) /
             static_cast<std::int64_t>(remaining_servers > 0 ? remaining_servers : 1);
         const auto server_deadline = std::min(request->deadline, now + server_budget);
-        self->scope_.spawn(
+        async::spawn_detached(
             run_server_deadline(self, request_id, request, socket, attempt, server_deadline));
 
         for (int query_index = 0; query_index < 2; ++query_index) {
@@ -453,8 +453,8 @@ class DnsBootstrapResolver final : public BootstrapResolver,
     // channel (the sender is shared so the copyable Handler can hold it).
     // The system resolver's own deadline bounds the wait; cancel() aborts it
     // and its send wakes this task to drop.
-    static exec::task<void> run_system(std::shared_ptr<DnsBootstrapResolver> self,
-                                       RequestId request_id, std::shared_ptr<Request> request) {
+    static stdexec::task<void> run_system(std::shared_ptr<DnsBootstrapResolver> self,
+                                          RequestId request_id, std::shared_ptr<Request> request) {
         request->in_system = true;
         if (request->completed || self->stopped_) {
             co_return;
@@ -484,7 +484,7 @@ class DnsBootstrapResolver final : public BootstrapResolver,
     // Per-server budget task: marks the server expired and closes its socket
     // to wake the driver. Stale firings (a newer attempt is driving) drop via
     // the attempt check. Bounded by the server deadline; never stopped.
-    static exec::task<void>
+    static stdexec::task<void>
     run_server_deadline(std::shared_ptr<DnsBootstrapResolver> self, RequestId request_id,
                         std::shared_ptr<Request> request,
                         std::shared_ptr<boost::asio::ip::udp::socket> socket, std::uint64_t attempt,
@@ -508,8 +508,9 @@ class DnsBootstrapResolver final : public BootstrapResolver,
     // Overall deadline task: pushes the driver into the system phase. When the
     // driver is already there, the system resolver's own deadline owns the
     // wait, so this only wakes it. Bounded by the deadline; never stopped.
-    static exec::task<void> run_deadline(std::shared_ptr<DnsBootstrapResolver> self,
-                                         RequestId request_id, std::shared_ptr<Request> request) {
+    static stdexec::task<void> run_deadline(std::shared_ptr<DnsBootstrapResolver> self,
+                                            RequestId request_id,
+                                            std::shared_ptr<Request> request) {
         try {
             co_await async::sleep_until(self->runtime_.serialized_executor(), request->deadline);
         } catch (...) {
@@ -553,7 +554,6 @@ class DnsBootstrapResolver final : public BootstrapResolver,
     runtime::AsioRuntime &runtime_;
     std::vector<DnsServerEndpoint> configured_servers_;
     std::shared_ptr<BootstrapResolver> system_resolver_;
-    exec::async_scope scope_;
     std::unordered_map<RequestId, std::shared_ptr<Request>> requests_;
     RequestId next_request_id_ = 1;
     std::uint16_t next_query_id_ = 1;

@@ -1,10 +1,9 @@
 #include <clash_native/app/application.hpp>
 
-#include <clash_native/async/callback_sender.hpp>
 #include <clash_native/platform/platform_adapter.hpp>
 
 #include <boost/asio/signal_set.hpp>
-#include <exec/task.hpp>
+#include <exec/asio/use_sender.hpp>
 
 #include <stdexec/execution.hpp>
 
@@ -20,34 +19,25 @@
 namespace clash_native::app {
 namespace {
 
-// Awaits one shutdown signal as a task instead of a signal_set.async_wait
-// callback leaf, so the wait composes with stop/when_any/timeout instead
-// of firing a handler into the run() frame. Abortion cancels the set;
-// cancellation or set destruction completes stopped.
-exec::task<void> await_shutdown_signal(std::shared_ptr<boost::asio::signal_set> signals) {
-    using Signatures = stdexec::completion_signatures<stdexec::set_value_t(int),
-                                                      stdexec::set_error_t(std::exception_ptr),
-                                                      stdexec::set_stopped_t()>;
-    co_await async::callback_sender<Signatures>(
-        [signals](auto terminal) mutable -> async::CallbackAbortFn {
-            signals->async_wait([terminal = std::move(terminal),
-                                 signals](const boost::system::error_code &error,
-                                          int signo) mutable { terminal(error, signo); });
-            return async::CallbackAbortFn{[signals = std::move(signals)] { signals->cancel(); }};
-        },
-        [](stdexec::receiver auto &&receiver, const boost::system::error_code &error, int signo) {
-            if (!error) {
-                stdexec::set_value(std::forward<decltype(receiver)>(receiver), signo);
-            } else if (error == boost::asio::error::operation_aborted) {
-                stdexec::set_stopped(std::forward<decltype(receiver)>(receiver));
-            } else {
-                stdexec::set_error(std::forward<decltype(receiver)>(receiver),
-                                   std::make_exception_ptr(boost::system::system_error(error)));
-            }
-        });
+// Awaits one shutdown signal as a task: signal_set.async_wait as a use_sender
+// leaf, so the wait composes with stop/when_any/timeout instead of firing a
+// handler into the run() frame. Stop wires to Asio cancellation, which cancels
+// the set; abort delivers stopped natively via use_sender (operation_aborted
+// maps to set_stopped), other failures surface as system_error.
+stdexec::task<void> await_shutdown_signal(std::shared_ptr<boost::asio::signal_set> signals) {
+    co_await (signals->async_wait(exec::asio::use_sender) | stdexec::then([](int) {}) |
+              stdexec::let_error([](std::exception_ptr error) {
+                  try {
+                      std::rethrow_exception(std::move(error));
+                  } catch (const boost::system::system_error &failure) {
+                      if (failure.code() == boost::asio::error::operation_aborted) {
+                          return stdexec::just_stopped();
+                      }
+                      throw;
+                  }
+              }));
     co_return;
 }
-
 } // namespace
 
 Application::Application() : runtime_(runtime::AsioRuntime::instance()), proxy_server_(runtime_) {}

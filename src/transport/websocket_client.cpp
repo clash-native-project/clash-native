@@ -14,7 +14,6 @@
 #include <boost/system/error_code.hpp>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
 
 #include <stdexec/execution.hpp>
 
@@ -760,7 +759,7 @@ class FastOpenUpgradeStream final : public io::StreamHandle {
                     shared->pending_buffer_ = buffer;
                 }
                 // Task cannot be connected via start_with_receiver
-                // (exec::task has no connect()); spawn it on the
+                // (stdexec::task has no connect()); spawn it on the
                 // State-owned scope and bridge the terminal back through
                 // finish_validation. Abort closes the inner stream to
                 // unblock the task's co_awaited pull.
@@ -840,7 +839,7 @@ class FastOpenUpgradeStream final : public io::StreamHandle {
     // 101 validation as a single task: each inner pull is co_awaited
     // directly (cancellable via abort/close); the terminal travels via the
     // State pending slot so no Step/Serve receivers remain.
-    static exec::task<void> run_validation(std::shared_ptr<State> state) {
+    static stdexec::task<void> run_validation(std::shared_ptr<State> state) {
         boost::asio::mutable_buffer buffer;
         {
             std::unique_lock<std::mutex> lock(state->mutex_);
@@ -952,8 +951,8 @@ class WebSocketClientHandshakeOperation final
     // framing. Sends the GET (with early data), validates the 101 with
     // upgrade headers, writes the remainder raw, and delivers the inner
     // stream directly.
-    static exec::task<void> run_raw_upgrade(std::shared_ptr<WebSocketClientHandshakeOperation> self,
-                                            EarlyDataSplit early) {
+    static stdexec::task<void>
+    run_raw_upgrade(std::shared_ptr<WebSocketClientHandshakeOperation> self, EarlyDataSplit early) {
         std::string request = "GET " + early.target + " HTTP/1.1\r\nHost: " + self->options_.host +
                               "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n";
         for (const auto &header : self->options_.headers) {
@@ -1050,9 +1049,9 @@ class WebSocketClientHandshakeOperation final
         self->finish(std::unique_ptr<io::StreamHandle>(std::move(self->stream_)));
     }
 
-    static exec::task<void> run_deadline(std::shared_ptr<WebSocketClientHandshakeOperation> self,
-                                         boost::asio::any_io_executor executor,
-                                         std::chrono::steady_clock::time_point deadline) {
+    static stdexec::task<void> run_deadline(std::shared_ptr<WebSocketClientHandshakeOperation> self,
+                                            boost::asio::any_io_executor executor,
+                                            std::chrono::steady_clock::time_point deadline) {
         try {
             co_await async::sleep_until(executor, deadline);
         } catch (...) {
@@ -1061,7 +1060,7 @@ class WebSocketClientHandshakeOperation final
         self->finish(core::fail(timeout_error()));
     }
 
-    static exec::task<void> run_open(std::shared_ptr<WebSocketClientHandshakeOperation> self) {
+    static stdexec::task<void> run_open(std::shared_ptr<WebSocketClientHandshakeOperation> self) {
         if (const auto error = validate_options(self->options_)) {
             self->finish(core::fail(*error));
             co_return;
@@ -1140,6 +1139,9 @@ class WebSocketClientHandshakeOperation final
                     request.set(header.name, header.value);
                 }
             }));
+        // Beast async_handshake completes with a void-signature handler
+        // (error_code only), which exec::asio::use_sender cannot express;
+        // stays on callback_sender per docs/async-pitfalls.md:92-95.
         using HandshakeSigs =
             stdexec::completion_signatures<stdexec::set_value_t(bool),
                                            stdexec::set_error_t(std::exception_ptr),

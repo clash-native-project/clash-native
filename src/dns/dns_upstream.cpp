@@ -3,7 +3,7 @@
 #include <clash_native/io/sender.hpp>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <boost/asio/post.hpp>
 
@@ -51,7 +51,7 @@ struct DriveShared : public std::enable_shared_from_this<DriveShared> {
     exec::async_scope scope;
     std::atomic_bool settled{false};
 
-    static exec::task<void> run(std::shared_ptr<DriveShared> self) {
+    static stdexec::task<void> run(std::shared_ptr<DriveShared> self) {
         DnsExchangeResult result =
             core::fail(core::Error{core::ErrorCode::cancelled, "DNS upstream exchange cancelled"});
         try {
@@ -163,7 +163,7 @@ class DnsUpstreamGroup::Operation final
     // co_await each selected member sender, record health, and continue to
     // the next member while the deadline holds. Every path funnels through
     // member_finished()/finish(), so the task always ends with a value.
-    static exec::task<void> run(std::shared_ptr<Operation> self, std::size_t start_index) {
+    static stdexec::task<void> run(std::shared_ptr<Operation> self, std::size_t start_index) {
         auto index = start_index;
         while (!self->completed_) {
             if (std::chrono::steady_clock::now() >= self->deadline_) {

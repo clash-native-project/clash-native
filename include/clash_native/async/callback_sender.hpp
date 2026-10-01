@@ -265,9 +265,4 @@ using BridgeSignatures = stdexec::completion_signatures<stdexec::set_value_t(Res
                                                         stdexec::set_error_t(std::exception_ptr),
                                                         stdexec::set_stopped_t()>;
 
-template <typename Result, typename Starter> auto bridge_sender(Starter &&starter) {
-    return callback_sender<BridgeSignatures<Result>>(std::forward<Starter>(starter),
-                                                     BridgeTranslate<Result>{});
-}
-
 } // namespace clash_native::async

@@ -55,7 +55,7 @@ completion. (`CoreToIo`/`IoToCore` adapters follow the same rule.)
 
 ## stdexec shape notes
 
-- `exec::task` has no `.connect()`; only `co_await` it.
+- `stdexec::task` has no `.connect()`; only `co_await` it.
 - `exec::any_sender` receivers must declare
   `inplace_stop_token(get_stop_token_t)` handling.
 - The erased sender invokes the wrapped receiver as an lvalue, so
@@ -96,10 +96,10 @@ tasks; the following keep their shape deliberately:
 - Test-only APIs (e.g. the gRPC client): convert if and when a
   production caller appears.
 
-## Never create exec::task from an immediately-invoked capturing lambda
+## Never create stdexec::task from an immediately-invoked capturing lambda
 
 A coroutine frame built from an immediately-invoked capturing lambda
-(`[captures]() -> exec::task<T> { ... }()`) is corrupt on Windows
+(`[captures]() -> stdexec::task<T> { ... }()`) is corrupt on Windows
 clang-cl with this stdexec version (proven by minimal repro: captures
 read back null/garbage, bodies never run; AV/hang/stopped follow).
 Named functions, capture-free lambdas, and stored (named) lambdas
@@ -108,12 +108,12 @@ invoked later are unaffected. Rules:
 - Tasks come from named functions (static members, free functions)
   with explicit parameters, e.g. `scope.spawn(run(...))`, or from a
   stored lambda variable invoked later. Never an immediately-invoked
-  `[captures]() -> exec::task` inline, however convenient.
+  `[captures]() -> stdexec::task` inline, however convenient.
   `tests/transport/task_coroutine_test.cpp` pins the allowed shapes.
 - Drive a value-only chain to a callback with a plain shared state
   machine (`start_with_receiver` + small receivers) when no named
   function shape fits, not by adapting an inline task into a bridge.
-- `exec::task` cannot be type-erased into `AnySender` either (sticky
+- `stdexec::task` cannot be type-erased into `AnySender` either (sticky
   scheduler affinity fails `sender_to<any_receiver>`); expose chains as
   `callback_sender` + `then`, like `async_tls_client_handshake`.
 - A `Guard`-style RAII reservation must be filled in place

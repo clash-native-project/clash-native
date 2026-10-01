@@ -1,5 +1,27 @@
 # Implementation Log
 
+### 2026-10-01 — Migrate exec::task to stdexec::task, delete bridge_sender shim
+
+- Mechanical rename only: every `exec::task<T>` coroutine (~175-190 unique
+  defs across dns/outbound/proxy/transport/app/async/tests) to
+  `stdexec::task<T>`; `#include <exec/task.hpp>` dropped where
+  `<stdexec/execution.hpp>` present else swapped. `exec::async_scope`,
+  `exec::when_any`, `exec::asio::use_sender` kept (no `stdexec::async_scope`
+  in vcpkg 0.10.0; `stdexec::task` has no `connect()` so scope-spawn is the
+  only driver; `task_scheduler` builds from the spawn env's
+  `inline_scheduler`). Sticky-to-affine hop preserved via `affine()`.
+- Deleted the `bridge_sender<Result>(starter)` shim in
+  `callback_sender.hpp` (zero call sites; `BridgeSignatures`/
+  `BridgeTranslate`/`BridgeHandler` vocabulary stays). Only
+  `clang-cl 22 jump-threading 0xC0000005` TU workaround kept
+  (`trojan_outbound.cpp /O1`, clean-tree repro).
+- DNS cancel path deliberately untouched: `Operation` held-drive +
+  scope/request_stop design reverted to HEAD after a detached-cutover
+  attempt broke `CancelsInjectedTransportExchangeOnce`/`SiblingFlowing`
+  (abandon vs true abort). Reverted files re-renamed task-only.
+- Validation: Windows Release `clash-native-tests.exe` 313/313 passed;
+  `clang-format` clean on all touched files.
+
 ### 2026-09-22 — Add sender-based io handle abstractions (migration targets)
 
 - Added `include/clash_native/io/` with sender-based counterparts of the four

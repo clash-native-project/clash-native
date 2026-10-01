@@ -49,7 +49,7 @@ ProxyStream::ProxyStream(Stream stream, boost::asio::any_io_executor executor,
     : stream_(std::move(stream)), executor_(std::move(executor)),
       tls_context_(std::move(tls_context)) {}
 
-exec::task<void> ProxyStream::async_server_handshake() {
+stdexec::task<void> ProxyStream::async_server_handshake() {
     if (!tls_enabled()) {
         co_return;
     }
@@ -57,12 +57,16 @@ exec::task<void> ProxyStream::async_server_handshake() {
     // initiation (error only) that use_sender cannot express, so the leaf
     // stays a callback_sender while callers drive it from a task.
     const auto error = co_await async::callback_sender<HandshakeSignatures>(
+        // Raw this is sound: ProxyStream is a ProxySession member and the handshake task is only
+        // driven from run_handshake, which holds the owning session across the co_await.
         [this](auto terminal) mutable -> async::CallbackAbortFn {
             TlsSocket *stream = std::get_if<std::unique_ptr<TlsSocket>>(&stream_) != nullptr
                                     ? std::get<std::unique_ptr<TlsSocket>>(stream_).get()
                                     : nullptr;
             if (stream == nullptr) {
                 terminal(boost::asio::error::operation_aborted);
+                // cannot abort because the handshake never started (inline failure); nothing to
+                // cancel.
                 return async::CallbackAbortFn{[] {}};
             }
             stream->async_handshake(boost::asio::ssl::stream_base::server,

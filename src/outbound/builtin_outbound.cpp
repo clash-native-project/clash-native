@@ -11,7 +11,6 @@
 #include <boost/asio/post.hpp>
 
 #include <exec/asio/use_sender.hpp>
-#include <exec/task.hpp>
 
 #include <stdexec/execution.hpp>
 
@@ -95,7 +94,7 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
     // teardown (socket close) is subsumed by finish()'s !succeeded close
     // path. A named function (not an immediately-invoked capturing
     // lambda) builds the task; see docs/async-pitfalls.md.
-    static exec::task<void> run_guarded(std::shared_ptr<DirectConnectState> self) {
+    static stdexec::task<void> run_guarded(std::shared_ptr<DirectConnectState> self) {
         const std::string destination = destination_text(self->request_.destination);
         core::StreamOpenResult result =
             core::StreamOpenResult::failed({core::ErrorCode::cancelled, "direct connect stopped"});
@@ -121,7 +120,8 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
     // returns a Result; run_guarded funnels it through finish(), so the
     // spawned task always ends with a value unless an outer stop ends it
     // early.
-    static exec::task<core::StreamOpenResult> run_open(std::shared_ptr<DirectConnectState> self) {
+    static stdexec::task<core::StreamOpenResult>
+    run_open(std::shared_ptr<DirectConnectState> self) {
         if (self->request_.resolved_address) {
             co_return co_await connect_addresses(
                 self, std::vector<boost::asio::ip::address>{*self->request_.resolved_address});
@@ -159,7 +159,7 @@ class DirectConnectState final : public std::enable_shared_from_this<DirectConne
         co_return co_await connect_addresses(self, std::move(resolved.value()));
     }
 
-    static exec::task<core::StreamOpenResult>
+    static stdexec::task<core::StreamOpenResult>
     connect_addresses(std::shared_ptr<DirectConnectState> self,
                       std::vector<boost::asio::ip::address> addresses) {
         auto endpoints = std::make_shared<std::vector<boost::asio::ip::tcp::endpoint>>();

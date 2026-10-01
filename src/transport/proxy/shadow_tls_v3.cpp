@@ -24,7 +24,6 @@
 #include <clash_native/net/stream_handle_adapter.hpp>
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
@@ -401,7 +400,7 @@ class ShadowTlsV3Stream final : public io::StreamHandle,
         scope_.spawn(run_write_wire(shared_from_this()));
     }
 
-    static exec::task<void> run_write_wire(std::shared_ptr<ShadowTlsV3Stream> self) {
+    static stdexec::task<void> run_write_wire(std::shared_ptr<ShadowTlsV3Stream> self) {
         boost::system::error_code status;
         try {
             co_await self->lower_->async_write(boost::asio::buffer(self->write_wire_));
@@ -542,7 +541,7 @@ class ShadowTlsV3Stream final : public io::StreamHandle,
         scope_.spawn(run_read_exact(shared_from_this(), buffer, offset, std::move(handler)));
     }
 
-    static exec::task<void>
+    static stdexec::task<void>
     run_read_exact(std::shared_ptr<ShadowTlsV3Stream> self, boost::asio::mutable_buffer buffer,
                    std::size_t offset,
                    std::function<void(const boost::system::error_code &)> handler) {
@@ -798,7 +797,7 @@ class ShadowTlsV3OpenOperation final
         maybe_open();
     }
 
-    static exec::task<void> run_deadline(std::shared_ptr<ShadowTlsV3OpenOperation> self) {
+    static stdexec::task<void> run_deadline(std::shared_ptr<ShadowTlsV3OpenOperation> self) {
         try {
             co_await async::sleep_after(self->executor_, kHandshakeTimeout);
         } catch (...) {
@@ -824,7 +823,7 @@ class ShadowTlsV3OpenOperation final
     // engine callbacks above; the wire push itself is a task that
     // co_awaits the lower sender, so the completion stays cancellable
     // via stop/abort instead of a bridge receiver.
-    static exec::task<void> run_tls_write(std::shared_ptr<ShadowTlsV3OpenOperation> self) {
+    static stdexec::task<void> run_tls_write(std::shared_ptr<ShadowTlsV3OpenOperation> self) {
         boost::system::error_code terminal;
         try {
             co_await self->stream_->async_write(boost::asio::buffer(self->tls_write_current_));
@@ -850,7 +849,7 @@ class ShadowTlsV3OpenOperation final
         scope_.spawn(run_wire_read(shared_from_this()));
     }
 
-    static exec::task<void> run_wire_read(std::shared_ptr<ShadowTlsV3OpenOperation> self) {
+    static stdexec::task<void> run_wire_read(std::shared_ptr<ShadowTlsV3OpenOperation> self) {
         boost::system::error_code terminal;
         std::size_t size = 0;
         try {

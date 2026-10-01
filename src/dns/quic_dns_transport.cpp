@@ -1,9 +1,8 @@
 #include "quic_dns_transport_internal.hpp"
+#include <clash_native/async/detached.hpp>
 #include <clash_native/async/timer.hpp>
 #include <clash_native/dns/dns_codec.hpp>
 #include <clash_native/io/datagram_handle.hpp>
-
-#include <exec/task.hpp>
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
@@ -109,16 +108,19 @@ void QuicDnsTransport::Operation::start_on_strand() {
         return;
     }
     started_ = true;
-    // Open as a task: co_await the dialer sender, then hop back onto the
-    // strand through the shared state (ferrying move-only captures through
-    // asio::dispatch directly proved unreliable). The task always ends
-    // with a value; datagram_opened drops late opens when retired/empty.
-    scope_.spawn(run_open(shared_from_this(),
-                          core::Destination::address(owner_.config_.endpoint.address(), port_)));
+    // Open as a detached task: co_await the dialer sender, then hop back
+    // onto the strand through the shared state (ferrying move-only captures
+    // through asio::dispatch directly proved unreliable). The task always
+    // ends with a value; datagram_opened drops late opens when
+    // retired/empty. Detached (not scope-owned): the sleeper outlives the
+    // exchange it races, and a scope-owned task self-deletes inside
+    // __complete while holding the scope mutex (async_scope.hpp:162 UAF).
+    async::spawn_detached(run_open(
+        shared_from_this(), core::Destination::address(owner_.config_.endpoint.address(), port_)));
 }
 
-exec::task<void> QuicDnsTransport::Operation::run_open(std::shared_ptr<Operation> self,
-                                                       core::Destination destination) {
+stdexec::task<void> QuicDnsTransport::Operation::run_open(std::shared_ptr<Operation> self,
+                                                          core::Destination destination) {
     core::DatagramOpenResult opened = core::DatagramOpenResult::failed(
         {core::ErrorCode::endpoint_connection, "QUIC DNS datagram dialer failed to open a handle"});
     try {
@@ -149,7 +151,7 @@ exec::task<void> QuicDnsTransport::Operation::run_open(std::shared_ptr<Operation
     co_return;
 }
 
-exec::task<void>
+stdexec::task<void>
 QuicDnsTransport::Operation::run_deadline(std::shared_ptr<Operation> self, DnsExchangeId id,
                                           std::chrono::steady_clock::time_point deadline) {
     try {
@@ -161,8 +163,8 @@ QuicDnsTransport::Operation::run_deadline(std::shared_ptr<Operation> self, DnsEx
     co_return;
 }
 
-exec::task<void> QuicDnsTransport::Operation::run_idle(std::shared_ptr<Operation> self,
-                                                       std::uint64_t generation) {
+stdexec::task<void> QuicDnsTransport::Operation::run_idle(std::shared_ptr<Operation> self,
+                                                          std::uint64_t generation) {
     try {
         co_await async::sleep_after(self->owner_.runtime_.serialized_executor(),
                                     std::chrono::seconds(30));
@@ -207,12 +209,13 @@ void QuicDnsTransport::Operation::add_exchange(DnsExchangeId id, DnsExchangeRequ
         drain_exchange_results();
         return;
     }
-    // Deadline as a sleep_until task racing the exchange: whichever
+    // Deadline as a detached sleep_until racing the exchange: whichever
     // finishes first wins via the result guard in set_exchange_error plus
     // the map lookup in cancel_exchange; the loser observes the exchange
-    // is already gone and drops. The task always ends with a value so the
-    // scope never fails.
-    scope_.spawn(run_deadline(shared_from_this(), id, exchange->request.deadline));
+    // is already gone and drops. The task always ends with a value.
+    // Detached (see start_on_strand): a scope-owned sleeper races owner
+    // teardown through __complete (async_scope.hpp:162 UAF).
+    async::spawn_detached(run_deadline(shared_from_this(), id, exchange->request.deadline));
     if (mode_ == DnsTransportMode::doq || !http3_) {
         pending_exchanges_.push_back(id);
     } else {
@@ -365,10 +368,10 @@ void QuicDnsTransport::Operation::enter_idle_or_retire() {
     }
     idle_ = true;
     const auto self = shared_from_this();
-    // Idle as a sleep task racing new exchanges: the generation guard
+    // Idle as a detached sleep racing new exchanges: the generation guard
     // drops a stale sleep when add_exchange re-armed idleness meanwhile.
-    // The task always ends with a value so the scope never fails.
-    scope_.spawn(run_idle(self, ++idle_generation_));
+    // The task always ends with a value. Detached (see start_on_strand).
+    async::spawn_detached(run_idle(self, ++idle_generation_));
     owner_.session_idle(self);
 }
 
@@ -437,6 +440,8 @@ io::AnySender<DnsExchangeResult> QuicDnsTransport::exchange(DnsExchangeRequest r
         [self, box](auto terminal) mutable -> async::CallbackAbortFn {
             if (!box || !*box) {
                 terminal(core::fail(cancelled_error()));
+                // Inline terminal: no work was started, so there is nothing
+                // to abort.
                 return async::CallbackAbortFn{};
             }
             auto done = std::make_shared<async::BridgeHandler<DnsExchangeResult>>(

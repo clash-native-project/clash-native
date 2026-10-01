@@ -1,6 +1,6 @@
 #pragma once
 
-// Detached fire-and-forget tasks: run one exec::task<void> without an
+// Detached fire-and-forget tasks: run one stdexec::task<void> without an
 // owning async_scope.
 //
 // Why not scope_.spawn(): a spawned task self-deletes inside __complete
@@ -26,9 +26,9 @@
 // detached tasks never request_stop and are never drained via on_empty,
 // so no join ordering exists to violate.
 //
-// Why a scope at all (rather than exec::start_detached): exec::task is only
+// Why a scope at all (rather than exec::start_detached): stdexec::task is only
 // a sender where a spawn-like environment is present -- sender_in<root_env>
-// is false for both exec::task and stdexec::task, while true under an env
+// is false for stdexec::task, while true under an env
 // carrying a stop token plus start scheduler. So start_detached rejects bare
 // tasks at compile time ("no matching function ... sender_in<root_env>
 // evaluated to false"), and async_scope::spawn's internal submit path is the
@@ -39,7 +39,7 @@
 // owner.
 
 #include <exec/async_scope.hpp>
-#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <exception>
 #include <utility>
@@ -56,7 +56,7 @@ inline exec::async_scope &detached_scope() {
 
 // Value-only wrapper: async_scope::spawn terminates on set_error, so swallow
 // everything like the deadline tasks always did.
-inline exec::task<void> detach_wrap(exec::task<void> inner) {
+inline stdexec::task<void> detach_wrap(stdexec::task<void> inner) {
     try {
         co_await std::move(inner);
     } catch (...) {
@@ -64,10 +64,10 @@ inline exec::task<void> detach_wrap(exec::task<void> inner) {
     co_return;
 }
 
-// Fire-and-forget for exec::task<void> with no owning scope. The task runs
+// Fire-and-forget for stdexec::task<void> with no owning scope. The task runs
 // on the shared process-lifetime scope; completion destroys only the heap
 // opstate, never owner memory.
-inline void spawn_detached(exec::task<void> task) {
+inline void spawn_detached(stdexec::task<void> task) {
     detached_scope().spawn(detach_wrap(std::move(task)));
 }
 
