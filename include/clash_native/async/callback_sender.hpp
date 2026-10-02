@@ -8,8 +8,9 @@
 #include <exception>
 #include <memory>
 #include <optional>
-#include <thread>
 #include <utility>
+
+#include <boost/smart_ptr/detail/spinlock.hpp>
 
 namespace clash_native::async {
 
@@ -86,7 +87,11 @@ template <class Sigs, class Initiate, class Translate> class CallbackSender {
         // deletes the block, so a late terminal never touches a dead
         // operation state and no separate control block is allocated.
         struct Shared {
-            std::atomic_flag spin = ATOMIC_FLAG_INIT;
+            // Borrowed: boost::detail::spinlock (atomic_flag + yield(k)
+            // backoff: pause, then sleep). Same primitive backing
+            // shared_ptr's control block on this toolchain, so the backoff
+            // policy is inherited, not invented here.
+            boost::detail::spinlock spin = BOOST_DETAIL_SPINLOCK_INIT;
             bool done = false;
             CallbackAbortFn aborter;
             // Intrusive refs: 1 at construction (state ref). start()
@@ -95,41 +100,17 @@ template <class Sigs, class Initiate, class Translate> class CallbackSender {
             std::atomic<int> refs{1};
         };
 
-        static void lock(Shared *shared) noexcept {
-            // Bounded spin: critical sections only flip the flag and move
-            // the aborter (a few stores), so the wait is ns-scale; the
-            // aborter itself always runs after unlocking. Borrowed from
-            // stdexec's own __spin_wait shape (pause, then yield).
-            unsigned spins = 0;
-            while (shared->spin.test_and_set(std::memory_order_acquire)) {
-                if (++spins < 16) {
-#if defined(__x86_64__) || defined(_M_X64)
-                    __builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(_M_ARM64)
-                    __asm__ volatile("yield" ::: "memory");
-#endif
-                } else {
-                    std::this_thread::yield();
-                }
-            }
-        }
-
-        static void unlock(Shared *shared) noexcept {
-            shared->spin.clear(std::memory_order_release);
-        }
-
         // RAII spin guard: every claim path returns early, so scoped
         // unlock keeps the pairing review-proof.
         struct SpinGuard {
             Shared *shared;
-            explicit SpinGuard(Shared *s) noexcept : shared(s) { lock(shared); }
+            explicit SpinGuard(Shared *s) noexcept : shared(s) { shared->spin.lock(); }
             SpinGuard(const SpinGuard &) = delete;
             SpinGuard &operator=(const SpinGuard &) = delete;
-            ~SpinGuard() { unlock(shared); }
+            ~SpinGuard() { shared->spin.unlock(); }
         };
 
         static void release(Shared *shared) noexcept {
-            // Last reference deletes. Three references exist per started
             // op: state (dtor), terminal (settle win/lose, or the throw
             // catch), and start-frame (tail, or the throw catch). The block
             // therefore outlives the final claim and aborter handoff.

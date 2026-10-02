@@ -1,7 +1,22 @@
 # Implementation Log
 
-### 2026-10-02 — Lock-free intrusive Shared block (bridge alloc minus control block)
+### 2026-10-02 — Borrow boost spinlock for bridge Shared (drop hand-rolled backoff)
 
+- `Shared::spin` is now `boost::detail::spinlock`
+  (`boost/smart_ptr/detail/spinlock.hpp`, `scoped` via the existing
+  `SpinGuard`): same atomic_flag + `yield(k)` pause-then-sleep backoff that
+  already backs `shared_ptr`'s control block on this toolchain. Backoff
+  policy (including the sleep fallback after sustained contention, which
+  the hand-rolled version lacked) is inherited, not invented.
+- Header-only `detail` dependency only — no new vcpkg package
+  (`boost-asio`/`boost-beast` already required); `<thread>` include gone.
+- Numbers unchanged (Linux probe): B 0 allocs / ~29ns, C+D 2 allocs / 88B,
+  ASan/UBSan clean. `GunStreamTest.DecodesResponseFramesWithRemainder`
+  flaked once in the full suite but also flakes on the clean tree (stash
+  check) and passes 10/10 shuffle + 20/20 solo retries — pre-existing
+  flake, unrelated to this change.
+- Validation: Windows Release build clean, `CallbackSenderTest` 9/9 x10,
+  `clang-format` clean.
 - `CallbackSender::OpState::Shared` lost its `std::mutex` + `shared_ptr`
   control block: raw `new Shared()` with intrusive refs (state + terminal
   + start-frame = 3 per started op; pre-stop and throw paths adjusted),
