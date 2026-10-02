@@ -1,5 +1,31 @@
 # Implementation Log
 
+### 2026-10-02 — Project-owned AnySender erasure (relay path zero heap)
+
+- Replaced `exec::any_sender` with a project-owned erasure
+  (`io/any_sender.hpp`, `io::AnySender` alias in `io/sender.hpp`): sender
+  SBO 128 / op SBO 256, sized from Linux probe measurements (largest
+  production sender 88B datagram bridge, largest concrete op 232B
+  use_sender read chain). Sender must be nothrow-move-constructible to
+  stay inline; op connects directly into the buffer and the `AnySenderOp`
+  is immovable, so immovable asio chains stay inline too. Oversized
+  senders/ops fall back to the heap with identical semantics.
+- Receiver is never type-erased (templated op, like exec's `_any_opstate`):
+  stop token reaches the inner sender through a thin thunk. Only
+  inplace_stop_token / never_stop_token receivers accepted (everything in
+  the repo); exotic tokens are a compile error instead of a silent heap
+  adaptation. No scheduler/domain queries cross the erasure; completion
+  behavior stays unknown, so task co_await lowering is unchanged.
+- Added move-assign to `AnySender` (stock had it; `DnsUpstream::sender`
+  optional reassigns).
+- Linux probe (`D:/tmp/anysender_prof.cpp`): B chain-in-erasure 1 -> 0
+  allocs/op (805 -> 28ns), D bridge-in-erasure 3 -> 2 allocs (erasure
+  mallocs gone; remaining 2 are the bridge Shared block + aborter state).
+  Task-context probe: erased chain 1 -> 0 allocs, erased bridge 3 -> 2.
+  ASan+UBSan probe clean, 0 allocs on B preserved.
+- Validation: Windows Release build clean, `clash-native-tests.exe`
+  313/313, `clang-format` clean.
+
 ### 2026-10-02 — SBO for vendored move_only_function (hot-path alloc cut)
 
 - `move_only_function` fallback gained 32-byte small-buffer storage
