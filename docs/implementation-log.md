@@ -1,7 +1,22 @@
 # Implementation Log
 
-### 2026-10-02 — Unary bridge_sender factory, cancel hardening
+### 2026-10-02 — SBO for vendored move_only_function (hot-path alloc cut)
 
+- `move_only_function` fallback gained 32-byte small-buffer storage
+  (`kMoveOnlyFunctionSboSize`): hot-path aborters (one shared_ptr / id
+  pair) stay inline, larger or over-aligned callables use the heap.
+  Construction publishes state only after success; moves relocate SBO
+  targets and transfer heap pointers. Net: one fewer heap allocation per
+  bridge op.
+- Linux probe (`D:/tmp/anysender_prof.cpp`, ASan on): raw bridge 3 -> 2
+  allocs/op, bridge-in-AnySender 4 -> 3 allocs/op; noSan D 928ns/op
+  (B/A ~50x erasure ratio unchanged — erasure keeps its own malloc).
+  Windows Release build clean, `clash-native-tests.exe` 313/313,
+  `clang-format` clean. One full-suite run showed a transient
+  `GunStreamTest.DecodesResponseFramesWithRemainder` set_stopped failure;
+  10x shuffle repeats green plus a clean 313/313 rerun, treated as flake.
+
+### 2026-10-02 — Unary bridge_sender factory, cancel hardening
 - Added unary `async::bridge_sender<Result>(initiate)` in
   `callback_sender.hpp` (same `CallbackSender` type, Sigs/Translate built
   in); migrated all ~45 `callback_sender<BridgeSignatures<X>>` +
@@ -20,7 +35,6 @@
   (bridge migration reshaped the open helpers; jump-threading crashed again).
 - Validation: Windows Release build clean, `clash-native-tests.exe`
   313/313 passed, `clang-format` clean on all touched files.
-***
 
 ### 2026-10-01 — Migrate exec::task to stdexec::task, delete bridge_sender shim
 
