@@ -1,7 +1,25 @@
 # Implementation Log
 
-### 2026-10-02 — Project-owned AnySender erasure (relay path zero heap)
+### 2026-10-02 — Lock-free intrusive Shared block (bridge alloc minus control block)
 
+- `CallbackSender::OpState::Shared` lost its `std::mutex` + `shared_ptr`
+  control block: raw `new Shared()` with intrusive refs (state + terminal
+  + start-frame = 3 per started op; pre-stop and throw paths adjusted),
+  spin-guarded claim/aborter handoff (`SpinGuard`, pause-then-yield,
+  aborters always run unlocked). Net per bridge op: 2 allocs / 88B
+  (block + aborter state), down from 2 allocs / 136B; mutex gone.
+- Ownership: terminal consumes its ref on settle win/lose, start tail
+  consumes the frame ref before running any aborter (aborters may fire
+  the terminal synchronously), dtor consumes the state ref; catch takes
+  terminal + frame. Releases after guard drop (last-ref delete would
+  invalidate the guard's unlock).
+- Linux probe (`D:/tmp/anysender_prof.cpp`, noSan + ASan/UBSan clean):
+  C raw bridge and D bridge-in-erasure both 2 allocs / 88B (was 136B);
+  B chain-in-erasure unchanged 0 allocs / ~29ns. Full-suite bg_53 run
+  showed a transient unrelated failure signature; rerun 313/313.
+- Validation: Windows Release build clean, `clash-native-tests.exe`
+  313/313 (CallbackSenderTest 9/9 x20 repeats, Gun flake 10/10 pass on
+  retry), `clang-format` clean.
 - Replaced `exec::any_sender` with a project-owned erasure
   (`io/any_sender.hpp`, `io::AnySender` alias in `io/sender.hpp`): sender
   SBO 128 / op SBO 256, sized from Linux probe measurements (largest
