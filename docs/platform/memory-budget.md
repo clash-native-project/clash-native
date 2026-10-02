@@ -100,9 +100,19 @@ There is currently **no memory accounting anywhere**: no RSS gauge, no
    explicit error (the existing `already_started` guard shape), never as
    silent growth into jetsam/OOM.
 
-## 5. Explicit non-goals
+## 6. Deferred: aborter-state merge into Shared (intentionally not done)
 
-- Further sender/SBO micro-optimization: CPU-only, RSS-neutral.
-- The Apple port itself: TUN access, background execution, and jetsam
+- The bridge op still costs up to 2 allocs: the `Shared` block plus the
+  aborter's own captured state (`callback_sender.hpp`). Merging the capture
+  into `Shared` would save ~10ns and ~8B bookkeeping per op — but only on
+  one-shot paths (connect/resolve chains with owning captures). Relay
+  fast-path aborters capture existing long-lived state (`[state]`/`[self]`)
+  with no new allocation, so the merge saves nothing there (~µs/s, noise).
+- The remaining bytes are business state (socket/stream/session objects),
+  whose lifetime belongs to the business layer; moving them is a
+  lifetime-design change, not an allocator trick. Revisit only if the
+  per-connection profiling from step 1 shows otherwise.
+
+## 7. Explicit non-goals
   behavior must be built and validated per `docs/architecture.md` §16 before
   any of the above is testable on iOS.
